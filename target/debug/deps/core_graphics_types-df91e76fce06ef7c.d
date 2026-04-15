@@ -1,7 +1,0 @@
-/Users/pgmac/Data/prjcts/wiredesk/target/debug/deps/core_graphics_types-df91e76fce06ef7c.d: /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/lib.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/base.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/geometry.rs
-
-/Users/pgmac/Data/prjcts/wiredesk/target/debug/deps/libcore_graphics_types-df91e76fce06ef7c.rmeta: /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/lib.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/base.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/geometry.rs
-
-/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/lib.rs:
-/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/base.rs:
-/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/core-graphics-types-0.1.3/src/geometry.rs:

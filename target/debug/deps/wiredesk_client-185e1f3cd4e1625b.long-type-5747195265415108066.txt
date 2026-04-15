@@ -1,1 +1,0 @@
-Box<(dyn wiredesk_transport::transport::Transport + 'static)>: wiredesk_transport::transport::Transport
