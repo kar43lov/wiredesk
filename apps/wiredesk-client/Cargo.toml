@@ -1,0 +1,17 @@
+[package]
+name = "wiredesk-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wiredesk-core.workspace = true
+wiredesk-protocol.workspace = true
+wiredesk-transport.workspace = true
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+eframe = "0.31"
+serialport.workspace = true

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wiredesk-core",
+    "crates/wiredesk-protocol",
+    "crates/wiredesk-transport",
+    "apps/wiredesk-host",
+    "apps/wiredesk-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+wiredesk-core = { path = "crates/wiredesk-core" }
+wiredesk-protocol = { path = "crates/wiredesk-protocol" }
+wiredesk-transport = { path = "crates/wiredesk-transport" }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+serialport = "4"
+crc = "3"

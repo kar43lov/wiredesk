@@ -1,0 +1,11 @@
+[package]
+name = "wiredesk-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wiredesk-core.workspace = true
+wiredesk-protocol.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serialport.workspace = true

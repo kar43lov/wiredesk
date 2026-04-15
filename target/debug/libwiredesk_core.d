@@ -1,0 +1,1 @@
+/Users/pgmac/Data/prjcts/wiredesk/target/debug/libwiredesk_core.rlib: /Users/pgmac/Data/prjcts/wiredesk/crates/wiredesk-core/src/error.rs /Users/pgmac/Data/prjcts/wiredesk/crates/wiredesk-core/src/lib.rs /Users/pgmac/Data/prjcts/wiredesk/crates/wiredesk-core/src/types.rs

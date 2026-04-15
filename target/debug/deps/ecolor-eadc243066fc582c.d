@@ -1,0 +1,12 @@
+/Users/pgmac/Data/prjcts/wiredesk/target/debug/deps/ecolor-eadc243066fc582c.d: /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/lib.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/color32.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva_gamma.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/rgba.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hex_color_runtime.rs
+
+/Users/pgmac/Data/prjcts/wiredesk/target/debug/deps/libecolor-eadc243066fc582c.rlib: /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/lib.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/color32.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva_gamma.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/rgba.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hex_color_runtime.rs
+
+/Users/pgmac/Data/prjcts/wiredesk/target/debug/deps/libecolor-eadc243066fc582c.rmeta: /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/lib.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/color32.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva_gamma.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/rgba.rs /Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hex_color_runtime.rs
+
+/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/lib.rs:
+/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/color32.rs:
+/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva_gamma.rs:
+/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hsva.rs:
+/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/rgba.rs:
+/Users/pgmac/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.31.1/src/hex_color_runtime.rs:

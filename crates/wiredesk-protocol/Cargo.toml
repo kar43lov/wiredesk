@@ -1,0 +1,12 @@
+[package]
+name = "wiredesk-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wiredesk-core.workspace = true
+thiserror.workspace = true
+crc.workspace = true
+
+[dev-dependencies]
+proptest = "1"
