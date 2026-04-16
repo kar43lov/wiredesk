@@ -234,6 +234,10 @@ impl eframe::App for WireDeskApp {
                     for event in &events {
                         match event {
                             egui::Event::Key { key, pressed, modifiers, .. } => {
+                                // Don't forward the capture-toggle combo to Host
+                                if *key == egui::Key::G && modifiers.ctrl && modifiers.alt {
+                                    continue;
+                                }
                                 let _ = self.mapper.send_key(&mut *t, key, modifiers, *pressed);
                             }
                             egui::Event::PointerButton { button, pressed, .. } => {

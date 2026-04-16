@@ -96,13 +96,20 @@ impl InputInjector for WindowsInjector {
     fn key_down(&mut self, scancode: u16, _modifiers: u8) -> Result<()> {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
+        // Extended scancodes (0xE0xx) need KEYEVENTF_EXTENDEDKEY flag
+        let (scan, mut flags) = if scancode & 0xFF00 == 0xE000 {
+            ((scancode & 0xFF) as u16, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
+        } else {
+            (scancode, KEYEVENTF_SCANCODE)
+        };
+
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0),
-                    wScan: scancode,
-                    dwFlags: KEYEVENTF_SCANCODE,
+                    wScan: scan,
+                    dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -115,13 +122,19 @@ impl InputInjector for WindowsInjector {
     fn key_up(&mut self, scancode: u16, _modifiers: u8) -> Result<()> {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
+        let (scan, base_flags) = if scancode & 0xFF00 == 0xE000 {
+            ((scancode & 0xFF) as u16, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
+        } else {
+            (scancode, KEYEVENTF_SCANCODE)
+        };
+
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0),
-                    wScan: scancode,
-                    dwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+                    wScan: scan,
+                    dwFlags: base_flags | KEYEVENTF_KEYUP,
                     time: 0,
                     dwExtraInfo: 0,
                 },

@@ -100,6 +100,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     fn handle_packet(&mut self, packet: Packet) -> Result<()> {
         match (&self.state, &packet.message) {
             (SessionState::WaitingForHello, Message::Hello { version, client_name }) => {
+                if *version != VERSION {
+                    log::warn!("version mismatch: client v{version}, host v{VERSION}");
+                    self.send(Message::Error {
+                        code: 1,
+                        msg: format!("unsupported version {version}, expected {VERSION}"),
+                    })?;
+                    return Ok(());
+                }
                 log::info!("HELLO from '{client_name}' v{version}");
                 self.send(Message::HelloAck {
                     version: VERSION,

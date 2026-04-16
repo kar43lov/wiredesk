@@ -104,10 +104,10 @@ fn transport_thread(
     loop {
         let packet = {
             let Ok(mut t) = transport.lock() else {
-            log::error!("transport mutex poisoned");
-            let _ = events_tx.send(TransportEvent::Disconnected("internal error".into()));
-            return;
-        };
+                log::error!("transport mutex poisoned");
+                let _ = events_tx.send(TransportEvent::Disconnected("internal error".into()));
+                return;
+            };
             t.recv()
         };
 

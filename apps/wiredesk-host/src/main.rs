@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     loop {
         match sess.tick() {
             Ok(_) => {}
-            Err(ref e) if format!("{e}").contains("timeout") => continue,
+            Err(wiredesk_core::error::WireDeskError::Transport(ref msg)) if msg.contains("timeout") => continue,
             Err(e) => {
                 log::error!("session error: {e}");
                 std::thread::sleep(std::time::Duration::from_secs(1));
