@@ -6,6 +6,7 @@ use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
 
 use crate::injector::InputInjector;
+use crate::shell::{ShellEvent, ShellProcess};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(6); // 3 missed heartbeats
@@ -28,6 +29,7 @@ pub struct Session<T: Transport, I: InputInjector> {
     host_name: String,
     screen_w: u16,
     screen_h: u16,
+    shell: Option<ShellProcess>,
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
@@ -43,6 +45,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             host_name,
             screen_w,
             screen_h,
+            shell: None,
         }
     }
 
@@ -80,9 +83,13 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         {
             log::warn!("heartbeat timeout — disconnecting");
             self.injector.release_all()?;
+            self.shell_kill();
             self.state = SessionState::WaitingForHello;
             return Ok(false);
         }
+
+        // Drain pending shell output and exit events without blocking
+        self.pump_shell_events()?;
 
         // Try to receive a packet
         let packet = match self.transport.recv() {
@@ -95,6 +102,61 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
         self.handle_packet(packet)?;
         Ok(true)
+    }
+
+    /// Drain any stdout/stderr from running shell into outbound packets.
+    /// Also detects shell exit and notifies the client.
+    fn pump_shell_events(&mut self) -> Result<()> {
+        if self.shell.is_none() {
+            return Ok(());
+        }
+
+        // Up to N events per tick to avoid starving recv()
+        const MAX_PER_TICK: usize = 16;
+        let mut outputs: Vec<Vec<u8>> = Vec::new();
+        let mut exit_code: Option<i32> = None;
+
+        if let Some(sh) = self.shell.as_ref() {
+            for _ in 0..MAX_PER_TICK {
+                match sh.events_rx.try_recv() {
+                    Ok(ShellEvent::Output(data)) => outputs.push(data),
+                    Ok(ShellEvent::Exit(code)) => {
+                        exit_code = Some(code);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
+        for chunk in outputs {
+            // Split into max-payload-sized chunks (512 bytes is the protocol limit)
+            for piece in chunk.chunks(480) {
+                self.send(Message::ShellOutput { data: piece.to_vec() })?;
+            }
+        }
+
+        // Detect process exit even if we didn't get an Exit event
+        if exit_code.is_none() {
+            if let Some(sh) = self.shell.as_mut() {
+                exit_code = sh.try_exit_code();
+            }
+        }
+
+        if let Some(code) = exit_code {
+            log::info!("shell exited with code {code}");
+            self.shell = None;
+            self.send(Message::ShellExit { code })?;
+        }
+
+        Ok(())
+    }
+
+    fn shell_kill(&mut self) {
+        if let Some(mut sh) = self.shell.take() {
+            sh.kill();
+        }
     }
 
     fn handle_packet(&mut self, packet: Packet) -> Result<()> {
@@ -144,9 +206,46 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.injector.key_up(*scancode, *modifiers)?;
             }
 
+            (SessionState::Connected, Message::ShellOpen { shell }) => {
+                if self.shell.is_some() {
+                    log::warn!("ShellOpen received but a shell is already running");
+                    self.send(Message::Error {
+                        code: 2,
+                        msg: "shell already open".into(),
+                    })?;
+                } else {
+                    log::info!("opening shell '{shell}'");
+                    match ShellProcess::spawn(shell) {
+                        Ok(proc) => self.shell = Some(proc),
+                        Err(e) => {
+                            log::error!("failed to spawn shell: {e}");
+                            self.send(Message::Error {
+                                code: 3,
+                                msg: format!("shell spawn: {e}"),
+                            })?;
+                        }
+                    }
+                }
+            }
+
+            (SessionState::Connected, Message::ShellInput { data }) => {
+                if let Some(sh) = self.shell.as_ref() {
+                    if !sh.write(data.clone()) {
+                        log::warn!("shell stdin writer is gone");
+                    }
+                }
+            }
+
+            (SessionState::Connected, Message::ShellClose) => {
+                if let Some(sh) = self.shell.as_ref() {
+                    sh.close();
+                }
+            }
+
             (SessionState::Connected, Message::Disconnect) => {
                 log::info!("client disconnected");
                 self.injector.release_all()?;
+                self.shell_kill();
                 self.state = SessionState::WaitingForHello;
             }
 

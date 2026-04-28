@@ -1,5 +1,6 @@
 mod injector;
 mod session;
+mod shell;
 
 use clap::Parser;
 use wiredesk_core::error::Result;

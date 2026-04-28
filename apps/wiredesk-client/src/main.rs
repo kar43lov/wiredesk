@@ -67,7 +67,7 @@ fn main() {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 350.0])
+            .with_inner_size([520.0, 600.0])
             .with_title("WireDesk"),
         ..Default::default()
     };
@@ -127,6 +127,19 @@ fn transport_thread(
                 Message::ClipOffer { total_len, .. } => {
                     log::debug!("clipboard offer: {total_len} bytes");
                     // TODO: receive clipboard chunks
+                }
+                Message::ShellOutput { data } => {
+                    let _ = events_tx.send(TransportEvent::ShellOutput(data));
+                }
+                Message::ShellExit { code } => {
+                    let _ = events_tx.send(TransportEvent::ShellExit(code));
+                }
+                Message::Error { code, msg } => {
+                    log::warn!("error from host: code={code} msg={msg}");
+                    // Surface as shell error if it looks shell-related; otherwise log only.
+                    if msg.contains("shell") {
+                        let _ = events_tx.send(TransportEvent::ShellError(msg));
+                    }
                 }
                 Message::Disconnect => {
                     log::info!("host disconnected");

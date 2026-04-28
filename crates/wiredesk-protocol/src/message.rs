@@ -23,6 +23,12 @@ pub enum MessageType {
     Heartbeat = 0x30,
     Error = 0x31,
     Disconnect = 0x32,
+    // Shell (terminal-over-serial)
+    ShellOpen = 0x40,
+    ShellInput = 0x41,
+    ShellOutput = 0x42,
+    ShellClose = 0x43,
+    ShellExit = 0x44,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -43,6 +49,11 @@ impl TryFrom<u8> for MessageType {
             0x30 => Ok(Self::Heartbeat),
             0x31 => Ok(Self::Error),
             0x32 => Ok(Self::Disconnect),
+            0x40 => Ok(Self::ShellOpen),
+            0x41 => Ok(Self::ShellInput),
+            0x42 => Ok(Self::ShellOutput),
+            0x43 => Ok(Self::ShellClose),
+            0x44 => Ok(Self::ShellExit),
             _ => Err(WireDeskError::Protocol(format!("unknown message type: 0x{v:02X}"))),
         }
     }
@@ -64,6 +75,11 @@ pub enum Message {
     Heartbeat,
     Error { code: u16, msg: String },
     Disconnect,
+    ShellOpen { shell: String },           // "powershell", "cmd", "" for default
+    ShellInput { data: Vec<u8> },          // bytes to write to shell stdin
+    ShellOutput { data: Vec<u8> },         // bytes from shell stdout/stderr
+    ShellClose,
+    ShellExit { code: i32 },
 }
 
 impl Message {
@@ -82,6 +98,11 @@ impl Message {
             Self::Heartbeat => MessageType::Heartbeat,
             Self::Error { .. } => MessageType::Error,
             Self::Disconnect => MessageType::Disconnect,
+            Self::ShellOpen { .. } => MessageType::ShellOpen,
+            Self::ShellInput { .. } => MessageType::ShellInput,
+            Self::ShellOutput { .. } => MessageType::ShellOutput,
+            Self::ShellClose => MessageType::ShellClose,
+            Self::ShellExit { .. } => MessageType::ShellExit,
         }
     }
 
@@ -129,10 +150,19 @@ impl Message {
             Self::ClipAck { index } => {
                 buf.extend_from_slice(&index.to_le_bytes());
             }
-            Self::Heartbeat | Self::Disconnect => {}
+            Self::Heartbeat | Self::Disconnect | Self::ShellClose => {}
             Self::Error { code, msg } => {
                 buf.extend_from_slice(&code.to_le_bytes());
                 write_string(&mut buf, msg, 256);
+            }
+            Self::ShellOpen { shell } => {
+                write_string(&mut buf, shell, 32);
+            }
+            Self::ShellInput { data } | Self::ShellOutput { data } => {
+                buf.extend_from_slice(data);
+            }
+            Self::ShellExit { code } => {
+                buf.extend_from_slice(&code.to_le_bytes());
             }
         }
         buf
@@ -214,6 +244,22 @@ impl Message {
                 let code = u16::from_le_bytes([payload[0], payload[1]]);
                 let msg = read_string(&payload[2..])?;
                 Ok(Self::Error { code, msg })
+            }
+            MessageType::ShellOpen => {
+                let shell = if payload.is_empty() {
+                    String::new()
+                } else {
+                    read_string(payload)?
+                };
+                Ok(Self::ShellOpen { shell })
+            }
+            MessageType::ShellInput => Ok(Self::ShellInput { data: payload.to_vec() }),
+            MessageType::ShellOutput => Ok(Self::ShellOutput { data: payload.to_vec() }),
+            MessageType::ShellClose => Ok(Self::ShellClose),
+            MessageType::ShellExit => {
+                ensure_min_len(payload, 4)?;
+                let code = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Self::ShellExit { code })
             }
         }
     }
@@ -342,6 +388,39 @@ mod tests {
     #[test]
     fn roundtrip_error() {
         roundtrip(&Message::Error { code: 500, msg: "something broke".into() });
+    }
+
+    #[test]
+    fn roundtrip_shell_open_default() {
+        roundtrip(&Message::ShellOpen { shell: String::new() });
+    }
+
+    #[test]
+    fn roundtrip_shell_open_powershell() {
+        roundtrip(&Message::ShellOpen { shell: "powershell".into() });
+    }
+
+    #[test]
+    fn roundtrip_shell_input() {
+        roundtrip(&Message::ShellInput { data: b"ls -la\n".to_vec() });
+    }
+
+    #[test]
+    fn roundtrip_shell_output() {
+        // Output may contain arbitrary bytes including 0x00
+        roundtrip(&Message::ShellOutput { data: vec![0, 1, 0xFF, b'x', b'y'] });
+    }
+
+    #[test]
+    fn roundtrip_shell_close() {
+        roundtrip(&Message::ShellClose);
+    }
+
+    #[test]
+    fn roundtrip_shell_exit() {
+        roundtrip(&Message::ShellExit { code: 0 });
+        roundtrip(&Message::ShellExit { code: -1 });
+        roundtrip(&Message::ShellExit { code: 130 });
     }
 
     #[test]

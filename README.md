@@ -28,6 +28,7 @@ Host (Windows 11)                       Client (macOS)
 - Syncs clipboard text in both directions
 - Toggle capture with Ctrl+Alt+G — input goes to Host when active, back to Mac when released
 - Special key buttons: Ctrl+Alt+Del, Win key
+- **Terminal-over-serial**: opens a shell on Host (powershell/cmd) and pipes I/O over the same serial link. From there you can run scripts, copy files, or `ssh` to other machines using the Host's internet connection.
 
 ## What WireDesk does NOT do
 
