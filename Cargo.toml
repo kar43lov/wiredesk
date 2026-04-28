@@ -6,6 +6,7 @@ members = [
     "crates/wiredesk-transport",
     "apps/wiredesk-host",
     "apps/wiredesk-client",
+    "apps/wiredesk-term",
 ]
 
 [workspace.package]

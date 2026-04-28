@@ -1,0 +1,14 @@
+[package]
+name = "wiredesk-term"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wiredesk-core.workspace = true
+wiredesk-protocol.workspace = true
+wiredesk-transport.workspace = true
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+crossterm = "0.28"

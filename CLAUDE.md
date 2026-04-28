@@ -22,9 +22,15 @@ Host agent компилируется только на Windows (Windows API з�
 # запуск host agent (Windows)
 cargo run -p wiredesk-host -- --port COM3 --baud 921600
 
-# запуск client (macOS)
+# запуск GUI клиента (macOS) — мышь/клавиатура/clipboard/встроенный терминал
 cargo run -p wiredesk-client -- --port /dev/tty.usbserial-XXX --baud 921600
+
+# запуск только терминала в Ghostty/iTerm (raw-mode CLI bridge)
+cargo run -p wiredesk-term -- --port /dev/tty.usbserial-XXX --baud 921600
+# Ctrl+] для выхода
 ```
+
+`wiredesk-client` и `wiredesk-term` взаимоисключающие — оба открывают serial-порт.
 
 ## Architecture
 
@@ -36,8 +42,9 @@ crates/
   wiredesk-protocol   — бинарный протокол: Packet, Message (13 типов), COBS framing, CRC-16
   wiredesk-transport  — trait Transport, SerialTransport, MockTransport
 apps/
-  wiredesk-host       — Windows console agent: Session state machine + InputInjector
-  wiredesk-client     — macOS egui app: маленькое окно с toggle capture + input mapping
+  wiredesk-host       — Windows console agent: Session state machine + InputInjector + shell subprocess
+  wiredesk-client     — macOS egui app: маленькое окно с toggle capture + input mapping + collapsible shell panel
+  wiredesk-term       — macOS CLI: raw-mode terminal bridge для Ghostty/iTerm (только shell)
 ```
 
 ### Data flow

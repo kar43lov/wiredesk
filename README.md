@@ -17,8 +17,8 @@ Host (Windows 11)                       Client (macOS)
     |                                        |
     |-- USB-Serial <-- null-modem --> USB-Serial
     |                                        |
-    wiredesk-host                       wiredesk-client
-    (console agent)                     (egui control panel)
+    wiredesk-host                       wiredesk-client (GUI)
+    (console agent)                     wiredesk-term   (terminal-only, e.g. in Ghostty)
 ```
 
 ## What WireDesk does
@@ -64,18 +64,32 @@ cargo test --workspace
 wiredesk-host --port COM3 --baud 921600 --width 1920 --height 1080
 ```
 
-**Client (macOS):**
+**Client (macOS) — full GUI** (mouse, keyboard, clipboard, embedded terminal):
 
 ```bash
 wiredesk-client --port /dev/tty.usbserial-XXX --baud 921600
 ```
+
+**Client (macOS) — terminal only** (run inside Ghostty/iTerm/Terminal.app for a real shell experience with history, scrollback, copy/paste):
+
+```bash
+wiredesk-term --port /dev/tty.usbserial-XXX --baud 921600
+
+# Optional: pick a specific shell
+wiredesk-term --port /dev/tty.usbserial-XXX --shell powershell
+wiredesk-term --port /dev/tty.usbserial-XXX --shell cmd
+```
+
+Press **Ctrl+]** in `wiredesk-term` to quit and restore the local terminal.
+
+`wiredesk-client` and `wiredesk-term` are mutually exclusive — they share the same serial port. Run one or the other depending on whether you need the GUI or just a shell.
 
 ## Protocol
 
 Custom binary protocol over COBS-framed serial:
 
 - Packet: `[magic "WD"][type][flags][seq][len][payload][crc16]`
-- 13 message types: handshake, 5 input types, 3 clipboard types, heartbeat/error/disconnect
+- 18 message types: handshake, 5 input types, 3 clipboard types, heartbeat/error/disconnect, 5 shell types
 - Input events: fire-and-forget (low latency)
 - Clipboard: chunked with ACK (reliable delivery)
 - Heartbeat: every 2 sec, timeout after 6 sec
@@ -90,13 +104,14 @@ crates/
   wiredesk-protocol    — packet format, messages, COBS, CRC-16
   wiredesk-transport   — Transport trait, SerialTransport, MockTransport
 apps/
-  wiredesk-host        — Windows agent (Session + InputInjector via SendInput)
-  wiredesk-client      — macOS app (egui UI + input capture + keymap)
+  wiredesk-host        — Windows agent (Session + InputInjector + shell subprocess)
+  wiredesk-client      — macOS GUI (egui — input capture, keymap, clipboard, shell panel)
+  wiredesk-term        — macOS CLI (raw-mode terminal bridge — runs inside Ghostty/iTerm)
 ```
 
 ## Status
 
-Early prototype (MVP). Core protocol and transport working. 62 tests passing.
+Early prototype (MVP). Core protocol and transport working. 71 tests passing.
 
 ## License
 
