@@ -17,10 +17,26 @@ const MAX_PARTIAL_TIMEOUTS: u32 = 50; // ~5 sec at 100ms timeout
 
 impl SerialTransport {
     pub fn open(port_name: &str, baud_rate: u32) -> Result<Self> {
-        let port = serialport::new(port_name, baud_rate)
+        let mut port = serialport::new(port_name, baud_rate)
             .timeout(Duration::from_millis(100))
             .open()
             .map_err(|e| WireDeskError::Transport(format!("serial open {port_name}: {e}")))?;
+
+        // Many USB-UART chips (CH340, FTDI, etc.) emit a stray byte when DTR
+        // toggles on open. Wait briefly for the line to settle, then drain
+        // anything that arrived during that window so it doesn't get glued to
+        // the first real frame and produce "bad magic" errors.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut scratch = [0u8; 256];
+        loop {
+            match port.read(&mut scratch) {
+                Ok(n) if n > 0 => {
+                    log::debug!("serial open: drained {n} byte(s) of startup junk");
+                    continue;
+                }
+                _ => break,
+            }
+        }
 
         Ok(Self {
             port,
@@ -34,6 +50,12 @@ impl Transport for SerialTransport {
     fn send(&mut self, packet: &Packet) -> Result<()> {
         let raw = packet.to_bytes()?;
         let encoded = cobs::encode(&raw);
+        // Leading 0x00 forces a frame boundary so any line noise preceding
+        // this packet ends up in its own (invalid, ignored) frame instead of
+        // getting concatenated with our payload.
+        self.port
+            .write_all(&[0x00])
+            .map_err(|e| WireDeskError::Transport(format!("serial write: {e}")))?;
         self.port
             .write_all(&encoded)
             .map_err(|e| WireDeskError::Transport(format!("serial write: {e}")))?;

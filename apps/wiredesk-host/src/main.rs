@@ -51,6 +51,12 @@ fn main() -> Result<()> {
         match sess.tick() {
             Ok(_) => {}
             Err(wiredesk_core::error::WireDeskError::Transport(ref msg)) if msg.contains("timeout") => continue,
+            // Protocol errors (bad magic, CRC mismatch, COBS decode) are
+            // recoverable: the framing layer already discarded the bad bytes,
+            // so just go back to recv() and try the next frame.
+            Err(wiredesk_core::error::WireDeskError::Protocol(ref msg)) => {
+                log::warn!("dropping bad frame: {msg}");
+            }
             Err(e) => {
                 log::error!("session error: {e}");
                 std::thread::sleep(std::time::Duration::from_secs(1));
