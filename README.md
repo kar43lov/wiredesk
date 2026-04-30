@@ -83,17 +83,17 @@ wiredesk-host --port COM3 --baud 921600 --width 1920 --height 1080
 **Client (macOS) — full GUI** (mouse, keyboard, clipboard, embedded terminal):
 
 ```bash
-wiredesk-client --port /dev/tty.usbserial-XXX --baud 921600
+wiredesk-client --port /dev/cu.usbserial-XXX --baud 921600
 ```
 
 **Client (macOS) — terminal only** (run inside Ghostty/iTerm/Terminal.app for a real shell experience with history, scrollback, copy/paste):
 
 ```bash
-wiredesk-term --port /dev/tty.usbserial-XXX --baud 921600
+wiredesk-term --port /dev/cu.usbserial-XXX --baud 921600
 
 # Optional: pick a specific shell
-wiredesk-term --port /dev/tty.usbserial-XXX --shell powershell
-wiredesk-term --port /dev/tty.usbserial-XXX --shell cmd
+wiredesk-term --port /dev/cu.usbserial-XXX --shell powershell
+wiredesk-term --port /dev/cu.usbserial-XXX --shell cmd
 ```
 
 Press **Ctrl+]** in `wiredesk-term` to quit and restore the local terminal.

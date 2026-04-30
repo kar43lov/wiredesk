@@ -44,10 +44,12 @@
 **На Mac:**
 
 ```bash
-ls /dev/tty.* | grep -iE 'usb|wch|ch34'
+ls /dev/cu.* | grep -iE 'usb|wch|ch34'
 ```
 
-Должно появиться `/dev/tty.wchusbserial-XXX` или `/dev/tty.usbserial-XXX`. Запиши.
+Должно появиться что-то вроде `/dev/cu.usbserial-120` (с CH340-драйвером от Apple) или `/dev/cu.wchusbserial-XXX` (если стоит официальный WCH-драйвер). Запиши.
+
+> На macOS каждое serial-устройство имеет два узла: `/dev/tty.*` и `/dev/cu.*`. Для исходящих соединений всегда используй `cu.*` — `tty.*` блокируется в ожидании DCD-сигнала, которого USB-UART кабели обычно не выдают.
 
 **На Windows:**
 
@@ -115,14 +117,14 @@ cd C:\wiredesk
 
 ```bash
 cd ~/Data/prjcts/wiredesk
-./target/release/wiredesk-client --port /dev/tty.wchusbserial-XXX --baud 921600
+./target/release/wiredesk-client --port /dev/cu.usbserial-XXX --baud 921600
 ```
 
 Откроется маленькое окошко WireDesk. На Хосте появится `HelloAck sent`, в окне клиента — статус `Connected`.
 
 ### Если зависло на handshake
 
-1. Оба видят порты? (`ls /dev/tty.*` на Mac, Диспетчер на Windows)
+1. Оба видят порты? (`ls /dev/cu.*` на Mac, Диспетчер на Windows)
 2. Одинаковый baud с обеих сторон?
 3. Поменяй TX/RX (зелёный ↔ белый) на одном из кабелей — самая частая ошибка распиновки
 4. Проверь GND — без общей земли handshake не пройдёт
@@ -150,7 +152,7 @@ cd ~/Data/prjcts/wiredesk
 
 ```bash
 cd ~/Data/prjcts/wiredesk
-./target/release/wiredesk-term --port /dev/tty.wchusbserial-XXX --baud 921600
+./target/release/wiredesk-term --port /dev/cu.usbserial-XXX --baud 921600
 ```
 
 Появится приглашение PowerShell. **Ctrl+]** — выход с восстановлением локального терминала.
