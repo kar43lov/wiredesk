@@ -47,6 +47,20 @@ Host (Windows 11)                       Client (macOS)
 
 Total: ~$20-30.
 
+### Wiring (CH340 USB-to-TTL)
+
+Standard CH340 cables expose four wires. Connect them as a null-modem (TX/RX crossed, GND straight, VCC NOT connected):
+
+```
+Cable A              Cable B
+🟢 green (TX) ────►  ⚪ white (RX)
+⚪ white (RX) ◄────  🟢 green (TX)
+🔵 blue  (GND) ────  🔵 blue  (GND)
+🔴 red   (VCC) ╳ ╳   🔴 red   (VCC)   — leave isolated
+```
+
+Full step-by-step (wiring + first-time install + first run + troubleshooting): **[docs/setup.md](docs/setup.md)**.
+
 ## Build
 
 Requires Rust toolchain.
@@ -57,6 +71,8 @@ cargo test --workspace
 ```
 
 ## Run
+
+> First time? Read **[docs/setup.md](docs/setup.md)** — covers wiring, port discovery, Rust install on Windows (incl. how to do it under "Continent" lockdown), and handshake troubleshooting.
 
 **Host (Windows):**
 
