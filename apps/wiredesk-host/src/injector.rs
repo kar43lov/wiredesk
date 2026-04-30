@@ -97,7 +97,7 @@ impl InputInjector for WindowsInjector {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
         // Extended scancodes (0xE0xx) need KEYEVENTF_EXTENDEDKEY flag
-        let (scan, mut flags) = if scancode & 0xFF00 == 0xE000 {
+        let (scan, flags) = if scancode & 0xFF00 == 0xE000 {
             ((scancode & 0xFF) as u16, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
         } else {
             (scancode, KEYEVENTF_SCANCODE)
@@ -158,11 +158,13 @@ impl InputInjector for WindowsInjector {
 
 /// Mock injector for testing — records all calls.
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct MockInjector {
     pub events: Vec<InjectorEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum InjectorEvent {
     MouseMove { x: u16, y: u16 },
     MouseButton { button: u8, pressed: bool },

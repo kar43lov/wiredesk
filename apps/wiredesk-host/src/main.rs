@@ -38,7 +38,11 @@ fn main() -> Result<()> {
     log::info!("screen: {}x{}", args.width, args.height);
 
     let transport = wiredesk_transport::serial::SerialTransport::open(&args.port, args.baud)?;
-    let inj = injector::MockInjector::default(); // TODO: use WindowsInjector on Windows
+
+    #[cfg(target_os = "windows")]
+    let inj = injector::WindowsInjector::new()?;
+    #[cfg(not(target_os = "windows"))]
+    let inj = injector::MockInjector::default();
 
     let mut sess = session::Session::new(transport, inj, args.name, args.width, args.height);
 
