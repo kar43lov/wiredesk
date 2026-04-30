@@ -4,6 +4,7 @@ mod input;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
@@ -100,8 +101,19 @@ fn transport_thread(
         }
     }
 
-    // Wait for HELLO_ACK and then handle incoming messages
+    // Wait for HELLO_ACK and then handle incoming messages.
+    // Also send a Heartbeat every HEARTBEAT_INTERVAL so the host doesn't drop us.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+    let mut last_heartbeat_sent = Instant::now();
+
     loop {
+        if last_heartbeat_sent.elapsed() >= HEARTBEAT_INTERVAL {
+            if let Ok(mut t) = transport.lock() {
+                let _ = t.send(&Packet::new(Message::Heartbeat, 0));
+            }
+            last_heartbeat_sent = Instant::now();
+        }
+
         let packet = {
             let Ok(mut t) = transport.lock() else {
                 log::error!("transport mutex poisoned");
