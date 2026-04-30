@@ -1,10 +1,8 @@
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
-use wiredesk_transport::transport::Transport;
 
 use crate::input::mapper::InputMapper;
 
@@ -38,7 +36,7 @@ pub struct WireDeskApp {
     status_msg: String,
     serial_port: String,
     events_rx: Option<mpsc::Receiver<TransportEvent>>,
-    transport: Option<Arc<Mutex<Box<dyn Transport>>>>,
+    outgoing_tx: mpsc::Sender<Packet>,
     mapper: InputMapper,
     seq: u16,
     // Terminal-over-serial state
@@ -52,7 +50,7 @@ impl WireDeskApp {
     pub fn new(
         serial_port: String,
         events_rx: mpsc::Receiver<TransportEvent>,
-        transport: Arc<Mutex<Box<dyn Transport>>>,
+        outgoing_tx: mpsc::Sender<Packet>,
     ) -> Self {
         Self {
             state: ConnectionState::Disconnected,
@@ -64,7 +62,7 @@ impl WireDeskApp {
             status_msg: "ready".into(),
             serial_port,
             events_rx: Some(events_rx),
-            transport: Some(transport),
+            outgoing_tx,
             mapper: InputMapper::new(1920, 1080),
             seq: 0,
             shell_open: false,
@@ -80,20 +78,16 @@ impl WireDeskApp {
         s
     }
 
-    /// Send a sequence of key packets through transport (used for special combos).
+    /// Send a sequence of key packets through the outgoing channel (used for special combos).
     fn send_key_sequence(&mut self, keys: &[(u16, u8, bool)]) {
-        if let Some(transport) = self.transport.clone() {
-            if let Ok(mut t) = transport.lock() {
-                for &(scancode, modifiers, pressed) in keys {
-                    let seq = self.next_seq();
-                    let msg = if pressed {
-                        Message::KeyDown { scancode, modifiers }
-                    } else {
-                        Message::KeyUp { scancode, modifiers }
-                    };
-                    let _ = t.send(&Packet::new(msg, seq));
-                }
-            }
+        for &(scancode, modifiers, pressed) in keys {
+            let seq = self.next_seq();
+            let msg = if pressed {
+                Message::KeyDown { scancode, modifiers }
+            } else {
+                Message::KeyUp { scancode, modifiers }
+            };
+            let _ = self.outgoing_tx.send(Packet::new(msg, seq));
         }
     }
 
@@ -107,12 +101,8 @@ impl WireDeskApp {
     }
 
     fn shell_send(&mut self, msg: Message) {
-        if let Some(transport) = self.transport.clone() {
-            if let Ok(mut t) = transport.lock() {
-                let seq = self.next_seq();
-                let _ = t.send(&Packet::new(msg, seq));
-            }
-        }
+        let seq = self.next_seq();
+        let _ = self.outgoing_tx.send(Packet::new(msg, seq));
     }
 
     fn shell_open_request(&mut self) {
@@ -379,57 +369,51 @@ impl eframe::App for WireDeskApp {
             ui.small(&self.status_msg);
         });
 
-        // Handle captured input — collect events first, then send
+        // Handle captured input — push to outgoing channel (non-blocking).
         if self.capturing && self.state == ConnectionState::Connected {
-            // Collect events from egui (no borrow on self)
             let events: Vec<egui::Event> = ctx.input(|input: &egui::InputState| {
                 input.events.clone()
             });
             let mouse_pos = ctx.input(|input: &egui::InputState| input.pointer.hover_pos());
             let screen_rect = ctx.screen_rect();
 
-            // Now send through transport (borrows self mutably)
-            if let Some(transport) = self.transport.clone() {
-                if let Ok(mut t) = transport.lock() {
-                    for event in &events {
-                        match event {
-                            egui::Event::Key { key, pressed, modifiers, .. } => {
-                                // Don't forward the capture-toggle combo to Host
-                                if *key == egui::Key::G && modifiers.ctrl && modifiers.alt {
-                                    continue;
-                                }
-                                let _ = self.mapper.send_key(&mut *t, key, modifiers, *pressed);
-                            }
-                            egui::Event::PointerButton { button, pressed, .. } => {
-                                let btn = match button {
-                                    egui::PointerButton::Primary => 0,
-                                    egui::PointerButton::Secondary => 1,
-                                    egui::PointerButton::Middle => 2,
-                                    _ => continue,
-                                };
-                                let _ = self.mapper.send_mouse_button(&mut *t, btn, *pressed);
-                            }
-                            egui::Event::MouseWheel { delta, .. } => {
-                                let _ = self.mapper.send_mouse_scroll(
-                                    &mut *t,
-                                    (delta.x * 120.0) as i16,
-                                    (delta.y * 120.0) as i16,
-                                );
-                            }
-                            _ => {}
+            for event in &events {
+                match event {
+                    egui::Event::Key { key, pressed, modifiers, .. } => {
+                        // Don't forward the capture-toggle combo to Host
+                        if *key == egui::Key::G && modifiers.ctrl && modifiers.alt {
+                            continue;
                         }
+                        self.mapper.send_key(&self.outgoing_tx, key, modifiers, *pressed);
                     }
-
-                    if let Some(pos) = mouse_pos {
-                        let _ = self.mapper.send_mouse_move(
-                            &mut *t,
-                            pos.x,
-                            pos.y,
-                            screen_rect.width(),
-                            screen_rect.height(),
+                    egui::Event::PointerButton { button, pressed, .. } => {
+                        let btn = match button {
+                            egui::PointerButton::Primary => 0,
+                            egui::PointerButton::Secondary => 1,
+                            egui::PointerButton::Middle => 2,
+                            _ => continue,
+                        };
+                        self.mapper.send_mouse_button(&self.outgoing_tx, btn, *pressed);
+                    }
+                    egui::Event::MouseWheel { delta, .. } => {
+                        self.mapper.send_mouse_scroll(
+                            &self.outgoing_tx,
+                            (delta.x * 120.0) as i16,
+                            (delta.y * 120.0) as i16,
                         );
                     }
+                    _ => {}
                 }
+            }
+
+            if let Some(pos) = mouse_pos {
+                self.mapper.send_mouse_move(
+                    &self.outgoing_tx,
+                    pos.x,
+                    pos.y,
+                    screen_rect.width(),
+                    screen_rect.height(),
+                );
             }
         }
 

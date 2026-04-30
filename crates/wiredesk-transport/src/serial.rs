@@ -13,12 +13,12 @@ pub struct SerialTransport {
     partial_timeouts: u32,
 }
 
-const MAX_PARTIAL_TIMEOUTS: u32 = 50; // ~5 sec at 100ms timeout
+const MAX_PARTIAL_TIMEOUTS: u32 = 500; // ~5 sec at 10ms timeout
 
 impl SerialTransport {
     pub fn open(port_name: &str, baud_rate: u32) -> Result<Self> {
         let mut port = serialport::new(port_name, baud_rate)
-            .timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(10))
             .open()
             .map_err(|e| WireDeskError::Transport(format!("serial open {port_name}: {e}")))?;
 

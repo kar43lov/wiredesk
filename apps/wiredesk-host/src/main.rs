@@ -13,7 +13,7 @@ struct Args {
     port: String,
 
     /// Baud rate
-    #[arg(short, long, default_value = "921600")]
+    #[arg(short, long, default_value = "115200")]
     baud: u32,
 
     /// Host display name

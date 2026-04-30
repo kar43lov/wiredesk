@@ -1,8 +1,8 @@
+use std::sync::mpsc::Sender;
+
 use eframe::egui;
-use wiredesk_core::error::Result;
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
-use wiredesk_transport::transport::Transport;
 
 use super::keymap;
 
@@ -66,54 +66,44 @@ impl InputMapper {
 
     pub fn send_mouse_move(
         &mut self,
-        transport: &mut dyn Transport,
+        out: &Sender<Packet>,
         window_x: f32,
         window_y: f32,
         window_w: f32,
         window_h: f32,
-    ) -> Result<()> {
+    ) {
         let (x, y) = self.normalize_mouse(window_x, window_y, window_w, window_h);
 
         // Debounce: skip if position hasn't changed
         if x == self.last_mouse_x && y == self.last_mouse_y {
-            return Ok(());
+            return;
         }
         self.last_mouse_x = x;
         self.last_mouse_y = y;
 
         let seq = self.next_seq();
-        transport.send(&Packet::new(Message::MouseMove { x, y }, seq))
+        let _ = out.send(Packet::new(Message::MouseMove { x, y }, seq));
     }
 
-    pub fn send_mouse_button(
-        &mut self,
-        transport: &mut dyn Transport,
-        button: u8,
-        pressed: bool,
-    ) -> Result<()> {
+    pub fn send_mouse_button(&mut self, out: &Sender<Packet>, button: u8, pressed: bool) {
         let seq = self.next_seq();
-        transport.send(&Packet::new(Message::MouseButton { button, pressed }, seq))
+        let _ = out.send(Packet::new(Message::MouseButton { button, pressed }, seq));
     }
 
-    pub fn send_mouse_scroll(
-        &mut self,
-        transport: &mut dyn Transport,
-        delta_x: i16,
-        delta_y: i16,
-    ) -> Result<()> {
+    pub fn send_mouse_scroll(&mut self, out: &Sender<Packet>, delta_x: i16, delta_y: i16) {
         let seq = self.next_seq();
-        transport.send(&Packet::new(Message::MouseScroll { delta_x, delta_y }, seq))
+        let _ = out.send(Packet::new(Message::MouseScroll { delta_x, delta_y }, seq));
     }
 
     pub fn send_key(
         &mut self,
-        transport: &mut dyn Transport,
+        out: &Sender<Packet>,
         key: &egui::Key,
         modifiers: &egui::Modifiers,
         pressed: bool,
-    ) -> Result<()> {
+    ) {
         let Some(scancode) = keymap::egui_key_to_scancode(key) else {
-            return Ok(());
+            return;
         };
         let mods = keymap::egui_modifiers_to_u8(modifiers);
         let seq = self.next_seq();
@@ -122,21 +112,20 @@ impl InputMapper {
         } else {
             Message::KeyUp { scancode, modifiers: mods }
         };
-        transport.send(&Packet::new(msg, seq))
+        let _ = out.send(Packet::new(msg, seq));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiredesk_transport::mock::MockTransport;
+    use std::sync::mpsc;
 
     #[test]
     fn normalize_same_aspect() {
         let mapper = InputMapper::new(1920, 1080);
-        // Window is same aspect ratio
         let (x, y) = mapper.normalize_mouse(480.0, 270.0, 960.0, 540.0);
-        assert_eq!(x, 32767); // ~center
+        assert_eq!(x, 32767);
         assert_eq!(y, 32767);
     }
 
@@ -154,20 +143,15 @@ mod tests {
 
     #[test]
     fn send_key_maps_correctly() {
-        let (mut client_t, mut host_t) = MockTransport::pair();
+        let (tx, rx) = mpsc::channel();
         let mut mapper = InputMapper::new(1920, 1080);
 
-        mapper.send_key(
-            &mut client_t,
-            &egui::Key::A,
-            &egui::Modifiers::default(),
-            true,
-        ).unwrap();
+        mapper.send_key(&tx, &egui::Key::A, &egui::Modifiers::default(), true);
 
-        let packet = host_t.recv().unwrap();
+        let packet = rx.try_recv().unwrap();
         match packet.message {
             Message::KeyDown { scancode, modifiers } => {
-                assert_eq!(scancode, 0x1E); // 'A' scancode
+                assert_eq!(scancode, 0x1E);
                 assert_eq!(modifiers, 0);
             }
             other => panic!("expected KeyDown, got {other:?}"),
@@ -176,17 +160,17 @@ mod tests {
 
     #[test]
     fn send_key_cmd_becomes_ctrl() {
-        let (mut client_t, mut host_t) = MockTransport::pair();
+        let (tx, rx) = mpsc::channel();
         let mut mapper = InputMapper::new(1920, 1080);
 
         let mods = egui::Modifiers { command: true, ..Default::default() };
-        mapper.send_key(&mut client_t, &egui::Key::C, &mods, true).unwrap();
+        mapper.send_key(&tx, &egui::Key::C, &mods, true);
 
-        let packet = host_t.recv().unwrap();
+        let packet = rx.try_recv().unwrap();
         match packet.message {
             Message::KeyDown { scancode, modifiers } => {
-                assert_eq!(scancode, 0x2E); // 'C'
-                assert_eq!(modifiers, 0x01); // CTRL
+                assert_eq!(scancode, 0x2E);
+                assert_eq!(modifiers, 0x01);
             }
             other => panic!("expected KeyDown, got {other:?}"),
         }
@@ -194,15 +178,13 @@ mod tests {
 
     #[test]
     fn mouse_debounce() {
-        let (mut client_t, mut host_t) = MockTransport::pair();
+        let (tx, rx) = mpsc::channel();
         let mut mapper = InputMapper::new(1920, 1080);
 
-        mapper.send_mouse_move(&mut client_t, 100.0, 100.0, 1920.0, 1080.0).unwrap();
-        // Same position → should be debounced (no second packet)
-        mapper.send_mouse_move(&mut client_t, 100.0, 100.0, 1920.0, 1080.0).unwrap();
+        mapper.send_mouse_move(&tx, 100.0, 100.0, 1920.0, 1080.0);
+        mapper.send_mouse_move(&tx, 100.0, 100.0, 1920.0, 1080.0);
 
-        let _first = host_t.recv().unwrap();
-        // Second recv should block/fail since no second packet was sent
-        // (MockTransport uses blocking recv, so we can't easily test this)
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err()); // debounced
     }
 }
