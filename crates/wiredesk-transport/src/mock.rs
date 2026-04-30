@@ -52,6 +52,12 @@ impl Transport for MockTransport {
     fn name(&self) -> &'static str {
         "mock"
     }
+
+    fn try_clone(&self) -> Result<Box<dyn Transport>> {
+        Err(WireDeskError::Transport(
+            "MockTransport does not support cloning".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

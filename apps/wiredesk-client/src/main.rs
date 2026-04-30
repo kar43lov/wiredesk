@@ -51,13 +51,30 @@ fn main() {
         }
     };
 
-    let transport: Box<dyn Transport> = Box::new(transport);
+    let writer_transport: Box<dyn Transport> = Box::new(transport);
+    let reader_transport = match writer_transport.try_clone() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: cannot clone serial port for reader thread: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let (events_tx, events_rx) = mpsc::channel();
     let (outgoing_tx, outgoing_rx) = mpsc::channel();
 
+    // Writer thread — owns one half of the port. Drains outgoing channel,
+    // sends heartbeats, sends Hello on startup. UI never blocks because this
+    // thread has zero shared locks with the egui thread.
+    let writer_events_tx = events_tx.clone();
     let client_name = args.name.clone();
     thread::spawn(move || {
-        transport_thread(transport, outgoing_rx, events_tx, client_name);
+        writer_thread(writer_transport, outgoing_rx, writer_events_tx, client_name);
+    });
+
+    // Reader thread — owns the other half. Just receives and dispatches.
+    thread::spawn(move || {
+        reader_thread(reader_transport, events_tx);
     });
 
     let app = WireDeskApp::new(args.port.clone(), events_rx, outgoing_tx);
@@ -74,9 +91,9 @@ fn main() {
     }
 }
 
-/// Single-threaded owner of the serial transport. Drains the outgoing channel,
-/// emits periodic heartbeats, and forwards received packets to the UI as events.
-fn transport_thread(
+/// Sole writer to the serial port. Any UI-driven packet hits the wire within
+/// one channel hop (~µs) — no waiting on a recv timeout.
+fn writer_thread(
     mut transport: Box<dyn Transport>,
     outgoing_rx: mpsc::Receiver<Packet>,
     events_tx: mpsc::Sender<TransportEvent>,
@@ -84,7 +101,6 @@ fn transport_thread(
 ) {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
-    // Send HELLO
     if let Err(e) = transport.send(&Packet::new(
         Message::Hello { version: VERSION, client_name },
         0,
@@ -94,31 +110,35 @@ fn transport_thread(
         return;
     }
 
-    let mut last_heartbeat_sent = Instant::now();
+    let mut last_heartbeat = Instant::now();
 
     loop {
-        // 1. Drain pending outgoing packets first — this is what keeps input latency low.
-        loop {
-            match outgoing_rx.try_recv() {
-                Ok(packet) => {
-                    if let Err(e) = transport.send(&packet) {
-                        log::error!("send error: {e}");
-                        let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
-                        return;
-                    }
+        let timeout = HEARTBEAT_INTERVAL
+            .saturating_sub(last_heartbeat.elapsed())
+            .max(Duration::from_millis(1));
+
+        match outgoing_rx.recv_timeout(timeout) {
+            Ok(packet) => {
+                if let Err(e) = transport.send(&packet) {
+                    log::error!("send error: {e}");
+                    let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
+                    return;
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        // 2. Periodic heartbeat
-        if last_heartbeat_sent.elapsed() >= HEARTBEAT_INTERVAL {
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             let _ = transport.send(&Packet::new(Message::Heartbeat, 0));
-            last_heartbeat_sent = Instant::now();
+            last_heartbeat = Instant::now();
         }
+    }
+}
 
-        // 3. Try to receive one packet (short timeout — see SerialTransport::open).
+/// Sole reader of the serial port. Translates incoming packets to UI events.
+fn reader_thread(mut transport: Box<dyn Transport>, events_tx: mpsc::Sender<TransportEvent>) {
+    loop {
         match transport.recv() {
             Ok(p) => match p.message {
                 Message::HelloAck { host_name, screen_w, screen_h, .. } => {
@@ -156,10 +176,7 @@ fn transport_thread(
                     log::debug!("ignored message: {other:?}");
                 }
             },
-            Err(ref e) if e.to_string().contains("timeout") => {
-                // Normal idle timeout — loop back and drain outgoing.
-                continue;
-            }
+            Err(ref e) if e.to_string().contains("timeout") => continue,
             Err(wiredesk_core::error::WireDeskError::Protocol(ref msg)) => {
                 log::warn!("dropping bad frame: {msg}");
                 continue;

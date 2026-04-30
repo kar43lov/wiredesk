@@ -50,14 +50,15 @@ impl Transport for SerialTransport {
     fn send(&mut self, packet: &Packet) -> Result<()> {
         let raw = packet.to_bytes()?;
         let encoded = cobs::encode(&raw);
-        // Leading 0x00 forces a frame boundary so any line noise preceding
-        // this packet ends up in its own (invalid, ignored) frame instead of
-        // getting concatenated with our payload.
+        // Single write: [0x00 leading delimiter] + encoded packet. The leading
+        // 0x00 forces a frame boundary so any line noise preceding this packet
+        // ends up in its own (invalid, ignored) frame. Combining into one
+        // write_all is one syscall instead of two.
+        let mut buf = Vec::with_capacity(encoded.len() + 1);
+        buf.push(0x00);
+        buf.extend_from_slice(&encoded);
         self.port
-            .write_all(&[0x00])
-            .map_err(|e| WireDeskError::Transport(format!("serial write: {e}")))?;
-        self.port
-            .write_all(&encoded)
+            .write_all(&buf)
             .map_err(|e| WireDeskError::Transport(format!("serial write: {e}")))?;
         self.port
             .flush()
@@ -131,5 +132,17 @@ impl Transport for SerialTransport {
 
     fn name(&self) -> &'static str {
         "serial"
+    }
+
+    fn try_clone(&self) -> Result<Box<dyn Transport>> {
+        let cloned = self
+            .port
+            .try_clone()
+            .map_err(|e| WireDeskError::Transport(format!("serial try_clone: {e}")))?;
+        Ok(Box::new(SerialTransport {
+            port: cloned,
+            read_buf: Vec::with_capacity(1024),
+            partial_timeouts: 0,
+        }))
     }
 }
