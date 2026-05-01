@@ -1,10 +1,12 @@
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
 use crate::input::mapper::InputMapper;
+use crate::keyboard_tap::{self, TapEvent, TapHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -29,6 +31,7 @@ pub enum TransportEvent {
 pub struct WireDeskApp {
     state: ConnectionState,
     capturing: bool,
+    fullscreen: bool,
     host_name: String,
     screen_w: u16,
     screen_h: u16,
@@ -37,8 +40,13 @@ pub struct WireDeskApp {
     serial_port: String,
     events_rx: Option<mpsc::Receiver<TransportEvent>>,
     outgoing_tx: mpsc::Sender<Packet>,
+    tap_events_rx: Option<mpsc::Receiver<TapEvent>>,
+    tap_handle: Option<TapHandle>,
     mapper: InputMapper,
     seq: u16,
+    // Permission state
+    permission_granted: bool,
+    last_perm_check: Instant,
     // Terminal-over-serial state
     shell_open: bool,
     shell_output: String,
@@ -51,10 +59,13 @@ impl WireDeskApp {
         serial_port: String,
         events_rx: mpsc::Receiver<TransportEvent>,
         outgoing_tx: mpsc::Sender<Packet>,
+        tap_events_rx: mpsc::Receiver<TapEvent>,
+        tap_handle: TapHandle,
     ) -> Self {
         Self {
             state: ConnectionState::Disconnected,
             capturing: false,
+            fullscreen: false,
             host_name: String::new(),
             screen_w: 1920,
             screen_h: 1080,
@@ -63,8 +74,12 @@ impl WireDeskApp {
             serial_port,
             events_rx: Some(events_rx),
             outgoing_tx,
+            tap_events_rx: Some(tap_events_rx),
+            tap_handle: Some(tap_handle),
             mapper: InputMapper::new(1920, 1080),
             seq: 0,
+            permission_granted: keyboard_tap::is_permission_granted(),
+            last_perm_check: Instant::now(),
             shell_open: false,
             shell_output: String::new(),
             shell_input: String::new(),
@@ -94,10 +109,41 @@ impl WireDeskApp {
     fn toggle_capture(&mut self) {
         self.capturing = !self.capturing;
         if self.capturing {
-            self.status_msg = "input captured (Ctrl+Alt+G to release)".into();
+            self.status_msg = "input captured (Cmd+Esc to release)".into();
         } else {
             self.status_msg = "input released".into();
         }
+        // Actual tap activation is driven by sync_tap_to_focus() in update()
+        // — that way clicking away to another Mac app pauses the tap so Mac
+        // shortcuts (Cmd+V to paste etc.) work on the Mac side.
+    }
+
+    /// Reconcile the tap's active state with the current intent
+    /// (`capturing` flag) AND window focus. Tap intercepts only when both
+    /// are true; losing focus pauses the tap so Mac apps work normally
+    /// without disturbing the user's `capturing` intent.
+    fn sync_tap_to_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let want_active = self.capturing && focused;
+        let is_active = self
+            .tap_handle
+            .as_ref()
+            .map(|h| h.is_enabled())
+            .unwrap_or(false);
+        if want_active != is_active {
+            if let Some(h) = self.tap_handle.as_ref() {
+                if want_active {
+                    h.enable();
+                } else {
+                    h.disable();
+                }
+            }
+        }
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
 
     fn shell_send(&mut self, msg: Message) {
@@ -127,6 +173,109 @@ impl WireDeskApp {
         let mut data = text.as_bytes().to_vec();
         data.push(b'\n');
         self.shell_send(Message::ShellInput { data });
+    }
+
+    /// True when WireDesk should render the full chrome (status, buttons,
+    /// shell panel). False in capture or fullscreen mode — when the user is
+    /// "in" Windows via the HDMI capture monitor and a stray click on a
+    /// WireDesk button would be disruptive.
+    fn should_show_chrome(&self) -> bool {
+        !self.capturing && !self.fullscreen
+    }
+
+    /// Permission instruction screen shown when macOS Accessibility
+    /// permission is missing. Without it the keyboard tap silently never
+    /// fires, so we block the chrome until the user grants it.
+    fn render_permission_screen(&self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("Accessibility permission required");
+        });
+        ui.add_space(12.0);
+
+        ui.label(
+            "WireDesk needs macOS Accessibility permission to intercept \
+             keyboard shortcuts (Cmd+Space, Cmd+C, etc.) and forward them \
+             to the Host. Without it the capture-mode would only receive a \
+             subset of keys, and clipboard syncs would be useless.",
+        );
+        ui.add_space(8.0);
+
+        ui.label("To grant it:");
+        ui.indent("perm_steps", |ui| {
+            ui.label("1. Open System Settings → Privacy & Security → Accessibility");
+            ui.label("2. Click \"+\" and add the wiredesk-client binary");
+            ui.label("3. Toggle the switch ON");
+            ui.label("4. Restart WireDesk — required: the tap thread is created at startup");
+        });
+        ui.add_space(12.0);
+
+        if ui.button("Open System Settings").clicked() {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    .spawn();
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.weak(
+            "(After granting permission, quit and relaunch wiredesk-client. \
+             The window detects the change but the tap won't activate \
+             without a fresh process.)",
+        );
+    }
+
+    /// Info-only screen shown when capture or fullscreen is active. No
+    /// clickable elements — just a description of what the app is doing
+    /// and the relevant hotkeys.
+    fn render_capture_info(&self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("WireDesk — input forwarded to Host");
+            ui.add_space(8.0);
+            if self.state == ConnectionState::Connected {
+                ui.label(format!(
+                    "● connected to {} ({}×{})",
+                    self.host_name, self.screen_w, self.screen_h
+                ));
+            } else {
+                ui.label("● not connected");
+            }
+        });
+        ui.add_space(20.0);
+
+        ui.label("Active hotkeys (intercepted locally — not sent to Host):");
+        ui.indent("local_hotkeys", |ui| {
+            ui.label("• Cmd+Esc — release capture");
+            ui.label("• Cmd+Enter — toggle fullscreen");
+        });
+        ui.add_space(8.0);
+
+        ui.label("Forwarded to Host (Cmd → Ctrl mapping):");
+        ui.indent("forwarded", |ui| {
+            ui.label("• Cmd+Space → Win+Space (input language toggle)");
+            ui.label("• Cmd+C / Cmd+V → Ctrl+C / Ctrl+V");
+            ui.label("• Cmd+Tab, Cmd+Q, etc. — all Cmd-combos go to Host");
+            ui.label("• Letters, digits, function keys, arrows — direct");
+        });
+        ui.add_space(12.0);
+
+        ui.label(
+            "Clipboard auto-syncs both ways every ~500 ms — copy on either \
+             side appears on the other.",
+        );
+        ui.add_space(8.0);
+        ui.weak(
+            "Tap pauses automatically when this window loses focus — switch \
+             to another Mac app and Cmd-shortcuts work locally again.",
+        );
+
+        if self.fullscreen {
+            ui.add_space(12.0);
+            ui.weak("(Cmd+Enter again to exit fullscreen)");
+        }
     }
 
     fn shell_append_output(&mut self, bytes: &[u8]) {
@@ -187,17 +336,71 @@ impl eframe::App for WireDeskApp {
             }
         }
 
-        // Check for global hotkey: Ctrl+Alt+G
-        let hotkey_pressed = ctx.input(|i: &egui::InputState| {
-            i.key_pressed(egui::Key::G)
-                && i.modifiers.ctrl
-                && i.modifiers.alt
-        });
-        if hotkey_pressed {
-            self.toggle_capture();
+        // Re-check Accessibility permission periodically. update() runs at
+        // ~60fps; we throttle to once every 2s — enough for the UI to react
+        // when the user grants permission via System Settings without
+        // hammering the (potentially slow) sync IPC call to SystemServices.
+        if self.last_perm_check.elapsed() >= Duration::from_secs(2) {
+            self.permission_granted = keyboard_tap::is_permission_granted();
+            self.last_perm_check = Instant::now();
         }
 
+        // Reconcile tap state with capture intent + window focus. When the
+        // WireDesk window loses focus (user clicks another Mac app), pause
+        // the tap so Mac shortcuts (Cmd+V to paste etc.) work normally on
+        // the Mac side. Resumes when window gets focus back.
+        self.sync_tap_to_focus(ctx);
+
+        // Drain TapEvents from the keyboard tap thread.
+        let mut pending_tap_events: Vec<TapEvent> = Vec::new();
+        if let Some(ref rx) = self.tap_events_rx {
+            while let Ok(ev) = rx.try_recv() {
+                pending_tap_events.push(ev);
+            }
+        }
+        for ev in pending_tap_events {
+            match ev {
+                TapEvent::ReleaseCapture => {
+                    if self.capturing {
+                        self.toggle_capture();
+                    }
+                }
+                TapEvent::ToggleFullscreen => {
+                    self.toggle_fullscreen(ctx);
+                }
+            }
+        }
+
+        // egui-side hotkeys for the OUT-OF-CAPTURE path. When tap is enabled
+        // it consumes these before egui sees them; this branch handles the
+        // case where the user presses them without capture being on.
+        let (cmd_esc_pressed, cmd_enter_pressed) = ctx.input(|i: &egui::InputState| {
+            (
+                i.key_pressed(egui::Key::Escape) && i.modifiers.command,
+                i.key_pressed(egui::Key::Enter) && i.modifiers.command,
+            )
+        });
+        if cmd_esc_pressed {
+            self.toggle_capture();
+        }
+        if cmd_enter_pressed {
+            self.toggle_fullscreen(ctx);
+        }
+
+        let show_chrome = self.should_show_chrome();
+        let permission_granted = self.permission_granted;
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            if !show_chrome {
+                self.render_capture_info(ui);
+                return;
+            }
+
+            if !permission_granted {
+                self.render_permission_screen(ui);
+                return;
+            }
+
             ui.heading("WireDesk");
             ui.separator();
 
@@ -220,7 +423,7 @@ impl eframe::App for WireDeskApp {
 
             // Capture toggle
             let capture_label = if self.capturing {
-                "Input: CAPTURED (Ctrl+Alt+G to release)"
+                "Input: CAPTURED (Cmd+Esc to release)"
             } else {
                 "Input: released"
             };
@@ -384,6 +587,16 @@ impl eframe::App for WireDeskApp {
 
         // Handle captured input — push to outgoing channel (non-blocking).
         if self.capturing && self.state == ConnectionState::Connected {
+            // When the OS-level keyboard tap is active (macOS + permission),
+            // it's the sole source of key events — skip egui forwarding to
+            // avoid double KeyDown. Mouse always goes through egui (the tap
+            // only intercepts keyboard).
+            let tap_owns_keys = self
+                .tap_handle
+                .as_ref()
+                .map(|h| h.is_active())
+                .unwrap_or(false);
+
             let events: Vec<egui::Event> = ctx.input(|input: &egui::InputState| {
                 input.events.clone()
             });
@@ -393,8 +606,15 @@ impl eframe::App for WireDeskApp {
             for event in &events {
                 match event {
                     egui::Event::Key { key, pressed, modifiers, .. } => {
+                        if tap_owns_keys {
+                            continue;
+                        }
                         // Don't forward the capture-toggle combo to Host
-                        if *key == egui::Key::G && modifiers.ctrl && modifiers.alt {
+                        if *key == egui::Key::Escape && modifiers.command {
+                            continue;
+                        }
+                        // Don't forward the fullscreen toggle either
+                        if *key == egui::Key::Enter && modifiers.command {
                             continue;
                         }
                         self.mapper.send_key(&self.outgoing_tx, key, modifiers, *pressed);
@@ -432,5 +652,65 @@ impl eframe::App for WireDeskApp {
 
         // Request repaint to keep event loop alive
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyboard_tap;
+
+    fn make_app() -> WireDeskApp {
+        let (out_tx, _out_rx) = mpsc::channel();
+        let (_ev_tx, ev_rx) = mpsc::channel();
+        let (tap_tx, tap_rx) = mpsc::channel();
+        let tap_handle = keyboard_tap::start(out_tx.clone(), tap_tx);
+        WireDeskApp::new("/dev/null".into(), ev_rx, out_tx, tap_rx, tap_handle)
+    }
+
+    #[test]
+    fn chrome_shown_by_default() {
+        let app = make_app();
+        assert!(app.should_show_chrome());
+    }
+
+    #[test]
+    fn capturing_hides_chrome() {
+        let mut app = make_app();
+        app.capturing = true;
+        assert!(!app.should_show_chrome());
+    }
+
+    #[test]
+    fn fullscreen_hides_chrome() {
+        let mut app = make_app();
+        app.fullscreen = true;
+        assert!(!app.should_show_chrome());
+    }
+
+    #[test]
+    fn permission_state_initialized() {
+        // Construct app — permission_granted reflects current TCC state.
+        // We don't assert true/false (depends on tester's permission), just
+        // that the field exists and is a bool.
+        let app = make_app();
+        let _: bool = app.permission_granted;
+    }
+
+    #[test]
+    fn capture_or_fullscreen_each_hides() {
+        let mut app = make_app();
+        app.capturing = true;
+        app.fullscreen = false;
+        assert!(!app.should_show_chrome());
+        app.capturing = false;
+        app.fullscreen = true;
+        assert!(!app.should_show_chrome());
+        app.capturing = true;
+        app.fullscreen = true;
+        assert!(!app.should_show_chrome());
+        app.capturing = false;
+        app.fullscreen = false;
+        assert!(app.should_show_chrome());
     }
 }
