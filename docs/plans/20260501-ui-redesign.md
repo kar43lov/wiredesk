@@ -518,16 +518,16 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-host/src/ui/settings_window.rs` (Frame blocks + nested grids)
 - Modify: `apps/wiredesk-client/src/app.rs` (Frame::group() / CollapsingHeader для трёх блоков)
 
-- [ ] добавить `connection_frame, display_frame, system_frame: nwg::Frame` в `SettingsWindow`
-- [ ] инициализировать каждую через `nwg::Frame::builder().text("Connection").parent(&s.window).build(...)?` и под-grid `GridLayout::builder().parent(&s.connection_frame)...`
-- [ ] перераспределить controls: port + baud в connection_frame; width + height в display_frame; autostart в system_frame
-- [ ] copy_mac_btn перенести в system_frame (логически относится к system)
-- [ ] Save / Hide / новые Detect/Restart кнопки — оставить вне frames в нижнем button-bar (Task 5)
-- [ ] ⚠️ если `nwg::Frame` не рисует group-box рамку с заголовком — fallback: panel + separator + Label, отметить ➕ в плане
-- [ ] на Mac — обернуть три блока в `ui.group(|ui|{...})` с `RichText::new("Connection").strong()` заголовками
-- [ ] write tests: pure-helper'ов в этом task'е нет, рендер визуально через скриншот в live-test. ➕ если появился helper (например `cfg_to_form_groups`) — табличный тест
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `refactor(ui): grouped settings layout — Frame blocks on Win + group() on Mac`
+- [x] добавить `connection_frame, display_frame, system_frame: nwg::Frame` в `SettingsWindow` (+ `connection_layout`, `display_layout`, `system_layout`, и три `*_title: nwg::Label` для headers — см. fallback ниже)
+- [x] инициализировать каждую через `nwg::Frame::builder().parent(&s.window).flags(VISIBLE | BORDER).build(...)?` и под-grid `GridLayout::builder().parent(&s.connection_frame).margin([6,6,6,6])...`
+- [x] перераспределить controls: port + baud в connection_frame; width + height в display_frame; autostart в system_frame
+- [x] copy_mac_btn перенести в system_frame (логически относится к system)
+- [x] Save / Hide / новые Detect/Restart кнопки — оставить вне frames в нижнем button-bar (Task 5)
+- [x] ⚠️ **fallback использован:** `nwg::Frame::builder()` не имеет `.text()` (см. native-windows-gui 1.0.13 `controls/frame.rs:147-213` — только size/position/enabled/flags/parent/ex_flags). Header GroupBox-style недоступен. Использован паттерн **Label "Connection" (strong) + Frame с BORDER** под ней — каждая группа = 2 строки внешнего grid (заголовок 1 row + frame со spread на 2 rows). На macOS аналогично — `ui.group()` не рисует header автоматически, добавлен `RichText::new("...").strong()` первой строкой внутри group.
+- [x] на Mac — обернуть три блока в `ui.group(|ui|{...})` с `RichText::new("Connection").strong()` заголовками
+- [x] write tests: pure-helper'ов в этом task'е не появилось — рендер визуально через скриншот в live-test (UX-проверка на железе). Existing tests (151 на workspace) продолжают проходить — структурные изменения не затронули логику.
+- [x] cargo test --workspace + clippy + cross-check — clean (151 tests pass, 0 warnings, Windows target clean)
+- [x] commit: `refactor(ui): grouped settings layout — Frame blocks on Win + group() on Mac`
 
 ### Task 5: Button-bar conventions — primary right-aligned, default action keyboarded
 

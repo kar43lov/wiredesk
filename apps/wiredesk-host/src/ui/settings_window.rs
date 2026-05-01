@@ -28,6 +28,13 @@ const APP_ICON_BYTES: &[u8] = include_bytes!("../../../../assets/app-icon.ico");
 
 /// All controls owned by the settings window. Stored together so the
 /// caller can wire up event handlers via `Rc<RefCell<SettingsWindow>>`.
+///
+/// Layout: status-row at the top, then three group-boxes (Connection /
+/// Display / System), then a button-bar, then a message label. nwg's
+/// `Frame` is only a container without a header label, so each group is
+/// rendered as `Label` (title, strong-styled) + `Frame` (bordered box
+/// holding nested controls via its own `GridLayout`). See plan task 4
+/// — fallback chosen because nwg::Frame::builder has no `text()`.
 #[derive(Default)]
 pub struct SettingsWindow {
     pub window: nwg::Window,
@@ -38,21 +45,33 @@ pub struct SettingsWindow {
     pub status_icon_bitmap: nwg::Bitmap,
     pub status_label: nwg::Label,
 
+    // --- Connection group ---
+    pub connection_title: nwg::Label,
+    pub connection_frame: nwg::Frame,
+    pub connection_layout: nwg::GridLayout,
     pub port_label: nwg::Label,
     pub port_input: nwg::TextInput,
-
     pub baud_label: nwg::Label,
     pub baud_input: nwg::TextInput,
 
+    // --- Display group ---
+    pub display_title: nwg::Label,
+    pub display_frame: nwg::Frame,
+    pub display_layout: nwg::GridLayout,
     pub width_label: nwg::Label,
     pub width_input: nwg::TextInput,
-
     pub height_label: nwg::Label,
     pub height_input: nwg::TextInput,
 
+    // --- System group ---
+    pub system_title: nwg::Label,
+    pub system_frame: nwg::Frame,
+    pub system_layout: nwg::GridLayout,
     pub autostart_check: nwg::CheckBox,
-
     pub copy_mac_btn: nwg::Button,
+
+    // --- Bottom button-bar (outside groups) ---
+    // Save & Restart slot reserved for Task 8; Detect for Task 7.
     pub save_btn: nwg::Button,
     pub hide_btn: nwg::Button,
 
@@ -89,7 +108,7 @@ impl SettingsWindow {
                 }
                 let icon_ref = if icon_ok { Some(&*window_icon) } else { None };
                 nwg::Window::builder()
-                    .size((420, 340))
+                    .size((460, 460))
                     .position((300, 300))
                     .title("WireDesk Host Settings")
                     .icon(icon_ref)
@@ -124,45 +143,75 @@ impl SettingsWindow {
                 .parent(&s.window)
                 .build(&mut s.status_label)?;
 
+            // ---- Connection group ----
+            nwg::Label::builder()
+                .text("Connection")
+                .parent(&s.window)
+                .build(&mut s.connection_title)?;
+            nwg::Frame::builder()
+                .parent(&s.window)
+                .flags(nwg::FrameFlags::VISIBLE | nwg::FrameFlags::BORDER)
+                .build(&mut s.connection_frame)?;
+
             nwg::Label::builder()
                 .text("Serial port:")
                 .h_align(nwg::HTextAlign::Right)
-                .parent(&s.window)
+                .parent(&s.connection_frame)
                 .build(&mut s.port_label)?;
             nwg::TextInput::builder()
                 .text(&config.port)
-                .parent(&s.window)
+                .parent(&s.connection_frame)
                 .build(&mut s.port_input)?;
 
             nwg::Label::builder()
                 .text("Baud:")
                 .h_align(nwg::HTextAlign::Right)
-                .parent(&s.window)
+                .parent(&s.connection_frame)
                 .build(&mut s.baud_label)?;
             nwg::TextInput::builder()
                 .text(&config.baud.to_string())
-                .parent(&s.window)
+                .parent(&s.connection_frame)
                 .build(&mut s.baud_input)?;
+
+            // ---- Display group ----
+            nwg::Label::builder()
+                .text("Display")
+                .parent(&s.window)
+                .build(&mut s.display_title)?;
+            nwg::Frame::builder()
+                .parent(&s.window)
+                .flags(nwg::FrameFlags::VISIBLE | nwg::FrameFlags::BORDER)
+                .build(&mut s.display_frame)?;
 
             nwg::Label::builder()
                 .text("Screen W:")
                 .h_align(nwg::HTextAlign::Right)
-                .parent(&s.window)
+                .parent(&s.display_frame)
                 .build(&mut s.width_label)?;
             nwg::TextInput::builder()
                 .text(&config.width.to_string())
-                .parent(&s.window)
+                .parent(&s.display_frame)
                 .build(&mut s.width_input)?;
 
             nwg::Label::builder()
                 .text("Screen H:")
                 .h_align(nwg::HTextAlign::Right)
-                .parent(&s.window)
+                .parent(&s.display_frame)
                 .build(&mut s.height_label)?;
             nwg::TextInput::builder()
                 .text(&config.height.to_string())
-                .parent(&s.window)
+                .parent(&s.display_frame)
                 .build(&mut s.height_input)?;
+
+            // ---- System group ----
+            nwg::Label::builder()
+                .text("System")
+                .parent(&s.window)
+                .build(&mut s.system_title)?;
+            nwg::Frame::builder()
+                .parent(&s.window)
+                .flags(nwg::FrameFlags::VISIBLE | nwg::FrameFlags::BORDER)
+                .build(&mut s.system_frame)?;
 
             // Reflect actual registry state, not just config.run_on_startup —
             // user might have toggled the run-key elsewhere between sessions.
@@ -175,13 +224,15 @@ impl SettingsWindow {
             nwg::CheckBox::builder()
                 .text("Run on startup")
                 .check_state(initial_check)
-                .parent(&s.window)
+                .parent(&s.system_frame)
                 .build(&mut s.autostart_check)?;
 
             nwg::Button::builder()
                 .text("Copy Mac launch command")
-                .parent(&s.window)
+                .parent(&s.system_frame)
                 .build(&mut s.copy_mac_btn)?;
+
+            // ---- Bottom button-bar (outside groups) ----
             nwg::Button::builder()
                 .text("Save")
                 .parent(&s.window)
@@ -196,26 +247,66 @@ impl SettingsWindow {
                 .parent(&s.window)
                 .build(&mut s.message_label)?;
 
-            // Two-column grid: labels on the left, inputs on the right.
+            // ---- Nested grids inside each frame ----
+            nwg::GridLayout::builder()
+                .parent(&s.connection_frame)
+                .max_column(Some(3))
+                .spacing(4)
+                .margin([6, 6, 6, 6])
+                .child(0, 0, &s.port_label)
+                .child_item(nwg::GridLayoutItem::new(&s.port_input, 1, 0, 2, 1))
+                .child(0, 1, &s.baud_label)
+                .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 1, 2, 1))
+                .build(&s.connection_layout)?;
+
+            nwg::GridLayout::builder()
+                .parent(&s.display_frame)
+                .max_column(Some(3))
+                .spacing(4)
+                .margin([6, 6, 6, 6])
+                .child(0, 0, &s.width_label)
+                .child_item(nwg::GridLayoutItem::new(&s.width_input, 1, 0, 2, 1))
+                .child(0, 1, &s.height_label)
+                .child_item(nwg::GridLayoutItem::new(&s.height_input, 1, 1, 2, 1))
+                .build(&s.display_layout)?;
+
+            nwg::GridLayout::builder()
+                .parent(&s.system_frame)
+                .max_column(Some(3))
+                .spacing(4)
+                .margin([6, 6, 6, 6])
+                .child_item(nwg::GridLayoutItem::new(&s.autostart_check, 0, 0, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.copy_mac_btn, 0, 1, 3, 1))
+                .build(&s.system_layout)?;
+
+            // ---- Outer grid: status row + 3 groups (title + frame) +
+            // button-bar + message. Each group is two rows: 1-row title,
+            // then a multi-row frame for nested controls. The frame row
+            // height is widened (rowspan) so the bordered box has air.
+            // Window-level grid uses 9 rows × 3 cols.
             nwg::GridLayout::builder()
                 .parent(&s.window)
-                .min_size([400, 320])
+                .min_size([440, 440])
                 .max_column(Some(3))
+                .spacing(4)
+                .margin([6, 6, 6, 6])
+                // Row 0: status icon + label
                 .child(0, 0, &s.status_icon)
                 .child_item(nwg::GridLayoutItem::new(&s.status_label, 1, 0, 2, 1))
-                .child(0, 1, &s.port_label)
-                .child_item(nwg::GridLayoutItem::new(&s.port_input, 1, 1, 2, 1))
-                .child(0, 2, &s.baud_label)
-                .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 2, 2, 1))
-                .child(0, 3, &s.width_label)
-                .child_item(nwg::GridLayoutItem::new(&s.width_input, 1, 3, 2, 1))
-                .child(0, 4, &s.height_label)
-                .child_item(nwg::GridLayoutItem::new(&s.height_input, 1, 4, 2, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.autostart_check, 0, 5, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.copy_mac_btn, 0, 6, 3, 1))
-                .child(0, 7, &s.save_btn)
-                .child(1, 7, &s.hide_btn)
-                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 8, 3, 1))
+                // Row 1: Connection title; rows 2-3: Connection frame
+                .child_item(nwg::GridLayoutItem::new(&s.connection_title, 0, 1, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.connection_frame, 0, 2, 3, 2))
+                // Row 4: Display title; rows 5-6: Display frame
+                .child_item(nwg::GridLayoutItem::new(&s.display_title, 0, 4, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.display_frame, 0, 5, 3, 2))
+                // Row 7: System title; rows 8-9: System frame
+                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 7, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 8, 3, 2))
+                // Row 10: button-bar (Save / Hide)
+                .child(1, 10, &s.save_btn)
+                .child(2, 10, &s.hide_btn)
+                // Row 11: message label
+                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 11, 3, 1))
                 .build(&s.layout)?;
 
             // Hidden by default — caller decides when to reveal.

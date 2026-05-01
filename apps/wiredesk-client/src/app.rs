@@ -135,85 +135,97 @@ impl WireDeskApp {
         ui.collapsing("Settings", |ui| {
             let cfg = &mut self.pending_config;
 
-            ui.horizontal(|ui| {
-                ui.label("Port:");
-                let combo = egui::ComboBox::from_id_salt("settings_port")
-                    .selected_text(cfg.port.clone())
-                    .show_ui(ui, |ui| {
-                        for p in &available_ports {
-                            if ui
-                                .selectable_value(&mut cfg.port, p.clone(), p)
-                                .changed()
-                            {
-                                dirty = true;
+            // ---- Connection group ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Connection").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Port:");
+                    let combo = egui::ComboBox::from_id_salt("settings_port")
+                        .selected_text(cfg.port.clone())
+                        .show_ui(ui, |ui| {
+                            for p in &available_ports {
+                                if ui
+                                    .selectable_value(&mut cfg.port, p.clone(), p)
+                                    .changed()
+                                {
+                                    dirty = true;
+                                }
                             }
+                        });
+                    if combo.response.clicked() {
+                        want_refresh_ports = true;
+                    }
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.port)
+                                .desired_width(220.0)
+                                .hint_text("/dev/cu.usbserial-XXX"),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Baud:");
+                    let mut baud_str = cfg.baud.to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
+                        .changed()
+                    {
+                        if let Ok(v) = baud_str.parse::<u32>() {
+                            cfg.baud = v;
+                            dirty = true;
                         }
-                    });
-                if combo.response.clicked() {
-                    want_refresh_ports = true;
-                }
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut cfg.port)
-                            .desired_width(220.0)
-                            .hint_text("/dev/cu.usbserial-XXX"),
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
+                    }
+                });
             });
 
-            ui.horizontal(|ui| {
-                ui.label("Baud:");
-                let mut baud_str = cfg.baud.to_string();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
-                    .changed()
-                {
-                    if let Ok(v) = baud_str.parse::<u32>() {
-                        cfg.baud = v;
-                        dirty = true;
+            // ---- Display group ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Display").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Host screen:");
+                    let mut w_str = cfg.width.to_string();
+                    let mut h_str = cfg.height.to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut w_str).desired_width(80.0))
+                        .changed()
+                    {
+                        if let Ok(v) = w_str.parse::<u16>() {
+                            cfg.width = v;
+                            dirty = true;
+                        }
                     }
-                }
+                    ui.label("×");
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut h_str).desired_width(80.0))
+                        .changed()
+                    {
+                        if let Ok(v) = h_str.parse::<u16>() {
+                            cfg.height = v;
+                            dirty = true;
+                        }
+                    }
+                });
             });
 
-            ui.horizontal(|ui| {
-                ui.label("Host screen:");
-                let mut w_str = cfg.width.to_string();
-                let mut h_str = cfg.height.to_string();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut w_str).desired_width(80.0))
-                    .changed()
-                {
-                    if let Ok(v) = w_str.parse::<u16>() {
-                        cfg.width = v;
+            // ---- System group ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("System").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Client name:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.client_name)
+                                .desired_width(220.0),
+                        )
+                        .changed()
+                    {
                         dirty = true;
                     }
-                }
-                ui.label("×");
-                if ui
-                    .add(egui::TextEdit::singleline(&mut h_str).desired_width(80.0))
-                    .changed()
-                {
-                    if let Ok(v) = h_str.parse::<u16>() {
-                        cfg.height = v;
-                        dirty = true;
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Client name:");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut cfg.client_name)
-                            .desired_width(220.0),
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
+                });
             });
 
             ui.horizontal(|ui| {
