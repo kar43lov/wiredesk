@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod input;
+mod keyboard_tap;
 
 use std::sync::mpsc;
 use std::thread;

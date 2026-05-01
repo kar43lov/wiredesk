@@ -16,3 +16,8 @@ toml.workspace = true
 eframe = "0.31"
 serialport.workspace = true
 arboard = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+core-foundation = "0.10"
+accessibility-sys = "0.1"
