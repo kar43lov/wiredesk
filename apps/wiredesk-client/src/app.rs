@@ -577,7 +577,18 @@ impl eframe::App for WireDeskApp {
                 return;
             }
 
-            ui.heading("WireDesk");
+            ui.horizontal(|ui| {
+                // 28px icon next to the heading — branding consistency with
+                // the Win host title-bar icon. egui downscales the 1024×1024
+                // source on the fly; no separate small asset needed.
+                ui.add(
+                    egui::Image::new(egui::include_image!(
+                        "../../../assets/icon-source.png"
+                    ))
+                    .fit_to_exact_size(egui::vec2(28.0, 28.0)),
+                );
+                ui.heading("WireDesk");
+            });
             ui.separator();
 
             // Connection status

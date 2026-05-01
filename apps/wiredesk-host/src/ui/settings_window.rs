@@ -17,11 +17,19 @@ use crate::config::HostConfig;
 use crate::session_thread::SessionStatus;
 use crate::ui::{autostart, format};
 
+// Window icon — title-bar / Alt-Tab. Loaded at runtime from the multi-size
+// .ico asset. This path runs without a windres / RC.exe toolchain (we'd
+// normally embed it as a PE resource for taskbar+Alt+Tab on first paint
+// and a clean Win-explorer .exe icon, but that requires a Windows-side
+// build environment — see plan task 2 fallback note).
+const APP_ICON_BYTES: &[u8] = include_bytes!("../../../../assets/app-icon.ico");
+
 /// All controls owned by the settings window. Stored together so the
 /// caller can wire up event handlers via `Rc<RefCell<SettingsWindow>>`.
 #[derive(Default)]
 pub struct SettingsWindow {
     pub window: nwg::Window,
+    pub window_icon: nwg::Icon,
     pub layout: nwg::GridLayout,
 
     pub status_label: nwg::Label,
@@ -57,12 +65,33 @@ impl SettingsWindow {
         {
             let mut s = me.borrow_mut();
 
-            nwg::Window::builder()
-                .size((420, 340))
-                .position((300, 300))
-                .title("WireDesk Host Settings")
-                .flags(nwg::WindowFlags::WINDOW)
-                .build(&mut s.window)?;
+            // Build window-icon and window in a single expression to give
+            // the borrow checker a clear field split: through a single
+            // `RefMut<SettingsWindow>` it can't see that `s.window_icon`
+            // and `s.window` are disjoint fields, so we destructure once.
+            {
+                let SettingsWindow {
+                    ref mut window,
+                    ref mut window_icon,
+                    ..
+                } = *s;
+                let icon_ok = nwg::Icon::builder()
+                    .source_bin(Some(APP_ICON_BYTES))
+                    .strict(false)
+                    .build(window_icon)
+                    .is_ok();
+                if !icon_ok {
+                    log::warn!("failed to load app icon (resource missing or malformed)");
+                }
+                let icon_ref = if icon_ok { Some(&*window_icon) } else { None };
+                nwg::Window::builder()
+                    .size((420, 340))
+                    .position((300, 300))
+                    .title("WireDesk Host Settings")
+                    .icon(icon_ref)
+                    .flags(nwg::WindowFlags::WINDOW)
+                    .build(window)?;
+            }
 
             nwg::Label::builder()
                 .text(&SessionStatus::Waiting.label())

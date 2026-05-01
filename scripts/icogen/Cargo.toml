@@ -1,0 +1,15 @@
+[package]
+name = "icogen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone one-shot tool — NOT part of the workspace. Run via:
+#   cargo run --manifest-path scripts/icogen/Cargo.toml --release
+# Reads assets/icon-source.png, writes assets/app-icon.ico with the standard
+# 16/32/48/256 multi-resolution layout (same set ImageMagick would produce).
+[workspace]
+
+[dependencies]
+ico = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }

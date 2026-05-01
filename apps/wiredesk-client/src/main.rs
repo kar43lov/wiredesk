@@ -109,7 +109,17 @@ fn main() {
         ..Default::default()
     };
 
-    if let Err(e) = eframe::run_native("WireDesk", options, Box::new(|_cc| Ok(Box::new(app)))) {
+    if let Err(e) = eframe::run_native(
+        "WireDesk",
+        options,
+        Box::new(|cc| {
+            // egui's `include_image!` macro emits an ImageSource that needs a
+            // registered loader at runtime — without this call the heading
+            // image just renders as an "unable to load image" placeholder.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    ) {
         log::error!("eframe error: {e}");
     }
 }

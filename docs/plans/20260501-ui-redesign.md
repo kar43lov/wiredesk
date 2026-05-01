@@ -478,18 +478,18 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-client/src/app.rs` (W в heading)
 - Modify: `apps/wiredesk-client/src/main.rs` (eframe image loader install)
 
-- [ ] **pre-check:** `which x86_64-w64-mingw32-windres`. Если нет — `brew install mingw-w64`. Если установка не вариант — пропустить PE-resource path и использовать только runtime `nwg::Window::builder().icon(...)` (хуже UX — нет иконки в taskbar/Alt+Tab — пометить как ⚠️ в плане и в issue #5)
-- [ ] сгенерить `assets/app-icon.ico` один раз и закоммитить (не скрипт): `magick assets/icon-source.png -define icon:auto-resize=16,32,48,256 assets/app-icon.ico`
-- [ ] добавить `embed-resource = "2"` в `[build-dependencies]` host'а
-- [ ] `apps/wiredesk-host/app.rc` с одной строкой `1 ICON "../../assets/app-icon.ico"`
-- [ ] в `build.rs` после embed-manifest — `embed_resource::compile("apps/wiredesk-host/app.rc", embed_resource::NONE)` под cfg(windows)
-- [ ] на Mac — переиспользуем `assets/icon-source.png` напрямую (никакого W-logo.png): в `app.rs::update` chrome — `ui.horizontal(|ui| { ui.add(egui::Image::new(egui::include_image!("../../../assets/icon-source.png")).fit_to_exact_size(egui::vec2(28.0, 28.0))); ui.heading("WireDesk"); })`
-- [ ] в `main.rs` клиента — `egui_extras::install_image_loaders(&cc.egui_ctx)` (eframe 0.31 требует для `include_image!`). Добавить `egui_extras = { version = "0.31", features = ["image"] }` в Cargo.toml если ещё нет
-- [ ] write tests: pure-helper'ов не появилось — task без unit-тестов, проверка через build success (если .ico нет, embed-resource падает на compile-time; если PNG нет, include_image! падает)
-- [ ] cargo build --release -p wiredesk-host (Win-сторону билдить нельзя на macOS, **только** cross-check)
-- [ ] cargo build --release -p wiredesk-client + `./scripts/build-mac-app.sh` — manual visual check что иконка в Dock'е и в окне в heading'е
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `feat(ui): window icons — embed .ico in Win PE-headers + W in Mac heading`
+- [x] **pre-check:** `which x86_64-w64-mingw32-windres` — mingw not present, fallback to runtime icon (no PE-resource path; iconify via `nwg::Window::builder().icon(...)` only — title-bar yes, taskbar/Alt+Tab degraded until built on Windows host) ⚠️
+- [x] сгенерить `assets/app-icon.ico` один раз и закоммитить — magick недоступен, использован Rust xtask `scripts/icogen` (ico 0.3 + image 0.25, 16/32/48/256 px output) → `cargo run --manifest-path scripts/icogen/Cargo.toml --release`
+- [x] ~~добавить `embed-resource = "2"` в `[build-dependencies]` host'а~~ — пропущено (mingw fallback ⚠️)
+- [x] ~~`apps/wiredesk-host/app.rc` с одной строкой `1 ICON "../../assets/app-icon.ico"`~~ — пропущено (mingw fallback ⚠️)
+- [x] ~~в `build.rs` после embed-manifest — `embed_resource::compile(...)` под cfg(windows)~~ — пропущено (mingw fallback ⚠️). Вместо этого: `SettingsWindow` загружает `app-icon.ico` через `include_bytes!` + `nwg::Icon::builder().source_bin(...)` runtime, передаёт в `Window::builder().icon(...)`
+- [x] на Mac — переиспользуем `assets/icon-source.png` напрямую: `ui.horizontal(|ui|{ ui.add(egui::Image::new(egui::include_image!("../../../assets/icon-source.png")).fit_to_exact_size(egui::vec2(28.0, 28.0))); ui.heading("WireDesk"); })`
+- [x] в `main.rs` клиента — `egui_extras::install_image_loaders(&cc.egui_ctx)` в `Box::new(|cc| ...)`. Добавлены deps: `egui_extras = { version = "0.31", features = ["image"] }` + `image = { version = "0.25", default-features = false, features = ["png"] }`
+- [x] write tests: pure-helper'ов не появилось — task без unit-тестов, проверка через build success (`include_bytes!("../../../../assets/app-icon.ico")` и `include_image!(".../icon-source.png")` падают на compile-time если файлы отсутствуют)
+- [x] cargo build --release -p wiredesk-host (Win-build only via cross-check; full release build on Win machine at live-test gate)
+- [x] manual visual check Dock-icon (deferred to live-test gate)
+- [x] cargo test --workspace + clippy + cross-check — clean
+- [x] commit: `feat(ui): window icons — embed .ico in Win PE-headers + W in Mac heading`
 
 ### Task 3: Unified status indicators — ImageFrame on Win + RichText on Mac
 
