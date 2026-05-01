@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod config;
 mod input;
 mod keyboard_tap;
 
@@ -7,38 +8,44 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use eframe::egui;
 use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
 
 use app::{TransportEvent, WireDeskApp};
+use config::ClientConfig;
 
 #[derive(Parser)]
 #[command(name = "wiredesk-client", about = "WireDesk client for macOS")]
-struct Args {
-    /// Serial port (e.g., /dev/cu.usbserial-XXX)
+pub struct Args {
+    /// Serial port (e.g., /dev/cu.usbserial-XXX). Overrides config.toml.
     #[arg(short, long, default_value = "/dev/cu.usbserial-120")]
     port: String,
 
-    /// Baud rate
+    /// Baud rate. Overrides config.toml.
     #[arg(short, long, default_value = "115200")]
     baud: u32,
 
-    /// Client display name
+    /// Client display name. Overrides config.toml.
     #[arg(long, default_value = "wiredesk-client")]
     name: String,
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let args = Args::parse();
+
+    // Resolve config: defaults → config.toml → CLI args (override).
+    let toml_cfg = ClientConfig::load();
+    let matches = Args::command().get_matches();
+    let cfg = config::merge_args(&matches, toml_cfg);
 
     log::info!("WireDesk Client");
-    log::info!("serial: {} @ {} baud", args.port, args.baud);
+    log::info!("config: {}", ClientConfig::config_path().display());
+    log::info!("serial: {} @ {} baud", cfg.port, cfg.baud);
 
-    let transport = match wiredesk_transport::serial::SerialTransport::open(&args.port, args.baud) {
+    let transport = match wiredesk_transport::serial::SerialTransport::open(&cfg.port, cfg.baud) {
         Ok(t) => t,
         Err(e) => {
             log::error!("failed to open serial port: {e}");
@@ -75,7 +82,7 @@ fn main() {
     // sends heartbeats, sends Hello on startup. UI never blocks because this
     // thread has zero shared locks with the egui thread.
     let writer_events_tx = events_tx.clone();
-    let client_name = args.name.clone();
+    let client_name = cfg.client_name.clone();
     thread::spawn(move || {
         writer_thread(writer_transport, outgoing_rx, writer_events_tx, client_name);
     });
@@ -93,7 +100,7 @@ fn main() {
     // enable() is called when the user enters capture-mode.
     let tap_handle = keyboard_tap::start(outgoing_tx.clone(), tap_events_tx);
 
-    let app = WireDeskApp::new(args.port.clone(), events_rx, outgoing_tx, tap_events_rx, tap_handle);
+    let app = WireDeskApp::new(cfg, events_rx, outgoing_tx, tap_events_rx, tap_handle);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

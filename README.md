@@ -80,17 +80,52 @@ cargo test --workspace
 
 > First time? Read **[docs/setup.md](docs/setup.md)** — covers wiring, port discovery, Rust install on Windows (incl. how to do it under "Continent" lockdown), and handshake troubleshooting.
 
-Defaults are baked in for a single-user setup (`COM3`, `/dev/cu.usbserial-120`, 115200 baud, 2560×1440). Override with flags if your hardware differs.
+Defaults are baked in for a single-user setup (`COM3`, `/dev/cu.usbserial-120`, 115200 baud, 2560×1440). Override with flags or via the settings UI / `config.toml`.
 
-**Host (Windows):**
+### Configuration
+
+Both binaries persist their settings in TOML at the OS config dir:
+
+| Platform | Path |
+|----------|------|
+| Windows  | `%APPDATA%\WireDesk\config.toml` |
+| macOS    | `~/Library/Application Support/WireDesk/config.toml` |
+
+Resolution order (low → high precedence): hardcoded defaults → `config.toml` → CLI flags.
+
+### Host (Windows) — tray agent
+
+Release builds run as a background tray agent — no console window, icon `W` in the system tray.
 
 ```bash
-wiredesk-host
-# or with overrides
+# Release build runs hidden as a tray app
+.\target\release\wiredesk-host.exe
+
+# Right-click the tray icon for: Show Settings… / Open Logs / Quit
+# Settings window persists changes to %APPDATA%\WireDesk\config.toml
+# "Run on startup" toggle writes HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+```
+
+Logs roll daily into `%APPDATA%\WireDesk\host.log.YYYY-MM-DD`. Panics and `log::*` macros across the host crate are captured into the same file via `tracing-log`.
+
+CLI overrides still work for one-off runs:
+
+```bash
 wiredesk-host --port COM4 --width 1920 --height 1080
 ```
 
-**Client (macOS) — full GUI** (mouse, keyboard, clipboard, embedded terminal):
+### Client (macOS) — `WireDesk.app` bundle
+
+Build the `.app` bundle once:
+
+```bash
+./scripts/build-mac-app.sh
+# → target/release/WireDesk.app
+```
+
+Double-click `WireDesk.app` to launch (first time: right-click → Open to bypass Gatekeeper). The Settings panel in chrome-mode (visible when not in capture/fullscreen) shows port/baud/width/height/client name with a Save button — changes write `~/Library/Application Support/WireDesk/config.toml` and require a restart to apply.
+
+Or run the binary directly for development:
 
 ```bash
 wiredesk-client
@@ -139,7 +174,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (OS-level keyboard hijack on macOS), fullscreen toggle, shell-over-serial. 106 tests passing.
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (OS-level keyboard hijack on macOS), fullscreen toggle, shell-over-serial, tray agent on Windows, `.app` bundle on macOS, TOML-backed settings UI on both sides, file logging on Windows, autostart toggle, single-instance lock. 165+ tests passing.
 
 ## License
 
