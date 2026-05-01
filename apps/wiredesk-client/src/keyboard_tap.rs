@@ -26,7 +26,7 @@ use crate::input::keymap::{
 
 /// Mac VK code constants used for hotkey detection.
 const CG_KEY_RETURN: u16 = 0x24;
-const CG_KEY_G: u16 = 0x05;
+const CG_KEY_ESCAPE: u16 = 0x35;
 
 /// Mask of all modifier bits we care about — used to reject combos with
 /// "extra" modifiers (e.g., Cmd+Shift+Enter shouldn't match Cmd+Enter).
@@ -37,9 +37,12 @@ fn is_cmd_enter(keycode: u16, flags: u64) -> bool {
     keycode == CG_KEY_RETURN && (flags & CG_MODIFIER_MASK) == CG_FLAG_COMMAND
 }
 
-/// `true` if the event matches Ctrl+Alt+G exactly (no Cmd, no Shift).
-fn is_ctrl_alt_g(keycode: u16, flags: u64) -> bool {
-    keycode == CG_KEY_G && (flags & CG_MODIFIER_MASK) == (CG_FLAG_CONTROL | CG_FLAG_ALT)
+/// `true` if the event matches Cmd+Esc — the release-capture combo.
+/// Picked over Ctrl+Alt+G because that one collides with common
+/// window-management apps (Rectangle, Hammerspoon binds, etc.) and
+/// because Cmd+Esc is unbound on default macOS.
+fn is_release_capture(keycode: u16, flags: u64) -> bool {
+    keycode == CG_KEY_ESCAPE && (flags & CG_MODIFIER_MASK) == CG_FLAG_COMMAND
 }
 
 /// Events from the tap thread back to the UI thread.
@@ -316,7 +319,7 @@ mod macos {
                                         let _ = tap_events_cb.send(TapEvent::ToggleFullscreen);
                                         return CallbackResult::Drop;
                                     }
-                                    if super::is_ctrl_alt_g(kc, flags) {
+                                    if super::is_release_capture(kc, flags) {
                                         let _ = tap_events_cb.send(TapEvent::ReleaseCapture);
                                         return CallbackResult::Drop;
                                     }
@@ -547,30 +550,40 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_alt_g_matches() {
-        assert!(super::is_ctrl_alt_g(CG_KEY_G, CG_FLAG_CONTROL | CG_FLAG_ALT));
+    fn release_capture_matches_cmd_esc() {
+        assert!(super::is_release_capture(CG_KEY_ESCAPE, CG_FLAG_COMMAND));
     }
 
     #[test]
-    fn ctrl_alt_g_rejects_extra_cmd() {
-        // Cmd+Ctrl+Alt+G must NOT match — anti-mask.
-        assert!(!super::is_ctrl_alt_g(
-            CG_KEY_G,
-            CG_FLAG_COMMAND | CG_FLAG_CONTROL | CG_FLAG_ALT
+    fn release_capture_rejects_extra_modifiers() {
+        // Cmd+Shift+Esc must NOT match.
+        assert!(!super::is_release_capture(
+            CG_KEY_ESCAPE,
+            CG_FLAG_COMMAND | CG_FLAG_SHIFT
+        ));
+        // Cmd+Ctrl+Esc must NOT match.
+        assert!(!super::is_release_capture(
+            CG_KEY_ESCAPE,
+            CG_FLAG_COMMAND | CG_FLAG_CONTROL
+        ));
+        // Cmd+Opt+Esc (Force Quit) — must NOT match.
+        assert!(!super::is_release_capture(
+            CG_KEY_ESCAPE,
+            CG_FLAG_COMMAND | CG_FLAG_ALT
         ));
     }
 
     #[test]
-    fn ctrl_alt_g_rejects_partial() {
-        // Just Ctrl+G (no Alt) shouldn't match.
-        assert!(!super::is_ctrl_alt_g(CG_KEY_G, CG_FLAG_CONTROL));
-        // Just Alt+G (no Ctrl) shouldn't match.
-        assert!(!super::is_ctrl_alt_g(CG_KEY_G, CG_FLAG_ALT));
+    fn release_capture_rejects_no_cmd() {
+        // Plain Esc.
+        assert!(!super::is_release_capture(CG_KEY_ESCAPE, 0));
+        // Ctrl+Esc.
+        assert!(!super::is_release_capture(CG_KEY_ESCAPE, CG_FLAG_CONTROL));
     }
 
     #[test]
-    fn ctrl_alt_g_rejects_wrong_key() {
-        // Ctrl+Alt+H — wrong letter.
-        assert!(!super::is_ctrl_alt_g(0x04, CG_FLAG_CONTROL | CG_FLAG_ALT));
+    fn release_capture_rejects_wrong_key() {
+        // Cmd+something-else — not Cmd+Esc.
+        assert!(!super::is_release_capture(0x00, CG_FLAG_COMMAND));
     }
 }

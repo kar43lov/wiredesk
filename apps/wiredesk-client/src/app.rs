@@ -109,7 +109,7 @@ impl WireDeskApp {
     fn toggle_capture(&mut self) {
         self.capturing = !self.capturing;
         if self.capturing {
-            self.status_msg = "input captured (Ctrl+Alt+G to release)".into();
+            self.status_msg = "input captured (Cmd+Esc to release)".into();
         } else {
             self.status_msg = "input released".into();
         }
@@ -248,7 +248,7 @@ impl WireDeskApp {
 
         ui.label("Active hotkeys (intercepted locally — not sent to Host):");
         ui.indent("local_hotkeys", |ui| {
-            ui.label("• Ctrl+Alt+G — release capture");
+            ui.label("• Cmd+Esc — release capture");
             ui.label("• Cmd+Enter — toggle fullscreen");
         });
         ui.add_space(8.0);
@@ -374,13 +374,13 @@ impl eframe::App for WireDeskApp {
         // egui-side hotkeys for the OUT-OF-CAPTURE path. When tap is enabled
         // it consumes these before egui sees them; this branch handles the
         // case where the user presses them without capture being on.
-        let (ctrl_alt_g_pressed, cmd_enter_pressed) = ctx.input(|i: &egui::InputState| {
+        let (cmd_esc_pressed, cmd_enter_pressed) = ctx.input(|i: &egui::InputState| {
             (
-                i.key_pressed(egui::Key::G) && i.modifiers.ctrl && i.modifiers.alt,
+                i.key_pressed(egui::Key::Escape) && i.modifiers.command,
                 i.key_pressed(egui::Key::Enter) && i.modifiers.command,
             )
         });
-        if ctrl_alt_g_pressed {
+        if cmd_esc_pressed {
             self.toggle_capture();
         }
         if cmd_enter_pressed {
@@ -423,7 +423,7 @@ impl eframe::App for WireDeskApp {
 
             // Capture toggle
             let capture_label = if self.capturing {
-                "Input: CAPTURED (Ctrl+Alt+G to release)"
+                "Input: CAPTURED (Cmd+Esc to release)"
             } else {
                 "Input: released"
             };
@@ -610,7 +610,7 @@ impl eframe::App for WireDeskApp {
                             continue;
                         }
                         // Don't forward the capture-toggle combo to Host
-                        if *key == egui::Key::G && modifiers.ctrl && modifiers.alt {
+                        if *key == egui::Key::Escape && modifiers.command {
                             continue;
                         }
                         // Don't forward the fullscreen toggle either
