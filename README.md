@@ -25,12 +25,16 @@ Host (Windows 11)                       Client (macOS)
 
 - Captures keyboard and mouse input on Mac, sends to Windows via serial
 - Injects input on Windows via SendInput API (scancodes, works with any keyboard layout, Cyrillic included)
+- **OS-level keyboard capture on macOS** via CGEventTap — system shortcuts like Cmd+Space (input-method switch) and Cmd+C/Cmd+V are intercepted before macOS gets them and forwarded to Host as Win+Space / Ctrl+C / Ctrl+V
 - Syncs clipboard text in both directions automatically (polled every 500ms, UTF-8 only)
-- Toggle capture with Ctrl+Alt+G — input goes to Host when active, back to Mac when released
-- Special key buttons: Win key, **Lang (Win+Space)** for input-method switching, Ctrl+Alt+Del
+- Toggle capture with `Cmd+Esc` — input goes to Host when active, back to Mac when released
+- Toggle fullscreen with `Cmd+Enter` — for "third monitor" workflow when WireDesk is dragged onto a display fed by the HDMI-capture
+- Auto-pauses capture when the WireDesk window loses focus — click any other Mac app and Cmd-shortcuts work locally again
 - **Terminal-over-serial**: opens a shell on Host (powershell/cmd) and pipes I/O over the same serial link. From there you can run scripts, copy files, or `ssh` to other machines using the Host's internet connection.
 
 > **Note on Ctrl+Alt+Del:** Windows reserves this combo for the kernel SAS handler, so a SendInput-driven press won't reach it without a SYSTEM-level service or `SoftwareSASGeneration` Group Policy. The button is in the UI but won't actually trigger the secure screen. Use Win+L to lock or Ctrl+Shift+Esc for Task Manager instead.
+
+> **macOS permission required.** WireDesk needs Accessibility permission (System Settings → Privacy & Security → Accessibility → add the `wiredesk-client` binary). Without it the OS-level keyboard capture is silently disabled. The app shows an instruction screen on first launch.
 
 ## What WireDesk does NOT do
 
@@ -135,7 +139,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle, bidirectional clipboard sync, shell-over-serial. 71 tests passing.
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (OS-level keyboard hijack on macOS), fullscreen toggle, shell-over-serial. 106 tests passing.
 
 ## License
 

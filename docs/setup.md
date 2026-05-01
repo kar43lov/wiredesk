@@ -134,19 +134,43 @@ cd ~/Data/prjcts/wiredesk
 
 ---
 
-## Шаг 7. Проверка ввода
+## Шаг 7. Accessibility permission на Mac
+
+Чтобы WireDesk перехватывал системные шорткаты (Cmd+Space, Cmd+C/V) и форвардил их на Windows, нужно разрешение macOS Accessibility. Без него работают только обычные клавиши, а системные комбинации уйдут в чужие приложения (ChatGPT, Spotlight и т.д.).
+
+При первом запуске `wiredesk-client` покажет экран с инструкцией. Делай так:
+
+1. Жми кнопку **Open System Settings** в окне (или вручную: System Settings → Privacy & Security → Accessibility)
+2. В Accessibility-списке нажми **+** внизу
+3. В Finder-диалоге **Cmd+Shift+G**, вставь полный путь:
+   ```
+   /Users/USERNAME/path/to/wiredesk/target/release/wiredesk-client
+   ```
+   (под свой путь). Жми Enter и Open.
+4. Включи тумблер справа от `wiredesk-client`
+5. **Закрой и перезапусти** `wiredesk-client` — это обязательно. Tap-поток создаётся один раз при старте, после grant'а нужен свежий процесс.
+
+После рестарта окно сразу откроется в обычном UI (без permission-экрана).
+
+> Permission привязана к конкретному пути бинаря. Если перекомпилируешь в другую папку — заново добавить.
+
+## Шаг 8. Проверка ввода
 
 В окне клиента:
 
-1. Нажми `Capture` (или Ctrl+Alt+G) — фокус ввода уходит на Host
+1. Нажми `Capture` (или **Cmd+Esc**) — фокус ввода уходит на Host
 2. Подвигай мышью — курсор на Windows-экране (через capture-карту в QuickTime/VLC) едет
 3. Напечатай в Notepad — набирается, кириллица тоже
-4. Скопируй текст на Mac (Cmd+C) — Ctrl+V на Host вставит
-5. Ctrl+Alt+G — фокус возвращается на Mac
+4. **Cmd+Space** — переключение языка ввода на Windows (Win+Space)
+5. **Cmd+C** в Windows-приложении → текст копируется (Ctrl+C effect), через ~1 сек прилетает в Mac clipboard
+6. **Cmd+V** в Mac-приложении (после переключения фокуса) — вставит синхронизированный текст
+7. **Cmd+Enter** — fullscreen toggle (полезно для «третьего монитора» через HDMI capture)
+8. **Cmd+Esc** — выход из capture, на Mac снова все клавиши работают штатно
+9. Кликни в любое другое Mac-приложение — capture автоматически паузится, Mac shortcuts работают
 
 ---
 
-## Шаг 8. Терминал в Ghostty/iTerm
+## Шаг 9. Терминал в Ghostty/iTerm
 
 Закрой `wiredesk-client` (он держит порт). В Ghostty:
 
