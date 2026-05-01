@@ -1,1 +1,14 @@
 target/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code workspace state (local-only)
+.claude/

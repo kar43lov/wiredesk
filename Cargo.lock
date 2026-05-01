@@ -4337,6 +4337,7 @@ dependencies = [
 name = "wiredesk-client"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "clap",
  "eframe",
  "env_logger",
@@ -4363,6 +4364,7 @@ dependencies = [
 name = "wiredesk-host"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "clap",
  "env_logger",
  "log",
