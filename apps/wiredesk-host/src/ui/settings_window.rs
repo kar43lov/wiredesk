@@ -71,9 +71,16 @@ pub struct SettingsWindow {
     pub copy_mac_btn: nwg::Button,
 
     // --- Bottom button-bar (outside groups) ---
-    // Save & Restart slot reserved for Task 8; Detect for Task 7.
+    // The bar holds two right-aligned buttons. `restart_btn` is built here
+    // so Task 8 only needs to wire its handler — currently it has no
+    // handler so clicking it is a no-op. `save_btn` is the primary action.
+    // No `set_default_button` — Enter inside a TextEdit shouldn't trigger
+    // Save (would surprise users typing baud / dimensions). Hide button
+    // removed — close-X provides the same affordance (UX-audit N3).
+    pub bar_frame: nwg::Frame,
+    pub bar_layout: nwg::GridLayout,
+    pub restart_btn: nwg::Button, // reserved handler for Task 8
     pub save_btn: nwg::Button,
-    pub hide_btn: nwg::Button,
 
     pub message_label: nwg::Label,
 }
@@ -233,14 +240,22 @@ impl SettingsWindow {
                 .build(&mut s.copy_mac_btn)?;
 
             // ---- Bottom button-bar (outside groups) ----
-            nwg::Button::builder()
-                .text("Save")
+            // Horizontal frame with right-aligned primary action. Captions
+            // use `&` accelerators (Alt+R / Alt+S — Win11 standard); the
+            // double-`&` in "Save && &Restart" produces a literal ampersand
+            // followed by an Alt+R accelerator on the R.
+            nwg::Frame::builder()
                 .parent(&s.window)
+                .flags(nwg::FrameFlags::VISIBLE)
+                .build(&mut s.bar_frame)?;
+            nwg::Button::builder()
+                .text("Save && &Restart")
+                .parent(&s.bar_frame)
+                .build(&mut s.restart_btn)?;
+            nwg::Button::builder()
+                .text("&Save")
+                .parent(&s.bar_frame)
                 .build(&mut s.save_btn)?;
-            nwg::Button::builder()
-                .text("Hide")
-                .parent(&s.window)
-                .build(&mut s.hide_btn)?;
 
             nwg::Label::builder()
                 .text("")
@@ -279,6 +294,18 @@ impl SettingsWindow {
                 .child_item(nwg::GridLayoutItem::new(&s.copy_mac_btn, 0, 1, 3, 1))
                 .build(&s.system_layout)?;
 
+            // Button-bar internal grid: 3 cols × 1 row. Col 0 is a spacer
+            // (no child) so the two buttons get pushed to the right; cols 1
+            // and 2 hold the action buttons in [Save&Restart][Save] order.
+            nwg::GridLayout::builder()
+                .parent(&s.bar_frame)
+                .max_column(Some(3))
+                .spacing(4)
+                .margin([0, 0, 0, 0])
+                .child(1, 0, &s.restart_btn)
+                .child(2, 0, &s.save_btn)
+                .build(&s.bar_layout)?;
+
             // ---- Outer grid: status row + 3 groups (title + frame) +
             // button-bar + message. Each group is two rows: 1-row title,
             // then a multi-row frame for nested controls. The frame row
@@ -302,9 +329,8 @@ impl SettingsWindow {
                 // Row 7: System title; rows 8-9: System frame
                 .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 7, 3, 1))
                 .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 8, 3, 2))
-                // Row 10: button-bar (Save / Hide)
-                .child(1, 10, &s.save_btn)
-                .child(2, 10, &s.hide_btn)
+                // Row 10: button-bar (right-aligned via internal grid)
+                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 10, 3, 1))
                 // Row 11: message label
                 .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 11, 3, 1))
                 .build(&s.layout)?;

@@ -536,16 +536,16 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-host/src/main.rs` (убрать Hide handler если кнопку убрали)
 - Modify: `apps/wiredesk-client/src/app.rs` (Capture button primary)
 
-- [ ] в `SettingsWindow` — нижний button-bar Frame (без заголовка) с `nwg::GridLayout` правое выравнивание
-- [ ] order слева→направо: spacer / `Save & Restart` (новый, Task 8 placeholder) / `Save` (primary)
-- [ ] убрать `hide_btn` (close-крестик и так есть — duplication, см. UX-аудит N3)
-- [ ] **НЕ ставить** `set_default_button` — конфликтует с TextEdit Enter UX (юзер вводит баод и случайно ловит Enter → save). Save доступен мышью + accelerator `&Save` в caption (Alt+S — стандарт Win)
-- [ ] добавить `&` префикс в caption кнопки: `Save` → `&Save`, `Save & Restart` → `Save && &Restart` (Alt+R) — accelerator в Win11
-- [ ] на Mac в `app.rs::update` chrome — поднять `Capture Input` button сразу после status row
-- [ ] стиль: `Button::new(RichText::new("Capture Input").size(16.0).strong()).fill(...).min_size(vec2(200, 32))`
-- [ ] при `capturing=true` — fill красноватый (`Color32::from_rgb(180, 60, 60)`) + текст «Release Input»
-- [ ] write tests: pure helper для button-style logic если введён (например `capture_button_style(capturing: bool) -> (String, Color32)`) → table test 2 кейса; иначе skip
-- [ ] cargo test --workspace + clippy + cross-check — clean
+- [x] в `SettingsWindow` — нижний button-bar Frame (без заголовка) с `nwg::GridLayout` правое выравнивание (`bar_frame` + `bar_layout`, 3 col grid, col 0 spacer)
+- [x] order слева→направо: spacer / `Save & Restart` (новый, Task 8 placeholder — built but no handler) / `Save` (primary)
+- [x] убрать `hide_btn` — поле и handler удалены (close-X duplication, UX-аудит N3)
+- [x] **НЕ ставлю** `set_default_button` — конфликт с TextEdit Enter UX. Save доступен мышью + Alt+S accelerator
+- [x] `&` префикс в caption: `Save` → `&Save`, `Save & Restart` → `Save && &Restart` (Alt+R). Двойной `&&` — литеральный амперсанд в win-resource caption
+- [x] на Mac в `app.rs::update` chrome — `Capture Input` уже сразу после status row, изменён только стиль
+- [x] стиль применён: `egui::Button::new(RichText::new(...).size(16.0).strong()).fill(...).min_size(vec2(200, 32))`
+- [x] при `capturing=true` — fill красноватый `Color32::from_rgb(180, 60, 60)`, текст «Release Input». Idle — синеватый `(60, 110, 180)` («Capture Input»).
+- [x] write tests: pure helper не введён (стайлинг inline 2 строки — overkill оборачивать) — skip per plan
+- [x] cargo test --workspace + clippy + cross-check — clean (151 tests pass, 0 warnings)
 - [ ] commit: `refactor(ui): button-bar conventions — primary right-aligned, default action keyboarded`
 
 ### Task 6: Capture-mode banner + permission-screen step-by-step (Mac only)

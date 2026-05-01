@@ -647,17 +647,29 @@ impl eframe::App for WireDeskApp {
             ui.label(format!("Serial: {}", self.runtime_serial_port));
             ui.separator();
 
-            // Capture toggle
+            // Capture toggle — primary action, prominent. RichText size
+            // 16pt strong + colored fill + min_size [200, 32] makes it the
+            // visual anchor of the chrome panel. Color flips between blue
+            // (idle) and red (capturing) as a state cue, matching the
+            // capture-banner palette in `render_capture_info`.
+            let (btn_text, btn_fill) = if self.capturing {
+                ("Release Input", egui::Color32::from_rgb(180, 60, 60))
+            } else {
+                ("Capture Input", egui::Color32::from_rgb(60, 110, 180))
+            };
+            let capture_btn = egui::Button::new(
+                egui::RichText::new(btn_text).size(16.0).strong(),
+            )
+            .fill(btn_fill)
+            .min_size(egui::vec2(200.0, 32.0));
+            if ui.add(capture_btn).clicked() {
+                self.toggle_capture();
+            }
             let capture_label = if self.capturing {
                 "Input: CAPTURED (Cmd+Esc to release)"
             } else {
                 "Input: released"
             };
-
-            let btn_text = if self.capturing { "Release Input" } else { "Capture Input" };
-            if ui.button(btn_text).clicked() {
-                self.toggle_capture();
-            }
             ui.label(capture_label);
 
             ui.separator();

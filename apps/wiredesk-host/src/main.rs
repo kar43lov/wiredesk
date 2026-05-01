@@ -284,9 +284,9 @@ fn run_windows(
                             nwg::Clipboard::set_data_text(&s.window, &cmd);
                             s.set_message("Copied Mac launch command to clipboard.");
                         }
-                    } else if handle == s.hide_btn.handle {
-                        s.hide();
                     }
+                    // restart_btn handler reserved for Task 8 — built but
+                    // currently no-op when clicked.
                 }
                 E::OnWindowClose => {
                     s.hide();
