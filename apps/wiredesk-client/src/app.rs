@@ -5,6 +5,7 @@ use eframe::egui;
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
+use crate::config::ClientConfig;
 use crate::input::mapper::InputMapper;
 use crate::keyboard_tap::{self, TapEvent, TapHandle};
 
@@ -37,7 +38,7 @@ pub struct WireDeskApp {
     screen_h: u16,
     clipboard_text: String,
     status_msg: String,
-    serial_port: String,
+    runtime_serial_port: String, // what the running process actually opened
     events_rx: Option<mpsc::Receiver<TransportEvent>>,
     outgoing_tx: mpsc::Sender<Packet>,
     tap_events_rx: Option<mpsc::Receiver<TapEvent>>,
@@ -52,31 +53,40 @@ pub struct WireDeskApp {
     shell_output: String,
     shell_input: String,
     shell_kind: String, // "" (default), "powershell", "cmd"
+    // Settings panel state — TOML-backed configuration the user is editing.
+    pending_config: ClientConfig,
+    config_dirty: bool,
+    save_toast: Option<(String, Instant)>,
+    // Cached available serial ports for the combo-box; refreshed on demand.
+    available_ports: Vec<String>,
 }
 
 impl WireDeskApp {
     pub fn new(
-        serial_port: String,
+        initial_config: ClientConfig,
         events_rx: mpsc::Receiver<TransportEvent>,
         outgoing_tx: mpsc::Sender<Packet>,
         tap_events_rx: mpsc::Receiver<TapEvent>,
         tap_handle: TapHandle,
     ) -> Self {
+        let runtime_serial_port = initial_config.port.clone();
+        let initial_w = initial_config.width;
+        let initial_h = initial_config.height;
         Self {
             state: ConnectionState::Disconnected,
             capturing: false,
             fullscreen: false,
             host_name: String::new(),
-            screen_w: 1920,
-            screen_h: 1080,
+            screen_w: initial_w,
+            screen_h: initial_h,
             clipboard_text: String::new(),
             status_msg: "ready".into(),
-            serial_port,
+            runtime_serial_port,
             events_rx: Some(events_rx),
             outgoing_tx,
             tap_events_rx: Some(tap_events_rx),
             tap_handle: Some(tap_handle),
-            mapper: InputMapper::new(1920, 1080),
+            mapper: InputMapper::new(initial_w, initial_h),
             seq: 0,
             permission_granted: keyboard_tap::is_permission_granted(),
             last_perm_check: Instant::now(),
@@ -84,6 +94,162 @@ impl WireDeskApp {
             shell_output: String::new(),
             shell_input: String::new(),
             shell_kind: String::new(),
+            pending_config: initial_config,
+            config_dirty: false,
+            save_toast: None,
+            available_ports: Vec::new(),
+        }
+    }
+
+    fn refresh_available_ports(&mut self) {
+        if let Ok(ports) = serialport::available_ports() {
+            self.available_ports = ports
+                .into_iter()
+                .map(|p| p.port_name)
+                .filter(|n| n.starts_with("/dev/cu."))
+                .collect();
+        }
+    }
+
+    /// Render the editable settings block — only shown in chrome mode.
+    /// Mutating any field flips `config_dirty`; Save persists to TOML and
+    /// flashes a 3-second toast. Changes don't affect the running session
+    /// until the user restarts the binary (per Save+Restart design).
+    fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
+        let mut dirty = false;
+        let mut want_save = false;
+        let mut want_reset = false;
+        let mut want_refresh_ports = false;
+        let available_ports = self.available_ports.clone();
+
+        ui.collapsing("Settings", |ui| {
+            let cfg = &mut self.pending_config;
+
+            ui.horizontal(|ui| {
+                ui.label("Port:");
+                let combo = egui::ComboBox::from_id_salt("settings_port")
+                    .selected_text(cfg.port.clone())
+                    .show_ui(ui, |ui| {
+                        for p in &available_ports {
+                            if ui
+                                .selectable_value(&mut cfg.port, p.clone(), p)
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                        }
+                    });
+                if combo.response.clicked() {
+                    want_refresh_ports = true;
+                }
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut cfg.port)
+                            .desired_width(220.0)
+                            .hint_text("/dev/cu.usbserial-XXX"),
+                    )
+                    .changed()
+                {
+                    dirty = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Baud:");
+                let mut baud_str = cfg.baud.to_string();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
+                    .changed()
+                {
+                    if let Ok(v) = baud_str.parse::<u32>() {
+                        cfg.baud = v;
+                        dirty = true;
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Host screen:");
+                let mut w_str = cfg.width.to_string();
+                let mut h_str = cfg.height.to_string();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut w_str).desired_width(80.0))
+                    .changed()
+                {
+                    if let Ok(v) = w_str.parse::<u16>() {
+                        cfg.width = v;
+                        dirty = true;
+                    }
+                }
+                ui.label("×");
+                if ui
+                    .add(egui::TextEdit::singleline(&mut h_str).desired_width(80.0))
+                    .changed()
+                {
+                    if let Ok(v) = h_str.parse::<u16>() {
+                        cfg.height = v;
+                        dirty = true;
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Client name:");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut cfg.client_name)
+                            .desired_width(220.0),
+                    )
+                    .changed()
+                {
+                    dirty = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                let save_enabled = self.config_dirty || dirty;
+                if ui
+                    .add_enabled(save_enabled, egui::Button::new("Save"))
+                    .clicked()
+                {
+                    want_save = true;
+                }
+                if ui.button("Reset to defaults").clicked() {
+                    want_reset = true;
+                }
+            });
+
+            if let Some((msg, when)) = &self.save_toast {
+                if when.elapsed() < Duration::from_secs(3) {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+                }
+            }
+        });
+
+        if dirty {
+            self.config_dirty = true;
+        }
+        if want_refresh_ports {
+            self.refresh_available_ports();
+        }
+        if want_reset {
+            self.pending_config = ClientConfig::default();
+            self.config_dirty = true;
+        }
+        if want_save {
+            match self.pending_config.save() {
+                Ok(()) => {
+                    self.config_dirty = false;
+                    self.save_toast = Some((
+                        "Saved. Restart WireDesk to apply.".to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    self.save_toast =
+                        Some((format!("Save failed: {e}"), Instant::now()));
+                }
+            }
         }
     }
 
@@ -418,7 +584,7 @@ impl eframe::App for WireDeskApp {
                 }
             });
 
-            ui.label(format!("Serial: {}", self.serial_port));
+            ui.label(format!("Serial: {}", self.runtime_serial_port));
             ui.separator();
 
             // Capture toggle
@@ -582,6 +748,9 @@ impl eframe::App for WireDeskApp {
             }
 
             ui.separator();
+            self.render_settings_panel(ui);
+
+            ui.separator();
             ui.small(&self.status_msg);
         });
 
@@ -665,7 +834,11 @@ mod tests {
         let (_ev_tx, ev_rx) = mpsc::channel();
         let (tap_tx, tap_rx) = mpsc::channel();
         let tap_handle = keyboard_tap::start(out_tx.clone(), tap_tx);
-        WireDeskApp::new("/dev/null".into(), ev_rx, out_tx, tap_rx, tap_handle)
+        let cfg = ClientConfig {
+            port: "/dev/null".into(),
+            ..ClientConfig::default()
+        };
+        WireDeskApp::new(cfg, ev_rx, out_tx, tap_rx, tap_handle)
     }
 
     #[test]

@@ -82,7 +82,7 @@ mod tests {
     fn send_recv_multiple() {
         let (mut a, mut b) = MockTransport::pair();
 
-        let messages = vec![
+        let messages = [
             Message::Heartbeat,
             Message::MouseMove { x: 100, y: 200 },
             Message::KeyDown { scancode: 0x1E, modifiers: 0x01 },

@@ -32,6 +32,8 @@ pub struct Session<T: Transport, I: InputInjector> {
     screen_h: u16,
     shell: Option<ShellProcess>,
     clipboard: ClipboardSync,
+    /// Latest client display name reported via Hello (None until handshake).
+    client_name: Option<String>,
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
@@ -49,7 +51,16 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_h,
             shell: None,
             clipboard: ClipboardSync::new(),
+            client_name: None,
         }
+    }
+
+    pub fn current_state(&self) -> SessionState {
+        self.state
+    }
+
+    pub fn client_name(&self) -> Option<&str> {
+        self.client_name.as_deref()
     }
 
     #[cfg(test)]
@@ -88,6 +99,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             self.injector.release_all()?;
             self.shell_kill();
             self.state = SessionState::WaitingForHello;
+            self.client_name = None;
             return Ok(false);
         }
 
@@ -181,6 +193,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                     return Ok(());
                 }
                 log::info!("HELLO from '{client_name}' v{version}");
+                self.client_name = Some(client_name.clone());
                 self.send(Message::HelloAck {
                     version: VERSION,
                     host_name: self.host_name.clone(),
@@ -265,12 +278,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.injector.release_all()?;
                 self.shell_kill();
                 self.state = SessionState::WaitingForHello;
+                self.client_name = None;
             }
 
             (_, Message::Hello { .. }) => {
                 // Re-handshake from any state
                 self.injector.release_all().ok();
                 self.state = SessionState::WaitingForHello;
+                self.client_name = None;
                 self.handle_packet(packet)?;
             }
 
@@ -285,7 +300,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::injector::{InjectorEvent, MockInjector};
+    use crate::injector::MockInjector;
     use wiredesk_transport::mock::MockTransport;
 
     fn setup() -> (Session<MockTransport, MockInjector>, MockTransport) {

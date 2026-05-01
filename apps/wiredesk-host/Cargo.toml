@@ -9,14 +9,29 @@ wiredesk-protocol.workspace = true
 wiredesk-transport.workspace = true
 thiserror.workspace = true
 log.workspace = true
-env_logger.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true
 arboard = "3"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+embed-manifest = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
+native-windows-gui = "1"
+native-windows-derive = "1"
