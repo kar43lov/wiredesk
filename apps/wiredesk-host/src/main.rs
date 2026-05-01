@@ -148,8 +148,20 @@ fn run_windows(
         return;
     }
 
-    log::info!("run_windows: setting default font");
-    let _ = nwg::Font::set_global_default(Some(nwg::Font::default()));
+    log::info!("run_windows: setting default font (Segoe UI 16px)");
+    // Segoe UI is the standard Win11 dialog font. nwg's Font::size is in
+    // pixels, not points — 16px ≈ 9pt at 96 DPI, matching the system default.
+    // Set this BEFORE building any windows so all controls inherit it.
+    let mut font = nwg::Font::default();
+    if let Err(e) = nwg::Font::builder()
+        .family("Segoe UI")
+        .size(16)
+        .build(&mut font)
+    {
+        log::warn!("Segoe UI font builder failed: {e}; falling back to system default");
+    } else {
+        let _ = nwg::Font::set_global_default(Some(font));
+    }
 
     let log_dir = logging::log_dir();
 

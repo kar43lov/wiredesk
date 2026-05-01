@@ -457,15 +457,15 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-host/src/main.rs`
 - Modify: `apps/wiredesk-client/src/app.rs`
 
-- [ ] создать ветку `feat/ui-redesign` от master `532a3df`
-- [ ] в `main.rs::run_windows` после `nwg::init()` — построить `nwg::Font::builder().family("Segoe UI").size(16)` и установить через `Font::set_global_default(Some(font))` ДО `SettingsWindow::build()` и `TrayUi::build()`
-- [ ] в `app.rs` — `impl Display for ConnectionState` с человеческими строками («Not connected» / «Connecting…» / «Connected»)
-- [ ] заменить `format!("{:?}", self.state)` в UI на `format!("{}", self.state)`
-- [ ] write tests: табличный тест для `Display for ConnectionState` (3 варианта)
-- [ ] cargo test --workspace — must pass before next task
-- [ ] cargo clippy --workspace --all-targets -- -D warnings — clean
-- [ ] cargo check --target x86_64-pc-windows-gnu -p wiredesk-host — clean
-- [ ] commit: `chore(ui): typography pass — Segoe UI on Win, Display for ConnectionState on Mac`
+- [x] создать ветку `feat/ui-redesign` от master `532a3df` (created as ui-redesign by /planning:exec)
+- [x] в `main.rs::run_windows` после `nwg::init()` — построить `nwg::Font::builder().family("Segoe UI").size(16)` и установить через `Font::set_global_default(Some(font))` ДО `SettingsWindow::build()` и `TrayUi::build()`
+- [x] в `app.rs` — `impl Display for ConnectionState` с человеческими строками («Not connected» / «Connecting…» / «Connected»)
+- [x] заменить `format!("{:?}", self.state)` в UI на `format!("{}", self.state)`
+- [x] write tests: табличный тест для `Display for ConnectionState` (3 варианта)
+- [x] cargo test --workspace — must pass before next task
+- [x] cargo clippy --workspace --all-targets -- -D warnings — clean
+- [x] cargo check --target x86_64-pc-windows-gnu -p wiredesk-host — clean
+- [x] commit: `chore(ui): typography pass — Segoe UI on Win, Display for ConnectionState on Mac`
 
 ### Task 2: Window icons — embed .ico in Win PE-headers + W в Mac heading
 

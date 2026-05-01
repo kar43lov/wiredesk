@@ -17,6 +17,16 @@ pub enum ConnectionState {
     Connected,
 }
 
+impl std::fmt::Display for ConnectionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionState::Disconnected => write!(f, "Not connected"),
+            ConnectionState::Connecting => write!(f, "Connecting…"),
+            ConnectionState::Connected => write!(f, "Connected"),
+        }
+    }
+}
+
 /// Messages from the transport thread to the UI.
 #[allow(dead_code)]
 pub enum TransportEvent {
@@ -578,7 +588,7 @@ impl eframe::App for WireDeskApp {
             };
             ui.horizontal(|ui| {
                 ui.colored_label(status_color, "\u{25CF}"); // ●
-                ui.label(format!("{:?}", self.state));
+                ui.label(format!("{}", self.state));
                 if self.state == ConnectionState::Connected {
                     ui.label(format!("- {} ({}x{})", self.host_name, self.screen_w, self.screen_h));
                 }
@@ -868,6 +878,20 @@ mod tests {
         // that the field exists and is a bool.
         let app = make_app();
         let _: bool = app.permission_granted;
+    }
+
+    #[test]
+    fn connection_state_display_human_readable() {
+        // Display impl is shown in the UI; assert exact strings to catch
+        // accidental changes (e.g. translator regressions, copy-paste typos).
+        let cases = [
+            (ConnectionState::Disconnected, "Not connected"),
+            (ConnectionState::Connecting, "Connecting…"),
+            (ConnectionState::Connected, "Connected"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(format!("{state}"), expected, "Display for {state:?}");
+        }
     }
 
     #[test]
