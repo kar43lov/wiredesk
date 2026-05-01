@@ -110,13 +110,33 @@ impl WireDeskApp {
         self.capturing = !self.capturing;
         if self.capturing {
             self.status_msg = "input captured (Ctrl+Alt+G to release)".into();
-            if let Some(h) = self.tap_handle.as_ref() {
-                h.enable();
-            }
         } else {
             self.status_msg = "input released".into();
+        }
+        // Actual tap activation is driven by sync_tap_to_focus() in update()
+        // — that way clicking away to another Mac app pauses the tap so Mac
+        // shortcuts (Cmd+V to paste etc.) work on the Mac side.
+    }
+
+    /// Reconcile the tap's active state with the current intent
+    /// (`capturing` flag) AND window focus. Tap intercepts only when both
+    /// are true; losing focus pauses the tap so Mac apps work normally
+    /// without disturbing the user's `capturing` intent.
+    fn sync_tap_to_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let want_active = self.capturing && focused;
+        let is_active = self
+            .tap_handle
+            .as_ref()
+            .map(|h| h.is_enabled())
+            .unwrap_or(false);
+        if want_active != is_active {
             if let Some(h) = self.tap_handle.as_ref() {
-                h.disable();
+                if want_active {
+                    h.enable();
+                } else {
+                    h.disable();
+                }
             }
         }
     }
@@ -186,7 +206,7 @@ impl WireDeskApp {
             ui.label("1. Open System Settings → Privacy & Security → Accessibility");
             ui.label("2. Click \"+\" and add the wiredesk-client binary");
             ui.label("3. Toggle the switch ON");
-            ui.label("4. Restart WireDesk (or wait — it re-checks every 2s)");
+            ui.label("4. Restart WireDesk — required: the tap thread is created at startup");
         });
         ui.add_space(12.0);
 
@@ -200,7 +220,11 @@ impl WireDeskApp {
         }
 
         ui.add_space(8.0);
-        ui.weak("(Status auto-refreshes; this screen will go away once permission is granted.)");
+        ui.weak(
+            "(After granting permission, quit and relaunch wiredesk-client. \
+             The window detects the change but the tap won't activate \
+             without a fresh process.)",
+        );
     }
 
     /// Info-only screen shown when capture or fullscreen is active. No
@@ -241,6 +265,11 @@ impl WireDeskApp {
         ui.label(
             "Clipboard auto-syncs both ways every ~500 ms — copy on either \
              side appears on the other.",
+        );
+        ui.add_space(8.0);
+        ui.weak(
+            "Tap pauses automatically when this window loses focus — switch \
+             to another Mac app and Cmd-shortcuts work locally again.",
         );
 
         if self.fullscreen {
@@ -315,6 +344,12 @@ impl eframe::App for WireDeskApp {
             self.permission_granted = keyboard_tap::is_permission_granted();
             self.last_perm_check = Instant::now();
         }
+
+        // Reconcile tap state with capture intent + window focus. When the
+        // WireDesk window loses focus (user clicks another Mac app), pause
+        // the tap so Mac shortcuts (Cmd+V to paste etc.) work normally on
+        // the Mac side. Resumes when window gets focus back.
+        self.sync_tap_to_focus(ctx);
 
         // Drain TapEvents from the keyboard tap thread.
         let mut pending_tap_events: Vec<TapEvent> = Vec::new();
