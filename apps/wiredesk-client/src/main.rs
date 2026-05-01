@@ -64,6 +64,7 @@ fn main() {
 
     let (events_tx, events_rx) = mpsc::channel();
     let (outgoing_tx, outgoing_rx) = mpsc::channel();
+    let (tap_events_tx, tap_events_rx) = mpsc::channel();
 
     // Shared clipboard state — used by both poll thread (which detects local
     // changes) and reader thread (which writes incoming text). Hash-based
@@ -88,7 +89,11 @@ fn main() {
     // Clipboard poll thread — pushes Mac clipboard changes to host.
     clipboard::spawn_poll_thread(clipboard_state, outgoing_tx.clone());
 
-    let app = WireDeskApp::new(args.port.clone(), events_rx, outgoing_tx);
+    // Keyboard tap (macOS only — no-op elsewhere). Initially disabled;
+    // enable() is called when the user enters capture-mode.
+    let tap_handle = keyboard_tap::start(outgoing_tx.clone(), tap_events_tx);
+
+    let app = WireDeskApp::new(args.port.clone(), events_rx, outgoing_tx, tap_events_rx, tap_handle);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

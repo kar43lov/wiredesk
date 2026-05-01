@@ -20,7 +20,27 @@ use std::sync::Arc;
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
-use crate::input::keymap::cg_flag_change_to_scancodes;
+use crate::input::keymap::{
+    cg_flag_change_to_scancodes, CG_FLAG_ALT, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_SHIFT,
+};
+
+/// Mac VK code constants used for hotkey detection.
+const CG_KEY_RETURN: u16 = 0x24;
+const CG_KEY_G: u16 = 0x05;
+
+/// Mask of all modifier bits we care about — used to reject combos with
+/// "extra" modifiers (e.g., Cmd+Shift+Enter shouldn't match Cmd+Enter).
+const CG_MODIFIER_MASK: u64 = CG_FLAG_COMMAND | CG_FLAG_CONTROL | CG_FLAG_ALT | CG_FLAG_SHIFT;
+
+/// `true` if the event matches Cmd+Enter exactly (no extra modifiers).
+fn is_cmd_enter(keycode: u16, flags: u64) -> bool {
+    keycode == CG_KEY_RETURN && (flags & CG_MODIFIER_MASK) == CG_FLAG_COMMAND
+}
+
+/// `true` if the event matches Ctrl+Alt+G exactly (no Cmd, no Shift).
+fn is_ctrl_alt_g(keycode: u16, flags: u64) -> bool {
+    keycode == CG_KEY_G && (flags & CG_MODIFIER_MASK) == (CG_FLAG_CONTROL | CG_FLAG_ALT)
+}
 
 /// Events from the tap thread back to the UI thread.
 #[allow(dead_code)] // variants used in later tasks
@@ -210,7 +230,7 @@ mod macos {
             enabled: Arc<AtomicBool>,
             prev_flags: Arc<AtomicU64>,
             outgoing_tx: mpsc::Sender<Packet>,
-            _tap_events_tx: mpsc::Sender<TapEvent>,
+            tap_events_tx: mpsc::Sender<TapEvent>,
         ) -> Self {
             let runloop = Arc::new(Mutex::new(None::<CFRunLoop>));
             let runloop_for_thread = Arc::clone(&runloop);
@@ -221,6 +241,7 @@ mod macos {
             let enabled_cb = Arc::clone(&enabled);
             let prev_flags_cb = Arc::clone(&prev_flags);
             let outgoing_cb = outgoing_tx.clone();
+            let tap_events_cb = tap_events_tx.clone();
 
             let join = thread::Builder::new()
                 .name("wiredesk-keyboard-tap".into())
@@ -270,6 +291,19 @@ mod macos {
                                     let kc = event.get_integer_value_field(
                                         EventField::KEYBOARD_EVENT_KEYCODE,
                                     ) as u16;
+                                    let flags = event.get_flags().bits();
+
+                                    // Local hotkeys — handled in the UI thread,
+                                    // never forwarded to Host.
+                                    if super::is_cmd_enter(kc, flags) {
+                                        let _ = tap_events_cb.send(TapEvent::ToggleFullscreen);
+                                        return CallbackResult::Drop;
+                                    }
+                                    if super::is_ctrl_alt_g(kc, flags) {
+                                        let _ = tap_events_cb.send(TapEvent::ReleaseCapture);
+                                        return CallbackResult::Drop;
+                                    }
+
                                     if let Some(sc) = cgkeycode_to_scancode(kc) {
                                         let _ = outgoing_cb.send(Packet::new(
                                             Message::KeyDown {
@@ -395,7 +429,10 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::keymap::{CG_FLAG_COMMAND, CG_FLAG_SHIFT, WIN_SCAN_LCTRL, WIN_SCAN_LSHIFT};
+    use crate::input::keymap::{
+        CG_FLAG_ALT, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_SHIFT, WIN_SCAN_LCTRL,
+        WIN_SCAN_LSHIFT,
+    };
     use std::sync::mpsc;
 
     #[test]
@@ -463,5 +500,60 @@ mod tests {
 
         h.disable();
         assert!(out_rx.try_recv().is_err(), "no modifiers held → no KeyUp packets");
+    }
+
+    // Hotkey detection table tests
+
+    #[test]
+    fn cmd_enter_matches() {
+        assert!(super::is_cmd_enter(CG_KEY_RETURN, CG_FLAG_COMMAND));
+    }
+
+    #[test]
+    fn cmd_enter_rejects_extra_modifier() {
+        // Cmd+Shift+Enter must NOT match (extra modifier).
+        assert!(!super::is_cmd_enter(CG_KEY_RETURN, CG_FLAG_COMMAND | CG_FLAG_SHIFT));
+        // Cmd+Ctrl+Enter must NOT match.
+        assert!(!super::is_cmd_enter(CG_KEY_RETURN, CG_FLAG_COMMAND | CG_FLAG_CONTROL));
+    }
+
+    #[test]
+    fn cmd_enter_rejects_no_cmd() {
+        assert!(!super::is_cmd_enter(CG_KEY_RETURN, 0));
+        assert!(!super::is_cmd_enter(CG_KEY_RETURN, CG_FLAG_CONTROL));
+    }
+
+    #[test]
+    fn cmd_enter_rejects_wrong_key() {
+        // Some other key with Cmd held — not Cmd+Enter.
+        assert!(!super::is_cmd_enter(0x00, CG_FLAG_COMMAND)); // Cmd+A
+    }
+
+    #[test]
+    fn ctrl_alt_g_matches() {
+        assert!(super::is_ctrl_alt_g(CG_KEY_G, CG_FLAG_CONTROL | CG_FLAG_ALT));
+    }
+
+    #[test]
+    fn ctrl_alt_g_rejects_extra_cmd() {
+        // Cmd+Ctrl+Alt+G must NOT match — anti-mask.
+        assert!(!super::is_ctrl_alt_g(
+            CG_KEY_G,
+            CG_FLAG_COMMAND | CG_FLAG_CONTROL | CG_FLAG_ALT
+        ));
+    }
+
+    #[test]
+    fn ctrl_alt_g_rejects_partial() {
+        // Just Ctrl+G (no Alt) shouldn't match.
+        assert!(!super::is_ctrl_alt_g(CG_KEY_G, CG_FLAG_CONTROL));
+        // Just Alt+G (no Ctrl) shouldn't match.
+        assert!(!super::is_ctrl_alt_g(CG_KEY_G, CG_FLAG_ALT));
+    }
+
+    #[test]
+    fn ctrl_alt_g_rejects_wrong_key() {
+        // Ctrl+Alt+H — wrong letter.
+        assert!(!super::is_ctrl_alt_g(0x04, CG_FLAG_CONTROL | CG_FLAG_ALT));
     }
 }

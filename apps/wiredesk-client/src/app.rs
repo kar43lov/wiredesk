@@ -5,6 +5,7 @@ use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
 use crate::input::mapper::InputMapper;
+use crate::keyboard_tap::{TapEvent, TapHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -29,6 +30,7 @@ pub enum TransportEvent {
 pub struct WireDeskApp {
     state: ConnectionState,
     capturing: bool,
+    fullscreen: bool,
     host_name: String,
     screen_w: u16,
     screen_h: u16,
@@ -37,6 +39,8 @@ pub struct WireDeskApp {
     serial_port: String,
     events_rx: Option<mpsc::Receiver<TransportEvent>>,
     outgoing_tx: mpsc::Sender<Packet>,
+    tap_events_rx: Option<mpsc::Receiver<TapEvent>>,
+    tap_handle: Option<TapHandle>,
     mapper: InputMapper,
     seq: u16,
     // Terminal-over-serial state
@@ -51,10 +55,13 @@ impl WireDeskApp {
         serial_port: String,
         events_rx: mpsc::Receiver<TransportEvent>,
         outgoing_tx: mpsc::Sender<Packet>,
+        tap_events_rx: mpsc::Receiver<TapEvent>,
+        tap_handle: TapHandle,
     ) -> Self {
         Self {
             state: ConnectionState::Disconnected,
             capturing: false,
+            fullscreen: false,
             host_name: String::new(),
             screen_w: 1920,
             screen_h: 1080,
@@ -63,6 +70,8 @@ impl WireDeskApp {
             serial_port,
             events_rx: Some(events_rx),
             outgoing_tx,
+            tap_events_rx: Some(tap_events_rx),
+            tap_handle: Some(tap_handle),
             mapper: InputMapper::new(1920, 1080),
             seq: 0,
             shell_open: false,
@@ -95,9 +104,20 @@ impl WireDeskApp {
         self.capturing = !self.capturing;
         if self.capturing {
             self.status_msg = "input captured (Ctrl+Alt+G to release)".into();
+            if let Some(h) = self.tap_handle.as_ref() {
+                h.enable();
+            }
         } else {
             self.status_msg = "input released".into();
+            if let Some(h) = self.tap_handle.as_ref() {
+                h.disable();
+            }
         }
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
 
     fn shell_send(&mut self, msg: Message) {
@@ -187,14 +207,40 @@ impl eframe::App for WireDeskApp {
             }
         }
 
-        // Check for global hotkey: Ctrl+Alt+G
-        let hotkey_pressed = ctx.input(|i: &egui::InputState| {
-            i.key_pressed(egui::Key::G)
-                && i.modifiers.ctrl
-                && i.modifiers.alt
+        // Drain TapEvents from the keyboard tap thread.
+        let mut pending_tap_events: Vec<TapEvent> = Vec::new();
+        if let Some(ref rx) = self.tap_events_rx {
+            while let Ok(ev) = rx.try_recv() {
+                pending_tap_events.push(ev);
+            }
+        }
+        for ev in pending_tap_events {
+            match ev {
+                TapEvent::ReleaseCapture => {
+                    if self.capturing {
+                        self.toggle_capture();
+                    }
+                }
+                TapEvent::ToggleFullscreen => {
+                    self.toggle_fullscreen(ctx);
+                }
+            }
+        }
+
+        // egui-side hotkeys for the OUT-OF-CAPTURE path. When tap is enabled
+        // it consumes these before egui sees them; this branch handles the
+        // case where the user presses them without capture being on.
+        let (ctrl_alt_g_pressed, cmd_enter_pressed) = ctx.input(|i: &egui::InputState| {
+            (
+                i.key_pressed(egui::Key::G) && i.modifiers.ctrl && i.modifiers.alt,
+                i.key_pressed(egui::Key::Enter) && i.modifiers.command,
+            )
         });
-        if hotkey_pressed {
+        if ctrl_alt_g_pressed {
             self.toggle_capture();
+        }
+        if cmd_enter_pressed {
+            self.toggle_fullscreen(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
