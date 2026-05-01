@@ -97,8 +97,25 @@ impl TapHandle {
 
     /// Is the tap currently intercepting? (Reflects the enable flag, not
     /// macOS-side tap-disabled-by-timeout state.)
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
+    }
+
+    /// Is the tap thread actually running? On macOS this is `true` only when
+    /// Accessibility permission was granted at startup; on other platforms
+    /// it's always `false` (no tap implementation). UI uses this to decide
+    /// whether egui-side key forwarding should be skipped (when the tap is
+    /// active, it's the sole source of key events to avoid double KeyDown).
+    pub fn is_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 }
 

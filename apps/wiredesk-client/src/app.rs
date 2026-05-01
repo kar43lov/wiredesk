@@ -149,6 +149,60 @@ impl WireDeskApp {
         self.shell_send(Message::ShellInput { data });
     }
 
+    /// True when WireDesk should render the full chrome (status, buttons,
+    /// shell panel). False in capture or fullscreen mode — when the user is
+    /// "in" Windows via the HDMI capture monitor and a stray click on a
+    /// WireDesk button would be disruptive.
+    fn should_show_chrome(&self) -> bool {
+        !self.capturing && !self.fullscreen
+    }
+
+    /// Info-only screen shown when capture or fullscreen is active. No
+    /// clickable elements — just a description of what the app is doing
+    /// and the relevant hotkeys.
+    fn render_capture_info(&self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("WireDesk — input forwarded to Host");
+            ui.add_space(8.0);
+            if self.state == ConnectionState::Connected {
+                ui.label(format!(
+                    "● connected to {} ({}×{})",
+                    self.host_name, self.screen_w, self.screen_h
+                ));
+            } else {
+                ui.label("● not connected");
+            }
+        });
+        ui.add_space(20.0);
+
+        ui.label("Active hotkeys (intercepted locally — not sent to Host):");
+        ui.indent("local_hotkeys", |ui| {
+            ui.label("• Ctrl+Alt+G — release capture");
+            ui.label("• Cmd+Enter — toggle fullscreen");
+        });
+        ui.add_space(8.0);
+
+        ui.label("Forwarded to Host (Cmd → Ctrl mapping):");
+        ui.indent("forwarded", |ui| {
+            ui.label("• Cmd+Space → Win+Space (input language toggle)");
+            ui.label("• Cmd+C / Cmd+V → Ctrl+C / Ctrl+V");
+            ui.label("• Cmd+Tab, Cmd+Q, etc. — all Cmd-combos go to Host");
+            ui.label("• Letters, digits, function keys, arrows — direct");
+        });
+        ui.add_space(12.0);
+
+        ui.label(
+            "Clipboard auto-syncs both ways every ~500 ms — copy on either \
+             side appears on the other.",
+        );
+
+        if self.fullscreen {
+            ui.add_space(12.0);
+            ui.weak("(Cmd+Enter again to exit fullscreen)");
+        }
+    }
+
     fn shell_append_output(&mut self, bytes: &[u8]) {
         // Lossy UTF-8 — shell output may contain mixed encodings or partial sequences.
         let s = String::from_utf8_lossy(bytes);
@@ -243,7 +297,14 @@ impl eframe::App for WireDeskApp {
             self.toggle_fullscreen(ctx);
         }
 
+        let show_chrome = self.should_show_chrome();
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            if !show_chrome {
+                self.render_capture_info(ui);
+                return;
+            }
+
             ui.heading("WireDesk");
             ui.separator();
 
@@ -430,6 +491,16 @@ impl eframe::App for WireDeskApp {
 
         // Handle captured input — push to outgoing channel (non-blocking).
         if self.capturing && self.state == ConnectionState::Connected {
+            // When the OS-level keyboard tap is active (macOS + permission),
+            // it's the sole source of key events — skip egui forwarding to
+            // avoid double KeyDown. Mouse always goes through egui (the tap
+            // only intercepts keyboard).
+            let tap_owns_keys = self
+                .tap_handle
+                .as_ref()
+                .map(|h| h.is_active())
+                .unwrap_or(false);
+
             let events: Vec<egui::Event> = ctx.input(|input: &egui::InputState| {
                 input.events.clone()
             });
@@ -439,8 +510,15 @@ impl eframe::App for WireDeskApp {
             for event in &events {
                 match event {
                     egui::Event::Key { key, pressed, modifiers, .. } => {
+                        if tap_owns_keys {
+                            continue;
+                        }
                         // Don't forward the capture-toggle combo to Host
                         if *key == egui::Key::G && modifiers.ctrl && modifiers.alt {
+                            continue;
+                        }
+                        // Don't forward the fullscreen toggle either
+                        if *key == egui::Key::Enter && modifiers.command {
                             continue;
                         }
                         self.mapper.send_key(&self.outgoing_tx, key, modifiers, *pressed);
@@ -478,5 +556,56 @@ impl eframe::App for WireDeskApp {
 
         // Request repaint to keep event loop alive
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyboard_tap;
+
+    fn make_app() -> WireDeskApp {
+        let (out_tx, _out_rx) = mpsc::channel();
+        let (_ev_tx, ev_rx) = mpsc::channel();
+        let (tap_tx, tap_rx) = mpsc::channel();
+        let tap_handle = keyboard_tap::start(out_tx.clone(), tap_tx);
+        WireDeskApp::new("/dev/null".into(), ev_rx, out_tx, tap_rx, tap_handle)
+    }
+
+    #[test]
+    fn chrome_shown_by_default() {
+        let app = make_app();
+        assert!(app.should_show_chrome());
+    }
+
+    #[test]
+    fn capturing_hides_chrome() {
+        let mut app = make_app();
+        app.capturing = true;
+        assert!(!app.should_show_chrome());
+    }
+
+    #[test]
+    fn fullscreen_hides_chrome() {
+        let mut app = make_app();
+        app.fullscreen = true;
+        assert!(!app.should_show_chrome());
+    }
+
+    #[test]
+    fn capture_or_fullscreen_each_hides() {
+        let mut app = make_app();
+        app.capturing = true;
+        app.fullscreen = false;
+        assert!(!app.should_show_chrome());
+        app.capturing = false;
+        app.fullscreen = true;
+        assert!(!app.should_show_chrome());
+        app.capturing = true;
+        app.fullscreen = true;
+        assert!(!app.should_show_chrome());
+        app.capturing = false;
+        app.fullscreen = false;
+        assert!(app.should_show_chrome());
     }
 }
