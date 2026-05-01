@@ -229,9 +229,9 @@ mod macos {
     use super::TapEvent;
     use crate::input::keymap::{cg_flag_change_to_scancodes, cgkeycode_to_scancode};
 
-    /// `CGEventTapEnable(tap, true)` — re-enable a tap that was disabled by
-    /// the system (timeout or user input). Not exposed by core-graphics
-    /// directly in a callback-friendly way, so we declare the FFI here.
+    // CGEventTapEnable(tap, true) — re-enable a tap that was disabled by
+    // the system (timeout or user input). Not exposed by core-graphics
+    // directly in a callback-friendly way, so we declare the FFI here.
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);

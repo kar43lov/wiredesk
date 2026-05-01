@@ -1,11 +1,12 @@
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
 use crate::input::mapper::InputMapper;
-use crate::keyboard_tap::{TapEvent, TapHandle};
+use crate::keyboard_tap::{self, TapEvent, TapHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -43,6 +44,9 @@ pub struct WireDeskApp {
     tap_handle: Option<TapHandle>,
     mapper: InputMapper,
     seq: u16,
+    // Permission state
+    permission_granted: bool,
+    last_perm_check: Instant,
     // Terminal-over-serial state
     shell_open: bool,
     shell_output: String,
@@ -74,6 +78,8 @@ impl WireDeskApp {
             tap_handle: Some(tap_handle),
             mapper: InputMapper::new(1920, 1080),
             seq: 0,
+            permission_granted: keyboard_tap::is_permission_granted(),
+            last_perm_check: Instant::now(),
             shell_open: false,
             shell_output: String::new(),
             shell_input: String::new(),
@@ -155,6 +161,46 @@ impl WireDeskApp {
     /// WireDesk button would be disruptive.
     fn should_show_chrome(&self) -> bool {
         !self.capturing && !self.fullscreen
+    }
+
+    /// Permission instruction screen shown when macOS Accessibility
+    /// permission is missing. Without it the keyboard tap silently never
+    /// fires, so we block the chrome until the user grants it.
+    fn render_permission_screen(&self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("Accessibility permission required");
+        });
+        ui.add_space(12.0);
+
+        ui.label(
+            "WireDesk needs macOS Accessibility permission to intercept \
+             keyboard shortcuts (Cmd+Space, Cmd+C, etc.) and forward them \
+             to the Host. Without it the capture-mode would only receive a \
+             subset of keys, and clipboard syncs would be useless.",
+        );
+        ui.add_space(8.0);
+
+        ui.label("To grant it:");
+        ui.indent("perm_steps", |ui| {
+            ui.label("1. Open System Settings → Privacy & Security → Accessibility");
+            ui.label("2. Click \"+\" and add the wiredesk-client binary");
+            ui.label("3. Toggle the switch ON");
+            ui.label("4. Restart WireDesk (or wait — it re-checks every 2s)");
+        });
+        ui.add_space(12.0);
+
+        if ui.button("Open System Settings").clicked() {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    .spawn();
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.weak("(Status auto-refreshes; this screen will go away once permission is granted.)");
     }
 
     /// Info-only screen shown when capture or fullscreen is active. No
@@ -261,6 +307,15 @@ impl eframe::App for WireDeskApp {
             }
         }
 
+        // Re-check Accessibility permission periodically. update() runs at
+        // ~60fps; we throttle to once every 2s — enough for the UI to react
+        // when the user grants permission via System Settings without
+        // hammering the (potentially slow) sync IPC call to SystemServices.
+        if self.last_perm_check.elapsed() >= Duration::from_secs(2) {
+            self.permission_granted = keyboard_tap::is_permission_granted();
+            self.last_perm_check = Instant::now();
+        }
+
         // Drain TapEvents from the keyboard tap thread.
         let mut pending_tap_events: Vec<TapEvent> = Vec::new();
         if let Some(ref rx) = self.tap_events_rx {
@@ -298,10 +353,16 @@ impl eframe::App for WireDeskApp {
         }
 
         let show_chrome = self.should_show_chrome();
+        let permission_granted = self.permission_granted;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if !show_chrome {
                 self.render_capture_info(ui);
+                return;
+            }
+
+            if !permission_granted {
+                self.render_permission_screen(ui);
                 return;
             }
 
@@ -590,6 +651,15 @@ mod tests {
         let mut app = make_app();
         app.fullscreen = true;
         assert!(!app.should_show_chrome());
+    }
+
+    #[test]
+    fn permission_state_initialized() {
+        // Construct app — permission_granted reflects current TCC state.
+        // We don't assert true/false (depends on tester's permission), just
+        // that the field exists and is a bool.
+        let app = make_app();
+        let _: bool = app.permission_granted;
     }
 
     #[test]
