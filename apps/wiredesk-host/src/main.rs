@@ -132,38 +132,52 @@ fn run_windows(
 ) {
     use native_windows_gui as nwg;
 
+    fn fatal(stage: &str, err: impl std::fmt::Display) {
+        log::error!("FATAL @ {stage}: {err}");
+        // MessageBox so the user sees something even when the tray icon
+        // failed to appear (or appeared and vanished).
+        nwg::simple_message(
+            "WireDesk Host — startup failed",
+            &format!("{stage}: {err}"),
+        );
+    }
+
+    log::info!("run_windows: nwg::init");
     if let Err(e) = nwg::init() {
-        log::error!("nwg init failed: {e}");
+        fatal("nwg::init", e);
         return;
     }
-    let _ = nwg::Font::set_global_default(Some(
-        nwg::Font::default(),
-    ));
+
+    log::info!("run_windows: setting default font");
+    let _ = nwg::Font::set_global_default(Some(nwg::Font::default()));
 
     let log_dir = logging::log_dir();
 
+    log::info!("run_windows: building TrayUi (log_dir={})", log_dir.display());
     let tray = match ui::tray::TrayUi::build(log_dir) {
         Ok(t) => t,
         Err(e) => {
-            log::error!("failed to build tray UI: {e}");
-            return;
-        }
-    };
-    let settings = match ui::settings_window::SettingsWindow::build(&cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("failed to build settings window: {e}");
+            fatal("TrayUi::build", e);
             return;
         }
     };
 
-    // Notice for cross-thread session status updates.
+    log::info!("run_windows: building SettingsWindow");
+    let settings = match ui::settings_window::SettingsWindow::build(&cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            fatal("SettingsWindow::build", e);
+            return;
+        }
+    };
+
+    log::info!("run_windows: building cross-thread Notice");
     let mut notice = nwg::Notice::default();
     if let Err(e) = nwg::Notice::builder()
         .parent(&tray.borrow().window)
         .build(&mut notice)
     {
-        log::error!("failed to build notice: {e}");
+        fatal("Notice::build", e);
         return;
     }
 
@@ -178,9 +192,12 @@ fn run_windows(
     let settings_clone = settings.clone();
     let last_clone = last.clone();
 
+    // CRITICAL: don't hold a `tray_clone.borrow()` across the whole match —
+    // `OnNotice` arm needs `borrow_mut()` to update the icon, and a second
+    // borrow on a RefCell already-borrowed → panic → process abort. Take
+    // the borrow lazily inside each arm.
     let event_handler = nwg::full_bind_event_handler(&tray_handle, move |evt, _evt_data, handle| {
         use nwg::Event as E;
-        let t = tray_clone.borrow();
         match evt {
             E::OnNotice => {
                 // Status bridge fired — update tray icon + settings status.
@@ -192,12 +209,15 @@ fn run_windows(
                 }
             }
             E::OnContextMenu => {
+                let t = tray_clone.borrow();
                 if handle == t.tray.handle {
                     t.show_popup();
                 }
             }
             E::OnMenuItemSelected => {
+                let t = tray_clone.borrow();
                 if handle == t.menu_show_settings.handle {
+                    drop(t);
                     settings_clone.borrow().show();
                 } else if handle == t.menu_open_logs.handle {
                     t.open_logs();
