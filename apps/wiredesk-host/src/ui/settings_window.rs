@@ -15,6 +15,8 @@ use native_windows_gui as nwg;
 
 use crate::config::HostConfig;
 use crate::session_thread::SessionStatus;
+use crate::ui::format::StatusColor;
+use crate::ui::icons::{ICON_GRAY_BYTES, ICON_GREEN_BYTES, ICON_YELLOW_BYTES};
 use crate::ui::{autostart, format};
 
 // Window icon — title-bar / Alt-Tab. Loaded at runtime from the multi-size
@@ -32,6 +34,8 @@ pub struct SettingsWindow {
     pub window_icon: nwg::Icon,
     pub layout: nwg::GridLayout,
 
+    pub status_icon: nwg::ImageFrame,
+    pub status_icon_bitmap: nwg::Bitmap,
     pub status_label: nwg::Label,
 
     pub port_label: nwg::Label,
@@ -91,6 +95,28 @@ impl SettingsWindow {
                     .icon(icon_ref)
                     .flags(nwg::WindowFlags::WINDOW)
                     .build(window)?;
+            }
+
+            // Initial status indicator: yellow (Waiting). The bitmap is
+            // rebuilt in-place every set_status() so we keep ownership of
+            // the field and the ImageFrame stays bound to the same struct.
+            // Destructure the borrow so the borrow checker sees that
+            // `status_icon`, `status_icon_bitmap` and `window` are disjoint.
+            {
+                let SettingsWindow {
+                    ref window,
+                    ref mut status_icon,
+                    ref mut status_icon_bitmap,
+                    ..
+                } = *s;
+                nwg::Bitmap::builder()
+                    .source_bin(Some(ICON_YELLOW_BYTES))
+                    .strict(true)
+                    .build(status_icon_bitmap)?;
+                nwg::ImageFrame::builder()
+                    .bitmap(Some(&*status_icon_bitmap))
+                    .parent(window)
+                    .build(status_icon)?;
             }
 
             nwg::Label::builder()
@@ -175,7 +201,8 @@ impl SettingsWindow {
                 .parent(&s.window)
                 .min_size([400, 320])
                 .max_column(Some(3))
-                .child_item(nwg::GridLayoutItem::new(&s.status_label, 0, 0, 3, 1))
+                .child(0, 0, &s.status_icon)
+                .child_item(nwg::GridLayoutItem::new(&s.status_label, 1, 0, 2, 1))
                 .child(0, 1, &s.port_label)
                 .child_item(nwg::GridLayoutItem::new(&s.port_input, 1, 1, 2, 1))
                 .child(0, 2, &s.baud_label)
@@ -226,7 +253,26 @@ impl SettingsWindow {
         })
     }
 
-    pub fn set_status(&self, status: &SessionStatus) {
+    /// Update the status indicator (icon + label) to reflect a new
+    /// `SessionStatus`. Rebuilds the bitmap in-place — the `ImageFrame`
+    /// stays bound to the same field, so the layout doesn't shift. Takes
+    /// `&mut self` because `nwg::Bitmap::builder` writes through a mut
+    /// reference into our owned field.
+    pub fn set_status(&mut self, status: &SessionStatus) {
+        let bytes = match format::status_color(status) {
+            StatusColor::Green => ICON_GREEN_BYTES,
+            StatusColor::Yellow => ICON_YELLOW_BYTES,
+            StatusColor::Gray => ICON_GRAY_BYTES,
+        };
+        if let Err(e) = nwg::Bitmap::builder()
+            .source_bin(Some(bytes))
+            .strict(true)
+            .build(&mut self.status_icon_bitmap)
+        {
+            log::warn!("status icon bitmap rebuild failed: {e}");
+        } else {
+            self.status_icon.set_bitmap(Some(&self.status_icon_bitmap));
+        }
         self.status_label.set_text(&status.label());
     }
 

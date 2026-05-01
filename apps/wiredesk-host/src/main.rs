@@ -217,7 +217,7 @@ fn run_windows(
                     if let Err(e) = tray_clone.borrow_mut().update_status(&g) {
                         log::warn!("tray icon update failed: {e}");
                     }
-                    settings_clone.borrow().set_status(&g);
+                    settings_clone.borrow_mut().set_status(&g);
                 }
             }
             E::OnContextMenu => {

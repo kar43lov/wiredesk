@@ -13,10 +13,7 @@ use native_windows_gui as nwg;
 
 use crate::session_thread::SessionStatus;
 use crate::ui::format::{self, StatusColor};
-
-const ICON_GREEN_BYTES: &[u8] = include_bytes!("../../../../assets/tray-green.png");
-const ICON_YELLOW_BYTES: &[u8] = include_bytes!("../../../../assets/tray-yellow.png");
-const ICON_GRAY_BYTES: &[u8] = include_bytes!("../../../../assets/tray-gray.png");
+use crate::ui::icons::{ICON_GRAY_BYTES, ICON_GREEN_BYTES, ICON_YELLOW_BYTES};
 
 #[derive(Default)]
 pub struct TrayUi {

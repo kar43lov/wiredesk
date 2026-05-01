@@ -501,16 +501,16 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-host/src/ui/mod.rs`
 - Modify: `apps/wiredesk-client/src/app.rs`
 
-- [ ] создать `ui/icons.rs` с тремя `pub const ICON_*_BYTES: &[u8] = include_bytes!("../../../../assets/tray-*.png")`
-- [ ] обновить `tray.rs` чтобы использовать константы из `icons.rs`
-- [ ] добавить `status_icon: nwg::ImageFrame` в `SettingsWindow`, инициализировать с `ICON_GRAY_BYTES`
-- [ ] в `set_status(&mut self, ...)` — построить новый `Bitmap` по `format::status_color(status)` и вызвать `set_bitmap(Some(&bmp))`. `set_status` теперь принимает `&mut self`.
-- [ ] обновить вызов `set_status` в main.rs (handler OnNotice ветка) — теперь `borrow_mut()`
-- [ ] на Mac в `app.rs::update` — заменить status row: `ui.horizontal(|ui|{ ui.add(Label::new(RichText::new("●").size(18.0).color(...))); ui.label(self.status_text()); })`
-- [ ] добавить метод `WireDeskApp::status_text(&self) -> String` — формирует human-friendly строку с причиной для Disconnected
-- [ ] write tests: pure-helper `status_text` для всех 3 ConnectionState вариантов + Disconnected с причиной (assert_eq! на ожидаемые строки)
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `feat(ui): unified status indicators — ImageFrame on Win + RichText on Mac`
+- [x] создать `ui/icons.rs` с тремя `pub const ICON_*_BYTES: &[u8] = include_bytes!("../../../../assets/tray-*.png")`
+- [x] обновить `tray.rs` чтобы использовать константы из `icons.rs`
+- [x] добавить `status_icon: nwg::ImageFrame` (+ owned `status_icon_bitmap: nwg::Bitmap`) в `SettingsWindow`, инициализировать с `ICON_YELLOW_BYTES` (Waiting — initial state). Destructured borrow в build() чтобы borrow-checker увидел disjoint поля.
+- [x] в `set_status(&mut self, ...)` — rebuild `status_icon_bitmap` in-place через builder по `format::status_color(status)` и вызвать `status_icon.set_bitmap(Some(&self.status_icon_bitmap))`. `set_status` теперь принимает `&mut self`.
+- [x] обновить вызов `set_status` в main.rs (handler OnNotice ветка) — теперь `borrow_mut()`
+- [x] на Mac в `app.rs::update` — заменить status row: `ui.horizontal(|ui|{ ui.add(Label::new(RichText::new("●").size(18.0).color(...))); ui.label(self.status_text()); })`
+- [x] добавить метод `WireDeskApp::status_text(&self) -> String` — формирует human-friendly строку с причиной для Disconnected (парсит `status_msg` префикс «disconnected: …»)
+- [x] write tests: pure-helper `status_text` для всех 3 ConnectionState вариантов + Disconnected с причиной (assert_eq! на ожидаемые строки)
+- [x] cargo test --workspace + clippy + cross-check — clean
+- [x] commit: `feat(ui): unified status indicators — ImageFrame on Win + RichText on Mac`
 
 ### Task 4: Grouped settings layout — Frame blocks on Win + group() on Mac
 

@@ -454,6 +454,30 @@ impl WireDeskApp {
         }
     }
 
+    /// Human-readable status string for the chrome status row. Pure helper
+    /// (no UI/IO) so it's unit-tested separately. `Disconnected` includes
+    /// the reason from `status_msg` when one is present, so the user sees
+    /// "Disconnected: serial: device busy" instead of just "Not connected".
+    fn status_text(&self) -> String {
+        match self.state {
+            ConnectionState::Connected => format!(
+                "Connected to {} ({}×{})",
+                self.host_name, self.screen_w, self.screen_h
+            ),
+            ConnectionState::Connecting => "Connecting…".to_string(),
+            ConnectionState::Disconnected => {
+                // Echo the most recent status message when it carries a
+                // disconnect reason ("disconnected: …"). Otherwise fall
+                // back to a plain "Not connected".
+                if let Some(rest) = self.status_msg.strip_prefix("disconnected: ") {
+                    format!("Disconnected: {rest}")
+                } else {
+                    "Not connected".to_string()
+                }
+            }
+        }
+    }
+
     fn shell_append_output(&mut self, bytes: &[u8]) {
         // Lossy UTF-8 — shell output may contain mixed encodings or partial sequences.
         let s = String::from_utf8_lossy(bytes);
@@ -591,18 +615,21 @@ impl eframe::App for WireDeskApp {
             });
             ui.separator();
 
-            // Connection status
+            // Connection status — large coloured glyph + human-friendly
+            // text. The glyph is sized 18pt instead of egui's tiny default
+            // so it's readable at a glance, matching the Win-side
+            // ImageFrame indicator.
             let status_color = match self.state {
                 ConnectionState::Connected => egui::Color32::GREEN,
                 ConnectionState::Connecting => egui::Color32::YELLOW,
                 ConnectionState::Disconnected => egui::Color32::RED,
             };
+            let status_text = self.status_text();
             ui.horizontal(|ui| {
-                ui.colored_label(status_color, "\u{25CF}"); // ●
-                ui.label(format!("{}", self.state));
-                if self.state == ConnectionState::Connected {
-                    ui.label(format!("- {} ({}x{})", self.host_name, self.screen_w, self.screen_h));
-                }
+                ui.add(egui::Label::new(
+                    egui::RichText::new("\u{25CF}").size(18.0).color(status_color),
+                ));
+                ui.label(status_text);
             });
 
             ui.label(format!("Serial: {}", self.runtime_serial_port));
@@ -903,6 +930,34 @@ mod tests {
         for (state, expected) in cases {
             assert_eq!(format!("{state}"), expected, "Display for {state:?}");
         }
+    }
+
+    #[test]
+    fn status_text_for_each_state() {
+        // Pure helper — no UI/IO. Asserts the exact human-readable strings
+        // shown in the chrome status row so accidental copy-paste / format
+        // drift fails fast.
+        let mut app = make_app();
+
+        // Disconnected without a reason — generic fallback.
+        app.state = ConnectionState::Disconnected;
+        app.status_msg = "ready".into();
+        assert_eq!(app.status_text(), "Not connected");
+
+        // Disconnected with a transport reason — propagates to the user.
+        app.status_msg = "disconnected: serial: device busy".into();
+        assert_eq!(app.status_text(), "Disconnected: serial: device busy");
+
+        // Connecting — current spec uses ellipsis (…).
+        app.state = ConnectionState::Connecting;
+        assert_eq!(app.status_text(), "Connecting…");
+
+        // Connected — embeds host name and resolution.
+        app.state = ConnectionState::Connected;
+        app.host_name = "win-host".into();
+        app.screen_w = 2560;
+        app.screen_h = 1440;
+        assert_eq!(app.status_text(), "Connected to win-host (2560×1440)");
     }
 
     #[test]
