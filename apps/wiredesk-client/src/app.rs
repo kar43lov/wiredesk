@@ -253,6 +253,7 @@ impl eframe::App for WireDeskApp {
             // Special keys buttons
             let mut send_cad = false;
             let mut send_win = false;
+            let mut send_lang = false;
             if self.state == ConnectionState::Connected {
                 ui.horizontal(|ui| {
                     if ui.button("Ctrl+Alt+Del").clicked() {
@@ -260,6 +261,9 @@ impl eframe::App for WireDeskApp {
                     }
                     if ui.button("Win key").clicked() {
                         send_win = true;
+                    }
+                    if ui.button("Lang (Win+Space)").clicked() {
+                        send_lang = true;
                     }
                 });
             }
@@ -276,6 +280,15 @@ impl eframe::App for WireDeskApp {
             if send_win {
                 self.send_key_sequence(&[
                     (0xE05B, 0x00, true),  // Win down
+                    (0xE05B, 0x00, false), // Win up
+                ]);
+            }
+            if send_lang {
+                // Win+Space — стандартный шорткат смены языка в Windows 11.
+                self.send_key_sequence(&[
+                    (0xE05B, 0x08, true), // Win down (META=0x08)
+                    (0x39, 0x08, true),   // Space down
+                    (0x39, 0x00, false),  // Space up
                     (0xE05B, 0x00, false), // Win up
                 ]);
             }

@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod input;
 
 use std::sync::mpsc;
@@ -63,6 +64,11 @@ fn main() {
     let (events_tx, events_rx) = mpsc::channel();
     let (outgoing_tx, outgoing_rx) = mpsc::channel();
 
+    // Shared clipboard state — used by both poll thread (which detects local
+    // changes) and reader thread (which writes incoming text). Hash-based
+    // dedup avoids the bounce-back loop.
+    let clipboard_state = clipboard::ClipboardState::new();
+
     // Writer thread — owns one half of the port. Drains outgoing channel,
     // sends heartbeats, sends Hello on startup. UI never blocks because this
     // thread has zero shared locks with the egui thread.
@@ -73,9 +79,13 @@ fn main() {
     });
 
     // Reader thread — owns the other half. Just receives and dispatches.
+    let reader_clipboard = clipboard_state.clone();
     thread::spawn(move || {
-        reader_thread(reader_transport, events_tx);
+        reader_thread(reader_transport, events_tx, reader_clipboard);
     });
+
+    // Clipboard poll thread — pushes Mac clipboard changes to host.
+    clipboard::spawn_poll_thread(clipboard_state, outgoing_tx.clone());
 
     let app = WireDeskApp::new(args.port.clone(), events_rx, outgoing_tx);
 
@@ -137,7 +147,12 @@ fn writer_thread(
 }
 
 /// Sole reader of the serial port. Translates incoming packets to UI events.
-fn reader_thread(mut transport: Box<dyn Transport>, events_tx: mpsc::Sender<TransportEvent>) {
+fn reader_thread(
+    mut transport: Box<dyn Transport>,
+    events_tx: mpsc::Sender<TransportEvent>,
+    clipboard_state: clipboard::ClipboardState,
+) {
+    let mut incoming_clip = clipboard::IncomingClipboard::new(clipboard_state);
     loop {
         match transport.recv() {
             Ok(p) => match p.message {
@@ -153,7 +168,10 @@ fn reader_thread(mut transport: Box<dyn Transport>, events_tx: mpsc::Sender<Tran
                     let _ = events_tx.send(TransportEvent::Heartbeat);
                 }
                 Message::ClipOffer { total_len, .. } => {
-                    log::debug!("clipboard offer: {total_len} bytes (not yet implemented)");
+                    incoming_clip.on_offer(total_len);
+                }
+                Message::ClipChunk { index, data } => {
+                    incoming_clip.on_chunk(index, data);
                 }
                 Message::ShellOutput { data } => {
                     let _ = events_tx.send(TransportEvent::ShellOutput(data));

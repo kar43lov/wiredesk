@@ -1,3 +1,4 @@
+mod clipboard;
 mod injector;
 mod session;
 mod shell;

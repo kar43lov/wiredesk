@@ -5,6 +5,7 @@ use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
 
+use crate::clipboard::ClipboardSync;
 use crate::injector::InputInjector;
 use crate::shell::{ShellEvent, ShellProcess};
 
@@ -30,6 +31,7 @@ pub struct Session<T: Transport, I: InputInjector> {
     screen_w: u16,
     screen_h: u16,
     shell: Option<ShellProcess>,
+    clipboard: ClipboardSync,
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
@@ -46,6 +48,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_w,
             screen_h,
             shell: None,
+            clipboard: ClipboardSync::new(),
         }
     }
 
@@ -90,6 +93,13 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
         // Drain pending shell output and exit events without blocking
         self.pump_shell_events()?;
+
+        // Push local clipboard changes (poll-rate-limited internally).
+        if self.state == SessionState::Connected {
+            for msg in self.clipboard.poll() {
+                self.send(msg)?;
+            }
+        }
 
         // Try to receive a packet
         let packet = match self.transport.recv() {
@@ -204,6 +214,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
             (SessionState::Connected, Message::KeyUp { scancode, modifiers }) => {
                 self.injector.key_up(*scancode, *modifiers)?;
+            }
+
+            (SessionState::Connected, Message::ClipOffer { total_len, .. }) => {
+                self.clipboard.on_offer(*total_len);
+            }
+
+            (SessionState::Connected, Message::ClipChunk { index, data }) => {
+                self.clipboard.on_chunk(*index, data.clone());
             }
 
             (SessionState::Connected, Message::ShellOpen { shell }) => {
