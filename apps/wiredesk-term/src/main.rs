@@ -29,8 +29,8 @@ const ESCAPE_BYTE: u8 = 0x1D; // Ctrl+]
     about = "WireDesk terminal — shell on Host over serial. Press Ctrl+] to quit."
 )]
 struct Args {
-    /// Serial port (e.g., /dev/tty.usbserial-XXX on macOS, COM3 on Windows)
-    #[arg(short, long)]
+    /// Serial port (e.g., /dev/cu.usbserial-XXX on macOS, COM3 on Windows)
+    #[arg(short, long, default_value = "/dev/cu.usbserial-120")]
     port: String,
 
     /// Baud rate

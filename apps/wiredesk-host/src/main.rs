@@ -10,7 +10,7 @@ use wiredesk_core::error::Result;
 #[command(name = "wiredesk-host", about = "WireDesk host agent")]
 struct Args {
     /// Serial port (e.g., COM3 on Windows, /dev/ttyUSB0 on Linux)
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "COM3")]
     port: String,
 
     /// Baud rate
@@ -21,12 +21,12 @@ struct Args {
     #[arg(long, default_value = "wiredesk-host")]
     name: String,
 
-    /// Screen width (auto-detected on Windows)
-    #[arg(long, default_value = "1920")]
+    /// Screen width
+    #[arg(long, default_value = "2560")]
     width: u16,
 
-    /// Screen height (auto-detected on Windows)
-    #[arg(long, default_value = "1080")]
+    /// Screen height
+    #[arg(long, default_value = "1440")]
     height: u16,
 }
 

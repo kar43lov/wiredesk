@@ -18,7 +18,7 @@ use app::{TransportEvent, WireDeskApp};
 #[command(name = "wiredesk-client", about = "WireDesk client for macOS")]
 struct Args {
     /// Serial port (e.g., /dev/cu.usbserial-XXX)
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "/dev/cu.usbserial-120")]
     port: String,
 
     /// Baud rate
