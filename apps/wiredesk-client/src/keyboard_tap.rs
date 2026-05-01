@@ -13,11 +13,14 @@
 //! must list this binary. Without it CGEventTap creation succeeds but the
 //! tap never fires. We don't auto-prompt — UX guides the user instead.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
+
+use crate::input::keymap::cg_flag_change_to_scancodes;
 
 /// Events from the tap thread back to the UI thread.
 #[allow(dead_code)] // variants used in later tasks
@@ -31,11 +34,17 @@ pub enum TapEvent {
 
 /// Handle to the tap thread.
 ///
-/// Owns the enable flag so the UI can switch the tap on/off in O(1). On
-/// macOS additionally owns a reference to the CFRunLoop and the thread
+/// Owns the enable flag (so the UI can switch the tap on/off in O(1)) plus
+/// the previous-flags state and an outgoing-channel clone so `disable()`
+/// can emit KeyUp events for held modifiers (sticky-modifier cleanup —
+/// otherwise Host stays with Ctrl/Shift "stuck" until you re-press them).
+///
+/// On macOS additionally owns a reference to the CFRunLoop and the thread
 /// join handle for graceful shutdown via Drop.
 pub struct TapHandle {
     enabled: Arc<AtomicBool>,
+    prev_flags: Arc<AtomicU64>,
+    outgoing_tx: mpsc::Sender<Packet>,
     #[cfg(target_os = "macos")]
     inner: Option<macos::Inner>,
 }
@@ -43,21 +52,33 @@ pub struct TapHandle {
 impl TapHandle {
     /// Activate the tap — incoming key events are intercepted and forwarded.
     pub fn enable(&self) {
-        self.enabled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.enabled.store(true, Ordering::SeqCst);
     }
 
-    /// Deactivate the tap — events flow through to macOS as normal.
+    /// Deactivate the tap. Emits KeyUp events for any modifiers that were
+    /// held at the moment of disable so the Host doesn't stay stuck with
+    /// Ctrl/Shift/Alt pressed.
     pub fn disable(&self) {
-        self.enabled
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.enabled.store(false, Ordering::SeqCst);
+        // Sticky-modifier cleanup. Whatever was in prev_flags is now released.
+        let prev = self.prev_flags.swap(0, Ordering::SeqCst);
+        for (sc, pressed) in cg_flag_change_to_scancodes(0, prev) {
+            // pressed should always be false here (current = 0).
+            debug_assert!(!pressed);
+            let _ = self.outgoing_tx.send(Packet::new(
+                Message::KeyUp {
+                    scancode: sc,
+                    modifiers: 0,
+                },
+                0,
+            ));
+        }
     }
 
     /// Is the tap currently intercepting? (Reflects the enable flag, not
     /// macOS-side tap-disabled-by-timeout state.)
     pub fn is_enabled(&self) -> bool {
-        self.enabled
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.enabled.load(Ordering::SeqCst)
     }
 }
 
@@ -78,10 +99,11 @@ impl Drop for TapHandle {
 /// and returns a no-op handle. UI is expected to detect this via
 /// `is_permission_granted()` and direct the user to System Settings.
 pub fn start(
-    _outgoing_tx: mpsc::Sender<Packet>,
+    outgoing_tx: mpsc::Sender<Packet>,
     _tap_events_tx: mpsc::Sender<TapEvent>,
 ) -> TapHandle {
     let enabled = Arc::new(AtomicBool::new(false));
+    let prev_flags = Arc::new(AtomicU64::new(0));
 
     #[cfg(target_os = "macos")]
     {
@@ -91,20 +113,33 @@ pub fn start(
             );
             return TapHandle {
                 enabled,
+                prev_flags,
+                outgoing_tx,
                 inner: None,
             };
         }
-        let inner = macos::Inner::start(Arc::clone(&enabled), _outgoing_tx, _tap_events_tx);
+        let inner = macos::Inner::start(
+            Arc::clone(&enabled),
+            Arc::clone(&prev_flags),
+            outgoing_tx.clone(),
+            _tap_events_tx,
+        );
         TapHandle {
             enabled,
+            prev_flags,
+            outgoing_tx,
             inner: Some(inner),
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (_outgoing_tx, _tap_events_tx);
-        TapHandle { enabled }
+        let _ = _tap_events_tx;
+        TapHandle {
+            enabled,
+            prev_flags,
+            outgoing_tx,
+        }
     }
 }
 
@@ -139,7 +174,7 @@ pub fn is_permission_granted() -> bool {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -149,11 +184,13 @@ mod macos {
     use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
     use core_graphics::event::{
         CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-        CallbackResult,
+        CallbackResult, EventField,
     };
+    use wiredesk_protocol::message::Message;
     use wiredesk_protocol::packet::Packet;
 
     use super::TapEvent;
+    use crate::input::keymap::{cg_flag_change_to_scancodes, cgkeycode_to_scancode};
 
     /// `CGEventTapEnable(tap, true)` — re-enable a tap that was disabled by
     /// the system (timeout or user input). Not exposed by core-graphics
@@ -171,18 +208,19 @@ mod macos {
     impl Inner {
         pub(super) fn start(
             enabled: Arc<AtomicBool>,
+            prev_flags: Arc<AtomicU64>,
             outgoing_tx: mpsc::Sender<Packet>,
-            tap_events_tx: mpsc::Sender<TapEvent>,
+            _tap_events_tx: mpsc::Sender<TapEvent>,
         ) -> Self {
             let runloop = Arc::new(Mutex::new(None::<CFRunLoop>));
             let runloop_for_thread = Arc::clone(&runloop);
 
-            // Pointer to the tap's CFMachPort, stored as usize so it crosses
-            // the closure boundary as Copy. Written after the tap is created
-            // (closure runs on later events, never during construction).
             let tap_port_addr = Arc::new(AtomicUsize::new(0));
             let tap_port_for_cb = Arc::clone(&tap_port_addr);
-            let _ = (outgoing_tx, tap_events_tx, &enabled);
+
+            let enabled_cb = Arc::clone(&enabled);
+            let prev_flags_cb = Arc::clone(&prev_flags);
+            let outgoing_cb = outgoing_tx.clone();
 
             let join = thread::Builder::new()
                 .name("wiredesk-keyboard-tap".into())
@@ -221,11 +259,66 @@ mod macos {
                                 return CallbackResult::Drop;
                             }
 
-                            // Real decode in Task 4. For now: log and pass
-                            // through so we can verify the tap fires at all.
-                            log::trace!("keyboard_tap: event {event_type:?}");
-                            let _ = event;
-                            CallbackResult::Keep
+                            // If tap is not enabled, let macOS handle the event
+                            // normally — we don't intercept outside capture-mode.
+                            if !enabled_cb.load(Ordering::SeqCst) {
+                                return CallbackResult::Keep;
+                            }
+
+                            match event_type {
+                                CGEventType::KeyDown => {
+                                    let kc = event.get_integer_value_field(
+                                        EventField::KEYBOARD_EVENT_KEYCODE,
+                                    ) as u16;
+                                    if let Some(sc) = cgkeycode_to_scancode(kc) {
+                                        let _ = outgoing_cb.send(Packet::new(
+                                            Message::KeyDown {
+                                                scancode: sc,
+                                                modifiers: 0,
+                                            },
+                                            0,
+                                        ));
+                                    }
+                                    CallbackResult::Drop
+                                }
+                                CGEventType::KeyUp => {
+                                    let kc = event.get_integer_value_field(
+                                        EventField::KEYBOARD_EVENT_KEYCODE,
+                                    ) as u16;
+                                    if let Some(sc) = cgkeycode_to_scancode(kc) {
+                                        let _ = outgoing_cb.send(Packet::new(
+                                            Message::KeyUp {
+                                                scancode: sc,
+                                                modifiers: 0,
+                                            },
+                                            0,
+                                        ));
+                                    }
+                                    CallbackResult::Drop
+                                }
+                                CGEventType::FlagsChanged => {
+                                    let cur = event.get_flags().bits();
+                                    let prev = prev_flags_cb.swap(cur, Ordering::SeqCst);
+                                    for (sc, pressed) in
+                                        cg_flag_change_to_scancodes(cur, prev)
+                                    {
+                                        let msg = if pressed {
+                                            Message::KeyDown {
+                                                scancode: sc,
+                                                modifiers: 0,
+                                            }
+                                        } else {
+                                            Message::KeyUp {
+                                                scancode: sc,
+                                                modifiers: 0,
+                                            }
+                                        };
+                                        let _ = outgoing_cb.send(Packet::new(msg, 0));
+                                    }
+                                    CallbackResult::Drop
+                                }
+                                _ => CallbackResult::Keep,
+                            }
                         },
                     );
 
@@ -237,11 +330,11 @@ mod macos {
                         }
                     };
 
-                    // Save port addr for re-enable handler.
-                    tap_port_addr
-                        .store(tap.mach_port().as_concrete_TypeRef() as usize, Ordering::SeqCst);
+                    tap_port_addr.store(
+                        tap.mach_port().as_concrete_TypeRef() as usize,
+                        Ordering::SeqCst,
+                    );
 
-                    // Activate the tap (it starts disabled by default).
                     unsafe {
                         CGEventTapEnable(
                             tap.mach_port().as_concrete_TypeRef() as *mut _,
@@ -259,7 +352,6 @@ mod macos {
                         current.add_source(&source, kCFRunLoopCommonModes);
                     }
 
-                    // Stash the runloop ref for shutdown.
                     if let Ok(mut g) = runloop_for_thread.lock() {
                         *g = Some(current.clone());
                     }
@@ -267,8 +359,6 @@ mod macos {
                     log::debug!("keyboard_tap: runloop started on dedicated thread");
                     CFRunLoop::run_current();
                     log::debug!("keyboard_tap: runloop exited");
-
-                    // Tap dropped at end of scope → CFMachPort released.
                 })
                 .expect("failed to spawn keyboard tap thread");
 
@@ -279,15 +369,12 @@ mod macos {
         }
 
         pub(super) fn shutdown(self) {
-            // Stop the runloop on the tap thread.
             if let Ok(guard) = self.runloop.lock() {
                 if let Some(rl) = guard.as_ref() {
                     rl.stop();
                 }
             }
 
-            // Best-effort join with timeout. If the thread doesn't exit in
-            // 1s we give up and let the OS clean it on process exit.
             if let Some(handle) = self.join {
                 let start = std::time::Instant::now();
                 while !handle.is_finished() && start.elapsed() < Duration::from_secs(1) {
@@ -308,6 +395,7 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::keymap::{CG_FLAG_COMMAND, CG_FLAG_SHIFT, WIN_SCAN_LCTRL, WIN_SCAN_LSHIFT};
     use std::sync::mpsc;
 
     #[test]
@@ -334,13 +422,46 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
         let _h = start(out_tx, tap_tx);
-        // Dropped at end of scope. No assertion — just must not panic.
     }
 
     #[test]
     fn permission_query_returns_bool() {
-        // On non-macOS: always true. On macOS: depends on actual TCC state.
-        // Either way the function must not panic and must return a bool.
         let _ = is_permission_granted();
+    }
+
+    #[test]
+    fn disable_emits_keyup_for_held_modifiers() {
+        let (out_tx, out_rx) = mpsc::channel();
+        let (tap_tx, _tap_rx) = mpsc::channel();
+        let h = start(out_tx, tap_tx);
+
+        // Pretend Cmd + Shift were held at the moment of disable.
+        h.prev_flags
+            .store(CG_FLAG_COMMAND | CG_FLAG_SHIFT, Ordering::SeqCst);
+        h.disable();
+
+        let mut keyups = Vec::new();
+        while let Ok(packet) = out_rx.try_recv() {
+            if let wiredesk_protocol::message::Message::KeyUp { scancode, .. } = packet.message {
+                keyups.push(scancode);
+            }
+        }
+        keyups.sort();
+        let mut expected = vec![WIN_SCAN_LCTRL, WIN_SCAN_LSHIFT];
+        expected.sort();
+        assert_eq!(keyups, expected, "expected KeyUp for both held modifiers");
+
+        // prev_flags must be cleared.
+        assert_eq!(h.prev_flags.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn disable_when_no_modifiers_is_silent() {
+        let (out_tx, out_rx) = mpsc::channel();
+        let (tap_tx, _tap_rx) = mpsc::channel();
+        let h = start(out_tx, tap_tx);
+
+        h.disable();
+        assert!(out_rx.try_recv().is_err(), "no modifiers held → no KeyUp packets");
     }
 }
