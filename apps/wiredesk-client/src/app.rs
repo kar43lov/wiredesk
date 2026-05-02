@@ -70,6 +70,17 @@ pub struct WireDeskApp {
     save_toast: Option<(String, Instant)>,
     // Cached available serial ports for the combo-box; refreshed on demand.
     available_ports: Vec<String>,
+    // Cached monitor list for the Settings combo-box. `NSScreen::screens()`
+    // is a sync IPC call — refreshing once per second (or on combo focus) is
+    // plenty for a UI that's already gated behind an open settings panel,
+    // and avoids hammering the call at 60 FPS while the panel just sits open.
+    cached_monitors: Vec<monitor::MonitorInfo>,
+    cached_monitors_at: Option<Instant>,
+    // Sticky banner shown when an entered fullscreen fell back to "current
+    // display" because the saved `preferred_monitor` index is out of range.
+    // Carries its own TTL so it doesn't clobber `status_msg` when a real
+    // disconnect message wants the same slot.
+    monitor_fallback_msg: Option<(String, Instant)>,
     // Saved outer position before entering fullscreen on a non-active monitor.
     // Restored on fullscreen exit so the chrome window returns to where the
     // user originally had it. None when fullscreen wasn't entered via an
@@ -129,6 +140,9 @@ impl WireDeskApp {
             config_dirty: false,
             save_toast: None,
             available_ports: Vec::new(),
+            cached_monitors: Vec::new(),
+            cached_monitors_at: None,
+            monitor_fallback_msg: None,
             original_position: None,
         }
     }
@@ -143,6 +157,23 @@ impl WireDeskApp {
         }
     }
 
+    /// Refresh the cached monitor list if the cache is stale (older than
+    /// `MONITOR_CACHE_TTL`) or empty. `NSScreen::screens()` walks an Obj-C
+    /// array, so calling it 60×/s while the settings panel is open is wasteful;
+    /// 1 Hz is plenty for a list that only changes when displays are
+    /// hot-plugged.
+    fn refresh_monitors_if_stale(&mut self) {
+        const MONITOR_CACHE_TTL: Duration = Duration::from_secs(1);
+        let stale = self
+            .cached_monitors_at
+            .map(|t| t.elapsed() >= MONITOR_CACHE_TTL)
+            .unwrap_or(true);
+        if stale {
+            self.cached_monitors = monitor::list_monitors();
+            self.cached_monitors_at = Some(Instant::now());
+        }
+    }
+
     /// Render the editable settings block — only shown in chrome mode.
     /// Mutating any field flips `config_dirty`; Save persists to TOML and
     /// flashes a 3-second toast. Changes don't affect the running session
@@ -153,10 +184,11 @@ impl WireDeskApp {
         let mut want_reset = false;
         let mut want_refresh_ports = false;
         let available_ports = self.available_ports.clone();
-        // Cache the monitor list once per render — `NSScreen::screens()` is
-        // a sync IPC call, no point re-querying it for every widget in the
-        // Display group (or every frame at 60 FPS while the panel is open).
-        let monitors = monitor::list_monitors();
+        // Refresh cached monitors at most once a second — `NSScreen::screens()`
+        // is a sync IPC call, no point re-querying it 60×/s while the panel
+        // sits open (or at all unless something has changed).
+        self.refresh_monitors_if_stale();
+        let monitors = self.cached_monitors.clone();
 
         ui.collapsing("Settings", |ui| {
             let cfg = &mut self.pending_config;
@@ -246,13 +278,16 @@ impl WireDeskApp {
                     let selected_text = match cfg.preferred_monitor {
                         None => "(active monitor — default)".to_string(),
                         Some(idx) => match monitors.get(idx) {
-                            Some(m) => format!(
-                                "Display {} — {} ({}×{})",
-                                m.index + 1,
-                                m.name,
-                                m.size.x,
-                                m.size.y,
-                            ),
+                            Some(m) => {
+                                let size = m.frame.size();
+                                format!(
+                                    "Display {} — {} ({}×{})",
+                                    m.index + 1,
+                                    m.name,
+                                    size.x,
+                                    size.y,
+                                )
+                            }
                             // Saved index is out of range (display unplugged
                             // since last save). Show the bare "Display N" so
                             // the user knows something stale is selected.
@@ -273,12 +308,13 @@ impl WireDeskApp {
                                 dirty = true;
                             }
                             for m in &monitors {
+                                let size = m.frame.size();
                                 let label = format!(
                                     "Display {} — {} ({}×{})",
                                     m.index + 1,
                                     m.name,
-                                    m.size.x,
-                                    m.size.y,
+                                    size.x,
+                                    size.y,
                                 );
                                 if ui
                                     .selectable_value(
@@ -422,8 +458,18 @@ impl WireDeskApp {
     /// is currently on", so the move-then-fullscreen sequence is what targets
     /// a specific display. If preferred_monitor is None or the index is
     /// stale (display unplugged since save), fall back to "fullscreen on
-    /// current display" without moving and surface the fallback in the
-    /// status row so the user knows the choice was ignored.
+    /// current display" without moving and surface the fallback via a
+    /// dedicated TTL'd banner (`monitor_fallback_msg`) so it doesn't clobber
+    /// real disconnect reasons in `status_msg`.
+    ///
+    /// **Known limitation (egui 0.31 + AppKit):** `OuterPosition` is processed
+    /// asynchronously on macOS — there's a chance `Fullscreen(true)` fires
+    /// before AppKit has actually moved the window, so on rare races the
+    /// fullscreen lands on the original display. The two viewport commands
+    /// arrive in order and AppKit usually flushes the move before the
+    /// fullscreen transition; if this becomes a real problem we'd need a
+    /// state machine that waits for the next `update()` after the move
+    /// before issuing fullscreen.
     ///
     /// On exiting fullscreen: send `Fullscreen(false)`, then restore the
     /// saved outer position via `OuterPosition` (and clear it via `take()`).
@@ -448,12 +494,17 @@ impl WireDeskApp {
                 None => {
                     // preferred_monitor was Some(idx) but the index is now
                     // out of range (display unplugged) — surface the fallback
-                    // so the user notices, otherwise it would silently target
-                    // the active display with no feedback.
+                    // via a dedicated TTL banner instead of overwriting
+                    // status_msg, which is what disconnect reasons (e.g.
+                    // "disconnected: serial: device busy") use as their
+                    // home. Without a separate slot a fullscreen attempt
+                    // while disconnected would erase the real reason.
                     if self.pending_config.preferred_monitor.is_some() {
-                        self.status_msg =
+                        self.monitor_fallback_msg = Some((
                             "Selected monitor unavailable; fullscreen on current display"
-                                .to_string();
+                                .to_string(),
+                            Instant::now(),
+                        ));
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 }
@@ -992,6 +1043,15 @@ impl eframe::App for WireDeskApp {
 
             ui.separator();
             ui.small(&self.status_msg);
+            // Inline TTL banner for the per-monitor fullscreen fallback —
+            // separate from `status_msg` so it doesn't overwrite a real
+            // disconnect reason when both happen at once. Shows for 5 s
+            // then disappears on its own.
+            if let Some((msg, when)) = &self.monitor_fallback_msg {
+                if when.elapsed() < Duration::from_secs(5) {
+                    ui.colored_label(egui::Color32::from_rgb(220, 140, 60), msg);
+                }
+            }
         });
 
         // Handle captured input — push to outgoing channel (non-blocking).

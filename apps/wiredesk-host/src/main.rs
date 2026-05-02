@@ -64,33 +64,36 @@ fn main() {
     // 5 attempts × 100ms (~500ms total budget) — covers the Save & Restart
     // race where the freshly spawned process may briefly overlap with the
     // outgoing one before the old process drops its mutex handle.
-    let _instance_guard = match ui::single_instance::try_acquire_with_retry(
-        "WireDeskHostSingleton",
-        5,
-        100,
-    ) {
-        ui::single_instance::SingleInstanceResult::Acquired(g) => g,
-        ui::single_instance::SingleInstanceResult::AlreadyRunning => {
-            log::warn!("another wiredesk-host instance is already running");
-            #[cfg(windows)]
-            {
-                let _ = native_windows_gui::init();
-                native_windows_gui::simple_message(
-                    "WireDesk",
-                    "WireDesk Host is already running — check the tray icon.",
-                );
+    // `Option<SingleInstanceGuard>` so the Error fallback can simply hold
+    // `None` — start without a lock rather than panic. Duplicate-launch is
+    // a worse symptom than refusing to start, but on a check failure we'd
+    // rather still come up.
+    let _instance_guard: Option<ui::single_instance::SingleInstanceGuard> =
+        match ui::single_instance::try_acquire_with_retry(
+            "WireDeskHostSingleton",
+            5,
+            100,
+        ) {
+            ui::single_instance::SingleInstanceResult::Acquired(g) => Some(g),
+            ui::single_instance::SingleInstanceResult::AlreadyRunning => {
+                log::warn!("another wiredesk-host instance is already running");
+                #[cfg(windows)]
+                {
+                    let _ = native_windows_gui::init();
+                    native_windows_gui::simple_message(
+                        "WireDesk",
+                        "WireDesk Host is already running — check the tray icon.",
+                    );
+                }
+                #[cfg(not(windows))]
+                eprintln!("WireDesk Host is already running.");
+                return;
             }
-            #[cfg(not(windows))]
-            eprintln!("WireDesk Host is already running.");
-            return;
-        }
-        ui::single_instance::SingleInstanceResult::Error(e) => {
-            log::warn!("single-instance check failed: {e} (continuing anyway)");
-            // Fall through — better to start than to refuse on a check failure.
-            ui::single_instance::SingleInstanceGuard::acquire("WireDeskHostSingleton-fallback")
-                .into_guard_or_panic()
-        }
-    };
+            ui::single_instance::SingleInstanceResult::Error(e) => {
+                log::warn!("single-instance check failed: {e} (continuing without lock)");
+                None
+            }
+        };
 
     // Resolve config: defaults → config.toml → CLI args (override).
     let toml_cfg = HostConfig::load();
@@ -248,15 +251,35 @@ fn run_windows(
     });
 
     // Wire settings-window events.
+    //
+    // CRITICAL: never hold a `settings_clone2.borrow()` across the whole
+    // match. The OnNotice tray handler in the *other* event handler does
+    // `settings_clone.borrow_mut().set_status(&g)` — Win32 message pumping
+    // inside e.g. `nwg::Clipboard::set_data_text` can re-enter and trigger
+    // OnNotice while we're mid-click. A second borrow_mut on a RefCell
+    // already-borrowed → panic → process abort. Take the borrow lazily
+    // inside each `if handle == ...` arm so it's released before any nwg
+    // call that pumps messages.
     let settings_clone2 = settings.clone();
     let cfg_holder = Arc::new(Mutex::new(cfg.clone()));
     let settings_event_handler =
         nwg::full_bind_event_handler(&settings_handle, move |evt, _evt_data, handle| {
             use nwg::Event as E;
-            let s = settings_clone2.borrow();
+            // Resolve which control fired this event without holding any
+            // borrow across the match arms.
+            let (is_save, is_copy_mac, is_restart, is_detect) = {
+                let s = settings_clone2.borrow();
+                (
+                    handle == s.save_btn.handle,
+                    handle == s.copy_mac_btn.handle,
+                    handle == s.restart_btn.handle,
+                    handle == s.detect_btn.handle,
+                )
+            };
             match evt {
                 E::OnButtonClick => {
-                    if handle == s.save_btn.handle {
+                    if is_save {
+                        let s = settings_clone2.borrow();
                         match s.read_form() {
                             Ok(new_cfg) => {
                                 if let Err(e) = new_cfg.save() {
@@ -283,19 +306,29 @@ fn run_windows(
                             }
                             Err(e) => s.set_message(&e),
                         }
-                    } else if handle == s.copy_mac_btn.handle {
+                    } else if is_copy_mac {
                         let snapshot = cfg_holder.lock().ok().map(|g| g.clone());
                         if let Some(c) = snapshot {
                             let cmd = ui::format::format_mac_launch_command(&c);
-                            nwg::Clipboard::set_data_text(&s.window, &cmd);
-                            s.set_message("Copied Mac launch command to clipboard.");
+                            // `set_data_text` pumps the Win32 message loop —
+                            // grab a fresh borrow only for the arguments and
+                            // release before the call. Then re-borrow for the
+                            // status message.
+                            {
+                                let s = settings_clone2.borrow();
+                                nwg::Clipboard::set_data_text(&s.window, &cmd);
+                            }
+                            settings_clone2
+                                .borrow()
+                                .set_message("Copied Mac launch command to clipboard.");
                         }
-                    } else if handle == s.restart_btn.handle {
+                    } else if is_restart {
                         // Save & Restart: persist config + autostart, then
                         // spawn a fresh host process and stop our own event
                         // loop. The new process retries the single-instance
                         // mutex acquire (5×100ms in main.rs) so it'll wait
                         // out our shutdown without an artificial sleep here.
+                        let s = settings_clone2.borrow();
                         match s.read_form() {
                             Ok(new_cfg) => {
                                 if let Err(e) = new_cfg.save() {
@@ -314,13 +347,17 @@ fn run_windows(
                                     ));
                                     return;
                                 }
-                                if let Ok(mut g) = cfg_holder.lock() {
-                                    *g = new_cfg;
-                                }
+                                // Only update cfg_holder *after* spawn confirms —
+                                // if spawn fails, the running process keeps
+                                // serving the old config, so copy_mac_btn must
+                                // also keep formatting the old command.
                                 match std::env::current_exe() {
                                     Ok(exe) => match std::process::Command::new(exe).spawn() {
                                         Ok(_) => {
                                             log::info!("restart: spawned new host process");
+                                            if let Ok(mut g) = cfg_holder.lock() {
+                                                *g = new_cfg;
+                                            }
                                             nwg::stop_thread_dispatch();
                                         }
                                         Err(e) => {
@@ -338,7 +375,7 @@ fn run_windows(
                             }
                             Err(e) => s.set_message(&e),
                         }
-                    } else if handle == s.detect_btn.handle {
+                    } else if is_detect {
                         // Enumerate USB serial ports and pick the lone CH340
                         // (or report empty / multi). On enumeration failure we
                         // treat it as "no ports" — the user can still type a
@@ -347,6 +384,7 @@ fn run_windows(
                             log::warn!("serialport::available_ports failed: {e}");
                             Vec::new()
                         });
+                        let s = settings_clone2.borrow();
                         match ui::format::detect_ch340_port(&ports) {
                             ui::format::DetectResult::Found(name) => {
                                 s.port_input.set_text(&name);
@@ -367,7 +405,7 @@ fn run_windows(
                     }
                 }
                 E::OnWindowClose => {
-                    s.hide();
+                    settings_clone2.borrow().hide();
                 }
                 _ => {}
             }
@@ -381,12 +419,3 @@ fn run_windows(
     nwg::unbind_event_handler(&settings_event_handler);
 }
 
-// SingleInstanceResult helper — used in the fallback Error branch above.
-impl ui::single_instance::SingleInstanceResult {
-    fn into_guard_or_panic(self) -> ui::single_instance::SingleInstanceGuard {
-        match self {
-            ui::single_instance::SingleInstanceResult::Acquired(g) => g,
-            _ => panic!("expected SingleInstanceResult::Acquired in fallback path"),
-        }
-    }
-}

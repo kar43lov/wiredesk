@@ -5,13 +5,14 @@
 //! ship a Linux/Windows client today, but keeping the module cross-platform
 //! avoids `#[cfg]` noise at the call sites).
 
-// `MonitorInfo` / `list_monitors` / `resolve_target_monitor` are wired up by
-// follow-up tasks (config field + Settings combo + toggle_fullscreen). Until
-// then keep the module dead-code-free under `-D warnings`.
 #![allow(dead_code)]
 
 use eframe::egui;
 
+/// Snapshot of one physical display: stable index in `NSScreen::screens()`,
+/// human-readable name, and global-coordinate frame. Suitable input for
+/// `ViewportCommand::OuterPosition` (use `frame.min`) and for rendering
+/// "Display N — Name (W×H)" labels in the Settings combo-box.
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
     /// Index in the `NSScreen::screens()` array (stable while the screen
@@ -21,10 +22,9 @@ pub struct MonitorInfo {
     /// "Built-in Retina Display", …).
     pub name: String,
     /// Global-coordinate frame of the screen. `frame.min` is the top-left
-    /// corner suitable for `ViewportCommand::OuterPosition`.
+    /// corner suitable for `ViewportCommand::OuterPosition`; size is
+    /// `frame.size()`.
     pub frame: egui::Rect,
-    /// Convenience size (same as `frame.size()`).
-    pub size: egui::Vec2,
 }
 
 /// Enumerate physical displays connected to the system.
@@ -36,10 +36,10 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
     use objc2_app_kit::NSScreen;
     use objc2_foundation::MainThreadMarker;
 
-    // SAFETY: list_monitors is documented as main-thread-only. egui's
-    // `update()` runs on the main thread on macOS, which is the only call
-    // site. If the assertion fails we'd rather log + return empty than panic
-    // (no caller is set up to handle a panic from here).
+    // Main-thread check: `NSScreen::screens()` and `localizedName` both
+    // require the main thread. egui's `update()` runs on the main thread
+    // on macOS, which is the only call site — log + return empty if that
+    // ever changes rather than panicking.
     let Some(mtm) = MainThreadMarker::new() else {
         log::warn!("monitor::list_monitors called off main thread; returning empty list");
         return Vec::new();
@@ -52,7 +52,7 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
         .map(|(i, screen)| {
             let frame = screen.frame();
             // localizedName is marked unsafe in objc2-app-kit 0.2.x — calling
-            // it requires the main thread (already asserted) and a live
+            // it requires the main thread (already checked) and a live
             // NSScreen reference (we have one from the array).
             let name = unsafe { screen.localizedName() }.to_string();
             let origin = egui::Pos2::new(frame.origin.x as f32, frame.origin.y as f32);
@@ -61,7 +61,6 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
                 index: i,
                 name,
                 frame: egui::Rect::from_min_size(origin, size),
-                size,
             }
         })
         .collect()
@@ -102,7 +101,6 @@ mod tests {
             index: idx,
             name: name.to_string(),
             frame: egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(w, h)),
-            size: egui::Vec2::new(w, h),
         }
     }
 

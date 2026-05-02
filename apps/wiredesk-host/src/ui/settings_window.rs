@@ -106,15 +106,17 @@ impl SettingsWindow {
                     ref mut window_icon,
                     ..
                 } = *s;
-                let icon_ok = nwg::Icon::builder()
+                // `include_bytes!` already guarantees the asset is present
+                // and non-empty at compile time. A failure here means the
+                // bundled `.ico` is malformed — that's a build-time bug we
+                // want to catch loudly the first time it runs, not silently
+                // ship a windowless title-bar to users.
+                nwg::Icon::builder()
                     .source_bin(Some(APP_ICON_BYTES))
-                    .strict(false)
+                    .strict(true)
                     .build(window_icon)
-                    .is_ok();
-                if !icon_ok {
-                    log::warn!("failed to load app icon (resource missing or malformed)");
-                }
-                let icon_ref = if icon_ok { Some(&*window_icon) } else { None };
+                    .expect("malformed bundled app-icon.ico — rebuild assets");
+                let icon_ref = Some(&*window_icon);
                 nwg::Window::builder()
                     .size((460, 460))
                     .position((300, 300))
@@ -249,15 +251,18 @@ impl SettingsWindow {
 
             // ---- Bottom button-bar (outside groups) ----
             // Horizontal frame with right-aligned primary action. Captions
-            // use `&` accelerators (Alt+R / Alt+S — Win11 standard); the
-            // double-`&` in "Save && &Restart" produces a literal ampersand
-            // followed by an Alt+R accelerator on the R.
+            // use `&` accelerators (Alt+R / Alt+S — Win11 standard).
+            // "Re&start" was chosen over "Save && &Restart" — the double-`&`
+            // pattern produces a literal ampersand followed by an accelerator,
+            // but visually reads like AND ("Save AND Restart") and confused
+            // testers. The shorter "Re&start" makes the action self-evident
+            // (it always saves before restart), and Alt+R still hits.
             nwg::Frame::builder()
                 .parent(&s.window)
                 .flags(nwg::FrameFlags::VISIBLE)
                 .build(&mut s.bar_frame)?;
             nwg::Button::builder()
-                .text("Save && &Restart")
+                .text("Re&start")
                 .parent(&s.bar_frame)
                 .build(&mut s.restart_btn)?;
             nwg::Button::builder()
