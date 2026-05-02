@@ -28,7 +28,7 @@ Host (Windows 11)                       Client (macOS)
 - **OS-level keyboard capture on macOS** via CGEventTap — system shortcuts like Cmd+Space (input-method switch) and Cmd+C/Cmd+V are intercepted before macOS gets them and forwarded to Host as Win+Space / Ctrl+C / Ctrl+V
 - Syncs clipboard text in both directions automatically (polled every 500ms, UTF-8 only)
 - Toggle capture with `Cmd+Esc` — input goes to Host when active, back to Mac when released
-- Toggle fullscreen with `Cmd+Enter` — for "third monitor" workflow when WireDesk is dragged onto a display fed by the HDMI-capture. **Per-monitor selection** on macOS — pick a target display in Settings and `Cmd+Enter` lands fullscreen on that exact screen.
+- Toggle fullscreen with `Cmd+Enter` — for "third monitor" workflow when WireDesk is dragged onto a display fed by the HDMI-capture. **Per-monitor selection** on macOS — pick a target display in Settings and `Cmd+Enter` lands fullscreen on that exact screen. Entering fullscreen auto-engages capture, leaving it auto-releases — no second shortcut needed.
 - Auto-pauses capture when the WireDesk window loses focus — click any other Mac app and Cmd-shortcuts work locally again
 - **Auto-detect CH340 cable** on Windows — `Detect` button in the Settings window scans serial ports for VID 0x1A86 and fills in the COM port automatically
 - **Save & Restart** on Windows — apply settings without leaving the tray; the host respawns itself with the new config (single-instance retry-loop covers the handover)
@@ -176,7 +176,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (OS-level keyboard hijack on macOS), fullscreen toggle (per-monitor on macOS), shell-over-serial, tray agent on Windows with auto-detect CH340 + Save & Restart, `.app` bundle on macOS, TOML-backed settings UI on both sides, file logging on Windows, autostart toggle, single-instance lock. 164+ tests passing.
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (OS-level keyboard hijack on macOS), fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, shell-over-serial, tray agent on Windows with auto-detect CH340 + Save & Restart, `.app` bundle on macOS, TOML-backed settings UI on both sides, file logging on Windows, autostart toggle, single-instance lock. 174 tests passing.
 
 ## License
 
