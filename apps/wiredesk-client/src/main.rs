@@ -3,6 +3,7 @@ mod clipboard;
 mod config;
 mod input;
 mod keyboard_tap;
+mod monitor;
 
 use std::sync::mpsc;
 use std::thread;

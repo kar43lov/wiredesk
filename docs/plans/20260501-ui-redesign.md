@@ -601,14 +601,14 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-client/src/main.rs` (mod monitor)
 - Modify: `apps/wiredesk-client/Cargo.toml` (objc2-app-kit deps под cfg macOS)
 
-- [ ] **pre-check:** через context7 уточнить `objc2-app-kit::NSScreen` API в актуальной версии — есть ли `localizedName` без unsafe, какие feature-флаги для NSScreen, `MainThreadMarker` import
-- [ ] добавить `objc2 = "0.5"` + `objc2-app-kit = "0.2"` (с фичей если есть) + `objc2-foundation = "0.2"` в `[target.'cfg(target_os = "macos")'.dependencies]` клиента. Если context7 покажет что objc2-foundation транзитивно подтянется — оставить только objc2-app-kit.
-- [ ] `monitor.rs`: `pub struct MonitorInfo { pub index: usize, pub name: String, pub frame: egui::Rect, pub size: egui::Vec2 }`
-- [ ] `pub fn list_monitors() -> Vec<MonitorInfo>` — на macOS через `NSScreen::screens()`. На non-macOS — `Vec::new()` stub под cfg.
-- [ ] `pub fn resolve_target_monitor(preferred: Option<usize>, monitors: &[MonitorInfo]) -> Option<&MonitorInfo>` — pure helper, тестируемый: None → None, Some(invalid_idx) → None + log::warn, Some(valid_idx) → Some(&monitors[idx])
-- [ ] write tests (4): `list_monitors` на non-macOS возвращает empty Vec (sanity); `resolve_target_monitor(None, ...) == None`; `resolve_target_monitor(Some(99), &[..])` → None для невалидного индекса; `resolve_target_monitor(Some(0), &[m0, m1])` → Some(m0)
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `feat(client): monitor enumeration via NSScreen FFI`
+- [x] **pre-check:** через context7 уточнить `objc2-app-kit::NSScreen` API в актуальной версии — есть ли `localizedName` без unsafe, какие feature-флаги для NSScreen, `MainThreadMarker` import
+- [x] добавить `objc2 = "0.5"` + `objc2-app-kit = "0.2"` (с фичей `NSScreen`) + `objc2-foundation = "0.2"` (features: NSArray, NSString, NSGeometry, NSThread) в `[target.'cfg(target_os = "macos")'.dependencies]` клиента
+- [x] `monitor.rs`: `pub struct MonitorInfo { pub index: usize, pub name: String, pub frame: egui::Rect, pub size: egui::Vec2 }`
+- [x] `pub fn list_monitors() -> Vec<MonitorInfo>` — на macOS через `NSScreen::screens()`. На non-macOS — `Vec::new()` stub под cfg.
+- [x] `pub fn resolve_target_monitor(preferred: Option<usize>, monitors: &[MonitorInfo]) -> Option<&MonitorInfo>` — pure helper, тестируемый: None → None, Some(invalid_idx) → None + log::warn, Some(valid_idx) → Some(&monitors[idx]). Lifetime'ы elided (clippy-clean).
+- [x] write tests (4): `list_monitors` на non-macOS возвращает empty Vec (sanity); `resolve_target_monitor(None, ...) == None`; `resolve_target_monitor(Some(99), &[..])` → None для невалидного индекса; `resolve_target_monitor(Some(0), &[m0, m1])` → Some(m0)
+- [x] cargo test -p wiredesk-client — 63 passed, clippy clean, cross-check clean
+- [x] commit: `feat(client): monitor enumeration via NSScreen FFI`
 
 ### Task 9b: ClientConfig.preferred_monitor + Settings ComboBox (без fullscreen-orchestration)
 
