@@ -218,12 +218,22 @@ fn run_windows(
     };
 
     log::info!("run_windows: building TransferOverlay");
-    // Overlay is purely cosmetic — failure to build it shouldn't take down
-    // the whole host. Wrap in Option so the absence is graceful.
-    let overlay = match ui::transfer_overlay::TransferOverlay::build(counters.clone()) {
-        Ok(o) => Some(o),
-        Err(e) => {
+    // Overlay is purely cosmetic — failure to build it (Err OR panic from
+    // a brittle nwg corner) shouldn't take down the whole host. Catch
+    // panics with `catch_unwind` so a borked nwg combination only loses
+    // the overlay, not the entire tray agent.
+    let overlay = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ui::transfer_overlay::TransferOverlay::build(counters.clone())
+    })) {
+        Ok(Ok(o)) => Some(o),
+        Ok(Err(e)) => {
             log::warn!("transfer overlay build failed: {e}; continuing without overlay");
+            None
+        }
+        Err(_panic) => {
+            // The actual panic message has already been logged via
+            // `install_panic_hook`. Just note here that we're soldiering on.
+            log::warn!("transfer overlay panicked during build; continuing without overlay");
             None
         }
     };

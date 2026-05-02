@@ -202,19 +202,27 @@ mod windows_impl {
         (x, y): (i32, i32),
     ) -> Result<(), nwg::NwgError> {
         // WS_EX_TOOLWINDOW (excluded from Alt-Tab) is set via ex_flags.
-        // WS_EX_LAYERED would let us alpha-blend, but we'd need to call
-        // SetLayeredWindowAttributes after build — skipped for now; the
-        // overlay reads cleanly enough as a plain top-level popup.
         const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 
+        // Use the default `WindowFlags::WINDOW` (overlapped). nwg 1.0.13's
+        // `WindowFlags::POPUP` produces an HWND that AnimationTimer/Label
+        // refuse to bind to with "Cannot bind control with an handle of
+        // type" — see commit message. We strip the title bar / system
+        // menu post-build via SetWindowLongPtrW instead, which gives the
+        // borderless look without changing the window class.
         nwg::Window::builder()
             .size((OVERLAY_WIDTH, OVERLAY_HEIGHT))
             .position((x, y))
             .title("WireDesk Transfer")
-            .flags(nwg::WindowFlags::POPUP)
+            .flags(nwg::WindowFlags::WINDOW)
             .ex_flags(WS_EX_TOOLWINDOW)
             .topmost(true)
             .build(window)?;
+
+        // TODO: strip WS_CAPTION/WS_THICKFRAME via SetWindowLongPtrW so
+        // the overlay renders as a flat rectangle instead of a normal
+        // window with a title bar. First-iteration goal is just "host
+        // doesn't panic on startup"; cosmetic strip is a follow-up.
 
         nwg::Label::builder()
             .text("")
@@ -235,8 +243,12 @@ mod windows_impl {
         // the parent window. Safe to drop here.
         std::mem::forget(layout);
 
+        // AnimationTimer without `.parent()` — the default message-only
+        // host window receives the timer ticks. Binding it to a real
+        // top-level window paniced in nwg 1.0.13 ("Cannot bind control
+        // with an handle of type"); the timer doesn't need the parent
+        // anyway, only the event handler binds tick → tick().
         nwg::AnimationTimer::builder()
-            .parent(&*window)
             .interval(POLL_INTERVAL)
             .active(true)
             .build(timer)?;
@@ -246,6 +258,7 @@ mod windows_impl {
 
         Ok(())
     }
+
 
     /// Compute the overlay's top-left position so its right/bottom edge
     /// lands `RIGHT_MARGIN` / `BOTTOM_MARGIN` away from the primary
