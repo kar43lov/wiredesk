@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WireDesk — утилита для удалённого управления мышью, клавиатурой и clipboard на Windows-машине через serial-соединение (без сети). Видео — отдельно через HDMI capture card.
 
-Контекст: на Host (Windows 11) стоит ПО "Континент", которое блокирует все сетевые интерфейсы. Serial (COM-порт) не блокируется.
+Контекст: на Host (Windows 11) стоит «Континент-АП» (СКЗИ), который через WFP-фильтры на уровне ядра блокирует **всю IP-связь** мимо своего туннеля — включая локальный LAN (Wi-Fi, Ethernet) и любой USB CDC NCM / Plugable bridge cable / Thunderbolt Networking, потому что все они создают сетевой интерфейс. Подтверждено живым тестом 2026-05-02 (см. `docs/briefs/ft232h-upgrade.md`): Win и Mac в одной Wi-Fi 192.168.1.0/24, route table показывает default через Wi-Fi, но `ping 192.168.1.98` → `General failure`, `Test-NetConnection ... -Port 5001` → `TcpTestSucceeded: False`. Допустимы только non-network каналы: USB CDC ACM (текущий serial), WinUSB / libusb bulk, USB HID — Континент их не трогает.
 
 **Статус:** MVP работает end-to-end. Соединение, мышь, клавиатура (включая кириллицу), переключение языка через Cmd+Space, двунаправленный буфер обмена через Cmd+C/Cmd+V (текст + PNG-картинки до 1 MB encoded; системные шорткаты перехватываются на macOS-уровне через CGEventTap), fullscreen по Cmd+Enter с per-monitor selection и auto-engage/release capture — проверено живьём. Launcher UI: tray-агент на Windows (nwg) с auto-detect CH340 + Save & Restart, `.app` bundle на macOS, TOML config на обеих сторонах, file logging + autostart + single-instance на Windows. 211 тестов проходят.
 
@@ -266,6 +266,25 @@ Host USB-Serial ←→ null-modem (TX-RX crossed, GND-GND, VCC isolated) ←→ 
 
 CH340 USB-to-TTL кабели: красный=VCC (изолировать), синий=GND, зелёный=TX, белый=RX. Полная инструкция: `docs/setup.md`.
 
+## Channel speed upgrade — pre-decided plan
+
+Брейншторм 2026-05-02 (session "improve-FT232H") зафиксировал: текущий канал CH340 @ 115200 baud (~11 KB/s) — узкое место для clipboard'а (1 МБ картинка едет ~90 сек). Возможные пути ускорения проанализированы и ранжированы по effort/impact, см. `docs/briefs/ft232h-upgrade.md`.
+
+| План | Что | Effort | Impact | Confidence | Статус |
+|---|---|---|---|---|---|
+| **A** (выбран) | CH340 → FT232H breakout, baud 115200 → 3 000 000 (до 12 Mbps на FT4232H) | ~1 день, ~$30 железа | ×100, clipboard 1MB <2 сек | **high** | ждёт покупки железа |
+| **B** (Plan B) | WinUSB через Pi Zero 2W в gadget mode как мост, custom USB device class | 2–3 недели, ~$25 | ~30 MB/s, потенциально видео | medium | активируется если A флакает |
+| **C** (отклонён) | Thunderbolt AIC + TB DMA peer-to-peer вне TCP/IP стека | 1–2 месяца, дорого | 20+ Gbps, экзотика | low | отклонён: нет TB-header'а на B760M, undocumented API |
+| **D** (отклонён) | Не делать ничего | 0 | 0 | high | отклонён: clipboard-боль ощутима |
+
+**Закрытые тупики** (зачем-то проверены, чтобы не возвращались в будущих сессиях):
+- TCP/UDP по Wi-Fi/Ethernet/Thunderbolt Networking/USB CDC NCM/Plugable bridge cable — **все режутся WFP-фильтрами Континента** на уровне ядра, route-table обманчива. Нет смысла пробовать ни одно из них как канал WireDesk.
+- Thunderbolt в принципе — Host-материнка MAXSUN MS-Challenger B760M не имеет TB-header'а, AIC без него работать не будет. Mac mini M4 имеет 3×TB4 40 Gbps, но это бесполезно при отсутствии TB на Win.
+
+**Что делать когда железо приедет:** см. секцию "Первые шаги" в брифе. Никаких архитектурных изменений в коде — только правка `baud` в `config.toml` обеих сторон.
+
 ## Plan
 
 `docs/plans/wiredesk-mvp.md` — full MVP plan with protocol spec, etapes, and risk analysis.
+
+`docs/briefs/ft232h-upgrade.md` — бриф апгрейда канала (готов к /planning:make когда железо будет).
