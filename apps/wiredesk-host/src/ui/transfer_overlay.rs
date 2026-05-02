@@ -132,8 +132,13 @@ mod windows_impl {
             }));
             {
                 let mut s = me.borrow_mut();
+                // Reborrow through `&mut *` so the compiler can split
+                // disjoint-field borrows on `window`, `label`, `timer`.
+                // Going through `RefMut` directly defeats the splitting
+                // because `Deref::deref_mut` returns a single `&mut Self`.
+                let s_ref: &mut Self = &mut s;
                 let (x, y) = bottom_right_position(OVERLAY_WIDTH, OVERLAY_HEIGHT);
-                build_controls(&mut s.window, &mut s.label, &mut s.timer, (x, y))?;
+                build_controls(&mut s_ref.window, &mut s_ref.label, &mut s_ref.timer, (x, y))?;
             }
             Ok(me)
         }
