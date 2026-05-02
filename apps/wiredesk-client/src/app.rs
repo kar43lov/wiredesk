@@ -77,16 +77,22 @@ pub struct WireDeskApp {
     cached_monitors: Vec<monitor::MonitorInfo>,
     cached_monitors_at: Option<Instant>,
     // Sticky banner shown when an entered fullscreen fell back to "current
-    // display" because the saved `preferred_monitor` index is out of range.
-    // Carries its own TTL so it doesn't clobber `status_msg` when a real
-    // disconnect message wants the same slot.
+    // display" because the saved `preferred_monitor` name doesn't match any
+    // live display. Carries its own TTL so it doesn't clobber `status_msg`
+    // when a real disconnect message wants the same slot.
     monitor_fallback_msg: Option<(String, Instant)>,
     // Saved outer position before entering fullscreen on a non-active monitor.
     // Restored on fullscreen exit so the chrome window returns to where the
     // user originally had it. None when fullscreen wasn't entered via an
-    // explicit `OuterPosition` move (e.g. preferred_monitor=None or invalid
-    // index falling back to "fullscreen on current display").
+    // explicit `OuterPosition` move (e.g. preferred_monitor=None or stale
+    // name falling back to "fullscreen on current display").
     original_position: Option<egui::Pos2>,
+    // Snapshot of `preferred_monitor` taken once at startup. Used by
+    // `toggle_fullscreen` so unsaved edits in the Settings panel don't
+    // change live runtime behaviour — that contradicts the documented
+    // "Save & Restart" contract for port/baud/etc. Stays fixed for the
+    // process lifetime; user must restart to pick up a new value.
+    runtime_preferred_monitor: Option<String>,
 }
 
 // ---- UI palette / sizing constants ---------------------------------------
@@ -147,6 +153,7 @@ impl WireDeskApp {
         tap_handle: TapHandle,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
+        let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
         let initial_w = initial_config.width;
         let initial_h = initial_config.height;
         Self {
@@ -179,6 +186,7 @@ impl WireDeskApp {
             cached_monitors_at: None,
             monitor_fallback_msg: None,
             original_position: None,
+            runtime_preferred_monitor,
         }
     }
 
@@ -304,15 +312,15 @@ impl WireDeskApp {
                 });
 
                 // Fullscreen target monitor — saved as `preferred_monitor`
-                // index. Default `None` keeps the legacy behaviour
-                // (fullscreen on the display the window currently sits on).
-                // The actual `OuterPosition + Fullscreen` orchestration is
-                // wired in Task 9c — for now this only persists the choice.
+                // by display name (NSScreen.localizedName). Default `None`
+                // keeps the legacy behaviour (fullscreen on the display the
+                // window currently sits on). Name-based instead of index
+                // so a saved preference survives reboot / dock / hot-plug.
                 ui.horizontal(|ui| {
                     ui.label("Fullscreen monitor:");
-                    let selected_text = match cfg.preferred_monitor {
+                    let selected_text = match cfg.preferred_monitor.as_deref() {
                         None => "(active monitor — default)".to_string(),
-                        Some(idx) => match monitors.get(idx) {
+                        Some(name) => match monitors.iter().find(|m| m.name == name) {
                             Some(m) => {
                                 let size = m.frame.size();
                                 format!(
@@ -323,10 +331,11 @@ impl WireDeskApp {
                                     size.y,
                                 )
                             }
-                            // Saved index is out of range (display unplugged
-                            // since last save). Show the bare "Display N" so
+                            // Saved name doesn't match any live display
+                            // (unplugged or renamed since last save). Show
+                            // the saved name with an "(unavailable)" hint so
                             // the user knows something stale is selected.
-                            None => format!("Display {} (unavailable)", idx + 1),
+                            None => format!("{name} (unavailable)"),
                         },
                     };
                     egui::ComboBox::from_id_salt("settings_preferred_monitor")
@@ -354,7 +363,7 @@ impl WireDeskApp {
                                 if ui
                                     .selectable_value(
                                         &mut cfg.preferred_monitor,
-                                        Some(m.index),
+                                        Some(m.name.clone()),
                                         label,
                                     )
                                     .changed()
@@ -486,16 +495,21 @@ impl WireDeskApp {
 
     /// Toggle fullscreen with optional per-monitor targeting.
     ///
-    /// On entering fullscreen: if `pending_config.preferred_monitor` resolves
-    /// to a valid `MonitorInfo`, save the current outer position, move the
+    /// On entering fullscreen: if `runtime_preferred_monitor` resolves to a
+    /// valid `MonitorInfo`, save the current outer position, move the
     /// window onto that monitor's origin, then request `Fullscreen(true)` —
     /// egui-on-macOS treats fullscreen as "expand to the screen this window
-    /// is currently on", so the move-then-fullscreen sequence is what targets
-    /// a specific display. If preferred_monitor is None or the index is
-    /// stale (display unplugged since save), fall back to "fullscreen on
-    /// current display" without moving and surface the fallback via a
-    /// dedicated TTL'd banner (`monitor_fallback_msg`) so it doesn't clobber
-    /// real disconnect reasons in `status_msg`.
+    /// is currently on", so the move-then-fullscreen sequence is what
+    /// targets a specific display. If `runtime_preferred_monitor` is None
+    /// or its name no longer matches any live display, fall back to
+    /// "fullscreen on current display" without moving and surface the
+    /// fallback via a dedicated TTL'd banner (`monitor_fallback_msg`) so
+    /// it doesn't clobber real disconnect reasons in `status_msg`.
+    ///
+    /// **Reads `runtime_preferred_monitor`, NOT `pending_config`.** Unsaved
+    /// edits in the Settings panel must not change live runtime behaviour
+    /// — that contradicts the documented "Save & Restart" contract used
+    /// by every other Settings field (port, baud, etc.).
     ///
     /// **Known limitation (egui 0.31 + AppKit):** `OuterPosition` is processed
     /// asynchronously on macOS — there's a chance `Fullscreen(true)` fires
@@ -513,10 +527,8 @@ impl WireDeskApp {
         self.fullscreen = !self.fullscreen;
         if self.fullscreen {
             let monitors = monitor::list_monitors();
-            let target = monitor::resolve_target_monitor(
-                self.pending_config.preferred_monitor,
-                &monitors,
-            );
+            let preferred = self.runtime_preferred_monitor.as_deref();
+            let target = monitor::resolve_target_monitor(preferred, &monitors);
             match target {
                 Some(m) => {
                     self.original_position = ctx
@@ -527,14 +539,15 @@ impl WireDeskApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 }
                 None => {
-                    // preferred_monitor was Some(idx) but the index is now
-                    // out of range (display unplugged) — surface the fallback
-                    // via a dedicated TTL banner instead of overwriting
-                    // status_msg, which is what disconnect reasons (e.g.
-                    // "disconnected: serial: device busy") use as their
-                    // home. Without a separate slot a fullscreen attempt
-                    // while disconnected would erase the real reason.
-                    if self.pending_config.preferred_monitor.is_some() {
+                    // runtime_preferred_monitor was Some(name) but no live
+                    // display matches (unplugged or renamed) — surface the
+                    // fallback via a dedicated TTL banner instead of
+                    // overwriting status_msg, which is what disconnect
+                    // reasons (e.g. "disconnected: serial: device busy")
+                    // use as their home. Without a separate slot a
+                    // fullscreen attempt while disconnected would erase
+                    // the real reason.
+                    if preferred.is_some() {
                         self.monitor_fallback_msg = Some((
                             "Selected monitor unavailable; fullscreen on current display"
                                 .to_string(),

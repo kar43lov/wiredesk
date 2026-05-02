@@ -64,16 +64,19 @@ fn main() {
     // 5 attempts × 100ms (~500ms total budget) — covers the Save & Restart
     // race where the freshly spawned process may briefly overlap with the
     // outgoing one before the old process drops its mutex handle.
-    // `Option<SingleInstanceGuard>` so the Error fallback can simply hold
-    // `None` — start without a lock rather than panic. Duplicate-launch is
-    // a worse symptom than refusing to start, but on a check failure we'd
-    // rather still come up.
+    //
+    // Fail closed on `Error`: a `CreateMutexW` failure is rare in practice
+    // (would need an OS-level resource exhaustion or a malformed name) but
+    // when it does happen, silently starting without a lock can race a
+    // legitimate first instance over the tray icon and the serial port —
+    // both visible-bad failure modes. Better to surface the error and
+    // refuse to start than to fan out into duplicate hosts.
     let _instance_guard = match ui::single_instance::try_acquire_with_retry(
         "WireDeskHostSingleton",
         5,
         100,
     ) {
-            ui::single_instance::SingleInstanceResult::Acquired(g) => Some(g),
+            ui::single_instance::SingleInstanceResult::Acquired(g) => g,
             ui::single_instance::SingleInstanceResult::AlreadyRunning => {
                 log::warn!("another wiredesk-host instance is already running");
                 #[cfg(windows)]
@@ -89,8 +92,21 @@ fn main() {
                 return;
             }
             ui::single_instance::SingleInstanceResult::Error(e) => {
-                log::warn!("single-instance check failed: {e} (continuing without lock)");
-                None
+                log::error!("single-instance check failed: {e}");
+                #[cfg(windows)]
+                {
+                    let _ = native_windows_gui::init();
+                    native_windows_gui::simple_message(
+                        "WireDesk",
+                        &format!(
+                            "WireDesk Host failed to acquire single-instance lock: {e}\n\n\
+                             Refusing to start to avoid running two hosts at once."
+                        ),
+                    );
+                }
+                #[cfg(not(windows))]
+                eprintln!("WireDesk Host single-instance check failed: {e}");
+                return;
             }
         };
 
@@ -437,6 +453,12 @@ fn handle_detect(
         }
         ui::format::DetectResult::NotFound => {
             s.set_message("No CH340/CH341 detected. Plug the cable in and retry.");
+        }
+        ui::format::DetectResult::EnumerationFailed(msg) => {
+            // The OS port-enumeration API failed (driver issue, permission
+            // denied, etc.) — surface the underlying error instead of the
+            // misleading "No CH340 detected" message.
+            s.set_message(&format!("Port enumeration failed: {msg}"));
         }
     }
 }

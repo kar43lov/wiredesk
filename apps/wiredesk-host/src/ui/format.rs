@@ -61,25 +61,34 @@ pub const WCH_VID: u16 = 0x1A86;
 /// Outcome of an auto-detect scan over the system's USB serial ports.
 /// Caller decides UX: `Found` → autofill the port input; `Multiple` →
 /// show the list and ask the user to pick; `NotFound` → tell the user to
-/// plug the cable in.
+/// plug the cable in; `EnumerationFailed` → show the underlying error so
+/// the user doesn't get a misleading "No CH340 detected" when the OS API
+/// itself failed (driver missing, permissions denied, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectResult {
     Found(String),
     Multiple(Vec<String>),
     NotFound,
+    EnumerationFailed(String),
 }
 
 /// Run a CH340 auto-detect against the system's USB serial ports right now.
-/// Wraps `serialport::available_ports()` (logging + treating any enumeration
-/// error as "no ports") and feeds the list into `detect_ch340_port`. Lives
-/// here so the UI event handler stays a pure dispatch — the IO + filter
-/// logic ships together as one unit-testable surface.
+/// Wraps `serialport::available_ports()` and feeds the list into
+/// `detect_ch340_port`. On enumeration failure returns
+/// `DetectResult::EnumerationFailed(msg)` rather than collapsing to
+/// `NotFound` — the user needs to know if the OS API itself failed
+/// (driver missing, permissions denied) instead of being told to plug
+/// the cable in. Lives here so the UI event handler stays a pure
+/// dispatch — the IO + filter logic ships together as one unit-testable
+/// surface.
 pub fn detect_serial_port_now() -> DetectResult {
-    let ports = serialport::available_ports().unwrap_or_else(|e| {
-        log::warn!("serialport::available_ports failed: {e}");
-        Vec::new()
-    });
-    detect_ch340_port(&ports)
+    match serialport::available_ports() {
+        Ok(ports) => detect_ch340_port(&ports),
+        Err(e) => {
+            log::warn!("serialport::available_ports failed: {e}");
+            DetectResult::EnumerationFailed(e.to_string())
+        }
+    }
 }
 
 /// Filter the given port list for USB devices whose VID matches WCH

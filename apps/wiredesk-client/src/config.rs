@@ -14,11 +14,19 @@ pub struct ClientConfig {
     pub width: u16,
     pub height: u16,
     pub client_name: String,
-    /// Index into `monitor::list_monitors()` (NSScreen order) for fullscreen
-    /// target. `None` → use the display the window currently sits on.
+    /// Human-readable name (`NSScreen.localizedName`) of the preferred
+    /// fullscreen target — e.g. "Studio Display", "Built-in Retina Display".
+    /// `None` → use the display the window currently sits on.
     /// `#[serde(default)]` on the struct makes a missing field deserialize as
     /// `None`, so existing configs round-trip safely without migration.
-    pub preferred_monitor: Option<usize>,
+    ///
+    /// Stored as a name (not an `NSScreen::screens()` index) because ordinals
+    /// aren't stable across reboot / dock event / hot-plug — a saved index
+    /// stays in-range but silently points at a different physical display.
+    /// Name-based resolution survives reboots and re-orderings; if the user
+    /// renames the display in System Settings the saved preference falls
+    /// back to "active monitor" until they re-pick.
+    pub preferred_monitor: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -199,16 +207,19 @@ mod tests {
         assert_eq!(loaded, cfg_none);
         assert!(loaded.preferred_monitor.is_none());
 
-        // Case 2: Some(2) — a non-default index. Should survive roundtrip.
+        // Case 2: Some(name) — a real display name. Should survive roundtrip.
         let cfg_some = ClientConfig {
-            preferred_monitor: Some(2),
+            preferred_monitor: Some("Studio Display".to_string()),
             ..ClientConfig::default()
         };
         let path = dir.path().join("some.toml");
         cfg_some.save_to(&path).unwrap();
         let loaded = ClientConfig::load_from(&path);
         assert_eq!(loaded, cfg_some);
-        assert_eq!(loaded.preferred_monitor, Some(2));
+        assert_eq!(
+            loaded.preferred_monitor.as_deref(),
+            Some("Studio Display")
+        );
     }
 
     fn toml_cfg() -> ClientConfig {
