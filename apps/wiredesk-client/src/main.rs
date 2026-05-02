@@ -5,6 +5,8 @@ mod input;
 mod keyboard_tap;
 mod monitor;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -94,8 +96,19 @@ fn main() {
         reader_thread(reader_transport, events_tx, reader_clipboard);
     });
 
+    // Clipboard progress counters — read by the UI status-line (wired up in
+    // Task 7a). Created here so the same Arc is shared by the poll thread,
+    // the reader thread, and the egui app.
+    let outgoing_progress = Arc::new(AtomicU64::new(0));
+    let outgoing_total = Arc::new(AtomicU64::new(0));
+
     // Clipboard poll thread — pushes Mac clipboard changes to host.
-    clipboard::spawn_poll_thread(clipboard_state, outgoing_tx.clone());
+    clipboard::spawn_poll_thread(
+        clipboard_state,
+        outgoing_tx.clone(),
+        outgoing_progress.clone(),
+        outgoing_total.clone(),
+    );
 
     // Keyboard tap (macOS only — no-op elsewhere). Initially disabled;
     // enable() is called when the user enters capture-mode.

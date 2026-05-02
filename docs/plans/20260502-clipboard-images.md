@@ -253,16 +253,16 @@ main.rs:
 **Files:**
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 
-- [ ] добавить константу `MAX_IMAGE_BYTES: usize = 1024 * 1024` (1 MB) в `clipboard.rs`.
-- [ ] расширить `spawn_poll_thread`: после неудачного `get_text()` (или после успешного, если text empty) пробовать `get_image()`. При успехе — hash от `image.bytes` (RGBA), сравнить с `LastKind::Image(...)`, если новый — encode PNG.
-- [ ] если encoded PNG > `MAX_IMAGE_BYTES` — `log::warn!("clipboard: image too large ({} bytes), skipping", png.len())` + skip (toast в UI — отдельный сигнал, реализуется в Task 7).
-- [ ] иначе — `outgoing_tx.send(ClipOffer{format: FORMAT_PNG_IMAGE, total_len})` + chunked `ClipChunk`'и (256 B/chunk).
-- [ ] обновить `LastKind` в state на `Image(hash)`.
-- [ ] добавить параметры `outgoing_progress: Arc<AtomicU64>` и `outgoing_total: Arc<AtomicU64>` в сигнатуру `spawn_poll_thread`. После send'а ClipOffer — `total.store(png.len() as u64)`, `progress.store(0)`. После каждого ClipChunk — `progress.fetch_add(chunk.len(), Relaxed)`. После последнего chunk — оставить значения как есть (UI прочитает 100%, потом сам по таймеру очистит, либо очистим при следующем offer).
-- [ ] добавить unit-тест `image_too_large_skipped` через параметризацию: вынести size-check в pure helper `fn check_image_size(png_len: usize, limit: usize) -> Result<(), ImageTooLarge>` и тестировать с маленьким `limit` (например 512 байт), а poll thread в проде передаёт `MAX_IMAGE_BYTES`. Тест проверяет что при превышении лимита логика возвращает skip-сигнал, не вызывая send.
-- [ ] добавить unit-тест `image_emit_offer_and_chunks`: synthetic 4×4 RGBA → один ClipOffer + N ClipChunk через mpsc, total_len совпадает с encoded PNG length, sum(chunks) = encoded.
-- [ ] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
-- [ ] запустить `cargo clippy -p wiredesk-client --all-targets -- -D warnings` — clean.
+- [x] добавить константу `MAX_IMAGE_BYTES: usize = 1024 * 1024` (1 MB) в `clipboard.rs`.
+- [x] расширить `spawn_poll_thread`: после неудачного `get_text()` (или после успешного, если text empty) пробовать `get_image()`. При успехе — hash от `image.bytes` (RGBA), сравнить с `LastKind::Image(...)`, если новый — encode PNG.
+- [x] если encoded PNG > `MAX_IMAGE_BYTES` — `log::warn!("clipboard: image too large ({} bytes), skipping", png.len())` + skip (toast в UI — отдельный сигнал, реализуется в Task 7).
+- [x] иначе — `outgoing_tx.send(ClipOffer{format: FORMAT_PNG_IMAGE, total_len})` + chunked `ClipChunk`'и (256 B/chunk).
+- [x] обновить `LastKind` в state на `Image(hash)`.
+- [x] добавить параметры `outgoing_progress: Arc<AtomicU64>` и `outgoing_total: Arc<AtomicU64>` в сигнатуру `spawn_poll_thread`. После send'а ClipOffer — `total.store(png.len() as u64)`, `progress.store(0)`. После каждого ClipChunk — `progress.fetch_add(chunk.len(), Relaxed)`. После последнего chunk — оставить значения как есть (UI прочитает 100%, потом сам по таймеру очистит, либо очистим при следующем offer).
+- [x] добавить unit-тест `image_too_large_skipped` через параметризацию: вынести size-check в pure helper `fn check_image_size(png_len: usize, limit: usize) -> Result<(), ImageTooLarge>` и тестировать с маленьким `limit` (например 512 байт), а poll thread в проде передаёт `MAX_IMAGE_BYTES`. Тест проверяет что при превышении лимита логика возвращает skip-сигнал, не вызывая send.
+- [x] добавить unit-тест `image_emit_offer_and_chunks`: synthetic 4×4 RGBA → один ClipOffer + N ClipChunk через mpsc, total_len совпадает с encoded PNG length, sum(chunks) = encoded.
+- [x] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
+- [x] запустить `cargo clippy -p wiredesk-client --all-targets -- -D warnings` — clean.
 
 ### Task 5: Mac side — приём картинки (IncomingClipboard) + edge cases
 
