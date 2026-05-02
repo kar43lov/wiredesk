@@ -15,6 +15,7 @@ serialport.workspace = true
 toml.workspace = true
 arboard = "3"
 dirs = "5"
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"

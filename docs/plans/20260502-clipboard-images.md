@@ -227,11 +227,11 @@ main.rs:
 - Modify: `apps/wiredesk-client/Cargo.toml`
 - Modify: `apps/wiredesk-host/Cargo.toml`
 
-- [ ] добавить в `apps/wiredesk-client/Cargo.toml` секцию `[dependencies]`: `image = { version = "0.25", default-features = false, features = ["png"] }`.
-- [ ] добавить ту же строку в `apps/wiredesk-host/Cargo.toml`.
-- [ ] запустить `cargo build --workspace` — собирается без новых ошибок.
-- [ ] запустить `cargo tree -p wiredesk-client | grep image` и убедиться что используется уже существующий `image v0.25.x` (никакого duplicate-version bloat).
-- [ ] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- [x] добавить в `apps/wiredesk-client/Cargo.toml` секцию `[dependencies]`: `image = { version = "0.25", default-features = false, features = ["png"] }`.
+- [x] добавить ту же строку в `apps/wiredesk-host/Cargo.toml`.
+- [x] запустить `cargo build --workspace` — собирается без новых ошибок.
+- [x] запустить `cargo tree -p wiredesk-client | grep image` и убедиться что используется уже существующий `image v0.25.x` (никакого duplicate-version bloat).
+- [x] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 3: Mac side — PNG codec helpers + LastKind enum (без отправки)
 

@@ -18,6 +18,7 @@ egui_extras = { version = "0.31", features = ["image"] }
 serialport.workspace = true
 arboard = "3"
 dirs = "5"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tempfile = "3"
