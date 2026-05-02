@@ -585,7 +585,21 @@ impl WireDeskApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 }
             }
+            // Going fullscreen implies "I want to drive the Host" — auto-engage
+            // capture so the user doesn't need a second Cmd+Esc. If capture
+            // was already on, this is a no-op.
+            if !self.capturing {
+                self.toggle_capture();
+            }
         } else {
+            // Pair with the auto-engage above: leaving fullscreen releases
+            // capture so the Mac's keyboard works locally without a second
+            // shortcut. If the user had toggled capture independently while
+            // fullscreen, we still release it here — single-source-of-truth
+            // is fullscreen state for this UX.
+            if self.capturing {
+                self.toggle_capture();
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             if let Some(pos) = self.original_position.take() {
                 // Defer OuterPosition until macOS finishes the Spaces
