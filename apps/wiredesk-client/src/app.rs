@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -106,6 +108,17 @@ pub struct WireDeskApp {
     // "Save & Restart" contract for port/baud/etc. Stays fixed for the
     // process lifetime; user must restart to pick up a new value.
     runtime_preferred_monitor: Option<String>,
+    // Clipboard transfer progress counters. Shared with the clipboard
+    // poll thread (outgoing) and the reader thread's IncomingClipboard
+    // (incoming). Zero means "no transfer in flight"; non-zero `total`
+    // unlocks the "Sending/Receiving image — N/M KB (P%)" status line.
+    // Reset to zero on `TransportEvent::Disconnected` so a half-finished
+    // transfer doesn't leave the progress display stuck after the link
+    // drops.
+    outgoing_progress: Arc<AtomicU64>,
+    outgoing_total: Arc<AtomicU64>,
+    incoming_progress: Arc<AtomicU64>,
+    incoming_total: Arc<AtomicU64>,
 }
 
 // ---- UI palette / sizing constants ---------------------------------------
@@ -143,6 +156,28 @@ const CAPTURE_BTN_MIN_SIZE: egui::Vec2 = egui::vec2(200.0, 32.0);
 /// Numbered-step glyph size on the Accessibility permission screen.
 const STEP_NUMBER_SIZE: f32 = 20.0;
 
+/// Render a clipboard-transfer progress fragment for the chrome status row.
+///
+/// Returns `None` when there's no active transfer (`total == 0`) so the
+/// caller can skip rendering altogether — this is the common case once the
+/// poll thread has zeroed counters after a finished send. When a transfer is
+/// in flight, returns a string like `"Sending image — 340/780 KB (43%)"` so
+/// the user can see that something is moving across the wire.
+///
+/// `current` is clamped to `total` so a brief race (writer thread atomically
+/// adding before total wraps in tests) never produces "1100%". KB rounding
+/// uses integer division — sub-KB jitter doesn't matter at this scale.
+pub fn format_progress(action: &str, current: u64, total: u64) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let cur = current.min(total);
+    let pct = (cur * 100) / total;
+    let cur_kb = cur / 1024;
+    let tot_kb = total / 1024;
+    Some(format!("{action} — {cur_kb}/{tot_kb} KB ({pct}%)"))
+}
+
 /// Static list of macOS Accessibility-permission setup steps shown on the
 /// permission screen. Pure helper so the texts can be unit-tested
 /// independently of any UI rendering — a copy-paste typo in step 1 (the
@@ -158,12 +193,17 @@ pub fn permission_steps() -> &'static [&'static str] {
 }
 
 impl WireDeskApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_config: ClientConfig,
         events_rx: mpsc::Receiver<TransportEvent>,
         outgoing_tx: mpsc::Sender<Packet>,
         tap_events_rx: mpsc::Receiver<TapEvent>,
         tap_handle: TapHandle,
+        outgoing_progress: Arc<AtomicU64>,
+        outgoing_total: Arc<AtomicU64>,
+        incoming_progress: Arc<AtomicU64>,
+        incoming_total: Arc<AtomicU64>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -203,6 +243,10 @@ impl WireDeskApp {
             last_dock_icon_apply: None,
             dock_icon_apply_count: 0,
             runtime_preferred_monitor,
+            outgoing_progress,
+            outgoing_total,
+            incoming_progress,
+            incoming_total,
         }
     }
 
@@ -897,6 +941,14 @@ impl eframe::App for WireDeskApp {
                     self.state = ConnectionState::Disconnected;
                     self.capturing = false;
                     self.status_msg = format!("disconnected: {reason}");
+                    // Drop any in-flight clipboard progress — the wire is
+                    // gone, the receiver will reset its IncomingClipboard
+                    // separately, and a stale "Sending image — 30%" line in
+                    // the status row would mislead the user.
+                    self.outgoing_progress.store(0, Ordering::Relaxed);
+                    self.outgoing_total.store(0, Ordering::Relaxed);
+                    self.incoming_progress.store(0, Ordering::Relaxed);
+                    self.incoming_total.store(0, Ordering::Relaxed);
                 }
                 TransportEvent::ClipboardFromHost(text) => {
                     self.clipboard_text = text;
@@ -1010,6 +1062,32 @@ impl eframe::App for WireDeskApp {
             });
 
             ui.label(format!("Serial: {}", self.runtime_serial_port));
+
+            // Clipboard progress line — only renders when a transfer is
+            // active. Outgoing and incoming are both possible at the same
+            // time (peer copies an image while we copy text); show both in
+            // a single row so the chrome layout stays compact.
+            let out = format_progress(
+                "Sending image",
+                self.outgoing_progress.load(Ordering::Relaxed),
+                self.outgoing_total.load(Ordering::Relaxed),
+            );
+            let inc = format_progress(
+                "Receiving image",
+                self.incoming_progress.load(Ordering::Relaxed),
+                self.incoming_total.load(Ordering::Relaxed),
+            );
+            if out.is_some() || inc.is_some() {
+                let mut parts: Vec<String> = Vec::with_capacity(2);
+                if let Some(s) = out {
+                    parts.push(s);
+                }
+                if let Some(s) = inc {
+                    parts.push(s);
+                }
+                ui.label(parts.join(" | "));
+            }
+
             ui.separator();
 
             // Capture toggle — primary action, prominent. RichText size
@@ -1284,7 +1362,17 @@ mod tests {
             port: "/dev/null".into(),
             ..ClientConfig::default()
         };
-        WireDeskApp::new(cfg, ev_rx, out_tx, tap_rx, tap_handle)
+        WireDeskApp::new(
+            cfg,
+            ev_rx,
+            out_tx,
+            tap_rx,
+            tap_handle,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
     }
 
     #[test]
@@ -1366,6 +1454,42 @@ mod tests {
     #[test]
     fn permission_steps_first_mentions_system_settings() {
         assert!(permission_steps()[0].contains("System Settings"));
+    }
+
+    #[test]
+    fn format_progress_active() {
+        // Mid-transfer. KB rounding via integer division, percentage as
+        // floor((cur*100)/total). 340 KiB / 780 KiB ≈ 43.5% → 43%.
+        let s = format_progress("Sending image", 340 * 1024, 780 * 1024).expect("active");
+        assert!(s.contains("Sending image"), "action prefix missing: {s}");
+        assert!(s.contains("340"), "current KB missing: {s}");
+        assert!(s.contains("780"), "total KB missing: {s}");
+        assert!(s.contains("43%"), "percentage missing: {s}");
+    }
+
+    #[test]
+    fn format_progress_idle() {
+        // total == 0 → no progress to show.
+        assert!(format_progress("Sending image", 0, 0).is_none());
+        // total == 0 with stale `current` from a prior transfer should also
+        // hide — the writer thread should already have zeroed both, but
+        // belt-and-braces against ordering races.
+        assert!(format_progress("Sending image", 256, 0).is_none());
+    }
+
+    #[test]
+    fn format_progress_complete() {
+        // Boundary: cur == total exactly → 100%.
+        let s = format_progress("Receiving image", 1024, 1024).expect("active");
+        assert!(s.contains("100%"), "expected 100% at boundary: {s}");
+    }
+
+    #[test]
+    fn format_progress_clamps_overshoot() {
+        // Defensive: if `current` somehow exceeds `total` (atomic ordering
+        // race in tests), don't render >100%.
+        let s = format_progress("Sending image", 2048, 1024).expect("active");
+        assert!(s.contains("100%"), "overshoot must clamp to 100%: {s}");
     }
 
     #[test]

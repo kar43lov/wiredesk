@@ -124,7 +124,17 @@ fn main() {
     // enable() is called when the user enters capture-mode.
     let tap_handle = keyboard_tap::start(outgoing_tx.clone(), tap_events_tx);
 
-    let app = WireDeskApp::new(cfg, events_rx, outgoing_tx, tap_events_rx, tap_handle);
+    let app = WireDeskApp::new(
+        cfg,
+        events_rx,
+        outgoing_tx,
+        tap_events_rx,
+        tap_handle,
+        outgoing_progress,
+        outgoing_total,
+        incoming_progress,
+        incoming_total,
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

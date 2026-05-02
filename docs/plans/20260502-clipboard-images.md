@@ -324,19 +324,19 @@ main.rs:
 - Modify: `apps/wiredesk-client/src/main.rs`
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 
-- [ ] в `WireDeskApp` добавить четыре `Arc<AtomicU64>`: `outgoing_progress`, `outgoing_total`, `incoming_progress`, `incoming_total`.
-- [ ] в `main.rs::main` создать эти `Arc<AtomicU64>`'ы и передать в `spawn_poll_thread` + `reader_thread` (через `IncomingClipboard::new`) + `WireDeskApp::new`.
-- [ ] добавить pure helper `format_progress(action: &str, current: u64, total: u64) -> Option<String>`:
+- [x] в `WireDeskApp` добавить четыре `Arc<AtomicU64>`: `outgoing_progress`, `outgoing_total`, `incoming_progress`, `incoming_total`.
+- [x] в `main.rs::main` создать эти `Arc<AtomicU64>`'ы и передать в `spawn_poll_thread` + `reader_thread` (через `IncomingClipboard::new`) + `WireDeskApp::new`.
+- [x] добавить pure helper `format_progress(action: &str, current: u64, total: u64) -> Option<String>`:
   - возвращает `Some("Sending image — 340/780 KB (43%)")` при `total > 0 && current <= total`,
   - возвращает `None` при `total == 0`.
-- [ ] в обнаруженной status-render функции `app.rs`: вызвать `format_progress("Sending image", outgoing_progress.load(...), outgoing_total.load(...))` и `format_progress("Receiving image", ...)`. Конкатенировать с базовым `"Connected"` через `" | "`. Если оба None — рендер без изменений.
-- [ ] **timer-сброс:** при `current >= total > 0` запомнить `last_complete: Option<Instant>`, через 1 сек после этого — `total.store(0, Relaxed)`. Простейшее решение — сделать обнуление в `clipboard.rs` сразу после отправки последнего chunk (writer thread); UI просто отрендерит что есть.
-- [ ] **disconnect-сброс:** при `TransportEvent::Disconnected` в `WireDeskApp::handle_event` — `outgoing_progress/total/incoming_progress/total .store(0, Relaxed)`.
-- [ ] unit-тест `format_progress_active`: `format_progress("Sending image", 340*1024, 780*1024)` содержит `"340"`, `"780"`, `"43%"`.
-- [ ] unit-тест `format_progress_idle`: `total=0` → `None`.
-- [ ] unit-тест `format_progress_complete`: `current == total` → `Some("... 100%)")`.
-- [ ] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
-- [ ] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- [x] в обнаруженной status-render функции `app.rs`: вызвать `format_progress("Sending image", outgoing_progress.load(...), outgoing_total.load(...))` и `format_progress("Receiving image", ...)`. Конкатенировать с базовым `"Connected"` через `" | "`. Если оба None — рендер без изменений. (Реализовано: status-row около строки 1037, отдельная label-строка под Serial-строкой; рендерится только при наличии активного transfer.)
+- [x] **timer-сброс:** при `current >= total > 0` запомнить `last_complete: Option<Instant>`, через 1 сек после этого — `total.store(0, Relaxed)`. Простейшее решение — сделать обнуление в `clipboard.rs` сразу после отправки последнего chunk (writer thread); UI просто отрендерит что есть. (Применён простой вариант: `emit_offer_and_chunks` обнуляет оба counter'а после loop'а.)
+- [x] **disconnect-сброс:** при `TransportEvent::Disconnected` в `WireDeskApp::handle_event` — `outgoing_progress/total/incoming_progress/total .store(0, Relaxed)`.
+- [x] unit-тест `format_progress_active`: `format_progress("Sending image", 340*1024, 780*1024)` содержит `"340"`, `"780"`, `"43%"`.
+- [x] unit-тест `format_progress_idle`: `total=0` → `None`.
+- [x] unit-тест `format_progress_complete`: `current == total` → `Some("... 100%)")`.
+- [x] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
+- [x] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 7b: Toast при превышении лимита изображения
 

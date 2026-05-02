@@ -153,6 +153,15 @@ fn emit_offer_and_chunks(
         ));
         outgoing_progress.fetch_add(chunk_len, Ordering::Relaxed);
     }
+
+    // Zero counters once everything is queued. Per Task 7a plan: the
+    // simplest "transfer complete" UX is to clear the status fragment
+    // immediately after the last chunk is queued — the wire-side send
+    // happens in writer_thread asynchronously, so "queued progress" is the
+    // best signal we have without an extra ack channel. UI reads atomics
+    // each frame and silently stops rendering the "Sending …" line.
+    outgoing_progress.store(0, Ordering::Relaxed);
+    outgoing_total.store(0, Ordering::Relaxed);
 }
 
 /// Spawn a background thread that polls the local clipboard and pushes
@@ -583,9 +592,12 @@ mod tests {
         }
         assert_eq!(reassembled, png, "concatenated chunks must reassemble to PNG");
 
-        // Counter invariants.
-        assert_eq!(total.load(Ordering::Relaxed) as usize, png.len());
-        assert_eq!(progress.load(Ordering::Relaxed) as usize, png.len());
+        // Counter invariants — emit zeroes both atomics on completion so the
+        // status-line stops rendering "Sending …" once all chunks are queued
+        // (Task 7a). During the loop progress matches total, but by return
+        // both are back to zero.
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
     }
 
     #[test]
