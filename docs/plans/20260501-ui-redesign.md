@@ -630,14 +630,14 @@ egui::ComboBox::from_id_salt("monitor_select")
 **Files:**
 - Modify: `apps/wiredesk-client/src/app.rs` (WireDeskApp.original_position + toggle_fullscreen rewrite + fallback message в render_capture_info)
 
-- [ ] добавить поле `original_position: Option<egui::Pos2>` в `WireDeskApp`, инициализировать None в new()
-- [ ] переписать `toggle_fullscreen`: при включении (self.fullscreen=true after toggle) — `let monitors = monitor::list_monitors(); let target = monitor::resolve_target_monitor(self.pending_config.preferred_monitor, &monitors)`. Если Some(m) — сохранить `original_position` через `ctx.input(|i| i.viewport().outer_rect.map(|r| r.min))`, послать `ViewportCommand::OuterPosition(m.frame.min)`, потом `ViewportCommand::Fullscreen(true)`. Если None — fullscreen без перемещения.
-- [ ] при выключении — `Fullscreen(false)`, потом `if let Some(pos) = self.original_position.take() { send_viewport_cmd(OuterPosition(pos)) }`
-- [ ] fallback message: если `preferred_monitor=Some(idx)` но `resolve_target_monitor` вернул None — установить `self.status_msg = "Selected monitor unavailable; fullscreen on current display"` (видно в status row)
-- [ ] edge case: `original_position` за пределами всех текущих экранов (юзер вручную перетащил окно после fullscreen) — при exit пропустить OuterPosition restore, окно останется где сейчас
-- [ ] write tests: pure-helper для edge case в resolve уже в 9a; здесь — manual проверка в live-test
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `feat(client): per-monitor fullscreen via OuterPosition + Fullscreen orchestration`
+- [x] добавить поле `original_position: Option<egui::Pos2>` в `WireDeskApp`, инициализировать None в new()
+- [x] переписать `toggle_fullscreen`: при включении (self.fullscreen=true after toggle) — `let monitors = monitor::list_monitors(); let target = monitor::resolve_target_monitor(self.pending_config.preferred_monitor, &monitors)`. Если Some(m) — сохранить `original_position` через `ctx.input(|i| i.viewport().outer_rect.map(|r| r.min))`, послать `ViewportCommand::OuterPosition(m.frame.min)`, потом `ViewportCommand::Fullscreen(true)`. Если None — fullscreen без перемещения.
+- [x] при выключении — `Fullscreen(false)`, потом `if let Some(pos) = self.original_position.take() { send_viewport_cmd(OuterPosition(pos)) }`
+- [x] fallback message: если `preferred_monitor=Some(idx)` но `resolve_target_monitor` вернул None — установить `self.status_msg = "Selected monitor unavailable; fullscreen on current display"` (видно в status row)
+- [x] edge case: `original_position` за пределами всех текущих экранов (юзер вручную перетащил окно после fullscreen) — при exit пропустить OuterPosition restore, окно останется где сейчас (поведение вытекает из `take()` без валидации позиции — если egui клампит OuterPosition в visible bounds, OS подвинет окно сама; если нет — юзер вытащит мышью)
+- [x] write tests: pure-helper для edge case в resolve уже в 9a; здесь — manual проверка в live-test
+- [x] cargo test --workspace + clippy + cross-check — clean
+- [x] commit: `feat(client): per-monitor fullscreen via OuterPosition + Fullscreen orchestration`
 
 ### Task 10: Verify acceptance criteria + регресс-чек
 

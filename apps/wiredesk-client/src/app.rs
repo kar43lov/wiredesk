@@ -70,6 +70,12 @@ pub struct WireDeskApp {
     save_toast: Option<(String, Instant)>,
     // Cached available serial ports for the combo-box; refreshed on demand.
     available_ports: Vec<String>,
+    // Saved outer position before entering fullscreen on a non-active monitor.
+    // Restored on fullscreen exit so the chrome window returns to where the
+    // user originally had it. None when fullscreen wasn't entered via an
+    // explicit `OuterPosition` move (e.g. preferred_monitor=None or invalid
+    // index falling back to "fullscreen on current display").
+    original_position: Option<egui::Pos2>,
 }
 
 /// Static list of macOS Accessibility-permission setup steps shown on the
@@ -123,6 +129,7 @@ impl WireDeskApp {
             config_dirty: false,
             save_toast: None,
             available_ports: Vec::new(),
+            original_position: None,
         }
     }
 
@@ -406,9 +413,57 @@ impl WireDeskApp {
         }
     }
 
+    /// Toggle fullscreen with optional per-monitor targeting.
+    ///
+    /// On entering fullscreen: if `pending_config.preferred_monitor` resolves
+    /// to a valid `MonitorInfo`, save the current outer position, move the
+    /// window onto that monitor's origin, then request `Fullscreen(true)` —
+    /// egui-on-macOS treats fullscreen as "expand to the screen this window
+    /// is currently on", so the move-then-fullscreen sequence is what targets
+    /// a specific display. If preferred_monitor is None or the index is
+    /// stale (display unplugged since save), fall back to "fullscreen on
+    /// current display" without moving and surface the fallback in the
+    /// status row so the user knows the choice was ignored.
+    ///
+    /// On exiting fullscreen: send `Fullscreen(false)`, then restore the
+    /// saved outer position via `OuterPosition` (and clear it via `take()`).
+    /// If no position was saved, leave the window where the OS placed it.
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.fullscreen = !self.fullscreen;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        if self.fullscreen {
+            let monitors = monitor::list_monitors();
+            let target = monitor::resolve_target_monitor(
+                self.pending_config.preferred_monitor,
+                &monitors,
+            );
+            match target {
+                Some(m) => {
+                    self.original_position = ctx
+                        .input(|i| i.viewport().outer_rect.map(|r| r.min));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        m.frame.min,
+                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+                None => {
+                    // preferred_monitor was Some(idx) but the index is now
+                    // out of range (display unplugged) — surface the fallback
+                    // so the user notices, otherwise it would silently target
+                    // the active display with no feedback.
+                    if self.pending_config.preferred_monitor.is_some() {
+                        self.status_msg =
+                            "Selected monitor unavailable; fullscreen on current display"
+                                .to_string();
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+            }
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            if let Some(pos) = self.original_position.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
+        }
     }
 
     fn shell_send(&mut self, msg: Message) {
