@@ -685,8 +685,12 @@ impl WireDeskApp {
                 ui.with_layout(
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
+                        // No Unicode bullet — egui default font lacks
+                        // U+25CF on some macOS setups; "CAPTURING" + the
+                        // red banner background already convey the state
+                        // unambiguously.
                         ui.label(
-                            egui::RichText::new("\u{25CF} CAPTURING — Cmd+Esc to release")
+                            egui::RichText::new("CAPTURING — Cmd+Esc to release")
                                 .size(BANNER_FONT_SIZE)
                                 .strong()
                                 .color(egui::Color32::WHITE),
@@ -699,13 +703,14 @@ impl WireDeskApp {
         ui.vertical_centered(|ui| {
             ui.heading("WireDesk — input forwarded to Host");
             ui.add_space(8.0);
+            // Plain text — no Unicode bullet (see status row note above).
             if self.state == ConnectionState::Connected {
                 ui.label(format!(
-                    "● connected to {} ({}×{})",
+                    "Connected to {} ({}×{})",
                     self.host_name, self.screen_w, self.screen_h
                 ));
             } else {
-                ui.label("● not connected");
+                ui.label("Not connected");
             }
         });
         ui.add_space(20.0);
@@ -903,10 +908,11 @@ impl eframe::App for WireDeskApp {
             });
             ui.separator();
 
-            // Connection status — large coloured glyph + human-friendly
-            // text. The glyph is sized 18pt instead of egui's tiny default
-            // so it's readable at a glance, matching the Win-side
-            // ImageFrame indicator.
+            // Connection status — large coloured circle + human-friendly
+            // text. The circle is painted directly via `ui.painter()`
+            // instead of a Unicode glyph because egui's default font lacks
+            // U+25CF (BLACK CIRCLE) on some macOS configurations and falls
+            // back to an empty tofu box (observed live, ui-redesign branch).
             let status_color = match self.state {
                 ConnectionState::Connected => egui::Color32::GREEN,
                 ConnectionState::Connecting => egui::Color32::YELLOW,
@@ -914,9 +920,12 @@ impl eframe::App for WireDeskApp {
             };
             let status_text = self.status_text();
             ui.horizontal(|ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new("\u{25CF}").size(STATUS_GLYPH_SIZE).color(status_color),
-                ));
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(STATUS_GLYPH_SIZE, STATUS_GLYPH_SIZE),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .circle_filled(rect.center(), STATUS_GLYPH_SIZE * 0.45, status_color);
                 ui.label(status_text);
             });
 
@@ -1040,7 +1049,7 @@ impl eframe::App for WireDeskApp {
                             want_open = true;
                         }
                     } else {
-                        ui.label("● shell open");
+                        ui.label("shell open");
                         if ui.button("Close").clicked() {
                             want_close = true;
                         }
