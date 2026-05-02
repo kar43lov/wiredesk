@@ -312,31 +312,36 @@ impl WireDeskApp {
                 });
 
                 // Fullscreen target monitor — saved as `preferred_monitor`
-                // by display name (NSScreen.localizedName). Default `None`
-                // keeps the legacy behaviour (fullscreen on the display the
-                // window currently sits on). Name-based instead of index
-                // so a saved preference survives reboot / dock / hot-plug.
+                // using the combined label `monitor_label(m)` ("Studio
+                // Display (5120×2880)"). Default `None` keeps the legacy
+                // behaviour (fullscreen on the display the window currently
+                // sits on). Label-based so two monitors sharing `localizedName`
+                // are still distinguishable, and so a saved preference
+                // survives reboot / dock / hot-plug. Both the ComboBox label
+                // and the persisted value use the same `monitor_label`
+                // helper, so a Save → reload round-trip is byte-identical.
                 ui.horizontal(|ui| {
                     ui.label("Fullscreen monitor:");
                     let selected_text = match cfg.preferred_monitor.as_deref() {
                         None => "(active monitor — default)".to_string(),
-                        Some(name) => match monitors.iter().find(|m| m.name == name) {
-                            Some(m) => {
-                                let size = m.frame.size();
-                                format!(
-                                    "Display {} — {} ({}×{})",
+                        Some(saved) => {
+                            match monitors
+                                .iter()
+                                .find(|m| monitor::monitor_label(m) == saved)
+                            {
+                                Some(m) => format!(
+                                    "Display {} — {}",
                                     m.index + 1,
-                                    m.name,
-                                    size.x,
-                                    size.y,
-                                )
+                                    monitor::monitor_label(m),
+                                ),
+                                // Saved label doesn't match any live display
+                                // (unplugged, renamed, or resolution changed
+                                // since last save). Show the saved label with
+                                // an "(unavailable)" hint so the user knows
+                                // something stale is selected.
+                                None => format!("{saved} (unavailable)"),
                             }
-                            // Saved name doesn't match any live display
-                            // (unplugged or renamed since last save). Show
-                            // the saved name with an "(unavailable)" hint so
-                            // the user knows something stale is selected.
-                            None => format!("{name} (unavailable)"),
-                        },
+                        }
                     };
                     egui::ComboBox::from_id_salt("settings_preferred_monitor")
                         .selected_text(selected_text)
@@ -352,19 +357,14 @@ impl WireDeskApp {
                                 dirty = true;
                             }
                             for m in &monitors {
-                                let size = m.frame.size();
-                                let label = format!(
-                                    "Display {} — {} ({}×{})",
-                                    m.index + 1,
-                                    m.name,
-                                    size.x,
-                                    size.y,
-                                );
+                                let label = monitor::monitor_label(m);
+                                let display_text =
+                                    format!("Display {} — {}", m.index + 1, label);
                                 if ui
                                     .selectable_value(
                                         &mut cfg.preferred_monitor,
-                                        Some(m.name.clone()),
-                                        label,
+                                        Some(label),
+                                        display_text,
                                     )
                                     .changed()
                                 {

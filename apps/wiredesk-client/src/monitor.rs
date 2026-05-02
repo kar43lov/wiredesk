@@ -123,28 +123,52 @@ pub fn flip_nsscreen_y(ns_y: f32, ns_height: f32, primary_height: f32) -> f32 {
     primary_height - (ns_y + ns_height)
 }
 
-/// Resolve a stored `preferred_monitor` name against the live monitor list.
+/// Build the user-facing identity label for a monitor: name + size in the
+/// form `"Studio Display (5120×2880)"`. Combining `localizedName` with the
+/// screen dimensions disambiguates two monitors with identical names — e.g.
+/// a dual Studio Display setup, where AppKit gives both the same
+/// `localizedName` and a name-only key would round-trip a "Display 2" pick
+/// back to "Display 1" on the next launch.
+///
+/// Used by both the Settings ComboBox label AND the persisted
+/// `preferred_monitor` value so the two are always in lock-step. The width
+/// and height come from the already-converted `frame.size()` (winit
+/// coordinates), which matches what the user sees in the ComboBox.
+///
+/// **Edge case:** if two monitors share both name AND size (very rare —
+/// would require two physically identical displays at identical
+/// resolutions), the labels collide and only one is reachable via the
+/// preference. Acceptable for MVP — adding NSScreen `deviceDescription`
+/// disambiguation is a follow-up.
+pub fn monitor_label(m: &MonitorInfo) -> String {
+    let size = m.frame.size();
+    format!("{} ({}×{})", m.name, size.x as u32, size.y as u32)
+}
+
+/// Resolve a stored `preferred_monitor` label against the live monitor list.
 ///
 /// * `None` → caller wants "current display" semantics, return `None`.
-/// * `Some(name)` with no matching monitor → log a warning and return `None`
+/// * `Some(label)` with no matching monitor → log a warning and return `None`
 ///   (caller falls back to fullscreen on the active display). This happens
-///   when the saved display has been unplugged, renamed, or the user moved
-///   the config between machines.
-/// * `Some(name)` matching a monitor's `localizedName` → that `MonitorInfo`.
+///   when the saved display has been unplugged, renamed, resolution-changed,
+///   or the user moved the config between machines.
+/// * `Some(label)` matching `monitor_label(m)` → that `MonitorInfo`.
 ///
-/// Name-based instead of index-based because NSScreen ordinals aren't
+/// Label-based (name + size) instead of name-only because two physical
+/// monitors can share `localizedName`; the size suffix disambiguates them.
+/// Index-based was tried earlier and rejected: NSScreen ordinals aren't
 /// stable across reboot / dock / hot-plug — a saved index stays in-range
 /// but silently points at a different physical display.
 pub fn resolve_target_monitor<'a>(
     preferred: Option<&str>,
     monitors: &'a [MonitorInfo],
 ) -> Option<&'a MonitorInfo> {
-    let name = preferred?;
-    match monitors.iter().find(|m| m.name == name) {
+    let label = preferred?;
+    match monitors.iter().find(|m| monitor_label(m) == label) {
         Some(m) => Some(m),
         None => {
             log::warn!(
-                "preferred_monitor {name:?} not found among {} monitor(s)",
+                "preferred_monitor {label:?} not found among {} monitor(s)",
                 monitors.len()
             );
             None
@@ -171,29 +195,69 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_monitor_unknown_name_returns_none() {
+    fn resolve_target_monitor_unknown_label_returns_none() {
         let monitors = vec![
             make_monitor(0, "Built-in", 0.0, 0.0, 1920.0, 1080.0),
             make_monitor(1, "Studio Display", 1920.0, 0.0, 5120.0, 2880.0),
         ];
-        assert!(resolve_target_monitor(Some("Unplugged Display"), &monitors).is_none());
+        assert!(resolve_target_monitor(Some("Unplugged Display (4096×2160)"), &monitors).is_none());
+        // Bare name no longer matches — must include the size suffix to
+        // disambiguate against duplicate names.
+        assert!(resolve_target_monitor(Some("Studio Display"), &monitors).is_none());
     }
 
     #[test]
-    fn resolve_target_monitor_known_name_returns_monitor() {
+    fn resolve_target_monitor_known_label_returns_monitor() {
         let monitors = vec![
             make_monitor(0, "Built-in", 0.0, 0.0, 1920.0, 1080.0),
             make_monitor(1, "Studio Display", 1920.0, 0.0, 5120.0, 2880.0),
         ];
 
-        let m0 = resolve_target_monitor(Some("Built-in"), &monitors).expect("Built-in present");
+        let m0 = resolve_target_monitor(Some("Built-in (1920×1080)"), &monitors)
+            .expect("Built-in present");
         assert_eq!(m0.index, 0);
         assert_eq!(m0.name, "Built-in");
 
-        let m1 = resolve_target_monitor(Some("Studio Display"), &monitors)
+        let m1 = resolve_target_monitor(Some("Studio Display (5120×2880)"), &monitors)
             .expect("Studio Display present");
         assert_eq!(m1.index, 1);
         assert_eq!(m1.name, "Studio Display");
+    }
+
+    #[test]
+    fn monitor_label_format_matches_combo_box() {
+        // Combined identity string: localized name + size. Same shape on the
+        // ComboBox label and on the persisted preferred_monitor value so a
+        // round-trip through Save → load → Settings is byte-identical.
+        let m = make_monitor(0, "Studio Display", 0.0, 0.0, 5120.0, 2880.0);
+        assert_eq!(monitor_label(&m), "Studio Display (5120×2880)");
+
+        // Built-in retina, sub-1080p height — the cast to u32 truncates
+        // fractional points (`frame.size()` returns f32 in egui units), which
+        // matches what the user reads in the ComboBox.
+        let m = make_monitor(0, "Built-in Retina Display", 0.0, 0.0, 1728.0, 1117.0);
+        assert_eq!(monitor_label(&m), "Built-in Retina Display (1728×1117)");
+    }
+
+    #[test]
+    fn resolve_target_monitor_disambiguates_duplicate_names() {
+        // Two physically distinct monitors with the same `localizedName`
+        // (real-world case: dual Studio Display) — name-only resolution
+        // would always return the first one. Combining name with size
+        // makes the second selectable as long as it has a different
+        // resolution.
+        let monitors = vec![
+            make_monitor(0, "Studio Display", 0.0, 0.0, 5120.0, 2880.0),
+            make_monitor(1, "Studio Display", 5120.0, 0.0, 2560.0, 1440.0),
+        ];
+
+        let m0 = resolve_target_monitor(Some("Studio Display (5120×2880)"), &monitors)
+            .expect("first Studio Display present");
+        assert_eq!(m0.index, 0);
+
+        let m1 = resolve_target_monitor(Some("Studio Display (2560×1440)"), &monitors)
+            .expect("second Studio Display present");
+        assert_eq!(m1.index, 1);
     }
 
     // ---- flip_nsscreen_y ---------------------------------------------------
