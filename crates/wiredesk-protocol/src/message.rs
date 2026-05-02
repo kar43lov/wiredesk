@@ -3,6 +3,12 @@ use wiredesk_core::error::{Result, WireDeskError};
 /// Protocol version
 pub const VERSION: u8 = 1;
 
+/// Clipboard payload formats for `Message::ClipOffer { format, .. }`.
+///
+/// Receivers MUST treat unknown values as opaque/skip, not as an error.
+pub const FORMAT_TEXT_UTF8: u8 = 0;
+pub const FORMAT_PNG_IMAGE: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
@@ -363,6 +369,24 @@ mod tests {
     #[test]
     fn roundtrip_clip_offer() {
         roundtrip(&Message::ClipOffer { format: 1, total_len: 65536 });
+    }
+
+    #[test]
+    fn roundtrip_clip_offer_text() {
+        // Regression: text format (format=0) wire-format unchanged.
+        roundtrip(&Message::ClipOffer { format: FORMAT_TEXT_UTF8, total_len: 1024 });
+    }
+
+    #[test]
+    fn roundtrip_clip_offer_image() {
+        roundtrip(&Message::ClipOffer { format: FORMAT_PNG_IMAGE, total_len: 245_760 });
+    }
+
+    #[test]
+    fn clip_format_constants_are_distinct() {
+        assert_eq!(FORMAT_TEXT_UTF8, 0);
+        assert_eq!(FORMAT_PNG_IMAGE, 1);
+        assert_ne!(FORMAT_TEXT_UTF8, FORMAT_PNG_IMAGE);
     }
 
     #[test]

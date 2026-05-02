@@ -215,11 +215,11 @@ main.rs:
 **Files:**
 - Modify: `crates/wiredesk-protocol/src/message.rs`
 
-- [ ] добавить публичные константы `FORMAT_TEXT_UTF8: u8 = 0` и `FORMAT_PNG_IMAGE: u8 = 1` в `message.rs` (модульный уровень).
-- [ ] добавить тест `roundtrip_clip_offer_image`: `ClipOffer { format: FORMAT_PNG_IMAGE, total_len: 245760 }` сериализуется и десериализуется идентично.
-- [ ] добавить regression-тест `roundtrip_clip_offer_text`: `ClipOffer { format: FORMAT_TEXT_UTF8, total_len: 1024 }` (есть `roundtrip_clip_offer` с произвольным `format=1`, переименовать или дополнить — без потери покрытия).
-- [ ] запустить `cargo test -p wiredesk-protocol` — все тесты зелёные.
-- [ ] запустить `cargo clippy -p wiredesk-protocol --all-targets -- -D warnings` — clean.
+- [x] добавить публичные константы `FORMAT_TEXT_UTF8: u8 = 0` и `FORMAT_PNG_IMAGE: u8 = 1` в `message.rs` (модульный уровень).
+- [x] добавить тест `roundtrip_clip_offer_image`: `ClipOffer { format: FORMAT_PNG_IMAGE, total_len: 245760 }` сериализуется и десериализуется идентично.
+- [x] добавить regression-тест `roundtrip_clip_offer_text`: `ClipOffer { format: FORMAT_TEXT_UTF8, total_len: 1024 }` (есть `roundtrip_clip_offer` с произвольным `format=1`, переименовать или дополнить — без потери покрытия).
+- [x] запустить `cargo test -p wiredesk-protocol` — все тесты зелёные.
+- [x] запустить `cargo clippy -p wiredesk-protocol --all-targets -- -D warnings` — clean.
 
 ### Task 2: Добавить direct dep `image` в client и host crates
 
