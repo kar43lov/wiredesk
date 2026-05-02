@@ -666,13 +666,13 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `README.md` (упоминание features)
 - Modify: `docs/setup.md` (если новые шаги)
 
-- [ ] CLAUDE.md: обновить раздел Host module map (новый `ui/icons.rs`); добавить упоминание Detect / Save & Restart / monitor selection в Run-секцию
-- [ ] CLAUDE.md: дополнить «Известные ограничения» если что-то открылось в live-тесте
-- [ ] README.md: упомянуть auto-detect и monitor selection в feature list
-- [ ] docs/setup.md: если процесс изменился — обновить (вероятно нет)
-- [ ] move plan to `docs/plans/completed/20260501-ui-redesign.md`
-- [ ] commit: `docs: finalize UI redesign — update CLAUDE.md, README.md`
-- [ ] push feat/ui-redesign и создать PR в master с скриншотами до/после
+- [x] CLAUDE.md: обновить раздел Host module map (новый `ui/icons.rs`); добавить упоминание Detect / Save & Restart / monitor selection в Run-секцию — добавлены `ui/icons.rs` и `format::detect_ch340_port` в module map; добавлен Client module map с `monitor.rs`; обновлены Host/Client Settings секции с упоминанием Detect, Save & Restart, per-monitor fullscreen
+- [x] CLAUDE.md: дополнить «Известные ограничения» если что-то открылось в live-тесте — добавлен пункт про mingw fallback (taskbar/Alt+Tab иконка остаётся generic пока не пересобрать на Windows-машине с windres)
+- [x] README.md: упомянуть auto-detect и monitor selection в feature list — добавлены bullets про per-monitor fullscreen, Auto-detect CH340, Save & Restart; bumped 165+ → 164+ tests
+- [x] docs/setup.md: если процесс изменился — обновить (вероятно нет) — без изменений (процесс не изменился)
+- [x] move plan to `docs/plans/completed/20260501-ui-redesign.md` — done via `git mv`, history preserved
+- [x] commit: `docs: finalize UI redesign — update CLAUDE.md, README.md`
+- [ ] push feat/ui-redesign и создать PR в master с скриншотами до/после — deferred to user (autonomous mode does not push)
 
 ## Post-Completion
 
