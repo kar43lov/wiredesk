@@ -72,15 +72,15 @@ pub struct SettingsWindow {
     pub copy_mac_btn: nwg::Button,
 
     // --- Bottom button-bar (outside groups) ---
-    // The bar holds two right-aligned buttons. `restart_btn` is built here
-    // so Task 8 only needs to wire its handler — currently it has no
-    // handler so clicking it is a no-op. `save_btn` is the primary action.
+    // The bar holds two right-aligned buttons. `save_btn` is the primary
+    // action; `restart_btn` saves AND respawns the host process so settings
+    // changes take effect without the user manually quitting from tray.
     // No `set_default_button` — Enter inside a TextEdit shouldn't trigger
     // Save (would surprise users typing baud / dimensions). Hide button
     // removed — close-X provides the same affordance (UX-audit N3).
     pub bar_frame: nwg::Frame,
     pub bar_layout: nwg::GridLayout,
-    pub restart_btn: nwg::Button, // reserved handler for Task 8
+    pub restart_btn: nwg::Button,
     pub save_btn: nwg::Button,
 
     pub message_label: nwg::Label,

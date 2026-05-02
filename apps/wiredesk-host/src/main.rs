@@ -60,8 +60,14 @@ fn main() {
 
     // Single-instance lock — second launch shows a message box and exits.
     // On non-Windows targets this is a no-op (always Acquired).
-    let _instance_guard = match ui::single_instance::SingleInstanceGuard::acquire(
+    //
+    // 5 attempts × 100ms (~500ms total budget) — covers the Save & Restart
+    // race where the freshly spawned process may briefly overlap with the
+    // outgoing one before the old process drops its mutex handle.
+    let _instance_guard = match ui::single_instance::try_acquire_with_retry(
         "WireDeskHostSingleton",
+        5,
+        100,
     ) {
         ui::single_instance::SingleInstanceResult::Acquired(g) => g,
         ui::single_instance::SingleInstanceResult::AlreadyRunning => {
@@ -284,6 +290,54 @@ fn run_windows(
                             nwg::Clipboard::set_data_text(&s.window, &cmd);
                             s.set_message("Copied Mac launch command to clipboard.");
                         }
+                    } else if handle == s.restart_btn.handle {
+                        // Save & Restart: persist config + autostart, then
+                        // spawn a fresh host process and stop our own event
+                        // loop. The new process retries the single-instance
+                        // mutex acquire (5×100ms in main.rs) so it'll wait
+                        // out our shutdown without an artificial sleep here.
+                        match s.read_form() {
+                            Ok(new_cfg) => {
+                                if let Err(e) = new_cfg.save() {
+                                    s.set_message(&format!("Save failed: {e}"));
+                                    return;
+                                }
+                                let want_startup = new_cfg.run_on_startup;
+                                let r = if want_startup {
+                                    ui::autostart::enable()
+                                } else {
+                                    ui::autostart::disable()
+                                };
+                                if let Err(e) = r {
+                                    s.set_message(&format!(
+                                        "Saved, but autostart toggle failed: {e}"
+                                    ));
+                                    return;
+                                }
+                                if let Ok(mut g) = cfg_holder.lock() {
+                                    *g = new_cfg;
+                                }
+                                match std::env::current_exe() {
+                                    Ok(exe) => match std::process::Command::new(exe).spawn() {
+                                        Ok(_) => {
+                                            log::info!("restart: spawned new host process");
+                                            nwg::stop_thread_dispatch();
+                                        }
+                                        Err(e) => {
+                                            s.set_message(&format!(
+                                                "Saved, but restart failed to spawn: {e}"
+                                            ));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        s.set_message(&format!(
+                                            "Saved, but couldn't find own exe path: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => s.set_message(&e),
+                        }
                     } else if handle == s.detect_btn.handle {
                         // Enumerate USB serial ports and pick the lone CH340
                         // (or report empty / multi). On enumeration failure we
@@ -311,8 +365,6 @@ fn run_windows(
                             }
                         }
                     }
-                    // restart_btn handler reserved for Task 8 — built but
-                    // currently no-op when clicked.
                 }
                 E::OnWindowClose => {
                     s.hide();

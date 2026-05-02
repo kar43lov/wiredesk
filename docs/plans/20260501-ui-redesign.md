@@ -578,7 +578,7 @@ egui::ComboBox::from_id_salt("monitor_select")
 - [x] write tests (6): NotFound (пусто), NotFound (только non-USB: PciPort/BluetoothPort/Unknown), NotFound (только non-WCH USB: FTDI 0x0403, CP2102 0x10C4), Found (1 CH340 среди FTDI + non-USB), Multiple (3 CH340 + FTDI), Found через PID variants (0x7523, 0x55D3, 0x55D4)
 - [x] use mock `SerialPortInfo` через прямую конструкцию `SerialPortType::UsbPort(UsbPortInfo {...})` — helper `usb()` / `non_usb()` в tests-mod (нет фичи `usbportinfo-interface`, поэтому `interface` поле отсутствует)
 - [x] cargo test --workspace + clippy + cross-check — clean (159 тестов проходят, 0 warnings)
-- [ ] commit: `feat(host): auto-detect CH340 button (VID 0x1A86 filter)`
+- [x] commit: `feat(host): auto-detect CH340 button (VID 0x1A86 filter)` (committed 70d1638)
 
 ### Task 8: Save & Restart button (Command::spawn + stop_thread_dispatch)
 
@@ -586,12 +586,12 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-host/src/ui/settings_window.rs` (restart_btn в button-bar)
 - Modify: `apps/wiredesk-host/src/main.rs` (handler OnButtonClick для restart_btn)
 
-- [ ] добавить `restart_btn: nwg::Button` в SettingsWindow и в нижний button-bar (между spacer'ом и save_btn)
-- [ ] handler: `read_form` → `save` → `autostart toggle` → `Command::new(current_exe).spawn()` → `Sleep(200ms)` → `nwg::stop_thread_dispatch`
-- [ ] на ошибку валидации/save — `set_message` без рестарта
-- [ ] race-condition mitigation: 200ms между spawn и stop_dispatch — даёт новому процессу 200ms init time, к моменту exit'а старого mutex освобождается раньше чем новый дойдёт до acquire
-- [ ] write tests: pure helper `restart_command(exe: &Path) -> Command` если введён — тест что builder правильно собран; иначе skip (handler сам не тестируется без nwg-runtime)
-- [ ] cargo test --workspace + clippy + cross-check — clean
+- [x] добавить `restart_btn: nwg::Button` в SettingsWindow и в нижний button-bar (между spacer'ом и save_btn) — already wired in Task 5 placeholder, only handler needed
+- [x] handler: `read_form` → `save` → `autostart toggle` → `Command::new(current_exe).spawn()` → `nwg::stop_thread_dispatch` (без `Sleep(200ms)` — race решён через retry-loop в новом процессе)
+- [x] на ошибку валидации/save — `set_message` без рестарта (плюс отдельные ветки на ошибки spawn / current_exe — возвращают информативное сообщение, не убивают окно)
+- [x] race-condition mitigation: вместо `Sleep(200ms)` в старом процессе — **retry-loop в `single_instance::try_acquire_with_retry(name, attempts, delay_ms)`**. Новый процесс при `AlreadyRunning` пробует 5×100ms, что даёт 500ms-budget на graceful shutdown старого. Pure-helper, тестируемый без nwg.
+- [x] write tests (2): `try_acquire_with_retry_succeeds_when_free` — на свободном уникальном имени возвращает `Acquired` с первой попытки; `try_acquire_with_retry_returns_already_running_after_retries` (под `#[cfg(windows)]` — non-Windows stub всегда `Acquired`) — удерживая mutex параллельно, вызов с `attempts=2` возвращает `AlreadyRunning`.
+- [x] cargo test --workspace + clippy + cross-check — clean
 - [ ] commit: `feat(host): Save & Restart button (Command::spawn + stop_thread_dispatch)`
 
 ### Task 9a: Monitor enumeration module (NSScreen FFI + pure-helper)
