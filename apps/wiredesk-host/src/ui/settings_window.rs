@@ -51,6 +51,7 @@ pub struct SettingsWindow {
     pub connection_layout: nwg::GridLayout,
     pub port_label: nwg::Label,
     pub port_input: nwg::TextInput,
+    pub detect_btn: nwg::Button,
     pub baud_label: nwg::Label,
     pub baud_input: nwg::TextInput,
 
@@ -169,6 +170,13 @@ impl SettingsWindow {
                 .text(&config.port)
                 .parent(&s.connection_frame)
                 .build(&mut s.port_input)?;
+            // Auto-detect button — fills port_input with the discovered COM
+            // port if exactly one CH340 (VID 0x1A86) is plugged in. Handler
+            // wired in main.rs OnButtonClick. Alt+D accelerator.
+            nwg::Button::builder()
+                .text("&Detect")
+                .parent(&s.connection_frame)
+                .build(&mut s.detect_btn)?;
 
             nwg::Label::builder()
                 .text("Baud:")
@@ -268,8 +276,11 @@ impl SettingsWindow {
                 .max_column(Some(3))
                 .spacing(4)
                 .margin([6, 6, 6, 6])
+                // Row 0: [label] [port_input] [Detect]
                 .child(0, 0, &s.port_label)
-                .child_item(nwg::GridLayoutItem::new(&s.port_input, 1, 0, 2, 1))
+                .child(1, 0, &s.port_input)
+                .child(2, 0, &s.detect_btn)
+                // Row 1: [label] [baud_input spans cols 1..2]
                 .child(0, 1, &s.baud_label)
                 .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 1, 2, 1))
                 .build(&s.connection_layout)?;

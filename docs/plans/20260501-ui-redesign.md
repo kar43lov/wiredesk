@@ -570,14 +570,14 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-host/src/ui/settings_window.rs` (detect_btn в connection_frame)
 - Modify: `apps/wiredesk-host/src/main.rs` (handler OnButtonClick для detect_btn)
 
-- [ ] в `format.rs` добавить `pub const WCH_VID: u16 = 0x1A86`
-- [ ] в `format.rs` добавить `pub enum DetectResult { Found(String), Multiple(Vec<String>), NotFound }` (Debug, Clone, PartialEq, Eq)
-- [ ] `pub fn detect_ch340_port(ports: &[serialport::SerialPortInfo]) -> DetectResult` — фильтр по `SerialPortType::UsbPort(info)` где `info.vid == WCH_VID`
-- [ ] добавить `detect_btn: nwg::Button` в `SettingsWindow` рядом с port_input (внутри connection_frame)
-- [ ] handler в main.rs: `serialport::available_ports()` → `detect_ch340_port` → match → `set_text` + `set_message`
-- [ ] write tests (5+): NotFound (пусто), NotFound (только non-USB), Found (1 CH340 + другие), Multiple (2 CH340), Found через PID variants (0x7523, 0x55D4, 0x55D3)
-- [ ] use mock `SerialPortInfo` через прямую конструкцию `SerialPortType::UsbPort(UsbPortInfo {...})`
-- [ ] cargo test --workspace + clippy + cross-check — clean
+- [x] в `format.rs` добавить `pub const WCH_VID: u16 = 0x1A86`
+- [x] в `format.rs` добавить `pub enum DetectResult { Found(String), Multiple(Vec<String>), NotFound }` (Debug, Clone, PartialEq, Eq)
+- [x] `pub fn detect_ch340_port(ports: &[serialport::SerialPortInfo]) -> DetectResult` — фильтр по `SerialPortType::UsbPort(info)` где `info.vid == WCH_VID`
+- [x] добавить `detect_btn: nwg::Button` в `SettingsWindow` рядом с port_input (внутри connection_frame, col 2 row 0; port_input shrunk to col 1)
+- [x] handler в main.rs: `serialport::available_ports()` → `detect_ch340_port` → match → `set_text` + `set_message` (added `serialport.workspace = true` to host Cargo.toml)
+- [x] write tests (6): NotFound (пусто), NotFound (только non-USB: PciPort/BluetoothPort/Unknown), NotFound (только non-WCH USB: FTDI 0x0403, CP2102 0x10C4), Found (1 CH340 среди FTDI + non-USB), Multiple (3 CH340 + FTDI), Found через PID variants (0x7523, 0x55D3, 0x55D4)
+- [x] use mock `SerialPortInfo` через прямую конструкцию `SerialPortType::UsbPort(UsbPortInfo {...})` — helper `usb()` / `non_usb()` в tests-mod (нет фичи `usbportinfo-interface`, поэтому `interface` поле отсутствует)
+- [x] cargo test --workspace + clippy + cross-check — clean (159 тестов проходят, 0 warnings)
 - [ ] commit: `feat(host): auto-detect CH340 button (VID 0x1A86 filter)`
 
 ### Task 8: Save & Restart button (Command::spawn + stop_thread_dispatch)

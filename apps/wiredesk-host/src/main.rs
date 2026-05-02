@@ -284,6 +284,32 @@ fn run_windows(
                             nwg::Clipboard::set_data_text(&s.window, &cmd);
                             s.set_message("Copied Mac launch command to clipboard.");
                         }
+                    } else if handle == s.detect_btn.handle {
+                        // Enumerate USB serial ports and pick the lone CH340
+                        // (or report empty / multi). On enumeration failure we
+                        // treat it as "no ports" — the user can still type a
+                        // port manually.
+                        let ports = serialport::available_ports().unwrap_or_else(|e| {
+                            log::warn!("serialport::available_ports failed: {e}");
+                            Vec::new()
+                        });
+                        match ui::format::detect_ch340_port(&ports) {
+                            ui::format::DetectResult::Found(name) => {
+                                s.port_input.set_text(&name);
+                                s.set_message(&format!("Detected CH340 on {name}."));
+                            }
+                            ui::format::DetectResult::Multiple(names) => {
+                                s.set_message(&format!(
+                                    "Multiple CH340 found: {} — pick one.",
+                                    names.join(", ")
+                                ));
+                            }
+                            ui::format::DetectResult::NotFound => {
+                                s.set_message(
+                                    "No CH340/CH341 detected. Plug the cable in and retry.",
+                                );
+                            }
+                        }
                     }
                     // restart_btn handler reserved for Task 8 — built but
                     // currently no-op when clicked.
