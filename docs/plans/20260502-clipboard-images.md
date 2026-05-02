@@ -294,26 +294,26 @@ main.rs:
 - Modify: `apps/wiredesk-host/src/clipboard.rs`
 - Modify: `apps/wiredesk-host/src/session.rs` (или там, где Session диспатчит `Message::ClipOffer`)
 
-- [ ] продублировать `encode_rgba_to_png` / `decode_png_to_rgba` / `hash_bytes` / `LastKind` enum логику из Mac (CLAUDE.md разрешает duplication).
-- [ ] **удалить локальный `FORMAT_TEXT_UTF8: u8 = 0`** из `apps/wiredesk-host/src/clipboard.rs:13` — теперь импортируем `wiredesk_protocol::message::{FORMAT_TEXT_UTF8, FORMAT_PNG_IMAGE}` (константы добавлены в Task 1).
-- [ ] заменить `last_hash: u64` в `ClipboardSync` на `last: LastKind` (без `Arc<Mutex>` — host clipboard sync однопоточный, в tick-loop).
-- [ ] расширить `poll()`: после неудачного `get_text()` пробовать `get_image()`. Same flow: hash → dedup → encode → size-check (через тот же pure helper `check_image_size`) → ClipOffer{format=1} + ClipChunks.
-- [ ] **прогресс-state на Host:** локальные поля `outgoing_progress: u64`, `outgoing_total: u64`, `incoming_progress: u64`, `incoming_total: u64` в `ClipboardSync` (просто `u64`, не `Arc<AtomicU64>` — Host single-threaded). Используются только для логирования в Task 8.
-- [ ] **abort previous reassembly:** в `on_offer` — та же логика, что в Mac (warn + clear если новый offer пришёл во время незавершённой сборки).
-- [ ] добавить `pub fn reset(&mut self)` — обнуляет всё incoming-state.
-- [ ] **wiring `format` в Host-диспатче:** найти место где `Session` или `session.rs` обрабатывает `Message::ClipOffer` и убедиться что `format` передаётся в `clip.on_offer(format, total_len)`. Сейчас может быть `Message::ClipOffer { total_len, .. } => clip.on_offer(total_len)` — поправить на полное матчирование `{ format, total_len }`.
-- [ ] **disconnect handling:** при потере соединения / новом Hello в Session — вызвать `clipboard.reset()`.
-- [ ] расширить `commit()`: ветвление по `expected_format`, decode PNG → `set_image` при format=1, log::warn при invalid PNG.
-- [ ] unit-тест `host::encode_decode_roundtrip`.
-- [ ] unit-тест `host::hash_bytes_stable`.
-- [ ] unit-тест `host::image_too_large_skipped` (через `check_image_size` helper с маленьким `limit`).
-- [ ] unit-тест `host::incoming_image_reassembly`.
-- [ ] unit-тест `host::incoming_invalid_png_skipped`.
-- [ ] unit-тест `host::incoming_text_reassembly_unchanged`.
-- [ ] unit-тест `host::incoming_offer_during_reassembly_aborts_previous`.
-- [ ] unit-тест `host::reset_clears_state`.
-- [ ] запустить `cargo test -p wiredesk-host` — все тесты зелёные.
-- [ ] запустить `cargo clippy -p wiredesk-host --all-targets -- -D warnings` — clean.
+- [x] продублировать `encode_rgba_to_png` / `decode_png_to_rgba` / `hash_bytes` / `LastKind` enum логику из Mac (CLAUDE.md разрешает duplication).
+- [x] **удалить локальный `FORMAT_TEXT_UTF8: u8 = 0`** из `apps/wiredesk-host/src/clipboard.rs:13` — теперь импортируем `wiredesk_protocol::message::{FORMAT_TEXT_UTF8, FORMAT_PNG_IMAGE}` (константы добавлены в Task 1).
+- [x] заменить `last_hash: u64` в `ClipboardSync` на `last: LastKind` (без `Arc<Mutex>` — host clipboard sync однопоточный, в tick-loop).
+- [x] расширить `poll()`: после неудачного `get_text()` пробовать `get_image()`. Same flow: hash → dedup → encode → size-check (через тот же pure helper `check_image_size`) → ClipOffer{format=1} + ClipChunks.
+- [x] **прогресс-state на Host:** локальные поля `outgoing_progress: u64`, `outgoing_total: u64`, `incoming_progress: u64`, `incoming_total: u64` в `ClipboardSync` (просто `u64`, не `Arc<AtomicU64>` — Host single-threaded). Используются только для логирования в Task 8.
+- [x] **abort previous reassembly:** в `on_offer` — та же логика, что в Mac (warn + clear если новый offer пришёл во время незавершённой сборки).
+- [x] добавить `pub fn reset(&mut self)` — обнуляет всё incoming-state.
+- [x] **wiring `format` в Host-диспатче:** найти место где `Session` или `session.rs` обрабатывает `Message::ClipOffer` и убедиться что `format` передаётся в `clip.on_offer(format, total_len)`. Сейчас может быть `Message::ClipOffer { total_len, .. } => clip.on_offer(total_len)` — поправить на полное матчирование `{ format, total_len }`.
+- [x] **disconnect handling:** при потере соединения / новом Hello в Session — вызвать `clipboard.reset()`.
+- [x] расширить `commit()`: ветвление по `expected_format`, decode PNG → `set_image` при format=1, log::warn при invalid PNG.
+- [x] unit-тест `host::encode_decode_roundtrip`.
+- [x] unit-тест `host::hash_bytes_stable`.
+- [x] unit-тест `host::image_too_large_skipped` (через `check_image_size` helper с маленьким `limit`).
+- [x] unit-тест `host::incoming_image_reassembly`.
+- [x] unit-тест `host::incoming_invalid_png_skipped`.
+- [x] unit-тест `host::incoming_text_reassembly_unchanged`.
+- [x] unit-тест `host::incoming_offer_during_reassembly_aborts_previous`.
+- [x] unit-тест `host::reset_clears_state`.
+- [x] запустить `cargo test -p wiredesk-host` — все тесты зелёные.
+- [x] запустить `cargo clippy -p wiredesk-host --all-targets -- -D warnings` — clean.
 
 ### Task 7a: Status-line UI на Mac — counters + рендер прогресса
 

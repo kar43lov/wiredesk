@@ -98,6 +98,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             log::warn!("heartbeat timeout — disconnecting");
             self.injector.release_all()?;
             self.shell_kill();
+            self.clipboard.reset();
             self.state = SessionState::WaitingForHello;
             self.client_name = None;
             return Ok(false);
@@ -229,8 +230,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.injector.key_up(*scancode, *modifiers)?;
             }
 
-            (SessionState::Connected, Message::ClipOffer { total_len, .. }) => {
-                self.clipboard.on_offer(*total_len);
+            (SessionState::Connected, Message::ClipOffer { format, total_len }) => {
+                self.clipboard.on_offer(*format, *total_len);
             }
 
             (SessionState::Connected, Message::ClipChunk { index, data }) => {
@@ -277,13 +278,17 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 log::info!("client disconnected");
                 self.injector.release_all()?;
                 self.shell_kill();
+                self.clipboard.reset();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
             }
 
             (_, Message::Hello { .. }) => {
-                // Re-handshake from any state
+                // Re-handshake from any state — drop in-flight clipboard
+                // reassembly so a half-finished transfer doesn't leak across
+                // sessions.
                 self.injector.release_all().ok();
+                self.clipboard.reset();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
                 self.handle_packet(packet)?;
