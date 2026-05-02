@@ -196,6 +196,18 @@ pub fn format_progress(action: &str, current: u64, total: u64) -> Option<String>
     }
 }
 
+/// Compute fill ratio for a clipboard progress bar.
+///
+/// Returns `Some(ratio)` in 0.0..=1.0 when a transfer is active (`total > 0`),
+/// or `None` when idle. Overshoot is clamped to 1.0.
+pub fn progress_ratio(current: u64, total: u64) -> Option<f32> {
+    if total == 0 {
+        return None;
+    }
+    let cur = current.min(total);
+    Some(cur as f32 / total as f32)
+}
+
 /// Static list of macOS Accessibility-permission setup steps shown on the
 /// permission screen. Pure helper so the texts can be unit-tested
 /// independently of any UI rendering — a copy-paste typo in step 1 (the
@@ -1102,25 +1114,27 @@ impl eframe::App for WireDeskApp {
             // before being dropped. The status-line consumer only knows
             // bytes/total, not the format (which lives one layer down in
             // the Message::ClipOffer that's already long-since enqueued).
-            let out = format_progress(
-                "Sending clipboard",
-                self.outgoing_progress.load(Ordering::Relaxed),
-                self.outgoing_total.load(Ordering::Relaxed),
-            );
-            let inc = format_progress(
-                "Receiving clipboard",
-                self.incoming_progress.load(Ordering::Relaxed),
-                self.incoming_total.load(Ordering::Relaxed),
-            );
-            if out.is_some() || inc.is_some() {
-                let mut parts: Vec<String> = Vec::with_capacity(2);
-                if let Some(s) = out {
-                    parts.push(s);
-                }
-                if let Some(s) = inc {
-                    parts.push(s);
-                }
-                ui.label(parts.join(" | "));
+            // Visual progress bars per direction. ProgressBar fills from
+            // left as bytes hit the wire; text inside the bar shows
+            // "Sending/Receiving clipboard — N/M KB (P%)". Bars only render
+            // when their respective transfer is active (total > 0).
+            let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
+            let out_tot = self.outgoing_total.load(Ordering::Relaxed);
+            let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
+            let inc_tot = self.incoming_total.load(Ordering::Relaxed);
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(out_cur, out_tot),
+                format_progress("Sending clipboard", out_cur, out_tot),
+            ) {
+                ui.add(egui::ProgressBar::new(ratio).text(text));
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(inc_cur, inc_tot),
+                format_progress("Receiving clipboard", inc_cur, inc_tot),
+            ) {
+                ui.add(egui::ProgressBar::new(ratio).text(text));
+                ctx.request_repaint_after(Duration::from_millis(250));
             }
 
             ui.separator();
@@ -1561,6 +1575,30 @@ mod tests {
         let s = format_progress("Sending clipboard", 512, 1024).expect("active");
         assert!(s.contains("KB"), "1 KiB total must use KB units: {s}");
         assert!(s.contains("0/1 KB"), "expected 0/1 KB at 512/1024: {s}");
+    }
+
+    #[test]
+    fn progress_ratio_idle_returns_none() {
+        assert!(progress_ratio(0, 0).is_none());
+        assert!(progress_ratio(256, 0).is_none());
+    }
+
+    #[test]
+    fn progress_ratio_active_in_unit_range() {
+        let r = progress_ratio(256, 1024).expect("active");
+        assert!((r - 0.25).abs() < f32::EPSILON, "expected 0.25, got {r}");
+    }
+
+    #[test]
+    fn progress_ratio_complete_is_one() {
+        let r = progress_ratio(1024, 1024).expect("active");
+        assert!((r - 1.0).abs() < f32::EPSILON, "expected 1.0, got {r}");
+    }
+
+    #[test]
+    fn progress_ratio_overshoot_clamped() {
+        let r = progress_ratio(2048, 1024).expect("active");
+        assert!((r - 1.0).abs() < f32::EPSILON, "overshoot must clamp to 1.0, got {r}");
     }
 
     #[test]
