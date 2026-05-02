@@ -546,22 +546,22 @@ egui::ComboBox::from_id_salt("monitor_select")
 - [x] при `capturing=true` — fill красноватый `Color32::from_rgb(180, 60, 60)`, текст «Release Input». Idle — синеватый `(60, 110, 180)` («Capture Input»).
 - [x] write tests: pure helper не введён (стайлинг inline 2 строки — overkill оборачивать) — skip per plan
 - [x] cargo test --workspace + clippy + cross-check — clean (151 tests pass, 0 warnings)
-- [ ] commit: `refactor(ui): button-bar conventions — primary right-aligned, default action keyboarded`
+- [x] commit: `refactor(ui): button-bar conventions — primary right-aligned, default action keyboarded` (committed da7e9dd)
 
 ### Task 6: Capture-mode banner + permission-screen step-by-step (Mac only)
 
 **Files:**
 - Modify: `apps/wiredesk-client/src/app.rs` (render_capture_info, render_permission_screen)
 
-- [ ] в `render_capture_info` — full-width `egui::Frame::group(ui.style()).fill(...)` баннер сверху с `RichText::new("● CAPTURING — Cmd+Esc to release").size(20.0).strong().color(Color32::WHITE)`
-- [ ] цвет фона: `Color32::from_rgb(180, 60, 60).linear_multiply(0.3)` (полупрозрачный красноватый)
-- [ ] **обязательно** выделить `pub fn permission_steps() -> &'static [&'static str]` (4-pункта инструкции как массив строк) — pure helper, тестируется
-- [ ] в `render_permission_screen` — каждый из шагов из `permission_steps()` в `ui.group()` с цифрой в кружке слева (`RichText::new(format!("{}", i+1)).size(20.0).strong()`)
-- [ ] кнопка `Open System Settings` — внутри шага 1 (не в самом низу)
-- [ ] warning про restart внизу — `RichText` с цветом + иконка ⚠
-- [ ] write tests (2): `permission_steps()` возвращает 4 элемента; первый шаг содержит «System Settings» substring (защита от случайного breakage текста инструкции)
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `feat(client): capture-mode banner + permission-screen step-by-step`
+- [x] в `render_capture_info` — full-width `egui::Frame::group(ui.style()).fill(...)` баннер сверху с `RichText::new("● CAPTURING — Cmd+Esc to release").size(20.0).strong().color(Color32::WHITE)`
+- [x] цвет фона: `Color32::from_rgb(180, 60, 60).linear_multiply(0.3)` (полупрозрачный красноватый)
+- [x] **обязательно** выделить `pub fn permission_steps() -> &'static [&'static str]` (4-pункта инструкции как массив строк) — pure helper, тестируется
+- [x] в `render_permission_screen` — каждый из шагов из `permission_steps()` в `ui.group()` с цифрой в кружке слева (`RichText::new(format!("{}", i+1)).size(20.0).strong()`)
+- [x] кнопка `Open System Settings` — внутри шага 1 (не в самом низу)
+- [x] warning про restart внизу — `RichText` с цветом + иконка ⚠
+- [x] write tests (2): `permission_steps()` возвращает 4 элемента; первый шаг содержит «System Settings» substring (защита от случайного breakage текста инструкции)
+- [x] cargo test --workspace + clippy + cross-check — clean
+- [x] commit: `feat(client): capture-mode banner + permission-screen step-by-step`
 
 ### Task 7: Auto-detect CH340 button (VID 0x1A86 filter)
 

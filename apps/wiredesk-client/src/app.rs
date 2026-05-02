@@ -71,6 +71,20 @@ pub struct WireDeskApp {
     available_ports: Vec<String>,
 }
 
+/// Static list of macOS Accessibility-permission setup steps shown on the
+/// permission screen. Pure helper so the texts can be unit-tested
+/// independently of any UI rendering — a copy-paste typo in step 1 (the
+/// one with "System Settings") would otherwise only surface during a live
+/// run on macOS.
+pub fn permission_steps() -> &'static [&'static str] {
+    &[
+        "Open System Settings → Privacy & Security → Accessibility.",
+        "Click \"+\" and add the wiredesk-client binary.",
+        "Toggle the switch ON for wiredesk-client.",
+        "Restart WireDesk — required: the tap thread is created at startup.",
+    ]
+}
+
 impl WireDeskApp {
     pub fn new(
         initial_config: ClientConfig,
@@ -390,28 +404,42 @@ impl WireDeskApp {
         ui.add_space(8.0);
 
         ui.label("To grant it:");
-        ui.indent("perm_steps", |ui| {
-            ui.label("1. Open System Settings → Privacy & Security → Accessibility");
-            ui.label("2. Click \"+\" and add the wiredesk-client binary");
-            ui.label("3. Toggle the switch ON");
-            ui.label("4. Restart WireDesk — required: the tap thread is created at startup");
-        });
-        ui.add_space(12.0);
+        ui.add_space(4.0);
 
-        if ui.button("Open System Settings").clicked() {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                    .spawn();
-            }
+        // Each step in its own group with a large numbered glyph on the
+        // left. The "Open System Settings" button lives inside step 1 so
+        // the action is co-located with the instruction that requires it.
+        for (i, step) in permission_steps().iter().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}", i + 1))
+                            .size(20.0)
+                            .strong(),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(*step);
+                        if i == 0 && ui.button("Open System Settings").clicked() {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = std::process::Command::new("open")
+                                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                                    .spawn();
+                            }
+                        }
+                    });
+                });
+            });
         }
 
-        ui.add_space(8.0);
-        ui.weak(
-            "(After granting permission, quit and relaunch wiredesk-client. \
-             The window detects the change but the tap won't activate \
-             without a fresh process.)",
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(
+                "\u{26A0} After granting permission, quit and relaunch \
+                 wiredesk-client. The window detects the change but the \
+                 tap won't activate without a fresh process.",
+            )
+            .color(egui::Color32::from_rgb(220, 140, 60)),
         );
     }
 
@@ -419,6 +447,28 @@ impl WireDeskApp {
     /// clickable elements — just a description of what the app is doing
     /// and the relevant hotkeys.
     fn render_capture_info(&self, ui: &mut egui::Ui) {
+        // Full-width red-tinted banner — instantly communicates that the
+        // window is intercepting input. Sized large (20pt strong, white) so
+        // it's readable from across the room when the user is interacting
+        // with the Host monitor and not looking at the Mac display.
+        let banner_fill =
+            egui::Color32::from_rgb(180, 60, 60).linear_multiply(0.3);
+        egui::Frame::group(ui.style())
+            .fill(banner_fill)
+            .show(ui, |ui| {
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new("\u{25CF} CAPTURING — Cmd+Esc to release")
+                                .size(20.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                    },
+                );
+            });
+
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             ui.heading("WireDesk — input forwarded to Host");
@@ -982,6 +1032,16 @@ mod tests {
         app.screen_w = 2560;
         app.screen_h = 1440;
         assert_eq!(app.status_text(), "Connected to win-host (2560×1440)");
+    }
+
+    #[test]
+    fn permission_steps_has_four_steps() {
+        assert_eq!(permission_steps().len(), 4);
+    }
+
+    #[test]
+    fn permission_steps_first_mentions_system_settings() {
+        assert!(permission_steps()[0].contains("System Settings"));
     }
 
     #[test]
