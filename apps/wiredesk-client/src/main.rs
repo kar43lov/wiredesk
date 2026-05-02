@@ -137,7 +137,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn force_dock_icon_from_bundle() {
+pub(crate) unsafe fn force_dock_icon_from_bundle() {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};

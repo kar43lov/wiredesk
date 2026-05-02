@@ -88,6 +88,12 @@ pub struct WireDeskApp {
     /// applying it from `update()` after the timer ensures macOS has
     /// finished the transition before we move the window.
     pending_position_restore: Option<(egui::Pos2, Instant)>,
+    /// Last time we re-applied the bundle's Dock icon. winit/eframe's
+    /// NSApp init can overwrite the icon ~1s after creator runs, so we
+    /// re-apply periodically until macOS settles on our icon. Three or
+    /// four passes during the first 10 seconds is enough.
+    last_dock_icon_apply: Option<Instant>,
+    dock_icon_apply_count: u8,
     // Saved outer position before entering fullscreen on a non-active monitor.
     // Restored on fullscreen exit so the chrome window returns to where the
     // user originally had it. None when fullscreen wasn't entered via an
@@ -194,6 +200,8 @@ impl WireDeskApp {
             monitor_fallback_msg: None,
             original_position: None,
             pending_position_restore: None,
+            last_dock_icon_apply: None,
+            dock_icon_apply_count: 0,
             runtime_preferred_monitor,
         }
     }
@@ -589,6 +597,40 @@ impl WireDeskApp {
         }
     }
 
+    /// Re-apply the Dock icon a few times during startup. winit's NSApp
+    /// init (and possibly TCC re-registration after Accessibility prompt)
+    /// overwrites whatever was set in the creator callback ~1s in. Two
+    /// or three re-applies at 1s / 3s / 6s after launch beat that race
+    /// without permanently spinning the AppKit message pump.
+    #[cfg(target_os = "macos")]
+    fn reapply_dock_icon_if_needed(&mut self) {
+        if self.dock_icon_apply_count >= 4 {
+            return;
+        }
+        let due = match self.last_dock_icon_apply {
+            None => true,
+            Some(t) => {
+                let elapsed = t.elapsed();
+                let next_delay = match self.dock_icon_apply_count {
+                    1 => Duration::from_millis(1_500),
+                    2 => Duration::from_secs(3),
+                    _ => Duration::from_secs(5),
+                };
+                elapsed >= next_delay
+            }
+        };
+        if due {
+            unsafe {
+                crate::force_dock_icon_from_bundle();
+            }
+            self.last_dock_icon_apply = Some(Instant::now());
+            self.dock_icon_apply_count += 1;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reapply_dock_icon_if_needed(&mut self) {}
+
     /// Drain the pending `OuterPosition` after fullscreen exit if its
     /// settle timer has elapsed. Called from `update()`.
     fn drain_pending_position_restore(&mut self, ctx: &egui::Context) {
@@ -875,6 +917,7 @@ impl eframe::App for WireDeskApp {
         // the Mac side. Resumes when window gets focus back.
         self.sync_tap_to_focus(ctx);
         self.drain_pending_position_restore(ctx);
+        self.reapply_dock_icon_if_needed();
 
         // Drain TapEvents from the keyboard tap thread.
         let mut pending_tap_events: Vec<TapEvent> = Vec::new();
@@ -899,11 +942,35 @@ impl eframe::App for WireDeskApp {
         // egui-side hotkeys for the OUT-OF-CAPTURE path. When tap is enabled
         // it consumes these before egui sees them; this branch handles the
         // case where the user presses them without capture being on.
+        //
+        // Walk the raw event stream rather than `key_pressed(Esc) &&
+        // modifiers.command` — on macOS, eframe sometimes drops the
+        // command-modifier bit by the time `key_pressed` is sampled, so
+        // Cmd+Esc with capture-off was never firing toggle_capture (only
+        // the in-capture tap path released it). Reading events directly
+        // lets us see the exact `Key { key: Escape, modifiers: { mac_cmd
+        // | command, .. }, pressed: true }` that winit dispatches.
         let (cmd_esc_pressed, cmd_enter_pressed) = ctx.input(|i: &egui::InputState| {
-            (
-                i.key_pressed(egui::Key::Escape) && i.modifiers.command,
-                i.key_pressed(egui::Key::Enter) && i.modifiers.command,
-            )
+            let mut esc = false;
+            let mut enter = false;
+            for ev in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    if (modifiers.command || modifiers.mac_cmd) && !modifiers.shift {
+                        match key {
+                            egui::Key::Escape => esc = true,
+                            egui::Key::Enter => enter = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (esc, enter)
         });
         if cmd_esc_pressed {
             self.toggle_capture();
