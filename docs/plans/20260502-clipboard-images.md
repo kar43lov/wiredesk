@@ -270,23 +270,23 @@ main.rs:
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 - Modify: `apps/wiredesk-client/src/main.rs`
 
-- [ ] добавить поле `expected_format: u8` в `IncomingClipboard`. Изменить сигнатуру `on_offer(format: u8, total_len: u32)`.
-- [ ] **abort previous reassembly:** в `on_offer` если `self.received_total > 0 && self.received_total < self.expected_len` → `log::warn!("incoming offer aborted previous reassembly ({} bytes accumulated)")` + `self.received.clear() + self.received_total = 0` перед сохранением нового offer'а.
-- [ ] добавить публичный метод `pub fn reset(&mut self)` — обнуляет `expected_len`, `expected_format`, `received_total`, `received.clear()`, обнуляет `incoming_progress`/`incoming_total` (`store(0, Relaxed)`).
-- [ ] в `commit()` ветвление: `match self.expected_format { FORMAT_TEXT_UTF8 => set_text(...), FORMAT_PNG_IMAGE => decode + set_image(...), _ => log::warn!("unknown format {}, skipping") }`.
-- [ ] для image-ветки: `decode_png_to_rgba(&buf)` → если `Ok(image)` → hash от `image.bytes`, `state.set(Image(hash))`, `clip.set_image(image)`. Если `Err` — log::warn + skip.
-- [ ] добавить параметры `incoming_progress: Arc<AtomicU64>` и `incoming_total: Arc<AtomicU64>` в `IncomingClipboard::new`. В `on_offer` — `total.store(total_len as u64, Relaxed)`, `progress.store(0, Relaxed)`. В `on_chunk` — `progress.fetch_add(data.len() as u64, Relaxed)`.
-- [ ] **wiring в `main.rs::reader_thread`:** заменить текущее `Message::ClipOffer { total_len, .. } => incoming_clip.on_offer(total_len)` на `Message::ClipOffer { format, total_len } => incoming_clip.on_offer(format, total_len)`. Без этого compile-ошибка/regression (сейчас `format` отбрасывается через `..`).
-- [ ] **disconnect handling в reader_thread:** при `Message::Disconnect` или ошибке транспорта — `incoming_clip.reset()` перед выходом из цикла (либо отправить событие, чтобы `WireDeskApp` обнулил outgoing-counters; см. Task 7a).
-- [ ] обновить `main.rs::main` — создать `Arc<AtomicU64>`'ы для incoming + передать в `IncomingClipboard::new`.
-- [ ] unit-тест `incoming_image_reassembly`: synthetic PNG → on_offer + N×on_chunk → перед `clip.set_image()` извлечь decoded RGBA для проверки byte-equality с исходником. (Можно передать `Option<arboard::Clipboard>` = `None` в тестовом конструкторе и проверять `state` + accumulated buf через test-only accessor.)
-- [ ] unit-тест `incoming_text_reassembly_unchanged`: regression — text path работает как раньше.
-- [ ] unit-тест `incoming_invalid_png_skipped`: format=1, payload не PNG → commit не паникует, image hash не записан в state.
-- [ ] unit-тест `incoming_offer_during_reassembly_aborts_previous`: on_offer(0, 1024) → on_chunk(0, 256 байт) → on_offer(1, 512) → проверить что `received` очищен, `expected_format=1`, `expected_len=512`.
-- [ ] unit-тест `incoming_reset_clears_state`: накапливаем 3 chunk'а → `reset()` → проверить что `expected_len=0`, `received.is_empty()`, counters обнулены.
-- [ ] unit-тест `incoming_image_then_text_no_loop`: receive image → state становится `Image(h)` → следующий poll thread с тем же RGBA должен пропустить (regression для AC6).
-- [ ] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
-- [ ] запустить `cargo clippy -p wiredesk-client --all-targets -- -D warnings` — clean.
+- [x] добавить поле `expected_format: u8` в `IncomingClipboard`. Изменить сигнатуру `on_offer(format: u8, total_len: u32)`.
+- [x] **abort previous reassembly:** в `on_offer` если `self.received_total > 0 && self.received_total < self.expected_len` → `log::warn!("incoming offer aborted previous reassembly ({} bytes accumulated)")` + `self.received.clear() + self.received_total = 0` перед сохранением нового offer'а.
+- [x] добавить публичный метод `pub fn reset(&mut self)` — обнуляет `expected_len`, `expected_format`, `received_total`, `received.clear()`, обнуляет `incoming_progress`/`incoming_total` (`store(0, Relaxed)`).
+- [x] в `commit()` ветвление: `match self.expected_format { FORMAT_TEXT_UTF8 => set_text(...), FORMAT_PNG_IMAGE => decode + set_image(...), _ => log::warn!("unknown format {}, skipping") }`.
+- [x] для image-ветки: `decode_png_to_rgba(&buf)` → если `Ok(image)` → hash от `image.bytes`, `state.set(Image(hash))`, `clip.set_image(image)`. Если `Err` — log::warn + skip.
+- [x] добавить параметры `incoming_progress: Arc<AtomicU64>` и `incoming_total: Arc<AtomicU64>` в `IncomingClipboard::new`. В `on_offer` — `total.store(total_len as u64, Relaxed)`, `progress.store(0, Relaxed)`. В `on_chunk` — `progress.fetch_add(data.len() as u64, Relaxed)`.
+- [x] **wiring в `main.rs::reader_thread`:** заменить текущее `Message::ClipOffer { total_len, .. } => incoming_clip.on_offer(total_len)` на `Message::ClipOffer { format, total_len } => incoming_clip.on_offer(format, total_len)`. Без этого compile-ошибка/regression (сейчас `format` отбрасывается через `..`).
+- [x] **disconnect handling в reader_thread:** при `Message::Disconnect` или ошибке транспорта — `incoming_clip.reset()` перед выходом из цикла (либо отправить событие, чтобы `WireDeskApp` обнулил outgoing-counters; см. Task 7a).
+- [x] обновить `main.rs::main` — создать `Arc<AtomicU64>`'ы для incoming + передать в `IncomingClipboard::new`.
+- [x] unit-тест `incoming_image_reassembly`: synthetic PNG → on_offer + N×on_chunk → перед `clip.set_image()` извлечь decoded RGBA для проверки byte-equality с исходником. (Можно передать `Option<arboard::Clipboard>` = `None` в тестовом конструкторе и проверять `state` + accumulated buf через test-only accessor.)
+- [x] unit-тест `incoming_text_reassembly_unchanged`: regression — text path работает как раньше.
+- [x] unit-тест `incoming_invalid_png_skipped`: format=1, payload не PNG → commit не паникует, image hash не записан в state.
+- [x] unit-тест `incoming_offer_during_reassembly_aborts_previous`: on_offer(0, 1024) → on_chunk(0, 256 байт) → on_offer(1, 512) → проверить что `received` очищен, `expected_format=1`, `expected_len=512`.
+- [x] unit-тест `incoming_reset_clears_state`: накапливаем 3 chunk'а → `reset()` → проверить что `expected_len=0`, `received.is_empty()`, counters обнулены.
+- [x] unit-тест `incoming_image_then_text_no_loop`: receive image → state становится `Image(h)` → следующий poll thread с тем же RGBA должен пропустить (regression для AC6).
+- [x] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
+- [x] запустить `cargo clippy -p wiredesk-client --all-targets -- -D warnings` — clean.
 
 ### Task 6: Host side — симметричная реализация (отправка + приём + edge cases)
 

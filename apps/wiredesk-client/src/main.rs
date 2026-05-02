@@ -90,17 +90,27 @@ fn main() {
         writer_thread(writer_transport, outgoing_rx, writer_events_tx, client_name);
     });
 
-    // Reader thread — owns the other half. Just receives and dispatches.
-    let reader_clipboard = clipboard_state.clone();
-    thread::spawn(move || {
-        reader_thread(reader_transport, events_tx, reader_clipboard);
-    });
-
     // Clipboard progress counters — read by the UI status-line (wired up in
     // Task 7a). Created here so the same Arc is shared by the poll thread,
     // the reader thread, and the egui app.
     let outgoing_progress = Arc::new(AtomicU64::new(0));
     let outgoing_total = Arc::new(AtomicU64::new(0));
+    let incoming_progress = Arc::new(AtomicU64::new(0));
+    let incoming_total = Arc::new(AtomicU64::new(0));
+
+    // Reader thread — owns the other half. Just receives and dispatches.
+    let reader_clipboard = clipboard_state.clone();
+    let reader_incoming_progress = incoming_progress.clone();
+    let reader_incoming_total = incoming_total.clone();
+    thread::spawn(move || {
+        reader_thread(
+            reader_transport,
+            events_tx,
+            reader_clipboard,
+            reader_incoming_progress,
+            reader_incoming_total,
+        );
+    });
 
     // Clipboard poll thread — pushes Mac clipboard changes to host.
     clipboard::spawn_poll_thread(
@@ -233,13 +243,23 @@ fn reader_thread(
     mut transport: Box<dyn Transport>,
     events_tx: mpsc::Sender<TransportEvent>,
     clipboard_state: clipboard::ClipboardState,
+    incoming_progress: Arc<AtomicU64>,
+    incoming_total: Arc<AtomicU64>,
 ) {
-    let mut incoming_clip = clipboard::IncomingClipboard::new(clipboard_state);
+    let mut incoming_clip = clipboard::IncomingClipboard::new(
+        clipboard_state,
+        incoming_progress,
+        incoming_total,
+    );
     loop {
         match transport.recv() {
             Ok(p) => match p.message {
                 Message::HelloAck { host_name, screen_w, screen_h, .. } => {
                     log::info!("connected to '{host_name}' ({screen_w}x{screen_h})");
+                    // New session — drop any stale partial reassembly from a
+                    // previous (now-defunct) connection so the progress UI
+                    // doesn't carry over old counters.
+                    incoming_clip.reset();
                     let _ = events_tx.send(TransportEvent::Connected {
                         host_name,
                         screen_w,
@@ -249,8 +269,8 @@ fn reader_thread(
                 Message::Heartbeat => {
                     let _ = events_tx.send(TransportEvent::Heartbeat);
                 }
-                Message::ClipOffer { total_len, .. } => {
-                    incoming_clip.on_offer(total_len);
+                Message::ClipOffer { format, total_len } => {
+                    incoming_clip.on_offer(format, total_len);
                 }
                 Message::ClipChunk { index, data } => {
                     incoming_clip.on_chunk(index, data);
@@ -269,6 +289,7 @@ fn reader_thread(
                 }
                 Message::Disconnect => {
                     log::info!("host disconnected");
+                    incoming_clip.reset();
                     let _ = events_tx.send(TransportEvent::Disconnected("host disconnected".into()));
                     return;
                 }
@@ -283,6 +304,7 @@ fn reader_thread(
             }
             Err(e) => {
                 log::error!("transport error: {e}");
+                incoming_clip.reset();
                 let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
                 return;
             }

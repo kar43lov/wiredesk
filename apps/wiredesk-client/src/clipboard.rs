@@ -107,10 +107,6 @@ pub(crate) fn check_image_size(png_len: usize, limit: usize) -> Result<(), Image
 }
 
 /// Decode PNG bytes to an arboard `ImageData` (RGBA8, owned).
-///
-/// Wired up by `IncomingClipboard::commit` in Task 5. Currently exercised
-/// only by tests.
-#[allow(dead_code)]
 fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image::ImageError> {
     let dyn_img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
     let rgba = dyn_img.to_rgba8();
@@ -262,36 +258,113 @@ pub fn spawn_poll_thread(
 pub struct IncomingClipboard {
     state: ClipboardState,
     expected_len: u32,
+    /// Format from the most recent `ClipOffer`. Determines whether `commit()`
+    /// writes UTF-8 text or decodes a PNG and pushes RGBA to arboard.
+    expected_format: u8,
     received: BTreeMap<u16, Vec<u8>>,
     received_total: u32,
     clip: Option<arboard::Clipboard>,
+    /// Live counters consumed by the UI status-line (Task 7a). Also reset by
+    /// `reset()` on disconnect / new Hello so a half-finished transfer doesn't
+    /// leave the progress display stuck.
+    incoming_progress: Arc<AtomicU64>,
+    incoming_total: Arc<AtomicU64>,
+    /// Test-only sink for the last successfully committed payload. Lets unit
+    /// tests assert on what would have been written to the local clipboard
+    /// without depending on the host platform's actual clipboard backend
+    /// (which arboard cannot stub out portably).
+    #[cfg(test)]
+    last_committed: Option<CommittedPayload>,
+}
+
+/// What the most recent `commit()` produced. Test-only — production code
+/// pushes straight to `arboard::Clipboard`.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CommittedPayload {
+    Text(String),
+    Image { width: usize, height: usize, bytes: Vec<u8> },
 }
 
 impl IncomingClipboard {
-    pub fn new(state: ClipboardState) -> Self {
+    pub fn new(
+        state: ClipboardState,
+        incoming_progress: Arc<AtomicU64>,
+        incoming_total: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             state,
             expected_len: 0,
+            expected_format: 0,
             received: BTreeMap::new(),
             received_total: 0,
             clip: arboard::Clipboard::new().ok(),
+            incoming_progress,
+            incoming_total,
+            #[cfg(test)]
+            last_committed: None,
         }
     }
 
-    pub fn on_offer(&mut self, total_len: u32) {
+    /// Test constructor — skips arboard init (which would fail in headless CI
+    /// or in test environments without a window server) and lets us inspect
+    /// committed payloads via `last_committed`.
+    #[cfg(test)]
+    fn new_for_test(state: ClipboardState) -> Self {
+        Self {
+            state,
+            expected_len: 0,
+            expected_format: 0,
+            received: BTreeMap::new(),
+            received_total: 0,
+            clip: None,
+            incoming_progress: Arc::new(AtomicU64::new(0)),
+            incoming_total: Arc::new(AtomicU64::new(0)),
+            last_committed: None,
+        }
+    }
+
+    pub fn on_offer(&mut self, format: u8, total_len: u32) {
+        // Abort an in-progress reassembly if a new offer arrives mid-transfer.
+        // Sender is single-threaded so this is a real signal (peer
+        // started a fresh payload) — not a race.
+        if self.received_total > 0 && self.received_total < self.expected_len {
+            log::warn!(
+                "clipboard: incoming offer aborted previous reassembly ({} of {} bytes accumulated)",
+                self.received_total,
+                self.expected_len
+            );
+        }
         self.expected_len = total_len;
+        self.expected_format = format;
         self.received.clear();
         self.received_total = 0;
-        log::debug!("clipboard: incoming offer of {total_len} bytes");
+        self.incoming_total.store(total_len as u64, Ordering::Relaxed);
+        self.incoming_progress.store(0, Ordering::Relaxed);
+        log::debug!("clipboard: incoming offer format={format} of {total_len} bytes");
     }
 
     pub fn on_chunk(&mut self, index: u16, data: Vec<u8>) {
-        self.received_total += data.len() as u32;
+        let added = data.len() as u32;
+        self.received_total += added;
         self.received.insert(index, data);
+        self.incoming_progress
+            .fetch_add(added as u64, Ordering::Relaxed);
 
         if self.received_total >= self.expected_len && self.expected_len > 0 {
             self.commit();
         }
+    }
+
+    /// Drop any in-flight reassembly state and zero progress counters.
+    /// Called from the reader thread on disconnect and on Hello (new session).
+    pub fn reset(&mut self) {
+        self.expected_len = 0;
+        self.expected_format = 0;
+        self.received.clear();
+        self.received_total = 0;
+        self.incoming_progress.store(0, Ordering::Relaxed);
+        self.incoming_total.store(0, Ordering::Relaxed);
     }
 
     fn commit(&mut self) {
@@ -300,10 +373,28 @@ impl IncomingClipboard {
             buf.extend_from_slice(&chunk);
         }
 
+        match self.expected_format {
+            FORMAT_TEXT_UTF8 => self.commit_text(buf),
+            FORMAT_PNG_IMAGE => self.commit_image(&buf),
+            other => {
+                log::warn!("clipboard: unknown format {other}, skipping {} bytes", buf.len());
+            }
+        }
+
+        self.expected_len = 0;
+        self.expected_format = 0;
+        self.received_total = 0;
+    }
+
+    fn commit_text(&mut self, buf: Vec<u8>) {
         match String::from_utf8(buf) {
             Ok(text) => {
                 let hash = hash_text(&text);
                 self.state.set(LastKind::Text(hash)); // mark as ours so poll won't echo
+                #[cfg(test)]
+                {
+                    self.last_committed = Some(CommittedPayload::Text(text.clone()));
+                }
                 if let Some(clip) = self.clip.as_mut() {
                     if let Err(e) = clip.set_text(text.clone()) {
                         log::warn!("clipboard: set_text failed: {e}");
@@ -314,9 +405,40 @@ impl IncomingClipboard {
             }
             Err(e) => log::warn!("clipboard: incoming bytes not valid UTF-8: {e}"),
         }
+    }
 
-        self.expected_len = 0;
-        self.received_total = 0;
+    fn commit_image(&mut self, buf: &[u8]) {
+        let img = match decode_png_to_rgba(buf) {
+            Ok(i) => i,
+            Err(e) => {
+                log::warn!("clipboard: PNG decode failed: {e}");
+                return;
+            }
+        };
+
+        // Hash from RGBA, not the encoded PNG bytes — round-trip
+        // arboard PNG↔RGBA produces different encoded bytes across
+        // peers, but the RGBA buffer is stable and is what the next
+        // `get_image()` poll will read.
+        let hash = hash_bytes(&img.bytes);
+        self.state.set(LastKind::Image(hash));
+
+        #[cfg(test)]
+        {
+            self.last_committed = Some(CommittedPayload::Image {
+                width: img.width,
+                height: img.height,
+                bytes: img.bytes.to_vec(),
+            });
+        }
+
+        if let Some(clip) = self.clip.as_mut() {
+            if let Err(e) = clip.set_image(img) {
+                log::warn!("clipboard: set_image failed: {e}");
+            } else {
+                log::debug!("clipboard: wrote image from host ({} encoded bytes)", buf.len());
+            }
+        }
     }
 }
 
@@ -493,5 +615,178 @@ mod tests {
         assert!(got_offer, "first message must be ClipOffer");
         // ceil(len / CHUNK_SIZE) = 4 for 256*3+7 bytes
         assert_eq!(chunk_count, 4);
+    }
+
+    /// Push `payload` through `IncomingClipboard` as one offer + N chunks.
+    fn feed_offer(incoming: &mut IncomingClipboard, format: u8, payload: &[u8]) {
+        incoming.on_offer(format, payload.len() as u32);
+        for (i, chunk) in payload.chunks(CHUNK_SIZE).enumerate() {
+            incoming.on_chunk(i as u16, chunk.to_vec());
+        }
+    }
+
+    #[test]
+    fn incoming_image_reassembly() {
+        // synthetic RGBA → encode → feed back through IncomingClipboard →
+        // decoded RGBA must match the original byte-for-byte. Verifies
+        // commit() routes format=1 through decode_png_to_rgba and stamps
+        // LastKind::Image in shared state.
+        let original = synthetic_rgba_4x4();
+        let png = encode_rgba_to_png(&original).expect("encode");
+
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state.clone());
+        feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &png);
+
+        match incoming.last_committed.as_ref().expect("committed payload") {
+            CommittedPayload::Image { width, height, bytes } => {
+                assert_eq!(*width, original.width);
+                assert_eq!(*height, original.height);
+                assert_eq!(bytes.as_slice(), &*original.bytes);
+            }
+            other => panic!("expected image payload, got {other:?}"),
+        }
+
+        // LastKind must be Image — guards against the receiver echoing back
+        // the image we just wrote ourselves.
+        assert!(matches!(state.get(), LastKind::Image(_)));
+    }
+
+    #[test]
+    fn incoming_text_reassembly_unchanged() {
+        // Regression: text path keeps working (format=0 → set_text equivalent).
+        let text = "hello, мир";
+        let bytes = text.as_bytes().to_vec();
+
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state.clone());
+        feed_offer(&mut incoming, FORMAT_TEXT_UTF8, &bytes);
+
+        match incoming.last_committed.as_ref().expect("committed payload") {
+            CommittedPayload::Text(s) => assert_eq!(s, text),
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert!(matches!(state.get(), LastKind::Text(_)));
+    }
+
+    #[test]
+    fn incoming_invalid_png_skipped() {
+        // format=1 + non-PNG payload → commit logs warn, no panic, no state
+        // update. Reset of `expected_*` still happens so the next offer can
+        // proceed.
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state.clone());
+
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
+        feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &garbage);
+
+        assert!(incoming.last_committed.is_none(), "no payload should commit");
+        assert!(matches!(state.get(), LastKind::None));
+        // After failed commit the receiver must be ready for a new offer.
+        assert_eq!(incoming.expected_len, 0);
+        assert_eq!(incoming.expected_format, 0);
+    }
+
+    #[test]
+    fn incoming_unknown_format_skipped() {
+        // An unrecognised format value must not panic and must not stamp
+        // anything in the shared state.
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state.clone());
+
+        feed_offer(&mut incoming, 0xFE, b"opaque");
+
+        assert!(incoming.last_committed.is_none());
+        assert!(matches!(state.get(), LastKind::None));
+    }
+
+    #[test]
+    fn incoming_offer_during_reassembly_aborts_previous() {
+        // Start a 1024-byte text offer, push only one chunk (256B), then
+        // send a fresh PNG offer. Receiver must drop the partial text
+        // and switch context to the new offer.
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state);
+
+        incoming.on_offer(FORMAT_TEXT_UTF8, 1024);
+        incoming.on_chunk(0, vec![b'a'; 256]);
+        assert_eq!(incoming.received_total, 256);
+
+        incoming.on_offer(FORMAT_PNG_IMAGE, 512);
+        assert_eq!(incoming.expected_format, FORMAT_PNG_IMAGE);
+        assert_eq!(incoming.expected_len, 512);
+        assert_eq!(incoming.received_total, 0);
+        assert!(incoming.received.is_empty(), "previous chunks must be dropped");
+    }
+
+    #[test]
+    fn incoming_reset_clears_state() {
+        // Accumulate partial state, call reset(), verify everything is zero.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        // Override the test ctor's own counters so we can assert on them.
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        incoming.on_offer(FORMAT_PNG_IMAGE, 4096);
+        incoming.on_chunk(0, vec![0u8; 256]);
+        incoming.on_chunk(1, vec![0u8; 256]);
+        incoming.on_chunk(2, vec![0u8; 256]);
+        assert!(incoming.received_total > 0);
+        assert!(progress.load(Ordering::Relaxed) > 0);
+        assert!(total.load(Ordering::Relaxed) > 0);
+
+        incoming.reset();
+
+        assert_eq!(incoming.expected_len, 0);
+        assert_eq!(incoming.expected_format, 0);
+        assert_eq!(incoming.received_total, 0);
+        assert!(incoming.received.is_empty());
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn incoming_image_then_text_no_loop() {
+        // After receiving an image, LastKind::Image(h) is set. The poll-side
+        // dedup path (verified by the matches! check below) must treat the
+        // same RGBA as a duplicate so we don't echo it back to peer (AC6).
+        let original = synthetic_rgba_4x4();
+        let png = encode_rgba_to_png(&original).expect("encode");
+
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state.clone());
+        feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &png);
+
+        let img_hash = hash_bytes(&original.bytes);
+        assert!(
+            matches!(state.get(), LastKind::Image(h) if h == img_hash),
+            "state must hold the image's RGBA hash for loop avoidance"
+        );
+
+        // Now mimic the poll thread reading get_image() and checking dedup.
+        let next_hash = hash_bytes(&original.bytes);
+        let dedup_hits = matches!(state.get(), LastKind::Image(h) if h == next_hash);
+        assert!(dedup_hits, "next poll with same RGBA must short-circuit");
+    }
+
+    #[test]
+    fn incoming_progress_counters_track_chunks() {
+        // on_offer initialises total, on_chunk increments progress.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        incoming.on_offer(FORMAT_TEXT_UTF8, 800);
+        assert_eq!(total.load(Ordering::Relaxed), 800);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+
+        incoming.on_chunk(0, vec![b'x'; 256]);
+        assert_eq!(progress.load(Ordering::Relaxed), 256);
+        incoming.on_chunk(1, vec![b'x'; 256]);
+        assert_eq!(progress.load(Ordering::Relaxed), 512);
     }
 }
