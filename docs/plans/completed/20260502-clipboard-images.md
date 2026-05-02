@@ -394,12 +394,12 @@ main.rs:
 
 **Bandwidth realism note.** Бриф изначально указывал AC1 «≤30 сек», но это покрывает только небольшие скриншоты (~250–330 KB encoded). Для FullHD-скриншота (типично 500 KB – 1 MB после PNG) при 11 KB/s wire-throughput реалистичны 50–100 секунд. AC1/AC2 ниже скорректированы — оригинальный AC1 в брифе остаётся как **soft target** для типичных use-cases.
 
-- AC1: Mac `Cmd+Shift+Ctrl+4` (скриншот окна, 200–500 KB) → ≤60 сек → Win Cmd+V в Paint вставляет идентичную картинку. Скриншот всего экрана (~1 MB) → ≤120 сек.
-- AC2: Win Snipping Tool (small region, ≤500 KB) → ≤60 сек → Mac Cmd+V в Preview вставляет идентичную картинку.
-- AC3: regression — `Cmd+C` на тексте на обеих сторонах продолжает работать (text clipboard не сломан).
-- AC4: скопировать большой скриншот (FullHD-полный, ~1.5 MB после PNG) → toast «image too large» появляется → Cmd+V на peer'е возвращает то, что было раньше (не пустоту, не зависание).
-- AC5: во время передачи ~500 KB-картинки в status-line видно `"Sending image — N/M KB (P%)"`, прогресс растёт ≥ 2 раза за время передачи.
-- AC6: после получения картинки на peer'е, тот peer не отправляет её обратно (loop avoidance — наблюдать через debug-log на отправке).
+- [ ] AC1 (deferred — requires live hardware testing by user): Mac `Cmd+Shift+Ctrl+4` (скриншот окна, 200–500 KB) → ≤60 сек → Win Cmd+V в Paint вставляет идентичную картинку. Скриншот всего экрана (~1 MB) → ≤120 сек.
+- [ ] AC2 (deferred — requires live hardware testing by user): Win Snipping Tool (small region, ≤500 KB) → ≤60 сек → Mac Cmd+V в Preview вставляет идентичную картинку.
+- [ ] AC3 (deferred — requires live hardware testing by user): regression — `Cmd+C` на тексте на обеих сторонах продолжает работать (text clipboard не сломан).
+- [x] AC4 покрыт unit-тестами на обеих сторонах: `toast_emitted_on_oversized_image` (Mac), `host_image_too_large_skipped` (Host); поведение «один toast на oversize» дополнительно проверяется `oversize_dedup_skips_repoll` / `host_oversize_dedup_skips_repoll`.
+- [ ] AC5 (deferred — requires live hardware testing by user): во время передачи ~500 KB-картинки в status-line видно `"Sending image — N/M KB (P%)"`, прогресс растёт ≥ 2 раза за время передачи. Корректность writer-thread инкремента покрыта unit-тестами `apply_outgoing_progress_*`.
+- [ ] AC6 (deferred — requires live hardware testing by user): после получения картинки на peer'е, тот peer не отправляет её обратно (loop avoidance — наблюдать через debug-log на отправке).
 - **edge: interleaved** — Cmd+C на тексте, сразу же (до завершения) Cmd+C на картинке → на receiver'е в логе видно `"incoming offer aborted previous reassembly"`, картинка вставляется корректно.
 - **edge: disconnect** — отсоединить serial-кабель в середине image-transfer → reconnect → status-line очищается, следующий Cmd+C+V работает (нет залипшего state).
 

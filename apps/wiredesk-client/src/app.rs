@@ -172,21 +172,28 @@ const STEP_NUMBER_SIZE: f32 = 20.0;
 /// Returns `None` when there's no active transfer (`total == 0`) so the
 /// caller can skip rendering altogether — this is the common case once the
 /// poll thread has zeroed counters after a finished send. When a transfer is
-/// in flight, returns a string like `"Sending image — 340/780 KB (43%)"` so
+/// in flight, returns a string like `"Sending clipboard — 340/780 KB (43%)"` so
 /// the user can see that something is moving across the wire.
 ///
 /// `current` is clamped to `total` so a brief race (writer thread atomically
-/// adding before total wraps in tests) never produces "1100%". KB rounding
-/// uses integer division — sub-KB jitter doesn't matter at this scale.
+/// adding before total wraps in tests) never produces "1100%".
+///
+/// Codex iter3 E5: unit selection — sub-KB transfers (short Cmd+C of a few
+/// dozen chars) used to render as "0/0 KB" because of integer division. Now
+/// we switch to raw bytes when `total < 1024`, and KB otherwise.
 pub fn format_progress(action: &str, current: u64, total: u64) -> Option<String> {
     if total == 0 {
         return None;
     }
     let cur = current.min(total);
     let pct = (cur * 100) / total;
-    let cur_kb = cur / 1024;
-    let tot_kb = total / 1024;
-    Some(format!("{action} — {cur_kb}/{tot_kb} KB ({pct}%)"))
+    if total < 1024 {
+        Some(format!("{action} — {cur}/{total} B ({pct}%)"))
+    } else {
+        let cur_kb = cur / 1024;
+        let tot_kb = total / 1024;
+        Some(format!("{action} — {cur_kb}/{tot_kb} KB ({pct}%)"))
+    }
 }
 
 /// Static list of macOS Accessibility-permission setup steps shown on the
@@ -948,6 +955,13 @@ impl eframe::App for WireDeskApp {
                     self.screen_h = screen_h;
                     self.mapper.set_screen_size(screen_w, screen_h);
                     self.status_msg = format!("connected to {}", self.host_name);
+                    // Counter reset for re-handshake-without-prior-Disconnect
+                    // is owned by `reader_thread` now (Codex iter5): clearing
+                    // counters from the UI thread on Connected raced with a
+                    // peer ClipOffer arriving in the same frame and wiped the
+                    // freshly stored `incoming_total` mid-transfer. The reader
+                    // already zeroes both directions at HelloAck before
+                    // emitting this event, so the status row starts clean.
                 }
                 TransportEvent::Disconnected(reason) => {
                     self.state = ConnectionState::Disconnected;
@@ -1082,13 +1096,19 @@ impl eframe::App for WireDeskApp {
             // active. Outgoing and incoming are both possible at the same
             // time (peer copies an image while we copy text); show both in
             // a single row so the chrome layout stays compact.
+            // Codex C4: labels are intentionally generic ("clipboard", not
+            // "image") — the same counters track text and image transfers
+            // and a text Cmd+C briefly flashed "Sending image — 0/512 B"
+            // before being dropped. The status-line consumer only knows
+            // bytes/total, not the format (which lives one layer down in
+            // the Message::ClipOffer that's already long-since enqueued).
             let out = format_progress(
-                "Sending image",
+                "Sending clipboard",
                 self.outgoing_progress.load(Ordering::Relaxed),
                 self.outgoing_total.load(Ordering::Relaxed),
             );
             let inc = format_progress(
-                "Receiving image",
+                "Receiving clipboard",
                 self.incoming_progress.load(Ordering::Relaxed),
                 self.incoming_total.load(Ordering::Relaxed),
             );
@@ -1296,11 +1316,11 @@ impl eframe::App for WireDeskApp {
             // Rendered in warning-orange to match the other inline alert
             // hue. After the 3-second TTL elapses, drop the value so the
             // chrome doesn't keep allocating layout space for an empty row.
-            let toast_expired = matches!(
-                &self.transient_toast,
-                Some((_, when)) if when.elapsed() >= Duration::from_secs(3)
-            );
-            if toast_expired {
+            if self
+                .transient_toast
+                .as_ref()
+                .is_some_and(|(_, when)| when.elapsed() >= Duration::from_secs(3))
+            {
                 self.transient_toast = None;
             }
             if let Some((msg, _)) = &self.transient_toast {
@@ -1490,8 +1510,10 @@ mod tests {
     fn format_progress_active() {
         // Mid-transfer. KB rounding via integer division, percentage as
         // floor((cur*100)/total). 340 KiB / 780 KiB ≈ 43.5% → 43%.
-        let s = format_progress("Sending image", 340 * 1024, 780 * 1024).expect("active");
-        assert!(s.contains("Sending image"), "action prefix missing: {s}");
+        // Codex C4: label is "Sending clipboard" (generic) — "image" was
+        // wrong for text transfers and confused users.
+        let s = format_progress("Sending clipboard", 340 * 1024, 780 * 1024).expect("active");
+        assert!(s.contains("Sending clipboard"), "action prefix missing: {s}");
         assert!(s.contains("340"), "current KB missing: {s}");
         assert!(s.contains("780"), "total KB missing: {s}");
         assert!(s.contains("43%"), "percentage missing: {s}");
@@ -1500,17 +1522,17 @@ mod tests {
     #[test]
     fn format_progress_idle() {
         // total == 0 → no progress to show.
-        assert!(format_progress("Sending image", 0, 0).is_none());
+        assert!(format_progress("Sending clipboard", 0, 0).is_none());
         // total == 0 with stale `current` from a prior transfer should also
         // hide — the writer thread should already have zeroed both, but
         // belt-and-braces against ordering races.
-        assert!(format_progress("Sending image", 256, 0).is_none());
+        assert!(format_progress("Sending clipboard", 256, 0).is_none());
     }
 
     #[test]
     fn format_progress_complete() {
         // Boundary: cur == total exactly → 100%.
-        let s = format_progress("Receiving image", 1024, 1024).expect("active");
+        let s = format_progress("Receiving clipboard", 1024, 1024).expect("active");
         assert!(s.contains("100%"), "expected 100% at boundary: {s}");
     }
 
@@ -1518,8 +1540,27 @@ mod tests {
     fn format_progress_clamps_overshoot() {
         // Defensive: if `current` somehow exceeds `total` (atomic ordering
         // race in tests), don't render >100%.
-        let s = format_progress("Sending image", 2048, 1024).expect("active");
+        let s = format_progress("Sending clipboard", 2048, 1024).expect("active");
         assert!(s.contains("100%"), "overshoot must clamp to 100%: {s}");
+    }
+
+    #[test]
+    fn format_progress_sub_kb_uses_bytes() {
+        // Codex iter3 E5: a short Cmd+C (e.g. 50-byte string) used to
+        // render as "0/0 KB" because of integer division. Now totals
+        // under 1 KiB render in raw bytes.
+        let s = format_progress("Sending clipboard", 25, 50).expect("active");
+        assert!(s.contains("25/50 B"), "expected raw bytes for sub-KB: {s}");
+        assert!(s.contains("50%"), "percentage missing: {s}");
+        assert!(!s.contains("KB"), "must not say KB for sub-KB total: {s}");
+    }
+
+    #[test]
+    fn format_progress_exactly_1kb_uses_kb() {
+        // Boundary: total == 1024 → KB units (the `< 1024` predicate).
+        let s = format_progress("Sending clipboard", 512, 1024).expect("active");
+        assert!(s.contains("KB"), "1 KiB total must use KB units: {s}");
+        assert!(s.contains("0/1 KB"), "expected 0/1 KB at 512/1024: {s}");
     }
 
     #[test]

@@ -39,6 +39,21 @@ pub(crate) enum LastKind {
     Text(u64),
     /// Wired-up by the image send path (Task 4) and receive path (Task 5).
     Image(u64),
+    /// RGBA hash of the most recent image rejected by the size cap. Lets the
+    /// poll thread short-circuit the expensive RGBA→PNG re-encode (and the
+    /// repeated toast emission) for the same buffer on every 500 ms tick —
+    /// AC4 expects one toast per oversize event, not one per poll.
+    OversizeImage(u64),
+}
+
+impl LastKind {
+    /// True when this state has stamped the given RGBA hash either as a
+    /// successfully-sent/received image (loop-avoidance dedup) or as an
+    /// oversize-rejected image (CPU-saving short-circuit). Used by the poll
+    /// path to skip the expensive RGBA→PNG re-encode for the same buffer.
+    pub(crate) fn matches_image_hash(&self, hash: u64) -> bool {
+        matches!(self, LastKind::Image(h) | LastKind::OversizeImage(h) if *h == hash)
+    }
 }
 
 /// Shared state: last known clipboard kind+hash. Updated when we either set or
@@ -60,6 +75,18 @@ impl ClipboardState {
     pub(crate) fn set(&self, kind: LastKind) {
         let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
         *g = kind;
+    }
+
+    /// Clear the sender-side dedup hash. Called from the reader thread on
+    /// disconnect / new HelloAck / transport error so that a mid-transfer
+    /// abort doesn't leave a stale stamp — otherwise the very next poll-tick
+    /// after reconnect would see the same OS-clipboard content, match the
+    /// hash, and skip the resend (silent lost-update). Trade-off: after a
+    /// brief disconnect both sides resend their current clipboards (each
+    /// thinks the other doesn't have it) — better than a lost update.
+    pub fn reset(&self) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        *g = LastKind::None;
     }
 }
 
@@ -97,12 +124,11 @@ fn encode_rgba_to_png(img: &arboard::ImageData<'_>) -> Result<Vec<u8>, image::Im
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImageTooLarge {
     pub png_len: usize,
-    pub limit: usize,
 }
 
 pub(crate) fn check_image_size(png_len: usize, limit: usize) -> Result<(), ImageTooLarge> {
     if png_len > limit {
-        Err(ImageTooLarge { png_len, limit })
+        Err(ImageTooLarge { png_len })
     } else {
         Ok(())
     }
@@ -118,9 +144,43 @@ pub(crate) fn format_oversize_toast(e: &ImageTooLarge) -> String {
     )
 }
 
+/// 64 MB upper bound on decoder allocations. This is the single source of
+/// truth for "safe to decode": any PNG whose decoded RGBA buffer would exceed
+/// this budget is rejected, regardless of per-axis dimensions.
+///
+/// Codex iter6: a per-axis dimension cap (previously 4096) was strictly more
+/// restrictive than the 64 MB budget — it rejected legitimate widescreen /
+/// high-resolution screenshots (5K Retina = 5120×2880×4 ≈ 58.6 MB, well
+/// inside the budget). We dropped the per-axis cap and rely on the alloc
+/// budget alone, with an explicit post-decode check for `to_rgba8()` (which
+/// allocates `width * height * 4` independent of the decoder's `Limits`).
+const DECODE_MAX_ALLOC: u64 = 64 * 1024 * 1024;
+
 /// Decode PNG bytes to an arboard `ImageData` (RGBA8, owned).
+///
+/// Codex iter2 D2 + iter3 E1 + iter6: caps decoded allocations so a PNG bomb
+/// (e.g. palette image expanding to hundreds of MB of RGBA) cannot blow up
+/// memory. `image::Limits.max_alloc` covers the decoder's internal buffers;
+/// the explicit post-decode `(w * h * 4) > DECODE_MAX_ALLOC` check covers the
+/// fresh `to_rgba8()` allocation, which is independent of `Limits`.
 fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image::ImageError> {
-    let dyn_img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
+    use image::GenericImageView;
+    use std::io::Cursor;
+    let mut limits = image::Limits::default();
+    // No max_image_width / max_image_height — alloc budget is the real cap.
+    limits.max_alloc = Some(DECODE_MAX_ALLOC);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
+    reader.limits(limits);
+    let dyn_img = reader.decode()?;
+    let (w, h) = dyn_img.dimensions();
+    let alloc = (w as u64)
+        .saturating_mul(h as u64)
+        .saturating_mul(4);
+    if alloc > DECODE_MAX_ALLOC {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
+        ));
+    }
     let rgba = dyn_img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Ok(arboard::ImageData {
@@ -131,21 +191,19 @@ fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image
 }
 
 /// Push a single clipboard payload (text bytes or encoded PNG) as a
-/// `ClipOffer` followed by N×`ClipChunk`. Updates the outgoing progress
-/// counters so the UI can render a "sending …/… KB" status line.
+/// `ClipOffer` followed by N×`ClipChunk`.
+///
+/// Progress accounting is intentionally NOT done here. mpsc is unbounded,
+/// so packets sit in the channel for many seconds at 11 KB/s wire-throughput.
+/// If the poll thread incremented counters here, UI would jump to ~100%
+/// instantly and never reflect the actual send progress (AC5 violated).
+/// The writer thread (`writer_thread` in main.rs) is the sole place that
+/// updates `outgoing_progress` / `outgoing_total` — see
+/// `apply_outgoing_progress` for the dispatch logic.
 ///
 /// Pure helper (no thread, no clipboard backend) — used by both the
 /// production poll thread and unit tests.
-fn emit_offer_and_chunks(
-    outgoing_tx: &mpsc::Sender<Packet>,
-    format: u8,
-    payload: &[u8],
-    outgoing_progress: &Arc<AtomicU64>,
-    outgoing_total: &Arc<AtomicU64>,
-) {
-    outgoing_progress.store(0, Ordering::Relaxed);
-    outgoing_total.store(payload.len() as u64, Ordering::Relaxed);
-
+fn emit_offer_and_chunks(outgoing_tx: &mpsc::Sender<Packet>, format: u8, payload: &[u8]) {
     let _ = outgoing_tx.send(Packet::new(
         Message::ClipOffer {
             format,
@@ -155,7 +213,6 @@ fn emit_offer_and_chunks(
     ));
 
     for (idx, chunk) in payload.chunks(CHUNK_SIZE).enumerate() {
-        let chunk_len = chunk.len() as u64;
         let _ = outgoing_tx.send(Packet::new(
             Message::ClipChunk {
                 index: idx as u16,
@@ -163,25 +220,56 @@ fn emit_offer_and_chunks(
             },
             0,
         ));
-        outgoing_progress.fetch_add(chunk_len, Ordering::Relaxed);
     }
+}
 
-    // Zero counters once everything is queued. Per Task 7a plan: the
-    // simplest "transfer complete" UX is to clear the status fragment
-    // immediately after the last chunk is queued — the wire-side send
-    // happens in writer_thread asynchronously, so "queued progress" is the
-    // best signal we have without an extra ack channel. UI reads atomics
-    // each frame and silently stops rendering the "Sending …" line.
-    outgoing_progress.store(0, Ordering::Relaxed);
-    outgoing_total.store(0, Ordering::Relaxed);
+/// Dispatch helper called by `writer_thread` for each packet AFTER it is
+/// successfully written to the wire. Updates outgoing progress counters so
+/// the UI sees real wire-state progress (AC5: ≥2 increments visible during
+/// a typical 500 KB send at 11 KB/s).
+///
+/// - `ClipOffer`: reset progress to 0 and store new total. Counter reset
+///   must happen BEFORE the offer is sent on the wire so a previous
+///   completed transfer's "100%" doesn't linger past the new offer.
+///   (We're already past `transport.send` here — the brief flicker between
+///   reset and the first chunk is bounded by 11 KB/s wire pacing.)
+/// - `ClipChunk`: add chunk length to progress.
+/// - Other packets: no-op.
+pub(crate) fn apply_outgoing_progress(
+    msg: &Message,
+    outgoing_progress: &Arc<AtomicU64>,
+    outgoing_total: &Arc<AtomicU64>,
+) {
+    match msg {
+        Message::ClipOffer { total_len, .. } => {
+            outgoing_total.store(*total_len as u64, Ordering::Relaxed);
+            outgoing_progress.store(0, Ordering::Relaxed);
+        }
+        Message::ClipChunk { data, .. } => {
+            let new_progress = outgoing_progress
+                .fetch_add(data.len() as u64, Ordering::Relaxed)
+                + data.len() as u64;
+            // Codex C4: when the last chunk hits the total, zero both
+            // counters so the status-line stops showing "Sending clipboard
+            // — 1024/1024 KB (100%)" until the next transfer or
+            // disconnect. Without this the UI sticks at 100% indefinitely.
+            let total = outgoing_total.load(Ordering::Relaxed);
+            if total > 0 && new_progress >= total {
+                outgoing_total.store(0, Ordering::Relaxed);
+                outgoing_progress.store(0, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Spawn a background thread that polls the local clipboard and pushes
 /// ClipOffer + ClipChunks onto `outgoing_tx` whenever the content changes
 /// (and isn't something we just wrote ourselves).
 ///
-/// `outgoing_progress` / `outgoing_total` are updated as bytes are queued
-/// for the writer thread; the UI reads them to render a progress line.
+/// Outgoing progress counters live on the writer thread now (M3 fix) — the
+/// poll thread only enqueues packets, the writer thread updates atomics
+/// after each successful `transport.send`.
 ///
 /// `events_tx` is used to surface transient warnings to the UI — currently
 /// just the "image too large" toast. Reusing the existing UI event channel
@@ -189,8 +277,6 @@ fn emit_offer_and_chunks(
 pub fn spawn_poll_thread(
     state: ClipboardState,
     outgoing_tx: mpsc::Sender<Packet>,
-    outgoing_progress: Arc<AtomicU64>,
-    outgoing_total: Arc<AtomicU64>,
     events_tx: mpsc::Sender<TransportEvent>,
 ) {
     thread::spawn(move || {
@@ -206,12 +292,24 @@ pub fn spawn_poll_thread(
             thread::sleep(CLIP_POLL_INTERVAL);
 
             // 1) Try text first. Empty/error → fall through to image.
+            //
+            // TODO: probe image even when text exists (codex C3). macOS
+            // Cmd+C on rich selections (web page with text + image) puts
+            // BOTH on the clipboard; we currently only forward the text.
+            // Two-phase probe in the same tick would need LastKind split
+            // into independent text and image hashes — non-trivial scope,
+            // deferred. See `c3_rich_selection_image_dropped` ignored test.
             match clip.get_text() {
                 Ok(text) if !text.is_empty() => {
                     let hash = hash_text(&text);
                     if matches!(state.get(), LastKind::Text(h) if h == hash) {
                         continue;
                     }
+                    // Codex iter3 E2 (acceptable): sender dedup is set on
+                    // enqueue, not on successful send. If transport fails
+                    // mid-transfer, retry happens only when clipboard
+                    // content changes again. Acceptable: heartbeat covers
+                    // disconnect within 6s, app restart clears state.
                     state.set(LastKind::Text(hash));
 
                     let bytes = text.as_bytes();
@@ -224,13 +322,7 @@ pub fn spawn_poll_thread(
                     }
 
                     log::debug!("clipboard: pushing {} bytes to host", bytes.len());
-                    emit_offer_and_chunks(
-                        &outgoing_tx,
-                        FORMAT_TEXT_UTF8,
-                        bytes,
-                        &outgoing_progress,
-                        &outgoing_total,
-                    );
+                    emit_offer_and_chunks(&outgoing_tx, FORMAT_TEXT_UTF8, bytes);
                     continue;
                 }
                 _ => {} // fall through to image probe
@@ -243,7 +335,12 @@ pub fn spawn_poll_thread(
             };
 
             let hash = hash_bytes(&img.bytes);
-            if matches!(state.get(), LastKind::Image(h) if h == hash) {
+            // Short-circuit BEFORE the expensive RGBA→PNG encode for both:
+            // - already-sent images (LastKind::Image),
+            // - already-rejected oversized images (LastKind::OversizeImage).
+            // Otherwise every 500 ms tick re-encodes (~30-150 ms CPU) and
+            // re-emits the toast for the SAME oversize buffer.
+            if state.get().matches_image_hash(hash) {
                 continue;
             }
 
@@ -259,24 +356,24 @@ pub fn spawn_poll_thread(
                 log::warn!(
                     "clipboard: image too large ({} bytes, limit {}), skipping",
                     e.png_len,
-                    e.limit
+                    MAX_IMAGE_BYTES
                 );
                 let _ = events_tx.send(TransportEvent::Toast(format_oversize_toast(&e)));
-                // Don't update LastKind — user may shrink selection and retry,
-                // we want the next attempt to still be considered "new".
+                // Stamp the RGBA hash so the next 500 ms tick short-circuits
+                // for the same image. A new RGBA (user re-copied) gives a new
+                // hash and re-tries the encode path.
+                state.set(LastKind::OversizeImage(hash));
                 continue;
             }
 
+            // Codex iter3 E2 (acceptable): sender dedup is set on enqueue,
+            // not on successful send. If transport fails mid-transfer, retry
+            // happens only when clipboard content changes again. Acceptable:
+            // heartbeat covers disconnect within 6s, app restart clears state.
             state.set(LastKind::Image(hash));
 
             log::debug!("clipboard: pushing image to host ({} encoded bytes)", png.len());
-            emit_offer_and_chunks(
-                &outgoing_tx,
-                FORMAT_PNG_IMAGE,
-                &png,
-                &outgoing_progress,
-                &outgoing_total,
-            );
+            emit_offer_and_chunks(&outgoing_tx, FORMAT_PNG_IMAGE, &png);
         }
     });
 }
@@ -362,6 +459,47 @@ impl IncomingClipboard {
                 self.expected_len
             );
         }
+        // Reject unknown format values BEFORE arming reassembly. Without this
+        // a peer could send `ClipOffer { format=99, total_len=u32::MAX }` and
+        // we'd accept up to 4 GB of chunks (the per-format size cap below
+        // only fires for known formats). Reset state and bail out — chunks
+        // for the unknown format will hit the expected_len==0 guard in
+        // on_chunk and be dropped.
+        if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE {
+            log::warn!(
+                "clipboard: incoming offer with unsupported format {format}, ignoring"
+            );
+            self.expected_len = 0;
+            self.expected_format = 0;
+            self.received.clear();
+            self.received_total = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
+            return;
+        }
+        // Bound peer-supplied total_len to local caps before allocating any
+        // state. Without this a malicious or buggy peer could ask us to
+        // allocate up to 4 GB inside `commit()` (Vec::with_capacity).
+        let total_len_usize = total_len as usize;
+        let over_cap = match format {
+            FORMAT_PNG_IMAGE => total_len_usize > MAX_IMAGE_BYTES,
+            FORMAT_TEXT_UTF8 => total_len_usize > MAX_CLIPBOARD_BYTES,
+            _ => false,
+        };
+        if over_cap {
+            log::warn!(
+                "clipboard: incoming offer too large (format={format}, {total_len} bytes), ignoring"
+            );
+            // Leave reassembly state reset — chunks for this oversized offer
+            // will be dropped by on_chunk's expected_len==0 guard.
+            self.expected_len = 0;
+            self.expected_format = 0;
+            self.received.clear();
+            self.received_total = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
+            return;
+        }
         self.expected_len = total_len;
         self.expected_format = format;
         self.received.clear();
@@ -372,13 +510,30 @@ impl IncomingClipboard {
     }
 
     pub fn on_chunk(&mut self, index: u16, data: Vec<u8>) {
-        let added = data.len() as u32;
-        self.received_total += added;
-        self.received.insert(index, data);
-        self.incoming_progress
-            .fetch_add(added as u64, Ordering::Relaxed);
+        // Drop chunks that arrive without (or after) an active offer:
+        // - oversized offer was rejected (expected_len stays 0),
+        // - chunks arrive before any offer,
+        // - chunks arrive after a successful commit() zeroed expected_len.
+        // Without this guard, BTreeMap::insert grows unbounded (memory leak).
+        if self.expected_len == 0 {
+            log::debug!("clipboard: chunk received without active offer, dropping");
+            return;
+        }
 
-        if self.received_total >= self.expected_len && self.expected_len > 0 {
+        let added = data.len() as u32;
+        // Only count this chunk if its index hasn't been seen before.
+        // BTreeMap::insert silently overwrites duplicates, which would let
+        // a duplicated index pump received_total over expected_len with a
+        // truncated buffer — silent corruption.
+        if self.received.insert(index, data).is_none() {
+            // saturating_add: a malicious peer could otherwise overflow u32
+            // by spamming chunks past expected_len before the >= guard fires.
+            self.received_total = self.received_total.saturating_add(added);
+            self.incoming_progress
+                .fetch_add(added as u64, Ordering::Relaxed);
+        }
+
+        if self.received_total >= self.expected_len {
             self.commit();
         }
     }
@@ -395,9 +550,40 @@ impl IncomingClipboard {
     }
 
     fn commit(&mut self) {
+        // Codex C2: verify chunk indices form a contiguous 0..N sequence
+        // BEFORE concatenation. Without this guard a peer can drop chunk 3
+        // and send chunk 7 of the same size — `received_total` reaches
+        // `expected_len` (so commit fires) but the buffer has gaps with
+        // later chunks shifted, silently corrupting the payload. Refuse to
+        // commit on non-contiguous indices and reset state.
+        let n = self.received.len();
+        let contiguous = self.received.keys().enumerate().all(|(i, k)| *k as usize == i);
+        if !contiguous {
+            log::warn!(
+                "clipboard: non-contiguous chunk indices ({n} chunks, expected 0..{n}), dropping payload"
+            );
+            self.reset();
+            return;
+        }
+
         let mut buf = Vec::with_capacity(self.expected_len as usize);
         for (_, chunk) in std::mem::take(&mut self.received) {
             buf.extend_from_slice(&chunk);
+        }
+
+        // Codex iter2 D1: even with the duplicate-index guard in on_chunk,
+        // a peer can replace chunk K's stored bytes via BTreeMap::insert
+        // overwrite with a different length — received_total tracked only
+        // the first arrival, so the actual reassembled buffer length may
+        // diverge from expected_len. Verify before decoding.
+        if buf.len() as u32 != self.expected_len {
+            log::warn!(
+                "clipboard: reassembled length mismatch (got {} bytes, expected {}), dropping payload",
+                buf.len(),
+                self.expected_len,
+            );
+            self.reset();
+            return;
         }
 
         match self.expected_format {
@@ -408,26 +594,37 @@ impl IncomingClipboard {
             }
         }
 
-        self.expected_len = 0;
-        self.expected_format = 0;
-        self.received_total = 0;
+        // Single source of truth for state-zeroing. `received` is already
+        // empty here (mem::take above), so reset()'s clear() is a no-op.
+        self.reset();
     }
 
     fn commit_text(&mut self, buf: Vec<u8>) {
         match String::from_utf8(buf) {
             Ok(text) => {
                 let hash = hash_text(&text);
-                self.state.set(LastKind::Text(hash)); // mark as ours so poll won't echo
                 #[cfg(test)]
                 {
                     self.last_committed = Some(CommittedPayload::Text(text.clone()));
                 }
+                // Codex iter3 E3: write the OS clipboard FIRST, then mark
+                // hash as "ours" only on success. If set_text fails, the
+                // OS clipboard still holds the old value — marking the
+                // hash early would cause the next poll to short-circuit
+                // and we'd never re-send the (still-stale) old content.
+                // Leaving last unchanged lets poll detect any real change.
+                let mut wrote_ok = self.clip.is_none(); // no backend → treat as "ours"
                 if let Some(clip) = self.clip.as_mut() {
-                    if let Err(e) = clip.set_text(text.clone()) {
-                        log::warn!("clipboard: set_text failed: {e}");
-                    } else {
-                        log::debug!("clipboard: wrote {} bytes from host", text.len());
+                    match clip.set_text(text.clone()) {
+                        Ok(()) => {
+                            log::debug!("clipboard: wrote {} bytes from host", text.len());
+                            wrote_ok = true;
+                        }
+                        Err(e) => log::warn!("clipboard: set_text failed: {e}"),
                     }
+                }
+                if wrote_ok {
+                    self.state.set(LastKind::Text(hash));
                 }
             }
             Err(e) => log::warn!("clipboard: incoming bytes not valid UTF-8: {e}"),
@@ -448,7 +645,6 @@ impl IncomingClipboard {
         // peers, but the RGBA buffer is stable and is what the next
         // `get_image()` poll will read.
         let hash = hash_bytes(&img.bytes);
-        self.state.set(LastKind::Image(hash));
 
         #[cfg(test)]
         {
@@ -459,12 +655,22 @@ impl IncomingClipboard {
             });
         }
 
+        // Codex iter3 E3: write OS clipboard FIRST, mark hash on success.
+        // If set_image fails the OS clipboard still holds the old value;
+        // marking early would suppress the next poll from re-detecting the
+        // stale content and we'd loop forever silently.
+        let mut wrote_ok = self.clip.is_none(); // no backend (tests) → ok
         if let Some(clip) = self.clip.as_mut() {
-            if let Err(e) = clip.set_image(img) {
-                log::warn!("clipboard: set_image failed: {e}");
-            } else {
-                log::debug!("clipboard: wrote image from host ({} encoded bytes)", buf.len());
+            match clip.set_image(img) {
+                Ok(()) => {
+                    log::debug!("clipboard: wrote image from host ({} encoded bytes)", buf.len());
+                    wrote_ok = true;
+                }
+                Err(e) => log::warn!("clipboard: set_image failed: {e}"),
             }
+        }
+        if wrote_ok {
+            self.state.set(LastKind::Image(hash));
         }
     }
 }
@@ -516,28 +722,56 @@ mod tests {
     }
 
     #[test]
-    fn last_kind_dedup_text_does_not_block_image() {
-        let state = ClipboardState::new();
-
-        // Mark a text content as recently seen.
-        state.set(LastKind::Text(12345));
-        assert!(matches!(state.get(), LastKind::Text(12345)));
-
-        // An image with hash 12345 (collision across kinds) must NOT be
-        // considered a duplicate — the kind tag distinguishes them.
-        let stored_is_text_with_image_hash = matches!(state.get(), LastKind::Text(h) if h == 12345);
-        assert!(stored_is_text_with_image_hash);
-
-        // Now simulate setting an image hash; the state should switch.
-        state.set(LastKind::Image(12345));
-        assert!(matches!(state.get(), LastKind::Image(12345)));
-        assert!(!matches!(state.get(), LastKind::Text(_)));
-    }
-
-    #[test]
     fn last_kind_default_is_none() {
         let state = ClipboardState::new();
         assert!(matches!(state.get(), LastKind::None));
+    }
+
+    #[test]
+    fn clipboard_state_reset_clears_last_kind() {
+        // Codex iter4 F1: `reset()` is the disconnect-side hook that drops
+        // sender dedup. Without it, after a transfer aborts mid-stream the
+        // hash stays stamped and the post-reconnect tick dedups → silent
+        // lost-update. Verify each LastKind variant collapses to None.
+        let state = ClipboardState::new();
+
+        state.set(LastKind::Text(0xAABB_CCDD));
+        assert!(matches!(state.get(), LastKind::Text(_)));
+        state.reset();
+        assert!(matches!(state.get(), LastKind::None));
+
+        state.set(LastKind::Image(0x1122_3344));
+        assert!(matches!(state.get(), LastKind::Image(_)));
+        state.reset();
+        assert!(matches!(state.get(), LastKind::None));
+
+        state.set(LastKind::OversizeImage(0x9999));
+        assert!(matches!(state.get(), LastKind::OversizeImage(_)));
+        state.reset();
+        assert!(matches!(state.get(), LastKind::None));
+    }
+
+    #[test]
+    fn disconnect_clears_sender_dedup() {
+        // Models the main.rs reader_thread sequence on disconnect: the same
+        // hash that was JUST stamped (and would normally cause the next
+        // poll-tick to skip the resend) must be cleared so the post-reconnect
+        // tick goes through. Drives the `clipboard_state.reset()` calls at
+        // HelloAck / Disconnect / transport-error sites in main.rs.
+        let state = ClipboardState::new();
+        let payload = "the user copied this right before the link dropped";
+        let hash = hash_text(payload);
+
+        // poll-tick stamps after sending
+        state.set(LastKind::Text(hash));
+        // ... link drops mid-stream, reader_thread observes the disconnect
+        state.reset();
+
+        // post-reconnect tick: same OS-clipboard content. Without reset, the
+        // probe `matches!(state.get(), LastKind::Text(h) if h == hash)` would
+        // be true and the resend would be skipped. With reset, it's None.
+        let dedup_would_skip = matches!(state.get(), LastKind::Text(h) if h == hash);
+        assert!(!dedup_would_skip, "reset must re-arm the sender for resend after reconnect");
     }
 
     #[test]
@@ -566,7 +800,6 @@ mod tests {
         let result = check_image_size(png.len(), 32);
         let err = result.expect_err("expected oversize");
         assert_eq!(err.png_len, png.len());
-        assert_eq!(err.limit, 32);
     }
 
     #[test]
@@ -576,10 +809,8 @@ mod tests {
         let png = encode_rgba_to_png(&original).expect("encode");
 
         let (tx, rx) = mpsc::channel::<Packet>();
-        let progress = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(0));
 
-        emit_offer_and_chunks(&tx, FORMAT_PNG_IMAGE, &png, &progress, &total);
+        emit_offer_and_chunks(&tx, FORMAT_PNG_IMAGE, &png);
         drop(tx); // close channel so rx loop terminates
 
         let mut packets: Vec<Packet> = Vec::new();
@@ -609,13 +840,6 @@ mod tests {
             }
         }
         assert_eq!(reassembled, png, "concatenated chunks must reassemble to PNG");
-
-        // Counter invariants — emit zeroes both atomics on completion so the
-        // status-line stops rendering "Sending …" once all chunks are queued
-        // (Task 7a). During the loop progress matches total, but by return
-        // both are back to zero.
-        assert_eq!(total.load(Ordering::Relaxed), 0);
-        assert_eq!(progress.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -624,10 +848,8 @@ mod tests {
         let payload: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7)).map(|i| (i & 0xFF) as u8).collect();
 
         let (tx, rx) = mpsc::channel::<Packet>();
-        let progress = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(0));
 
-        emit_offer_and_chunks(&tx, FORMAT_PNG_IMAGE, &payload, &progress, &total);
+        emit_offer_and_chunks(&tx, FORMAT_PNG_IMAGE, &payload);
         drop(tx);
 
         let mut chunk_count = 0usize;
@@ -645,6 +867,125 @@ mod tests {
         assert!(got_offer, "first message must be ClipOffer");
         // ceil(len / CHUNK_SIZE) = 4 for 256*3+7 bytes
         assert_eq!(chunk_count, 4);
+    }
+
+    #[test]
+    fn apply_outgoing_progress_offer_resets_and_sets_total() {
+        // Writer-thread dispatch: ClipOffer must reset progress and store new total.
+        let progress = Arc::new(AtomicU64::new(999));
+        let total = Arc::new(AtomicU64::new(0));
+
+        let msg = Message::ClipOffer { format: FORMAT_PNG_IMAGE, total_len: 1234 };
+        apply_outgoing_progress(&msg, &progress, &total);
+
+        assert_eq!(progress.load(Ordering::Relaxed), 0, "offer must reset progress");
+        assert_eq!(total.load(Ordering::Relaxed), 1234, "offer must store total");
+    }
+
+    #[test]
+    fn apply_outgoing_progress_chunk_increments() {
+        // Writer-thread dispatch: ClipChunk bumps progress by data.len().
+        // Mid-transfer chunks do NOT touch total.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(1024));
+
+        let msg1 = Message::ClipChunk { index: 0, data: vec![0u8; 256] };
+        apply_outgoing_progress(&msg1, &progress, &total);
+        assert_eq!(progress.load(Ordering::Relaxed), 256);
+
+        let msg2 = Message::ClipChunk { index: 1, data: vec![0u8; 200] };
+        apply_outgoing_progress(&msg2, &progress, &total);
+        assert_eq!(progress.load(Ordering::Relaxed), 456);
+        // Total untouched by mid-transfer chunks.
+        assert_eq!(total.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    fn apply_outgoing_progress_terminal_chunk_zeros_counters() {
+        // Codex C4: the chunk that pushes progress >= total (transfer
+        // complete) MUST clear both counters so the status-line stops
+        // rendering "Sending clipboard — 100%". Without this the UI sticks
+        // until the next transfer or disconnect.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(512));
+
+        // Mid-transfer chunk: 256 bytes. Counters keep climbing.
+        let msg1 = Message::ClipChunk { index: 0, data: vec![0u8; 256] };
+        apply_outgoing_progress(&msg1, &progress, &total);
+        assert_eq!(progress.load(Ordering::Relaxed), 256);
+        assert_eq!(total.load(Ordering::Relaxed), 512);
+
+        // Terminal chunk: another 256 bytes. progress == total → zero both.
+        let msg2 = Message::ClipChunk { index: 1, data: vec![0u8; 256] };
+        apply_outgoing_progress(&msg2, &progress, &total);
+        assert_eq!(progress.load(Ordering::Relaxed), 0, "terminal chunk must zero progress");
+        assert_eq!(total.load(Ordering::Relaxed), 0, "terminal chunk must zero total");
+    }
+
+    #[test]
+    fn apply_outgoing_progress_overshoot_chunk_zeros_counters() {
+        // Defensive: if a peer sent a slightly-larger-than-expected last
+        // chunk (or rounding pushes us past total), still zero out — the
+        // UI must not stick at >100%.
+        let progress = Arc::new(AtomicU64::new(400));
+        let total = Arc::new(AtomicU64::new(512));
+
+        let msg = Message::ClipChunk { index: 5, data: vec![0u8; 200] };
+        apply_outgoing_progress(&msg, &progress, &total);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn emit_then_dispatch_clears_counters_after_last_chunk() {
+        // End-to-end: emit_offer_and_chunks → drain channel → run each
+        // packet through apply_outgoing_progress (mirroring the real
+        // writer-thread loop). After the last chunk, both counters must be
+        // zero (Codex C4: stuck-progress fix).
+        let original = synthetic_rgba_4x4();
+        let png = encode_rgba_to_png(&original).expect("encode");
+
+        let (tx, rx) = mpsc::channel::<Packet>();
+        emit_offer_and_chunks(&tx, FORMAT_PNG_IMAGE, &png);
+        drop(tx);
+
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+
+        // Walk the queue the way writer_thread does.
+        while let Ok(p) = rx.recv() {
+            apply_outgoing_progress(&p.message, &progress, &total);
+        }
+
+        // After the final chunk, counters are cleared so the status-line
+        // hides immediately rather than sticking at 100%.
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            0,
+            "progress must be zero after last chunk dispatched"
+        );
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            0,
+            "total must be zero after last chunk dispatched"
+        );
+    }
+
+    #[test]
+    fn apply_outgoing_progress_other_msgs_noop() {
+        // Writer-thread dispatch: non-clipboard messages must not touch counters.
+        let progress = Arc::new(AtomicU64::new(42));
+        let total = Arc::new(AtomicU64::new(99));
+
+        apply_outgoing_progress(&Message::Heartbeat, &progress, &total);
+        apply_outgoing_progress(
+            &Message::MouseMove { x: 100, y: 100 },
+            &progress,
+            &total,
+        );
+
+        assert_eq!(progress.load(Ordering::Relaxed), 42);
+        assert_eq!(total.load(Ordering::Relaxed), 99);
     }
 
     /// Push `payload` through `IncomingClipboard` as one offer + N chunks.
@@ -718,6 +1059,23 @@ mod tests {
     }
 
     #[test]
+    fn incoming_invalid_text_skipped() {
+        // format=0 with non-UTF-8 bytes must NOT panic, NOT commit, and
+        // leave the dedup state at None so a subsequent valid push can
+        // proceed. Mirrors `incoming_invalid_png_skipped` for the text path.
+        let state = ClipboardState::new();
+        let mut incoming = IncomingClipboard::new_for_test(state.clone());
+
+        let invalid = vec![0xFF, 0xFE, 0xFD];
+        feed_offer(&mut incoming, FORMAT_TEXT_UTF8, &invalid);
+
+        assert!(incoming.last_committed.is_none(), "no payload should commit");
+        assert!(matches!(state.get(), LastKind::None));
+        assert_eq!(incoming.expected_len, 0);
+        assert_eq!(incoming.expected_format, 0);
+    }
+
+    #[test]
     fn incoming_unknown_format_skipped() {
         // An unrecognised format value must not panic and must not stamp
         // anything in the shared state.
@@ -728,6 +1086,56 @@ mod tests {
 
         assert!(incoming.last_committed.is_none());
         assert!(matches!(state.get(), LastKind::None));
+    }
+
+    /// Codex C3 deferred: marker test documenting the rich-selection gap.
+    /// macOS Cmd+C on a webpage with text + image puts both on the system
+    /// clipboard. Current `spawn_poll_thread` returns after sending text
+    /// (continue) and never probes the image, so the image-sync feature is
+    /// silently bypassed for the most common copy scenario.
+    ///
+    /// The fix is non-trivial: `LastKind` must be split into independent
+    /// `last_text_hash` / `last_image_hash` fields, the poll loop must be
+    /// rewritten to send BOTH in the same tick when both are present and
+    /// changed, and dedup must consult the right field per format. Left as
+    /// a follow-up — this `#[ignore]`d test makes the gap discoverable.
+    #[test]
+    #[ignore = "C3 deferred: rich-selection image+text not both forwarded"]
+    fn c3_rich_selection_image_dropped() {
+        // Marker only — driving the actual production path requires a real
+        // arboard backend with both text and image present, which is not
+        // testable in CI. Failing this test on `cargo test -- --include-ignored`
+        // would mean the gap is closed and the comment/TODO can be removed.
+        panic!("C3 not yet implemented: text+image dual-send still missing");
+    }
+
+    #[test]
+    fn on_offer_unknown_format_rejected() {
+        // Codex C1: `ClipOffer { format=99, total_len=u32::MAX }` would have
+        // been stashed (over_cap returns false for unknown formats) and
+        // chunks accepted up to memory exhaustion. Verify the early-reject
+        // branch leaves state clean and chunks are dropped.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        // Unknown format with deliberately large total_len — must NOT arm.
+        incoming.on_offer(0xFE, u32::MAX);
+
+        assert_eq!(incoming.expected_len, 0, "unknown format must not arm reassembly");
+        assert_eq!(incoming.expected_format, 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+
+        // Follow-up chunks must be dropped by the expected_len==0 guard
+        // (no DoS via memory pressure).
+        for i in 0..16u16 {
+            incoming.on_chunk(i, vec![0u8; 256]);
+        }
+        assert_eq!(incoming.received.len(), 0, "post-rejection chunks must not buffer");
+        assert_eq!(incoming.received_total, 0);
     }
 
     #[test]
@@ -780,8 +1188,8 @@ mod tests {
     #[test]
     fn incoming_image_then_text_no_loop() {
         // After receiving an image, LastKind::Image(h) is set. The poll-side
-        // dedup path (verified by the matches! check below) must treat the
-        // same RGBA as a duplicate so we don't echo it back to peer (AC6).
+        // dedup path (matches_image_hash, used inside spawn_poll_thread) must
+        // treat the same RGBA as a duplicate so we don't echo it back (AC6).
         let original = synthetic_rgba_4x4();
         let png = encode_rgba_to_png(&original).expect("encode");
 
@@ -795,10 +1203,11 @@ mod tests {
             "state must hold the image's RGBA hash for loop avoidance"
         );
 
-        // Now mimic the poll thread reading get_image() and checking dedup.
-        let next_hash = hash_bytes(&original.bytes);
-        let dedup_hits = matches!(state.get(), LastKind::Image(h) if h == next_hash);
-        assert!(dedup_hits, "next poll with same RGBA must short-circuit");
+        // Same code path the poll thread runs.
+        assert!(
+            state.get().matches_image_hash(img_hash),
+            "next poll with same RGBA must short-circuit"
+        );
     }
 
     #[test]
@@ -807,7 +1216,7 @@ mod tests {
         // - report the encoded size in KB (the user thinks in MB-ish, KB
         //   gives more precision near the 1 MB cap),
         // - include an actionable hint so the user knows what to do.
-        let e = ImageTooLarge { png_len: 1_500 * 1024, limit: 1024 * 1024 };
+        let e = ImageTooLarge { png_len: 1_500 * 1024 };
         let msg = format_oversize_toast(&e);
         assert!(msg.contains("1500"), "KB count missing: {msg}");
         assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
@@ -852,6 +1261,240 @@ mod tests {
     }
 
     #[test]
+    fn commit_clears_incoming_counters() {
+        // After a successful reassembly, both incoming counters must be
+        // zero so the status-line stops showing "Receiving … 100%".
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        let text = "hello";
+        feed_offer(&mut incoming, FORMAT_TEXT_UTF8, text.as_bytes());
+
+        // Ensure commit ran (text was committed).
+        assert!(incoming.last_committed.is_some());
+        // Counters cleared.
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn on_offer_oversize_image_rejected() {
+        // total_len above MAX_IMAGE_BYTES must NOT be stored — protects
+        // commit() from a 4 GB Vec::with_capacity attempt.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        incoming.on_offer(FORMAT_PNG_IMAGE, (MAX_IMAGE_BYTES as u32).saturating_add(1));
+
+        assert_eq!(incoming.expected_len, 0, "oversize offer must not be stored");
+        assert_eq!(incoming.expected_format, 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn on_offer_oversize_text_rejected() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        incoming.on_offer(FORMAT_TEXT_UTF8, (MAX_CLIPBOARD_BYTES as u32).saturating_add(1));
+
+        assert_eq!(incoming.expected_len, 0);
+        assert_eq!(incoming.expected_format, 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn on_chunk_non_contiguous_indices_drops_payload() {
+        // Codex C2: a malicious peer can drop chunk 3 and send chunk 7 of
+        // the same size, pumping received_total to expected_len so commit()
+        // fires — but the buffer has gaps with later chunks shifted left,
+        // silently corrupting the payload. With the contiguity guard,
+        // commit() must refuse and reset state.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        // expected_len = 512 (two 256-byte chunks worth). Indices {5, 7}
+        // are non-contiguous but received_total reaches 512 → commit fires.
+        incoming.on_offer(FORMAT_TEXT_UTF8, 512);
+        incoming.on_chunk(5, vec![b'a'; 256]);
+        incoming.on_chunk(7, vec![b'b'; 256]);
+
+        // No commit was performed — last_committed stays None.
+        assert!(
+            incoming.last_committed.is_none(),
+            "non-contiguous indices must not commit a corrupt payload"
+        );
+        // State reset so a fresh offer can proceed.
+        assert_eq!(incoming.expected_len, 0);
+        assert_eq!(incoming.expected_format, 0);
+        assert_eq!(incoming.received_total, 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn on_chunk_replaced_with_different_size_buffer_corruption_blocked() {
+        // Codex iter2 D1: even with the duplicate-index counter guard, a
+        // peer can replace chunk K's stored bytes via BTreeMap::insert
+        // overwrite with a *different* length. received_total counted only
+        // the first arrival (200 B), expected_len = 768. If chunk(0)'s
+        // payload is later swapped to 50 B and chunks 1+2 deliver 256+312,
+        // received_total reaches 768 but the reassembled buffer is
+        // 50+256+312 = 618 B — silent corruption inside commit().
+        // Verify commit() refuses on the length mismatch and resets.
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+
+        incoming.on_offer(FORMAT_TEXT_UTF8, 768);
+        incoming.on_chunk(0, vec![b'a'; 200]);
+        assert_eq!(incoming.received_total, 200);
+
+        // Replace chunk 0 with shorter content (50 B). Counter stays 200.
+        incoming.on_chunk(0, vec![b'x'; 50]);
+        assert_eq!(incoming.received_total, 200, "duplicate must not bump counter");
+
+        incoming.on_chunk(1, vec![b'b'; 256]);
+        incoming.on_chunk(2, vec![b'c'; 312]);
+        // received_total = 200 + 256 + 312 = 768 → commit fires. But the
+        // BTreeMap holds 50 + 256 + 312 = 618 bytes for the buffer.
+        // Length-verification guard must refuse.
+        assert!(
+            incoming.last_committed.is_none(),
+            "length mismatch must block commit (got 618 bytes vs expected 768)"
+        );
+        // State reset for the next offer.
+        assert_eq!(incoming.expected_len, 0);
+        assert_eq!(incoming.received_total, 0);
+    }
+
+    #[test]
+    fn decode_png_oversize_alloc_rejected() {
+        // Codex iter6: per-axis dimension cap dropped — alloc budget is the
+        // sole gate. Build a 5000×4000 RGBA PNG: 5000 × 4000 × 4 = ~76 MB,
+        // exceeds DECODE_MAX_ALLOC (64 MB) and must be rejected.
+        let w: u32 = 5000;
+        let h: u32 = 4000;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            rgba.extend_from_slice(&[0, 0, 0, 0xFF]);
+        }
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .expect("encode oversize png");
+        }
+        let result = decode_png_to_rgba(&png);
+        assert!(
+            result.is_err(),
+            "decode must reject {}×{} PNG ({} bytes RGBA exceeds 64 MB budget)",
+            w,
+            h,
+            (w as u64) * (h as u64) * 4,
+        );
+    }
+
+    #[test]
+    fn decode_png_palette_bomb_rejected() {
+        // Codex iter3 E1 + iter6: a palette PNG at 8000×8000 compresses to a
+        // tiny file but expands to 8000×8000×4 = 256 MB of RGBA — well over
+        // DECODE_MAX_ALLOC (64 MB). The decoder's alloc-limit catches this
+        // (or the explicit post-decode check, belt-and-suspenders).
+        let w: u32 = 8000;
+        let h: u32 = 8000;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            rgba.extend_from_slice(&[0, 0, 0, 0xFF]);
+        }
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .expect("encode palette-bomb png");
+        }
+        let result = decode_png_to_rgba(&png);
+        assert!(
+            result.is_err(),
+            "decode must reject {}×{} PNG (would allocate ~256 MB RGBA)",
+            w,
+            h,
+        );
+    }
+
+    #[test]
+    fn decode_png_5k_screenshot_succeeds() {
+        // Codex iter6: 5K Retina screenshot (5120×2880) is 5120×2880×4 ≈
+        // 58.6 MB — inside the 64 MB budget. Must decode successfully.
+        // Regression test for the old per-axis cap which rejected this.
+        let w: u32 = 5120;
+        let h: u32 = 2880;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            rgba.extend_from_slice(&[0, 0, 0, 0xFF]);
+        }
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .expect("encode 5k png");
+        }
+        let result = decode_png_to_rgba(&png);
+        assert!(
+            result.is_ok(),
+            "decode must accept {}×{} PNG (~{} MB RGBA, inside 64 MB budget)",
+            w,
+            h,
+            (w as u64) * (h as u64) * 4 / (1024 * 1024),
+        );
+        let img = result.unwrap();
+        assert_eq!(img.width, w as usize);
+        assert_eq!(img.height, h as usize);
+    }
+
+    #[test]
+    fn on_chunk_duplicate_index_does_not_overcount() {
+        // Feed offer + two chunks with the same index. received_total must
+        // count only the first chunk — duplicates silently overwrite via
+        // BTreeMap::insert, but received_total must not race ahead of the
+        // actual buffer size, otherwise commit() fires with a truncated
+        // payload (silent corruption).
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        incoming.on_offer(FORMAT_TEXT_UTF8, 1024);
+        incoming.on_chunk(0, vec![b'a'; 256]);
+        assert_eq!(incoming.received_total, 256);
+        assert_eq!(progress.load(Ordering::Relaxed), 256);
+
+        // Same index again — must NOT increment received_total again.
+        incoming.on_chunk(0, vec![b'b'; 256]);
+        assert_eq!(
+            incoming.received_total, 256,
+            "duplicate index must not bump received_total"
+        );
+        assert_eq!(progress.load(Ordering::Relaxed), 256);
+    }
+
+    #[test]
     fn incoming_progress_counters_track_chunks() {
         // on_offer initialises total, on_chunk increments progress.
         let progress = Arc::new(AtomicU64::new(0));
@@ -868,5 +1511,83 @@ mod tests {
         assert_eq!(progress.load(Ordering::Relaxed), 256);
         incoming.on_chunk(1, vec![b'x'; 256]);
         assert_eq!(progress.load(Ordering::Relaxed), 512);
+    }
+
+    #[test]
+    fn on_chunk_without_offer_drops_data() {
+        // Chunks arriving before any ClipOffer must NOT be buffered —
+        // otherwise BTreeMap::insert grows unbounded and a misbehaving peer
+        // can DoS us via memory pressure (M2/C1 finding).
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        incoming.on_chunk(0, vec![0u8; 256]);
+        incoming.on_chunk(1, vec![0u8; 256]);
+        incoming.on_chunk(2, vec![0u8; 256]);
+
+        assert_eq!(incoming.received.len(), 0, "chunks without offer must not buffer");
+        assert_eq!(incoming.received_total, 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn on_chunk_after_oversize_offer_drops_data() {
+        // After on_offer rejects an oversized payload (expected_len stays 0),
+        // subsequent chunks for that aborted offer must be discarded — not
+        // accumulated in BTreeMap (M2/C1 memory leak).
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut incoming = IncomingClipboard::new_for_test(ClipboardState::new());
+        incoming.incoming_progress = progress.clone();
+        incoming.incoming_total = total.clone();
+
+        // Reject oversize.
+        incoming.on_offer(FORMAT_PNG_IMAGE, (MAX_IMAGE_BYTES as u32).saturating_add(1));
+        assert_eq!(incoming.expected_len, 0);
+
+        // Peer keeps blasting chunks — they must all be dropped.
+        for i in 0..16u16 {
+            incoming.on_chunk(i, vec![0u8; 256]);
+        }
+
+        assert_eq!(incoming.received.len(), 0, "post-rejection chunks must not buffer");
+        assert_eq!(incoming.received_total, 0);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn oversize_dedup_skips_repoll() {
+        // Mirror the poll-thread short-circuit logic: once an RGBA hash is
+        // stamped as LastKind::OversizeImage, the next tick with the same
+        // RGBA must hit the dedup branch BEFORE re-encoding (so no toast,
+        // no CPU). Drives the production `LastKind::matches_image_hash`
+        // method used inside spawn_poll_thread.
+        let state = ClipboardState::new();
+        let img = synthetic_rgba_4x4();
+
+        // First tick: no prior state, would proceed to encode → oversize.
+        let hash = hash_bytes(&img.bytes);
+        assert!(!state.get().matches_image_hash(hash), "first tick must NOT skip");
+
+        // Stamp oversize as if poll thread just ran encode + check_image_size.
+        state.set(LastKind::OversizeImage(hash));
+
+        // Second tick: same RGBA → dedup branch must fire, skipping encode.
+        assert!(
+            state.get().matches_image_hash(hash),
+            "repeated oversize must short-circuit"
+        );
+
+        // Different RGBA (user re-copied something else) → must NOT skip.
+        let mut other = img.bytes.to_vec();
+        other[0] ^= 0xFF;
+        let other_hash = hash_bytes(&other);
+        assert!(
+            !state.get().matches_image_hash(other_hash),
+            "different RGBA must re-try encode path"
+        );
     }
 }

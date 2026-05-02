@@ -249,7 +249,7 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 - **Ctrl+Alt+Del** через SendInput не сработает на Windows (защищено ядром, нужен SAS API в SYSTEM-сервисе или Group Policy `SoftwareSASGeneration`). Кнопка в UI есть, но ничего не делает реально. Альтернативы — Win+L (lock), Ctrl+Shift+Esc (Task Manager).
 - **macOS Secure Input** — поля паролей в любом приложении на Mac отключают CGEventTap системно. Capture-mode перестаёт работать пока окно с паролем активно. Workaround — переключиться в другое окно перед стартом capture.
 - **Accessibility permission** требуется и привязана к binary path. После перекомпиляции в новую папку — заново добавить в System Settings → Privacy & Security → Accessibility.
-- **Картинки/файлы в clipboard** — не передаются, только текст.
+- **Файлы (file URLs / CF_HDROP)** — не передаются. Картинки PNG передаются (≤1 MB encoded; FullHD-скриншот ~50–100 сек на 11 KB/s wire).
 - **Видео** — никогда. Ставь HDMI capture card отдельно.
 - **Save+Restart pattern**: changes в settings UI требуют перезапуск процесса (нет live-reconnect supervisor'а). Это компромисс ради простоты — race conditions с открытым serial-портом и работающей session избегаются.
 - **Mac autostart** — не реализован (только manual launch из дока / Spotlight). Login Items / launchctl plist — follow-up.
