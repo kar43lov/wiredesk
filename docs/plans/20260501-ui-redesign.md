@@ -616,14 +616,14 @@ egui::ComboBox::from_id_salt("monitor_select")
 - Modify: `apps/wiredesk-client/src/config.rs` (preferred_monitor field + serde)
 - Modify: `apps/wiredesk-client/src/app.rs` (Settings ComboBox, без logic в toggle_fullscreen)
 
-- [ ] добавить `preferred_monitor: Option<usize>` в `ClientConfig` с `#[serde(default)]`
-- [ ] обновить тест `partial_toml_uses_defaults_for_missing_fields` — `preferred_monitor` после load должно быть `None`
-- [ ] добавить новый тест `toml_roundtrip_preferred_monitor` — Some(0) и Some(2) сохраняются и читаются
-- [ ] в `render_settings_panel` (или в Display group из Task 4) — `egui::ComboBox::from_id_salt("monitor_select")` со списком из `monitor::list_monitors()`. Default «(active monitor — default)» = None. Selected → задаёт `pending_config.preferred_monitor`
-- [ ] format строк в combo: «Display 1 — Studio Display (5120×2880)»
-- [ ] write tests: уже покрыто через config tests
-- [ ] cargo test --workspace + clippy + cross-check — clean
-- [ ] commit: `feat(client): preferred_monitor config + Settings ComboBox`
+- [x] добавить `preferred_monitor: Option<usize>` в `ClientConfig` с `#[serde(default)]` (через `#[serde(default)]` на структуре + `Default` impl)
+- [x] обновить тест `partial_toml_uses_defaults_for_missing_fields` — `preferred_monitor` после load должно быть `None`
+- [x] добавить новый тест `toml_roundtrip_preferred_monitor` — None и Some(2) сохраняются и читаются (плюс bonus assertion в `defaults_match_hardcodes`)
+- [x] в `render_settings_panel` Display group — `egui::ComboBox::from_id_salt("settings_preferred_monitor")` со списком из cached `monitor::list_monitors()`. Default «(active monitor — default)» = None. Selected → задаёт `pending_config.preferred_monitor`. Кэш делается один раз в начале `render_settings_panel` — не на каждый widget Display group.
+- [x] format строк в combo: «Display 1 — Studio Display (5120×2880)»; для устаревшего сохранённого индекса (display unplugged) — fallback «Display N (unavailable)» в `selected_text`
+- [x] write tests: уже покрыто через config tests (4 assertions: defaults_match_hardcodes, partial_toml_uses_defaults_for_missing_fields, toml_roundtrip_preferred_monitor None+Some(2))
+- [x] cargo test --workspace (164 passed) + clippy (clean) + cross-check (clean)
+- [x] commit: `feat(client): preferred_monitor config + Settings ComboBox`
 
 ### Task 9c: toggle_fullscreen orchestration (move-then-fullscreen + fallback)
 

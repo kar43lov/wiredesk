@@ -14,6 +14,11 @@ pub struct ClientConfig {
     pub width: u16,
     pub height: u16,
     pub client_name: String,
+    /// Index into `monitor::list_monitors()` (NSScreen order) for fullscreen
+    /// target. `None` → use the display the window currently sits on.
+    /// `#[serde(default)]` on the struct makes a missing field deserialize as
+    /// `None`, so existing configs round-trip safely without migration.
+    pub preferred_monitor: Option<usize>,
 }
 
 impl Default for ClientConfig {
@@ -24,6 +29,7 @@ impl Default for ClientConfig {
             width: 2560,
             height: 1440,
             client_name: "wiredesk-client".to_string(),
+            preferred_monitor: None,
         }
     }
 }
@@ -116,6 +122,7 @@ mod tests {
         assert_eq!(cfg.width, 2560);
         assert_eq!(cfg.height, 1440);
         assert_eq!(cfg.client_name, "wiredesk-client");
+        assert!(cfg.preferred_monitor.is_none());
     }
 
     #[test]
@@ -126,6 +133,7 @@ mod tests {
             width: 1920,
             height: 1080,
             client_name: "test-client".to_string(),
+            preferred_monitor: None,
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -171,6 +179,36 @@ mod tests {
         assert_eq!(cfg.port, "/dev/cu.usbserial-999");
         assert_eq!(cfg.baud, 115_200);
         assert_eq!(cfg.client_name, "wiredesk-client");
+        // New `preferred_monitor` field: a TOML written before the field
+        // existed must round-trip as `None` rather than fail to deserialize.
+        assert!(cfg.preferred_monitor.is_none());
+    }
+
+    #[test]
+    fn toml_roundtrip_preferred_monitor() {
+        let dir = tempdir().unwrap();
+
+        // Case 1: None — the implicit default. Should survive roundtrip.
+        let cfg_none = ClientConfig {
+            preferred_monitor: None,
+            ..ClientConfig::default()
+        };
+        let path = dir.path().join("none.toml");
+        cfg_none.save_to(&path).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(loaded, cfg_none);
+        assert!(loaded.preferred_monitor.is_none());
+
+        // Case 2: Some(2) — a non-default index. Should survive roundtrip.
+        let cfg_some = ClientConfig {
+            preferred_monitor: Some(2),
+            ..ClientConfig::default()
+        };
+        let path = dir.path().join("some.toml");
+        cfg_some.save_to(&path).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(loaded, cfg_some);
+        assert_eq!(loaded.preferred_monitor, Some(2));
     }
 
     fn toml_cfg() -> ClientConfig {
@@ -180,6 +218,7 @@ mod tests {
             width: 1280,
             height: 720,
             client_name: "from-toml".to_string(),
+            preferred_monitor: None,
         }
     }
 

@@ -8,6 +8,7 @@ use wiredesk_protocol::packet::Packet;
 use crate::config::ClientConfig;
 use crate::input::mapper::InputMapper;
 use crate::keyboard_tap::{self, TapEvent, TapHandle};
+use crate::monitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -145,6 +146,10 @@ impl WireDeskApp {
         let mut want_reset = false;
         let mut want_refresh_ports = false;
         let available_ports = self.available_ports.clone();
+        // Cache the monitor list once per render — `NSScreen::screens()` is
+        // a sync IPC call, no point re-querying it for every widget in the
+        // Display group (or every frame at 60 FPS while the panel is open).
+        let monitors = monitor::list_monitors();
 
         ui.collapsing("Settings", |ui| {
             let cfg = &mut self.pending_config;
@@ -222,6 +227,64 @@ impl WireDeskApp {
                             dirty = true;
                         }
                     }
+                });
+
+                // Fullscreen target monitor — saved as `preferred_monitor`
+                // index. Default `None` keeps the legacy behaviour
+                // (fullscreen on the display the window currently sits on).
+                // The actual `OuterPosition + Fullscreen` orchestration is
+                // wired in Task 9c — for now this only persists the choice.
+                ui.horizontal(|ui| {
+                    ui.label("Fullscreen monitor:");
+                    let selected_text = match cfg.preferred_monitor {
+                        None => "(active monitor — default)".to_string(),
+                        Some(idx) => match monitors.get(idx) {
+                            Some(m) => format!(
+                                "Display {} — {} ({}×{})",
+                                m.index + 1,
+                                m.name,
+                                m.size.x,
+                                m.size.y,
+                            ),
+                            // Saved index is out of range (display unplugged
+                            // since last save). Show the bare "Display N" so
+                            // the user knows something stale is selected.
+                            None => format!("Display {} (unavailable)", idx + 1),
+                        },
+                    };
+                    egui::ComboBox::from_id_salt("settings_preferred_monitor")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut cfg.preferred_monitor,
+                                    None,
+                                    "(active monitor — default)",
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            for m in &monitors {
+                                let label = format!(
+                                    "Display {} — {} ({}×{})",
+                                    m.index + 1,
+                                    m.name,
+                                    m.size.x,
+                                    m.size.y,
+                                );
+                                if ui
+                                    .selectable_value(
+                                        &mut cfg.preferred_monitor,
+                                        Some(m.index),
+                                        label,
+                                    )
+                                    .changed()
+                                {
+                                    dirty = true;
+                                }
+                            }
+                        });
                 });
             });
 
