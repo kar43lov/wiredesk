@@ -238,15 +238,15 @@ main.rs:
 **Files:**
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 
-- [ ] добавить private функции `encode_rgba_to_png(&arboard::ImageData) -> Result<Vec<u8>, image::ImageError>` и `decode_png_to_rgba(&[u8]) -> Result<arboard::ImageData<'static>, image::ImageError>` (смотри Technical Details).
-- [ ] добавить private функцию `hash_bytes(&[u8]) -> u64` (используется и для PNG-RGBA, и в перспективе для file-list).
-- [ ] заменить `ClipboardState.last_hash: Arc<Mutex<u64>>` на `last: Arc<Mutex<LastKind>>` где `enum LastKind { Text(u64), Image(u64), None }`. Старые методы `get/set` адаптировать под matching по типу.
-- [ ] обновить существующий код poll thread / commit чтобы использовать новый `LastKind::Text(hash)`.
-- [ ] добавить unit-тест `encode_decode_roundtrip`: synthetic 4×4 RGBA → encode PNG → decode → byte-equal RGBA.
-- [ ] добавить unit-тест `hash_bytes_stable`: один и тот же RGBA-буфер дважды даёт одинаковый hash.
-- [ ] добавить unit-тест `last_kind_dedup_text_does_not_block_image`: после `set(Text(h1))`, попытка отправить image с hash h2 должна пройти (не задевается dedup'ом).
-- [ ] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
-- [ ] запустить `cargo clippy -p wiredesk-client --all-targets -- -D warnings` — clean.
+- [x] добавить private функции `encode_rgba_to_png(&arboard::ImageData) -> Result<Vec<u8>, image::ImageError>` и `decode_png_to_rgba(&[u8]) -> Result<arboard::ImageData<'static>, image::ImageError>` (смотри Technical Details).
+- [x] добавить private функцию `hash_bytes(&[u8]) -> u64` (используется и для PNG-RGBA, и в перспективе для file-list).
+- [x] заменить `ClipboardState.last_hash: Arc<Mutex<u64>>` на `last: Arc<Mutex<LastKind>>` где `enum LastKind { Text(u64), Image(u64), None }`. Старые методы `get/set` адаптировать под matching по типу.
+- [x] обновить существующий код poll thread / commit чтобы использовать новый `LastKind::Text(hash)`.
+- [x] добавить unit-тест `encode_decode_roundtrip`: synthetic 4×4 RGBA → encode PNG → decode → byte-equal RGBA.
+- [x] добавить unit-тест `hash_bytes_stable`: один и тот же RGBA-буфер дважды даёт одинаковый hash.
+- [x] добавить unit-тест `last_kind_dedup_text_does_not_block_image`: после `set(Text(h1))`, попытка отправить image с hash h2 должна пройти (не задевается dedup'ом).
+- [x] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
+- [x] запустить `cargo clippy -p wiredesk-client --all-targets -- -D warnings` — clean.
 
 ### Task 4: Mac side — отправка картинки (poll thread)
 

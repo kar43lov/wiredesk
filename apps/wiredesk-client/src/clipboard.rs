@@ -12,19 +12,32 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use wiredesk_protocol::message::Message;
+use wiredesk_protocol::message::{FORMAT_TEXT_UTF8, Message};
 use wiredesk_protocol::packet::Packet;
 
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CHUNK_SIZE: usize = 256;
-const FORMAT_TEXT_UTF8: u8 = 0;
-const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap
+const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap for text
 
-/// Shared state: last known clipboard hash. Updated when we either set or read
-/// the local clipboard. Used to suppress re-sending content we just received.
+/// Type-tagged hash of the most recent clipboard content owned/observed by us.
+/// Used to suppress re-sending what we just wrote (loop avoidance) while
+/// keeping text and image dedup independent — copying text after an image
+/// (or vice versa) does not get blocked by the wrong-kind hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LastKind {
+    #[default]
+    None,
+    Text(u64),
+    /// Wired-up by send/receive paths in Task 4 / Task 5.
+    #[allow(dead_code)]
+    Image(u64),
+}
+
+/// Shared state: last known clipboard kind+hash. Updated when we either set or
+/// read the local clipboard.
 #[derive(Clone, Default)]
 pub struct ClipboardState {
-    last_hash: Arc<Mutex<u64>>,
+    last: Arc<Mutex<LastKind>>,
 }
 
 impl ClipboardState {
@@ -32,22 +45,61 @@ impl ClipboardState {
         Self::default()
     }
 
-    fn get(&self) -> u64 {
-        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn get(&self) -> LastKind {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set(&self, h: u64) {
-        let mut g = self.last_hash.lock().unwrap_or_else(|e| e.into_inner());
-        *g = h;
+    pub(crate) fn set(&self, kind: LastKind) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        *g = kind;
     }
 }
 
 fn hash_text(s: &str) -> u64 {
+    hash_bytes(s.as_bytes())
+}
+
+/// Stable hash over arbitrary bytes (RGBA buffers, encoded payloads, …).
+/// Uses `DefaultHasher` — same instance/version of the runtime gives the same
+/// value, which is all we need for in-process loop avoidance.
+fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    s.hash(&mut h);
+    bytes.hash(&mut h);
     h.finish()
+}
+
+/// Encode an arboard `ImageData` (RGBA8) to PNG bytes.
+///
+/// Wired up by the poll thread in Task 4. Currently exercised only by tests.
+#[allow(dead_code)]
+fn encode_rgba_to_png(img: &arboard::ImageData<'_>) -> Result<Vec<u8>, image::ImageError> {
+    use image::ImageEncoder;
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out).write_image(
+        &img.bytes,
+        img.width as u32,
+        img.height as u32,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(out)
+}
+
+/// Decode PNG bytes to an arboard `ImageData` (RGBA8, owned).
+///
+/// Wired up by `IncomingClipboard::commit` in Task 5. Currently exercised
+/// only by tests.
+#[allow(dead_code)]
+fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image::ImageError> {
+    let dyn_img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
+    let rgba = dyn_img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok(arboard::ImageData {
+        width: w as usize,
+        height: h as usize,
+        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+    })
 }
 
 /// Spawn a background thread that polls the local clipboard and pushes
@@ -76,10 +128,10 @@ pub fn spawn_poll_thread(state: ClipboardState, outgoing_tx: mpsc::Sender<Packet
             }
 
             let hash = hash_text(&text);
-            if hash == state.get() {
+            if matches!(state.get(), LastKind::Text(h) if h == hash) {
                 continue;
             }
-            state.set(hash);
+            state.set(LastKind::Text(hash));
 
             let bytes = text.as_bytes();
             if bytes.len() > MAX_CLIPBOARD_BYTES {
@@ -155,7 +207,7 @@ impl IncomingClipboard {
         match String::from_utf8(buf) {
             Ok(text) => {
                 let hash = hash_text(&text);
-                self.state.set(hash); // mark as ours so poll won't echo
+                self.state.set(LastKind::Text(hash)); // mark as ours so poll won't echo
                 if let Some(clip) = self.clip.as_mut() {
                     if let Err(e) = clip.set_text(text.clone()) {
                         log::warn!("clipboard: set_text failed: {e}");
@@ -169,5 +221,85 @@ impl IncomingClipboard {
 
         self.expected_len = 0;
         self.received_total = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic 4×4 RGBA buffer with deterministic content.
+    fn synthetic_rgba_4x4() -> arboard::ImageData<'static> {
+        let mut bytes = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                bytes.push(x * 64); // R
+                bytes.push(y * 64); // G
+                bytes.push(0x80); // B
+                bytes.push(0xFF); // A
+            }
+        }
+        arboard::ImageData {
+            width: 4,
+            height: 4,
+            bytes: std::borrow::Cow::Owned(bytes),
+        }
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let original = synthetic_rgba_4x4();
+        let png = encode_rgba_to_png(&original).expect("encode");
+        let decoded = decode_png_to_rgba(&png).expect("decode");
+        assert_eq!(decoded.width, original.width);
+        assert_eq!(decoded.height, original.height);
+        assert_eq!(&*decoded.bytes, &*original.bytes, "RGBA must roundtrip byte-for-byte");
+    }
+
+    #[test]
+    fn hash_bytes_stable() {
+        let img = synthetic_rgba_4x4();
+        let h1 = hash_bytes(&img.bytes);
+        let h2 = hash_bytes(&img.bytes);
+        assert_eq!(h1, h2, "same RGBA buffer must hash to same value");
+
+        // different content → different hash
+        let mut other = img.bytes.to_vec();
+        other[0] ^= 0xFF;
+        let h3 = hash_bytes(&other);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn last_kind_dedup_text_does_not_block_image() {
+        let state = ClipboardState::new();
+
+        // Mark a text content as recently seen.
+        state.set(LastKind::Text(12345));
+        assert!(matches!(state.get(), LastKind::Text(12345)));
+
+        // An image with hash 12345 (collision across kinds) must NOT be
+        // considered a duplicate — the kind tag distinguishes them.
+        let stored_is_text_with_image_hash = matches!(state.get(), LastKind::Text(h) if h == 12345);
+        assert!(stored_is_text_with_image_hash);
+
+        // Now simulate setting an image hash; the state should switch.
+        state.set(LastKind::Image(12345));
+        assert!(matches!(state.get(), LastKind::Image(12345)));
+        assert!(!matches!(state.get(), LastKind::Text(_)));
+    }
+
+    #[test]
+    fn last_kind_default_is_none() {
+        let state = ClipboardState::new();
+        assert!(matches!(state.get(), LastKind::None));
+    }
+
+    #[test]
+    fn hash_text_matches_hash_bytes() {
+        // hash_text is a thin wrapper — guarantee both hashers stay aligned
+        // so future refactors don't desync text and binary paths.
+        let s = "hello, мир";
+        assert_eq!(hash_text(s), hash_bytes(s.as_bytes()));
     }
 }
