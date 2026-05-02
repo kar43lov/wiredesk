@@ -3,6 +3,7 @@ mod clipboard;
 mod config;
 mod input;
 mod keyboard_tap;
+mod monitor;
 
 use std::sync::mpsc;
 use std::thread;
@@ -109,9 +110,64 @@ fn main() {
         ..Default::default()
     };
 
-    if let Err(e) = eframe::run_native("WireDesk", options, Box::new(|_cc| Ok(Box::new(app)))) {
+    if let Err(e) = eframe::run_native(
+        "WireDesk",
+        options,
+        Box::new(|cc| {
+            // egui's `include_image!` macro emits an ImageSource that needs a
+            // registered loader at runtime — without this call the heading
+            // image just renders as an "unable to load image" placeholder.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            // winit/eframe's NSApp init can leave the Dock with a generic
+            // exec icon a couple seconds after launch even when the bundle's
+            // AppIcon.icns is correct. Force-loading the bundle icon and
+            // re-applying via setApplicationIconImage on the main thread
+            // (which is where eframe creator callbacks run) overrides
+            // whatever winit did and pins the W to the Dock for the whole
+            // process lifetime.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                force_dock_icon_from_bundle();
+            }
+            Ok(Box::new(app))
+        }),
+    ) {
         log::error!("eframe error: {e}");
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn force_dock_icon_from_bundle() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+    if bundle.is_null() {
+        return;
+    }
+    let name = NSString::from_str("AppIcon");
+    let typ = NSString::from_str("icns");
+    let path: *mut AnyObject = msg_send![bundle, pathForResource: &*name, ofType: &*typ];
+    if path.is_null() {
+        log::warn!("force_dock_icon: AppIcon.icns not in bundle");
+        return;
+    }
+    let alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![alloc, initWithContentsOfFile: path];
+    if image.is_null() {
+        log::warn!("force_dock_icon: NSImage failed to load AppIcon.icns");
+        return;
+    }
+    let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+    // 0 = NSApplicationActivationPolicyRegular — guarantee the bundle stays
+    // visible in the Dock; without this, winit/eframe sometimes leaves the
+    // policy in an in-between state that drops us out of the Dock.
+    let _: () = msg_send![app, setActivationPolicy: 0_i64];
+    let _: () = msg_send![app, setApplicationIconImage: image];
+    // Drop the image — NSApplication retains it internally.
+    let _: Retained<AnyObject> = Retained::from_raw(image).expect("image was just constructed");
 }
 
 /// Sole writer to the serial port. Any UI-driven packet hits the wire within

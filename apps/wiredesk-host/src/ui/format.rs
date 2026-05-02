@@ -52,6 +52,68 @@ pub fn validate_port(s: &str) -> Result<&str, String> {
     Ok(trimmed)
 }
 
+/// USB Vendor ID for WCH (江苏沁恒微电子) — the maker of the CH340 / CH341
+/// USB-to-UART chips we ship in the cable kit. All PIDs (0x7523, 0x55D3,
+/// 0x55D4, …) sit under the same VID, so a VID-only filter picks up every
+/// CH340/CH341/CH343/CH9102 variant the user might plug in.
+pub const WCH_VID: u16 = 0x1A86;
+
+/// Outcome of an auto-detect scan over the system's USB serial ports.
+/// Caller decides UX: `Found` → autofill the port input; `Multiple` →
+/// show the list and ask the user to pick; `NotFound` → tell the user to
+/// plug the cable in; `EnumerationFailed` → show the underlying error so
+/// the user doesn't get a misleading "No CH340 detected" when the OS API
+/// itself failed (driver missing, permissions denied, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectResult {
+    Found(String),
+    Multiple(Vec<String>),
+    NotFound,
+    EnumerationFailed(String),
+}
+
+/// Run a CH340 auto-detect against the system's USB serial ports right now.
+/// Wraps `serialport::available_ports()` and feeds the list into
+/// `detect_ch340_port`. On enumeration failure returns
+/// `DetectResult::EnumerationFailed(msg)` rather than collapsing to
+/// `NotFound` — the user needs to know if the OS API itself failed
+/// (driver missing, permissions denied) instead of being told to plug
+/// the cable in. Lives here so the UI event handler stays a pure
+/// dispatch — the IO + filter logic ships together as one unit-testable
+/// surface.
+pub fn detect_serial_port_now() -> DetectResult {
+    match serialport::available_ports() {
+        Ok(ports) => detect_ch340_port(&ports),
+        Err(e) => {
+            log::warn!("serialport::available_ports failed: {e}");
+            DetectResult::EnumerationFailed(e.to_string())
+        }
+    }
+}
+
+/// Filter the given port list for USB devices whose VID matches WCH
+/// (0x1A86). Pure helper — caller supplies `serialport::available_ports()`.
+/// Order in `Multiple` follows the order in which the OS reported the
+/// ports; we don't sort because COMx ordering on Windows already reflects
+/// enumeration order (which the user's brain matches against Device Manager).
+pub fn detect_ch340_port(ports: &[serialport::SerialPortInfo]) -> DetectResult {
+    let matches: Vec<String> = ports
+        .iter()
+        .filter(|p| {
+            matches!(
+                &p.port_type,
+                serialport::SerialPortType::UsbPort(info) if info.vid == WCH_VID
+            )
+        })
+        .map(|p| p.port_name.clone())
+        .collect();
+    match matches.len() {
+        0 => DetectResult::NotFound,
+        1 => DetectResult::Found(matches.into_iter().next().unwrap()),
+        _ => DetectResult::Multiple(matches),
+    }
+}
+
 /// Width / height: must parse as u16 and meet a sane minimum (we cap at the
 /// u16 max from the protocol). VGA-class 320 is a generous floor — any real
 /// monitor will far exceed this.
@@ -172,5 +234,100 @@ mod tests {
         assert!(validate_dimension("65536").is_err()); // > u16::MAX
         assert!(validate_dimension("abc").is_err());
         assert!(validate_dimension("").is_err());
+    }
+
+    // ---- detect_ch340_port -------------------------------------------------
+
+    use serialport::{SerialPortInfo, SerialPortType, UsbPortInfo};
+
+    fn usb(name: &str, vid: u16, pid: u16) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: SerialPortType::UsbPort(UsbPortInfo {
+                vid,
+                pid,
+                serial_number: None,
+                manufacturer: None,
+                product: None,
+            }),
+        }
+    }
+
+    fn non_usb(name: &str, ty: SerialPortType) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: ty,
+        }
+    }
+
+    #[test]
+    fn detect_returns_notfound_on_empty_list() {
+        let ports: Vec<SerialPortInfo> = vec![];
+        assert_eq!(detect_ch340_port(&ports), DetectResult::NotFound);
+    }
+
+    #[test]
+    fn detect_returns_notfound_when_only_non_usb_ports() {
+        let ports = vec![
+            non_usb("COM1", SerialPortType::PciPort),
+            non_usb("COM2", SerialPortType::BluetoothPort),
+            non_usb("COM5", SerialPortType::Unknown),
+        ];
+        assert_eq!(detect_ch340_port(&ports), DetectResult::NotFound);
+    }
+
+    #[test]
+    fn detect_returns_notfound_when_only_non_wch_usb_devices() {
+        // FTDI (0x0403) and Silicon Labs (0x10C4) — common non-WCH USB UARTs.
+        let ports = vec![
+            usb("COM3", 0x0403, 0x6001), // FTDI FT232
+            usb("COM4", 0x10C4, 0xEA60), // CP2102
+        ];
+        assert_eq!(detect_ch340_port(&ports), DetectResult::NotFound);
+    }
+
+    #[test]
+    fn detect_returns_found_for_single_ch340() {
+        let ports = vec![
+            usb("COM3", 0x0403, 0x6001), // FTDI — should be skipped
+            usb("COM7", WCH_VID, 0x7523), // CH340
+            non_usb("COM8", SerialPortType::Unknown),
+        ];
+        assert_eq!(
+            detect_ch340_port(&ports),
+            DetectResult::Found("COM7".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_returns_multiple_when_two_or_more_ch340() {
+        let ports = vec![
+            usb("COM3", WCH_VID, 0x7523),
+            usb("COM4", 0x0403, 0x6001), // FTDI — filtered out
+            usb("COM7", WCH_VID, 0x55D4),
+            usb("COM9", WCH_VID, 0x55D3),
+        ];
+        assert_eq!(
+            detect_ch340_port(&ports),
+            DetectResult::Multiple(vec![
+                "COM3".to_string(),
+                "COM7".to_string(),
+                "COM9".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn detect_matches_all_known_pid_variants_via_vid() {
+        // CH340 (0x7523), CH343 (0x55D3), CH9102 (0x55D4) all share VID
+        // 0x1A86 — VID-only filter picks them all individually.
+        for pid in [0x7523_u16, 0x55D3, 0x55D4] {
+            let ports = vec![usb("COM10", WCH_VID, pid)];
+            assert_eq!(
+                detect_ch340_port(&ports),
+                DetectResult::Found("COM10".to_string()),
+                "PID 0x{pid:04X} should be detected via WCH VID filter"
+            );
+        }
     }
 }

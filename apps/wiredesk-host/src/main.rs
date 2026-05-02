@@ -60,31 +60,55 @@ fn main() {
 
     // Single-instance lock — second launch shows a message box and exits.
     // On non-Windows targets this is a no-op (always Acquired).
-    let _instance_guard = match ui::single_instance::SingleInstanceGuard::acquire(
+    //
+    // 5 attempts × 100ms (~500ms total budget) — covers the Save & Restart
+    // race where the freshly spawned process may briefly overlap with the
+    // outgoing one before the old process drops its mutex handle.
+    //
+    // Fail closed on `Error`: a `CreateMutexW` failure is rare in practice
+    // (would need an OS-level resource exhaustion or a malformed name) but
+    // when it does happen, silently starting without a lock can race a
+    // legitimate first instance over the tray icon and the serial port —
+    // both visible-bad failure modes. Better to surface the error and
+    // refuse to start than to fan out into duplicate hosts.
+    let _instance_guard = match ui::single_instance::try_acquire_with_retry(
         "WireDeskHostSingleton",
+        5,
+        100,
     ) {
-        ui::single_instance::SingleInstanceResult::Acquired(g) => g,
-        ui::single_instance::SingleInstanceResult::AlreadyRunning => {
-            log::warn!("another wiredesk-host instance is already running");
-            #[cfg(windows)]
-            {
-                let _ = native_windows_gui::init();
-                native_windows_gui::simple_message(
-                    "WireDesk",
-                    "WireDesk Host is already running — check the tray icon.",
-                );
+            ui::single_instance::SingleInstanceResult::Acquired(g) => g,
+            ui::single_instance::SingleInstanceResult::AlreadyRunning => {
+                log::warn!("another wiredesk-host instance is already running");
+                #[cfg(windows)]
+                {
+                    let _ = native_windows_gui::init();
+                    native_windows_gui::simple_message(
+                        "WireDesk",
+                        "WireDesk Host is already running — check the tray icon.",
+                    );
+                }
+                #[cfg(not(windows))]
+                eprintln!("WireDesk Host is already running.");
+                return;
             }
-            #[cfg(not(windows))]
-            eprintln!("WireDesk Host is already running.");
-            return;
-        }
-        ui::single_instance::SingleInstanceResult::Error(e) => {
-            log::warn!("single-instance check failed: {e} (continuing anyway)");
-            // Fall through — better to start than to refuse on a check failure.
-            ui::single_instance::SingleInstanceGuard::acquire("WireDeskHostSingleton-fallback")
-                .into_guard_or_panic()
-        }
-    };
+            ui::single_instance::SingleInstanceResult::Error(e) => {
+                log::error!("single-instance check failed: {e}");
+                #[cfg(windows)]
+                {
+                    let _ = native_windows_gui::init();
+                    native_windows_gui::simple_message(
+                        "WireDesk",
+                        &format!(
+                            "WireDesk Host failed to acquire single-instance lock: {e}\n\n\
+                             Refusing to start to avoid running two hosts at once."
+                        ),
+                    );
+                }
+                #[cfg(not(windows))]
+                eprintln!("WireDesk Host single-instance check failed: {e}");
+                return;
+            }
+        };
 
     // Resolve config: defaults → config.toml → CLI args (override).
     let toml_cfg = HostConfig::load();
@@ -148,8 +172,20 @@ fn run_windows(
         return;
     }
 
-    log::info!("run_windows: setting default font");
-    let _ = nwg::Font::set_global_default(Some(nwg::Font::default()));
+    log::info!("run_windows: setting default font (Segoe UI 16px)");
+    // Segoe UI is the standard Win11 dialog font. nwg's Font::size is in
+    // pixels, not points — 16px ≈ 9pt at 96 DPI, matching the system default.
+    // Set this BEFORE building any windows so all controls inherit it.
+    let mut font = nwg::Font::default();
+    if let Err(e) = nwg::Font::builder()
+        .family("Segoe UI")
+        .size(16)
+        .build(&mut font)
+    {
+        log::warn!("Segoe UI font builder failed: {e}; falling back to system default");
+    } else {
+        let _ = nwg::Font::set_global_default(Some(font));
+    }
 
     let log_dir = logging::log_dir();
 
@@ -205,7 +241,7 @@ fn run_windows(
                     if let Err(e) = tray_clone.borrow_mut().update_status(&g) {
                         log::warn!("tray icon update failed: {e}");
                     }
-                    settings_clone.borrow().set_status(&g);
+                    settings_clone.borrow_mut().set_status(&g);
                 }
             }
             E::OnContextMenu => {
@@ -230,54 +266,46 @@ fn run_windows(
     });
 
     // Wire settings-window events.
+    //
+    // CRITICAL: never hold a `settings_clone2.borrow()` across the whole
+    // match. The OnNotice tray handler in the *other* event handler does
+    // `settings_clone.borrow_mut().set_status(&g)` — Win32 message pumping
+    // inside e.g. `nwg::Clipboard::set_data_text` can re-enter and trigger
+    // OnNotice while we're mid-click. A second borrow_mut on a RefCell
+    // already-borrowed → panic → process abort. Take the borrow lazily
+    // inside each `if handle == ...` arm so it's released before any nwg
+    // call that pumps messages.
     let settings_clone2 = settings.clone();
     let cfg_holder = Arc::new(Mutex::new(cfg.clone()));
     let settings_event_handler =
         nwg::full_bind_event_handler(&settings_handle, move |evt, _evt_data, handle| {
             use nwg::Event as E;
-            let s = settings_clone2.borrow();
+            // Resolve which control fired this event without holding any
+            // borrow across the match arms — the handlers below take their
+            // own borrows internally.
+            let (is_save, is_copy_mac, is_restart, is_detect) = {
+                let s = settings_clone2.borrow();
+                (
+                    handle == s.save_btn.handle,
+                    handle == s.copy_mac_btn.handle,
+                    handle == s.restart_btn.handle,
+                    handle == s.detect_btn.handle,
+                )
+            };
             match evt {
                 E::OnButtonClick => {
-                    if handle == s.save_btn.handle {
-                        match s.read_form() {
-                            Ok(new_cfg) => {
-                                if let Err(e) = new_cfg.save() {
-                                    s.set_message(&format!("Save failed: {e}"));
-                                    return;
-                                }
-                                // Sync autostart with the checkbox.
-                                let want_startup = new_cfg.run_on_startup;
-                                let r = if want_startup {
-                                    ui::autostart::enable()
-                                } else {
-                                    ui::autostart::disable()
-                                };
-                                if let Err(e) = r {
-                                    s.set_message(&format!(
-                                        "Saved, but autostart toggle failed: {e}"
-                                    ));
-                                } else {
-                                    s.set_message("Saved. Restart WireDesk Host to apply.");
-                                }
-                                if let Ok(mut g) = cfg_holder.lock() {
-                                    *g = new_cfg;
-                                }
-                            }
-                            Err(e) => s.set_message(&e),
-                        }
-                    } else if handle == s.copy_mac_btn.handle {
-                        let snapshot = cfg_holder.lock().ok().map(|g| g.clone());
-                        if let Some(c) = snapshot {
-                            let cmd = ui::format::format_mac_launch_command(&c);
-                            nwg::Clipboard::set_data_text(&s.window, &cmd);
-                            s.set_message("Copied Mac launch command to clipboard.");
-                        }
-                    } else if handle == s.hide_btn.handle {
-                        s.hide();
+                    if is_save {
+                        handle_save(&settings_clone2, &cfg_holder);
+                    } else if is_copy_mac {
+                        handle_copy_mac(&settings_clone2, &cfg_holder);
+                    } else if is_restart {
+                        handle_restart(&settings_clone2, &cfg_holder);
+                    } else if is_detect {
+                        handle_detect(&settings_clone2);
                     }
                 }
                 E::OnWindowClose => {
-                    s.hide();
+                    settings_clone2.borrow().hide();
                 }
                 _ => {}
             }
@@ -291,12 +319,147 @@ fn run_windows(
     nwg::unbind_event_handler(&settings_event_handler);
 }
 
-// SingleInstanceResult helper — used in the fallback Error branch above.
-impl ui::single_instance::SingleInstanceResult {
-    fn into_guard_or_panic(self) -> ui::single_instance::SingleInstanceGuard {
-        match self {
-            ui::single_instance::SingleInstanceResult::Acquired(g) => g,
-            _ => panic!("expected SingleInstanceResult::Acquired in fallback path"),
+// ---- Settings-window button handlers --------------------------------------
+//
+// Each handler owns its own borrow lifecycle so the event-loop closure stays
+// a pure dispatch. They read the form, persist config / autostart, and write
+// status back via `set_message` — the same flow as before, just lifted out
+// of a 150-line `match` arm. Shared invariant: never hold a `borrow()` of
+// `settings` across an nwg call that pumps the Win32 message loop (e.g.
+// `Clipboard::set_data_text`), because the OnNotice tray handler may
+// re-enter `borrow_mut()` and abort the process.
+
+#[cfg(windows)]
+fn handle_save(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+    cfg_holder: &Arc<Mutex<HostConfig>>,
+) {
+    let s = settings.borrow();
+    match s.read_form() {
+        Ok(new_cfg) => {
+            if let Err(e) = new_cfg.save() {
+                s.set_message(&format!("Save failed: {e}"));
+                return;
+            }
+            // Sync autostart with the checkbox.
+            let r = if new_cfg.run_on_startup {
+                ui::autostart::enable()
+            } else {
+                ui::autostart::disable()
+            };
+            if let Err(e) = r {
+                s.set_message(&format!("Saved, but autostart toggle failed: {e}"));
+            } else {
+                s.set_message("Saved. Restart WireDesk Host to apply.");
+            }
+            if let Ok(mut g) = cfg_holder.lock() {
+                *g = new_cfg;
+            }
+        }
+        Err(e) => s.set_message(&e),
+    }
+}
+
+#[cfg(windows)]
+fn handle_copy_mac(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+    cfg_holder: &Arc<Mutex<HostConfig>>,
+) {
+    use native_windows_gui as nwg;
+    let snapshot = cfg_holder.lock().ok().map(|g| g.clone());
+    if let Some(c) = snapshot {
+        let cmd = ui::format::format_mac_launch_command(&c);
+        // `set_data_text` pumps the Win32 message loop — grab a fresh
+        // borrow only for the arguments and release before the call. Then
+        // re-borrow for the status message.
+        {
+            let s = settings.borrow();
+            nwg::Clipboard::set_data_text(&s.window, &cmd);
+        }
+        settings
+            .borrow()
+            .set_message("Copied Mac launch command to clipboard.");
+    }
+}
+
+#[cfg(windows)]
+fn handle_restart(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+    cfg_holder: &Arc<Mutex<HostConfig>>,
+) {
+    use native_windows_gui as nwg;
+    // Save & Restart: persist config + autostart, then spawn a fresh host
+    // process and stop our own event loop. The new process retries the
+    // single-instance mutex acquire (5×100ms in main.rs) so it'll wait
+    // out our shutdown without an artificial sleep here.
+    let s = settings.borrow();
+    let new_cfg = match s.read_form() {
+        Ok(c) => c,
+        Err(e) => {
+            s.set_message(&e);
+            return;
+        }
+    };
+    if let Err(e) = new_cfg.save() {
+        s.set_message(&format!("Save failed: {e}"));
+        return;
+    }
+    let r = if new_cfg.run_on_startup {
+        ui::autostart::enable()
+    } else {
+        ui::autostart::disable()
+    };
+    if let Err(e) = r {
+        s.set_message(&format!("Saved, but autostart toggle failed: {e}"));
+        return;
+    }
+    // Only update cfg_holder *after* spawn confirms — if spawn fails, the
+    // running process keeps serving the old config, so copy_mac_btn must
+    // also keep formatting the old command.
+    match std::env::current_exe() {
+        Ok(exe) => match std::process::Command::new(exe).spawn() {
+            Ok(_) => {
+                log::info!("restart: spawned new host process");
+                if let Ok(mut g) = cfg_holder.lock() {
+                    *g = new_cfg;
+                }
+                nwg::stop_thread_dispatch();
+            }
+            Err(e) => {
+                s.set_message(&format!("Saved, but restart failed to spawn: {e}"));
+            }
+        },
+        Err(e) => {
+            s.set_message(&format!("Saved, but couldn't find own exe path: {e}"));
         }
     }
 }
+
+#[cfg(windows)]
+fn handle_detect(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+) {
+    let s = settings.borrow();
+    match ui::format::detect_serial_port_now() {
+        ui::format::DetectResult::Found(name) => {
+            s.port_input.set_text(&name);
+            s.set_message(&format!("Detected CH340 on {name}."));
+        }
+        ui::format::DetectResult::Multiple(names) => {
+            s.set_message(&format!(
+                "Multiple CH340 found: {} — pick one.",
+                names.join(", ")
+            ));
+        }
+        ui::format::DetectResult::NotFound => {
+            s.set_message("No CH340/CH341 detected. Plug the cable in and retry.");
+        }
+        ui::format::DetectResult::EnumerationFailed(msg) => {
+            // The OS port-enumeration API failed (driver issue, permission
+            // denied, etc.) — surface the underlying error instead of the
+            // misleading "No CH340 detected" message.
+            s.set_message(&format!("Port enumeration failed: {msg}"));
+        }
+    }
+}
+

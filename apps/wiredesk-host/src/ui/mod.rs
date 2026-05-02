@@ -18,6 +18,8 @@ pub mod single_instance;
 pub mod status_bridge;
 
 #[cfg(windows)]
+pub mod icons;
+#[cfg(windows)]
 pub mod settings_window;
 #[cfg(windows)]
 pub mod tray;

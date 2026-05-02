@@ -8,6 +8,7 @@ use wiredesk_protocol::packet::Packet;
 use crate::config::ClientConfig;
 use crate::input::mapper::InputMapper;
 use crate::keyboard_tap::{self, TapEvent, TapHandle};
+use crate::monitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -15,6 +16,16 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+}
+
+impl std::fmt::Display for ConnectionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionState::Disconnected => write!(f, "Not connected"),
+            ConnectionState::Connecting => write!(f, "Connecting…"),
+            ConnectionState::Connected => write!(f, "Connected"),
+        }
+    }
 }
 
 /// Messages from the transport thread to the UI.
@@ -59,6 +70,91 @@ pub struct WireDeskApp {
     save_toast: Option<(String, Instant)>,
     // Cached available serial ports for the combo-box; refreshed on demand.
     available_ports: Vec<String>,
+    // Cached monitor list for the Settings combo-box. `NSScreen::screens()`
+    // is a sync IPC call — refreshing once per second (or on combo focus) is
+    // plenty for a UI that's already gated behind an open settings panel,
+    // and avoids hammering the call at 60 FPS while the panel just sits open.
+    cached_monitors: Vec<monitor::MonitorInfo>,
+    cached_monitors_at: Option<Instant>,
+    // Sticky banner shown when an entered fullscreen fell back to "current
+    // display" because the saved `preferred_monitor` name doesn't match any
+    // live display. Carries its own TTL so it doesn't clobber `status_msg`
+    // when a real disconnect message wants the same slot.
+    monitor_fallback_msg: Option<(String, Instant)>,
+    /// Queued `OuterPosition` to restore after fullscreen exit. macOS
+    /// Spaces transitions take ~500ms and a position command sent during
+    /// the transition lands the window off-screen on a Space that the
+    /// user's display no longer shows. Holding the position here and
+    /// applying it from `update()` after the timer ensures macOS has
+    /// finished the transition before we move the window.
+    pending_position_restore: Option<(egui::Pos2, Instant)>,
+    /// Last time we re-applied the bundle's Dock icon. winit/eframe's
+    /// NSApp init can overwrite the icon ~1s after creator runs, so we
+    /// re-apply periodically until macOS settles on our icon. Three or
+    /// four passes during the first 10 seconds is enough.
+    last_dock_icon_apply: Option<Instant>,
+    dock_icon_apply_count: u8,
+    // Saved outer position before entering fullscreen on a non-active monitor.
+    // Restored on fullscreen exit so the chrome window returns to where the
+    // user originally had it. None when fullscreen wasn't entered via an
+    // explicit `OuterPosition` move (e.g. preferred_monitor=None or stale
+    // name falling back to "fullscreen on current display").
+    original_position: Option<egui::Pos2>,
+    // Snapshot of `preferred_monitor` taken once at startup. Used by
+    // `toggle_fullscreen` so unsaved edits in the Settings panel don't
+    // change live runtime behaviour — that contradicts the documented
+    // "Save & Restart" contract for port/baud/etc. Stays fixed for the
+    // process lifetime; user must restart to pick up a new value.
+    runtime_preferred_monitor: Option<String>,
+}
+
+// ---- UI palette / sizing constants ---------------------------------------
+// Names for the values that appear in more than one place or carry
+// non-obvious meaning. Single-use sizes stay inline at the call site.
+
+/// Warning-orange — used by the permission-restart hint and the per-monitor
+/// fullscreen-fallback banner. Same hue both times so the user perceives
+/// "warning" as a single visual signal across screens.
+const COLOR_WARNING: egui::Color32 = egui::Color32::from_rgb(220, 140, 60);
+
+/// Capture / "release input" red — used as the capture-banner tint and the
+/// `Release Input` button fill, so the visual cue follows the user from the
+/// chrome panel into the capture/fullscreen banner.
+const COLOR_CAPTURE_RED: egui::Color32 = egui::Color32::from_rgb(180, 60, 60);
+
+/// Idle "Capture Input" button blue — paired with `COLOR_CAPTURE_RED` as a
+/// state cue (blue idle → red capturing).
+const COLOR_CAPTURE_BLUE: egui::Color32 = egui::Color32::from_rgb(60, 110, 180);
+
+/// Capture banner font size — large enough to read across the room while
+/// the user is interacting with the Host monitor, not the Mac.
+const BANNER_FONT_SIZE: f32 = 20.0;
+
+/// Connection-state glyph (●) size in the chrome status row. Larger than
+/// egui's default so it visually matches the Win-side ImageFrame indicator.
+const STATUS_GLYPH_SIZE: f32 = 18.0;
+
+/// Heading icon (top-left WireDesk logo) edge length in the chrome panel.
+const HEADING_ICON_SIZE: f32 = 28.0;
+
+/// Minimum size of the primary capture toggle button, in egui points.
+const CAPTURE_BTN_MIN_SIZE: egui::Vec2 = egui::vec2(200.0, 32.0);
+
+/// Numbered-step glyph size on the Accessibility permission screen.
+const STEP_NUMBER_SIZE: f32 = 20.0;
+
+/// Static list of macOS Accessibility-permission setup steps shown on the
+/// permission screen. Pure helper so the texts can be unit-tested
+/// independently of any UI rendering — a copy-paste typo in step 1 (the
+/// one with "System Settings") would otherwise only surface during a live
+/// run on macOS.
+pub fn permission_steps() -> &'static [&'static str] {
+    &[
+        "Open System Settings → Privacy & Security → Accessibility.",
+        "Click \"+\" and add the wiredesk-client binary.",
+        "Toggle the switch ON for wiredesk-client.",
+        "Restart WireDesk — required: the tap thread is created at startup.",
+    ]
 }
 
 impl WireDeskApp {
@@ -70,6 +166,7 @@ impl WireDeskApp {
         tap_handle: TapHandle,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
+        let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
         let initial_w = initial_config.width;
         let initial_h = initial_config.height;
         Self {
@@ -98,6 +195,14 @@ impl WireDeskApp {
             config_dirty: false,
             save_toast: None,
             available_ports: Vec::new(),
+            cached_monitors: Vec::new(),
+            cached_monitors_at: None,
+            monitor_fallback_msg: None,
+            original_position: None,
+            pending_position_restore: None,
+            last_dock_icon_apply: None,
+            dock_icon_apply_count: 0,
+            runtime_preferred_monitor,
         }
     }
 
@@ -111,6 +216,23 @@ impl WireDeskApp {
         }
     }
 
+    /// Refresh the cached monitor list if the cache is stale (older than
+    /// `MONITOR_CACHE_TTL`) or empty. `NSScreen::screens()` walks an Obj-C
+    /// array, so calling it 60×/s while the settings panel is open is wasteful;
+    /// 1 Hz is plenty for a list that only changes when displays are
+    /// hot-plugged.
+    fn refresh_monitors_if_stale(&mut self) {
+        const MONITOR_CACHE_TTL: Duration = Duration::from_secs(1);
+        let stale = self
+            .cached_monitors_at
+            .map(|t| t.elapsed() >= MONITOR_CACHE_TTL)
+            .unwrap_or(true);
+        if stale {
+            self.cached_monitors = monitor::list_monitors();
+            self.cached_monitors_at = Some(Instant::now());
+        }
+    }
+
     /// Render the editable settings block — only shown in chrome mode.
     /// Mutating any field flips `config_dirty`; Save persists to TOML and
     /// flashes a 3-second toast. Changes don't affect the running session
@@ -121,89 +243,179 @@ impl WireDeskApp {
         let mut want_reset = false;
         let mut want_refresh_ports = false;
         let available_ports = self.available_ports.clone();
+        // Refresh cached monitors at most once a second — `NSScreen::screens()`
+        // is a sync IPC call, no point re-querying it 60×/s while the panel
+        // sits open (or at all unless something has changed).
+        self.refresh_monitors_if_stale();
+        let monitors = self.cached_monitors.clone();
 
         ui.collapsing("Settings", |ui| {
             let cfg = &mut self.pending_config;
 
-            ui.horizontal(|ui| {
-                ui.label("Port:");
-                let combo = egui::ComboBox::from_id_salt("settings_port")
-                    .selected_text(cfg.port.clone())
-                    .show_ui(ui, |ui| {
-                        for p in &available_ports {
+            // ---- Connection group ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Connection").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Port:");
+                    let combo = egui::ComboBox::from_id_salt("settings_port")
+                        .selected_text(cfg.port.clone())
+                        .show_ui(ui, |ui| {
+                            for p in &available_ports {
+                                if ui
+                                    .selectable_value(&mut cfg.port, p.clone(), p)
+                                    .changed()
+                                {
+                                    dirty = true;
+                                }
+                            }
+                        });
+                    if combo.response.clicked() {
+                        want_refresh_ports = true;
+                    }
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.port)
+                                .desired_width(220.0)
+                                .hint_text("/dev/cu.usbserial-XXX"),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Baud:");
+                    let mut baud_str = cfg.baud.to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
+                        .changed()
+                    {
+                        if let Ok(v) = baud_str.parse::<u32>() {
+                            cfg.baud = v;
+                            dirty = true;
+                        }
+                    }
+                });
+            });
+
+            // ---- Display group ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Display").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Host screen:");
+                    let mut w_str = cfg.width.to_string();
+                    let mut h_str = cfg.height.to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut w_str).desired_width(80.0))
+                        .changed()
+                    {
+                        if let Ok(v) = w_str.parse::<u16>() {
+                            cfg.width = v;
+                            dirty = true;
+                        }
+                    }
+                    ui.label("×");
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut h_str).desired_width(80.0))
+                        .changed()
+                    {
+                        if let Ok(v) = h_str.parse::<u16>() {
+                            cfg.height = v;
+                            dirty = true;
+                        }
+                    }
+                });
+
+                // Fullscreen target monitor. The ComboBox **displays** the
+                // user-friendly `monitor_label(m)` ("Studio Display
+                // (5120×2880)") while the **saved value** is the unique
+                // `monitor_identity(m)` ("Studio Display (5120×2880 @ 0,0)").
+                // Splitting display from storage lets two physically
+                // identical displays — same name, same resolution — coexist
+                // in a dual-monitor setup without one shadowing the other on
+                // restart (origin disambiguates them, and NSScreen never
+                // lets two displays overlap). Default `None` keeps the
+                // legacy "fullscreen on whichever display the window sits
+                // on" behaviour. Identity also survives reboot / dock /
+                // hot-plug as long as the same physical layout returns.
+                ui.horizontal(|ui| {
+                    ui.label("Fullscreen monitor:");
+                    let selected_text = match cfg.preferred_monitor.as_deref() {
+                        None => "(active monitor — default)".to_string(),
+                        Some(saved) => {
+                            match monitors
+                                .iter()
+                                .find(|m| monitor::monitor_identity(m) == saved)
+                            {
+                                Some(m) => format!(
+                                    "Display {} — {}",
+                                    m.index + 1,
+                                    monitor::monitor_label(m),
+                                ),
+                                // Saved identity doesn't match any live
+                                // display (unplugged, renamed, resolution
+                                // changed, or moved to a different physical
+                                // position since last save). Show the saved
+                                // identity with an "(unavailable)" hint so
+                                // the user knows something stale is selected.
+                                None => format!("{saved} (unavailable)"),
+                            }
+                        }
+                    };
+                    egui::ComboBox::from_id_salt("settings_preferred_monitor")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
                             if ui
-                                .selectable_value(&mut cfg.port, p.clone(), p)
+                                .selectable_value(
+                                    &mut cfg.preferred_monitor,
+                                    None,
+                                    "(active monitor — default)",
+                                )
                                 .changed()
                             {
                                 dirty = true;
                             }
-                        }
-                    });
-                if combo.response.clicked() {
-                    want_refresh_ports = true;
-                }
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut cfg.port)
-                            .desired_width(220.0)
-                            .hint_text("/dev/cu.usbserial-XXX"),
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
+                            for m in &monitors {
+                                // Friendly text for the dropdown row …
+                                let display_text = format!(
+                                    "Display {} — {}",
+                                    m.index + 1,
+                                    monitor::monitor_label(m),
+                                );
+                                // … but persist the unique identity so
+                                // identical displays don't collide.
+                                let identity = monitor::monitor_identity(m);
+                                if ui
+                                    .selectable_value(
+                                        &mut cfg.preferred_monitor,
+                                        Some(identity),
+                                        display_text,
+                                    )
+                                    .changed()
+                                {
+                                    dirty = true;
+                                }
+                            }
+                        });
+                });
             });
 
-            ui.horizontal(|ui| {
-                ui.label("Baud:");
-                let mut baud_str = cfg.baud.to_string();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
-                    .changed()
-                {
-                    if let Ok(v) = baud_str.parse::<u32>() {
-                        cfg.baud = v;
+            // ---- System group ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("System").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Client name:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.client_name)
+                                .desired_width(220.0),
+                        )
+                        .changed()
+                    {
                         dirty = true;
                     }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Host screen:");
-                let mut w_str = cfg.width.to_string();
-                let mut h_str = cfg.height.to_string();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut w_str).desired_width(80.0))
-                    .changed()
-                {
-                    if let Ok(v) = w_str.parse::<u16>() {
-                        cfg.width = v;
-                        dirty = true;
-                    }
-                }
-                ui.label("×");
-                if ui
-                    .add(egui::TextEdit::singleline(&mut h_str).desired_width(80.0))
-                    .changed()
-                {
-                    if let Ok(v) = h_str.parse::<u16>() {
-                        cfg.height = v;
-                        dirty = true;
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Client name:");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut cfg.client_name)
-                            .desired_width(220.0),
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
+                });
             });
 
             ui.horizontal(|ui| {
@@ -290,26 +502,166 @@ impl WireDeskApp {
     /// without disturbing the user's `capturing` intent.
     fn sync_tap_to_focus(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        let want_active = self.capturing && focused;
-        let is_active = self
-            .tap_handle
-            .as_ref()
-            .map(|h| h.is_enabled())
-            .unwrap_or(false);
-        if want_active != is_active {
-            if let Some(h) = self.tap_handle.as_ref() {
-                if want_active {
-                    h.enable();
-                } else {
-                    h.disable();
+        let Some(h) = self.tap_handle.as_ref() else {
+            return;
+        };
+        // Three states:
+        // - focused && capturing → ACTIVE: tap intercepts every key, forwards
+        //   to Host. Cmd+Esc inside emits ReleaseCapture; Cmd+Enter emits
+        //   ToggleFullscreen.
+        // - focused && !capturing → PASSIVE: tap watches Cmd+Esc / Cmd+Enter
+        //   only. Cmd+Esc emits EngageCapture; Cmd+Enter emits
+        //   ToggleFullscreen. Other keys pass through to macOS.
+        // - !focused → IDLE: tap doesn't intercept anything. Mac shortcuts
+        //   work normally regardless of capture state.
+        match (focused, self.capturing) {
+            (true, true) => h.enable(),
+            (true, false) => h.enable_passive(),
+            (false, _) => h.disable(),
+        }
+    }
+
+    /// Toggle fullscreen with optional per-monitor targeting.
+    ///
+    /// On entering fullscreen: if `runtime_preferred_monitor` resolves to a
+    /// valid `MonitorInfo`, save the current outer position, move the
+    /// window onto that monitor's origin, then request `Fullscreen(true)` —
+    /// egui-on-macOS treats fullscreen as "expand to the screen this window
+    /// is currently on", so the move-then-fullscreen sequence is what
+    /// targets a specific display. If `runtime_preferred_monitor` is None
+    /// or its name no longer matches any live display, fall back to
+    /// "fullscreen on current display" without moving and surface the
+    /// fallback via a dedicated TTL'd banner (`monitor_fallback_msg`) so
+    /// it doesn't clobber real disconnect reasons in `status_msg`.
+    ///
+    /// **Reads `runtime_preferred_monitor`, NOT `pending_config`.** Unsaved
+    /// edits in the Settings panel must not change live runtime behaviour
+    /// — that contradicts the documented "Save & Restart" contract used
+    /// by every other Settings field (port, baud, etc.).
+    ///
+    /// **Known limitation (egui 0.31 + AppKit):** `OuterPosition` is processed
+    /// asynchronously on macOS — there's a chance `Fullscreen(true)` fires
+    /// before AppKit has actually moved the window, so on rare races the
+    /// fullscreen lands on the original display. The two viewport commands
+    /// arrive in order and AppKit usually flushes the move before the
+    /// fullscreen transition; if this becomes a real problem we'd need a
+    /// state machine that waits for the next `update()` after the move
+    /// before issuing fullscreen.
+    ///
+    /// On exiting fullscreen: send `Fullscreen(false)`, then restore the
+    /// saved outer position via `OuterPosition` (and clear it via `take()`).
+    /// If no position was saved, leave the window where the OS placed it.
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        if self.fullscreen {
+            let monitors = monitor::list_monitors();
+            let preferred = self.runtime_preferred_monitor.as_deref();
+            let target = monitor::resolve_target_monitor(preferred, &monitors);
+            match target {
+                Some(m) => {
+                    self.original_position = ctx
+                        .input(|i| i.viewport().outer_rect.map(|r| r.min));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        m.frame.min,
+                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 }
+                None => {
+                    // runtime_preferred_monitor was Some(name) but no live
+                    // display matches (unplugged or renamed) — surface the
+                    // fallback via a dedicated TTL banner instead of
+                    // overwriting status_msg, which is what disconnect
+                    // reasons (e.g. "disconnected: serial: device busy")
+                    // use as their home. Without a separate slot a
+                    // fullscreen attempt while disconnected would erase
+                    // the real reason.
+                    if preferred.is_some() {
+                        self.monitor_fallback_msg = Some((
+                            "Selected monitor unavailable; fullscreen on current display"
+                                .to_string(),
+                            Instant::now(),
+                        ));
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+            }
+            // Going fullscreen implies "I want to drive the Host" — auto-engage
+            // capture so the user doesn't need a second Cmd+Esc. If capture
+            // was already on, this is a no-op.
+            if !self.capturing {
+                self.toggle_capture();
+            }
+        } else {
+            // Pair with the auto-engage above: leaving fullscreen releases
+            // capture so the Mac's keyboard works locally without a second
+            // shortcut. If the user had toggled capture independently while
+            // fullscreen, we still release it here — single-source-of-truth
+            // is fullscreen state for this UX.
+            if self.capturing {
+                self.toggle_capture();
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            if let Some(pos) = self.original_position.take() {
+                // Defer OuterPosition until macOS finishes the Spaces
+                // transition (~500ms). Sending it inline puts the window
+                // on a Space that's already disappearing → user can't find
+                // it without Mission Control. The pending state is drained
+                // in update() once the timer elapses.
+                self.pending_position_restore = Some((pos, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(700));
             }
         }
     }
 
-    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
-        self.fullscreen = !self.fullscreen;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    /// Re-apply the Dock icon a few times during startup. winit's NSApp
+    /// init (and possibly TCC re-registration after Accessibility prompt)
+    /// overwrites whatever was set in the creator callback ~1s in. Two
+    /// or three re-applies at 1s / 3s / 6s after launch beat that race
+    /// without permanently spinning the AppKit message pump.
+    #[cfg(target_os = "macos")]
+    fn reapply_dock_icon_if_needed(&mut self) {
+        if self.dock_icon_apply_count >= 4 {
+            return;
+        }
+        let due = match self.last_dock_icon_apply {
+            None => true,
+            Some(t) => {
+                let elapsed = t.elapsed();
+                let next_delay = match self.dock_icon_apply_count {
+                    1 => Duration::from_millis(1_500),
+                    2 => Duration::from_secs(3),
+                    _ => Duration::from_secs(5),
+                };
+                elapsed >= next_delay
+            }
+        };
+        if due {
+            unsafe {
+                crate::force_dock_icon_from_bundle();
+            }
+            self.last_dock_icon_apply = Some(Instant::now());
+            self.dock_icon_apply_count += 1;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reapply_dock_icon_if_needed(&mut self) {}
+
+    /// Drain the pending `OuterPosition` after fullscreen exit if its
+    /// settle timer has elapsed. Called from `update()`.
+    fn drain_pending_position_restore(&mut self, ctx: &egui::Context) {
+        let Some((pos, when)) = self.pending_position_restore else {
+            return;
+        };
+        if when.elapsed() >= Duration::from_millis(600) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            self.pending_position_restore = None;
+        } else {
+            // Wake again at the deadline so we don't miss the window.
+            ctx.request_repaint_after(
+                Duration::from_millis(600).saturating_sub(when.elapsed()),
+            );
+        }
     }
 
     fn shell_send(&mut self, msg: Message) {
@@ -368,28 +720,42 @@ impl WireDeskApp {
         ui.add_space(8.0);
 
         ui.label("To grant it:");
-        ui.indent("perm_steps", |ui| {
-            ui.label("1. Open System Settings → Privacy & Security → Accessibility");
-            ui.label("2. Click \"+\" and add the wiredesk-client binary");
-            ui.label("3. Toggle the switch ON");
-            ui.label("4. Restart WireDesk — required: the tap thread is created at startup");
-        });
-        ui.add_space(12.0);
+        ui.add_space(4.0);
 
-        if ui.button("Open System Settings").clicked() {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                    .spawn();
-            }
+        // Each step in its own group with a large numbered glyph on the
+        // left. The "Open System Settings" button lives inside step 1 so
+        // the action is co-located with the instruction that requires it.
+        for (i, step) in permission_steps().iter().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new((i + 1).to_string())
+                            .size(STEP_NUMBER_SIZE)
+                            .strong(),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(*step);
+                        if i == 0 && ui.button("Open System Settings").clicked() {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = std::process::Command::new("open")
+                                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                                    .spawn();
+                            }
+                        }
+                    });
+                });
+            });
         }
 
-        ui.add_space(8.0);
-        ui.weak(
-            "(After granting permission, quit and relaunch wiredesk-client. \
-             The window detects the change but the tap won't activate \
-             without a fresh process.)",
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(
+                "\u{26A0} After granting permission, quit and relaunch \
+                 wiredesk-client. The window detects the change but the \
+                 tap won't activate without a fresh process.",
+            )
+            .color(COLOR_WARNING),
         );
     }
 
@@ -397,17 +763,43 @@ impl WireDeskApp {
     /// clickable elements — just a description of what the app is doing
     /// and the relevant hotkeys.
     fn render_capture_info(&self, ui: &mut egui::Ui) {
+        // Full-width red-tinted banner — instantly communicates that the
+        // window is intercepting input. Sized large (20pt strong, white) so
+        // it's readable from across the room when the user is interacting
+        // with the Host monitor and not looking at the Mac display.
+        let banner_fill = COLOR_CAPTURE_RED.linear_multiply(0.3);
+        egui::Frame::group(ui.style())
+            .fill(banner_fill)
+            .show(ui, |ui| {
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        // No Unicode bullet — egui default font lacks
+                        // U+25CF on some macOS setups; "CAPTURING" + the
+                        // red banner background already convey the state
+                        // unambiguously.
+                        ui.label(
+                            egui::RichText::new("CAPTURING — Cmd+Esc to release")
+                                .size(BANNER_FONT_SIZE)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                    },
+                );
+            });
+
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             ui.heading("WireDesk — input forwarded to Host");
             ui.add_space(8.0);
+            // Plain text — no Unicode bullet (see status row note above).
             if self.state == ConnectionState::Connected {
                 ui.label(format!(
-                    "● connected to {} ({}×{})",
+                    "Connected to {} ({}×{})",
                     self.host_name, self.screen_w, self.screen_h
                 ));
             } else {
-                ui.label("● not connected");
+                ui.label("Not connected");
             }
         });
         ui.add_space(20.0);
@@ -441,6 +833,30 @@ impl WireDeskApp {
         if self.fullscreen {
             ui.add_space(12.0);
             ui.weak("(Cmd+Enter again to exit fullscreen)");
+        }
+    }
+
+    /// Human-readable status string for the chrome status row. Pure helper
+    /// (no UI/IO) so it's unit-tested separately. `Disconnected` includes
+    /// the reason from `status_msg` when one is present, so the user sees
+    /// "Disconnected: serial: device busy" instead of just "Not connected".
+    fn status_text(&self) -> String {
+        match self.state {
+            ConnectionState::Connected => format!(
+                "Connected to {} ({}×{})",
+                self.host_name, self.screen_w, self.screen_h
+            ),
+            ConnectionState::Connecting => "Connecting…".to_string(),
+            ConnectionState::Disconnected => {
+                // Echo the most recent status message when it carries a
+                // disconnect reason ("disconnected: …"). Otherwise fall
+                // back to a plain "Not connected".
+                if let Some(rest) = self.status_msg.strip_prefix("disconnected: ") {
+                    format!("Disconnected: {rest}")
+                } else {
+                    "Not connected".to_string()
+                }
+            }
         }
     }
 
@@ -516,6 +932,8 @@ impl eframe::App for WireDeskApp {
         // the tap so Mac shortcuts (Cmd+V to paste etc.) work normally on
         // the Mac side. Resumes when window gets focus back.
         self.sync_tap_to_focus(ctx);
+        self.drain_pending_position_restore(ctx);
+        self.reapply_dock_icon_if_needed();
 
         // Drain TapEvents from the keyboard tap thread.
         let mut pending_tap_events: Vec<TapEvent> = Vec::new();
@@ -531,26 +949,15 @@ impl eframe::App for WireDeskApp {
                         self.toggle_capture();
                     }
                 }
+                TapEvent::EngageCapture => {
+                    if !self.capturing {
+                        self.toggle_capture();
+                    }
+                }
                 TapEvent::ToggleFullscreen => {
                     self.toggle_fullscreen(ctx);
                 }
             }
-        }
-
-        // egui-side hotkeys for the OUT-OF-CAPTURE path. When tap is enabled
-        // it consumes these before egui sees them; this branch handles the
-        // case where the user presses them without capture being on.
-        let (cmd_esc_pressed, cmd_enter_pressed) = ctx.input(|i: &egui::InputState| {
-            (
-                i.key_pressed(egui::Key::Escape) && i.modifiers.command,
-                i.key_pressed(egui::Key::Enter) && i.modifiers.command,
-            )
-        });
-        if cmd_esc_pressed {
-            self.toggle_capture();
-        }
-        if cmd_enter_pressed {
-            self.toggle_fullscreen(ctx);
         }
 
         let show_chrome = self.should_show_chrome();
@@ -567,37 +974,67 @@ impl eframe::App for WireDeskApp {
                 return;
             }
 
-            ui.heading("WireDesk");
+            ui.horizontal(|ui| {
+                // 28px icon next to the heading — branding consistency with
+                // the Win host title-bar icon. egui downscales the 1024×1024
+                // source on the fly; no separate small asset needed.
+                ui.add(
+                    egui::Image::new(egui::include_image!(
+                        "../../../assets/icon-source.png"
+                    ))
+                    .fit_to_exact_size(egui::vec2(HEADING_ICON_SIZE, HEADING_ICON_SIZE)),
+                );
+                ui.heading("WireDesk");
+            });
             ui.separator();
 
-            // Connection status
+            // Connection status — large coloured circle + human-friendly
+            // text. The circle is painted directly via `ui.painter()`
+            // instead of a Unicode glyph because egui's default font lacks
+            // U+25CF (BLACK CIRCLE) on some macOS configurations and falls
+            // back to an empty tofu box (observed live, ui-redesign branch).
             let status_color = match self.state {
                 ConnectionState::Connected => egui::Color32::GREEN,
                 ConnectionState::Connecting => egui::Color32::YELLOW,
                 ConnectionState::Disconnected => egui::Color32::RED,
             };
+            let status_text = self.status_text();
             ui.horizontal(|ui| {
-                ui.colored_label(status_color, "\u{25CF}"); // ●
-                ui.label(format!("{:?}", self.state));
-                if self.state == ConnectionState::Connected {
-                    ui.label(format!("- {} ({}x{})", self.host_name, self.screen_w, self.screen_h));
-                }
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(STATUS_GLYPH_SIZE, STATUS_GLYPH_SIZE),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .circle_filled(rect.center(), STATUS_GLYPH_SIZE * 0.45, status_color);
+                ui.label(status_text);
             });
 
             ui.label(format!("Serial: {}", self.runtime_serial_port));
             ui.separator();
 
-            // Capture toggle
+            // Capture toggle — primary action, prominent. RichText size
+            // 16pt strong + colored fill + min_size [200, 32] makes it the
+            // visual anchor of the chrome panel. Color flips between blue
+            // (idle) and red (capturing) as a state cue, matching the
+            // capture-banner palette in `render_capture_info`.
+            let (btn_text, btn_fill) = if self.capturing {
+                ("Release Input", COLOR_CAPTURE_RED)
+            } else {
+                ("Capture Input", COLOR_CAPTURE_BLUE)
+            };
+            let capture_btn = egui::Button::new(
+                egui::RichText::new(btn_text).size(16.0).strong(),
+            )
+            .fill(btn_fill)
+            .min_size(CAPTURE_BTN_MIN_SIZE);
+            if ui.add(capture_btn).clicked() {
+                self.toggle_capture();
+            }
             let capture_label = if self.capturing {
                 "Input: CAPTURED (Cmd+Esc to release)"
             } else {
                 "Input: released"
             };
-
-            let btn_text = if self.capturing { "Release Input" } else { "Capture Input" };
-            if ui.button(btn_text).clicked() {
-                self.toggle_capture();
-            }
             ui.label(capture_label);
 
             ui.separator();
@@ -692,7 +1129,7 @@ impl eframe::App for WireDeskApp {
                             want_open = true;
                         }
                     } else {
-                        ui.label("● shell open");
+                        ui.label("shell open");
                         if ui.button("Close").clicked() {
                             want_close = true;
                         }
@@ -752,6 +1189,15 @@ impl eframe::App for WireDeskApp {
 
             ui.separator();
             ui.small(&self.status_msg);
+            // Inline TTL banner for the per-monitor fullscreen fallback —
+            // separate from `status_msg` so it doesn't overwrite a real
+            // disconnect reason when both happen at once. Shows for 5 s
+            // then disappears on its own.
+            if let Some((msg, when)) = &self.monitor_fallback_msg {
+                if when.elapsed() < Duration::from_secs(5) {
+                    ui.colored_label(COLOR_WARNING, msg);
+                }
+            }
         });
 
         // Handle captured input — push to outgoing channel (non-blocking).
@@ -868,6 +1314,58 @@ mod tests {
         // that the field exists and is a bool.
         let app = make_app();
         let _: bool = app.permission_granted;
+    }
+
+    #[test]
+    fn connection_state_display_human_readable() {
+        // Display impl is shown in the UI; assert exact strings to catch
+        // accidental changes (e.g. translator regressions, copy-paste typos).
+        let cases = [
+            (ConnectionState::Disconnected, "Not connected"),
+            (ConnectionState::Connecting, "Connecting…"),
+            (ConnectionState::Connected, "Connected"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(format!("{state}"), expected, "Display for {state:?}");
+        }
+    }
+
+    #[test]
+    fn status_text_for_each_state() {
+        // Pure helper — no UI/IO. Asserts the exact human-readable strings
+        // shown in the chrome status row so accidental copy-paste / format
+        // drift fails fast.
+        let mut app = make_app();
+
+        // Disconnected without a reason — generic fallback.
+        app.state = ConnectionState::Disconnected;
+        app.status_msg = "ready".into();
+        assert_eq!(app.status_text(), "Not connected");
+
+        // Disconnected with a transport reason — propagates to the user.
+        app.status_msg = "disconnected: serial: device busy".into();
+        assert_eq!(app.status_text(), "Disconnected: serial: device busy");
+
+        // Connecting — current spec uses ellipsis (…).
+        app.state = ConnectionState::Connecting;
+        assert_eq!(app.status_text(), "Connecting…");
+
+        // Connected — embeds host name and resolution.
+        app.state = ConnectionState::Connected;
+        app.host_name = "win-host".into();
+        app.screen_w = 2560;
+        app.screen_h = 1440;
+        assert_eq!(app.status_text(), "Connected to win-host (2560×1440)");
+    }
+
+    #[test]
+    fn permission_steps_has_four_steps() {
+        assert_eq!(permission_steps().len(), 4);
+    }
+
+    #[test]
+    fn permission_steps_first_mentions_system_settings() {
+        assert!(permission_steps()[0].contains("System Settings"));
     }
 
     #[test]

@@ -14,6 +14,68 @@ pub struct ClientConfig {
     pub width: u16,
     pub height: u16,
     pub client_name: String,
+    /// Persisted identity of the preferred fullscreen target —
+    /// `monitor_identity(m)` format ("Studio Display (5120×2880 @ 0,0)").
+    /// Combines `NSScreen.localizedName` with the screen size **and** the
+    /// global-coordinate origin so two physically identical displays (same
+    /// name, same resolution — e.g. a dual Studio Display 5K setup) round-trip
+    /// distinctly. macOS doesn't allow two NSScreen frames to overlap, so
+    /// origin is always unique per connected display. `None` → use the
+    /// display the window currently sits on. `#[serde(default)]` on the
+    /// struct makes a missing field deserialize as `None`, so existing
+    /// configs round-trip safely without migration.
+    ///
+    /// Stored as an identity string (not an `NSScreen::screens()` index)
+    /// because ordinals aren't stable across reboot / dock event / hot-plug
+    /// — a saved index stays in-range but silently points at a different
+    /// physical display. Identity-based resolution survives reboots and
+    /// re-orderings; if the user renames the display in System Settings,
+    /// changes its resolution, or moves it to a different physical position,
+    /// the saved preference falls back to "active monitor" until they
+    /// re-pick.
+    ///
+    /// **Backward compatibility:** uses a custom deserializer
+    /// (`deserialize_preferred_monitor`) that accepts either a string
+    /// (current format, including legacy label-only "Studio Display
+    /// (5120×2880)" values that simply fail to resolve and fall back to
+    /// "active monitor" — user re-picks once) or a TOML integer (very-early
+    /// format from before the type was `String` — silently discarded as
+    /// `None`). Without this, upgrading an old config would fail to parse
+    /// and `load_from` would wipe ALL fields (port/baud/size/name) back to
+    /// defaults — losing the user's settings on first run after upgrade.
+    #[serde(deserialize_with = "deserialize_preferred_monitor")]
+    pub preferred_monitor: Option<String>,
+}
+
+/// Custom deserializer for `preferred_monitor` that accepts either a string
+/// (current format, e.g. "Studio Display (5120×2880 @ 0,0)") or a legacy TOML
+/// integer (the field was `Option<usize>` in earlier builds — silently
+/// dropped as `None` so the user re-picks via Settings).
+///
+/// Without this, a bare `Option::<String>` would refuse to parse an integer
+/// and the whole TOML file would fail at the struct level, dragging
+/// `load_from` into its "parse error → defaults" fallback path and wiping
+/// every other persisted field. See test
+/// `legacy_integer_preferred_monitor_keeps_other_fields`.
+fn deserialize_preferred_monitor<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        S(String),
+        // Legacy `Option<usize>` — accepted but silently discarded. `i64`
+        // because TOML integers are signed; the original field was usize but
+        // we never want to keep the value, just to avoid failing the parse.
+        #[allow(dead_code)]
+        I(i64),
+    }
+    Ok(match Option::<StringOrInt>::deserialize(d)? {
+        Some(StringOrInt::S(s)) => Some(s),
+        _ => None,
+    })
 }
 
 impl Default for ClientConfig {
@@ -24,6 +86,7 @@ impl Default for ClientConfig {
             width: 2560,
             height: 1440,
             client_name: "wiredesk-client".to_string(),
+            preferred_monitor: None,
         }
     }
 }
@@ -116,6 +179,7 @@ mod tests {
         assert_eq!(cfg.width, 2560);
         assert_eq!(cfg.height, 1440);
         assert_eq!(cfg.client_name, "wiredesk-client");
+        assert!(cfg.preferred_monitor.is_none());
     }
 
     #[test]
@@ -126,6 +190,7 @@ mod tests {
             width: 1920,
             height: 1080,
             client_name: "test-client".to_string(),
+            preferred_monitor: None,
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -171,6 +236,71 @@ mod tests {
         assert_eq!(cfg.port, "/dev/cu.usbserial-999");
         assert_eq!(cfg.baud, 115_200);
         assert_eq!(cfg.client_name, "wiredesk-client");
+        // New `preferred_monitor` field: a TOML written before the field
+        // existed must round-trip as `None` rather than fail to deserialize.
+        assert!(cfg.preferred_monitor.is_none());
+    }
+
+    #[test]
+    fn legacy_integer_preferred_monitor_keeps_other_fields() {
+        // Backward-compat: a config written by an older build had
+        // `preferred_monitor` as `Option<usize>`, so the TOML contained a
+        // bare integer (`preferred_monitor = 2`). Without the custom
+        // deserializer the whole struct would fail to parse, `load_from`
+        // would fall through to `Default::default()`, and the user would
+        // silently lose every other persisted field on first upgrade.
+        // We accept-and-discard the integer (→ None), preserving everything
+        // else.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            "port = \"/dev/cu.legacy\"\n\
+             baud = 57600\n\
+             width = 1920\n\
+             height = 1080\n\
+             client_name = \"legacy-client\"\n\
+             preferred_monitor = 2\n",
+        )
+        .unwrap();
+        let cfg = ClientConfig::load_from(&path);
+        assert_eq!(cfg.port, "/dev/cu.legacy");
+        assert_eq!(cfg.baud, 57_600);
+        assert_eq!(cfg.width, 1920);
+        assert_eq!(cfg.height, 1080);
+        assert_eq!(cfg.client_name, "legacy-client");
+        // The legacy integer is silently dropped — user re-picks via Settings.
+        assert!(cfg.preferred_monitor.is_none());
+    }
+
+    #[test]
+    fn toml_roundtrip_preferred_monitor() {
+        let dir = tempdir().unwrap();
+
+        // Case 1: None — the implicit default. Should survive roundtrip.
+        let cfg_none = ClientConfig {
+            preferred_monitor: None,
+            ..ClientConfig::default()
+        };
+        let path = dir.path().join("none.toml");
+        cfg_none.save_to(&path).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(loaded, cfg_none);
+        assert!(loaded.preferred_monitor.is_none());
+
+        // Case 2: Some(name) — a real display name. Should survive roundtrip.
+        let cfg_some = ClientConfig {
+            preferred_monitor: Some("Studio Display".to_string()),
+            ..ClientConfig::default()
+        };
+        let path = dir.path().join("some.toml");
+        cfg_some.save_to(&path).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(loaded, cfg_some);
+        assert_eq!(
+            loaded.preferred_monitor.as_deref(),
+            Some("Studio Display")
+        );
     }
 
     fn toml_cfg() -> ClientConfig {
@@ -180,6 +310,7 @@ mod tests {
             width: 1280,
             height: 720,
             client_name: "from-toml".to_string(),
+            preferred_monitor: None,
         }
     }
 
