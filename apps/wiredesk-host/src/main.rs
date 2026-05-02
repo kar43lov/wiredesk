@@ -258,12 +258,25 @@ fn run_windows(
     let settings_clone = settings.clone();
     let last_clone = last.clone();
 
+    // Tray icon does NOT raise WM_LBUTTONDBLCLK as a distinct nwg event —
+    // it only delivers WM_LBUTTONUP / WM_LBUTTONDOWN as
+    // `OnMousePress(MousePressLeftUp/Down)`. Track the previous left-up
+    // timestamp and treat two left-ups within `DOUBLE_CLICK_WINDOW` as a
+    // double-click. Win32's default double-click window is 500 ms (via
+    // `GetDoubleClickTime`); we hard-code that here — querying the API
+    // would just add a syscall to a hot path that's already user-driven.
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+    const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+    let last_left_up_for_handler: Cell<Option<Instant>> = Cell::new(None);
+
     // CRITICAL: don't hold a `tray_clone.borrow()` across the whole match —
     // `OnNotice` arm needs `borrow_mut()` to update the icon, and a second
     // borrow on a RefCell already-borrowed → panic → process abort. Take
     // the borrow lazily inside each arm.
     let event_handler = nwg::full_bind_event_handler(&tray_handle, move |evt, _evt_data, handle| {
         use nwg::Event as E;
+        use nwg::MousePressEvent as MP;
         match evt {
             E::OnNotice => {
                 // Status bridge fired — update tray icon + settings status.
@@ -278,6 +291,27 @@ fn run_windows(
                 let t = tray_clone.borrow();
                 if handle == t.tray.handle {
                     t.show_popup();
+                }
+            }
+            E::OnMousePress(MP::MousePressLeftUp) => {
+                // Synthetic double-click detection. Only react when the
+                // event came from the tray icon — `MousePressLeftUp` also
+                // fires for left-clicks on the popup menu host window.
+                let is_tray = {
+                    let t = tray_clone.borrow();
+                    handle == t.tray.handle
+                };
+                if !is_tray {
+                    return;
+                }
+                let now = Instant::now();
+                let prev = last_left_up_for_handler.replace(Some(now));
+                let is_double = matches!(prev, Some(p) if now.duration_since(p) <= DOUBLE_CLICK_WINDOW);
+                if is_double {
+                    // Reset so a third quick click doesn't immediately
+                    // count as another double-click.
+                    last_left_up_for_handler.set(None);
+                    settings_clone.borrow().show();
                 }
             }
             E::OnMenuItemSelected => {
