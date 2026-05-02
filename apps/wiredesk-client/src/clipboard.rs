@@ -16,6 +16,8 @@ use std::time::Duration;
 use wiredesk_protocol::message::{FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
 use wiredesk_protocol::packet::Packet;
 
+use crate::app::TransportEvent;
+
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CHUNK_SIZE: usize = 256;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap for text
@@ -106,6 +108,16 @@ pub(crate) fn check_image_size(png_len: usize, limit: usize) -> Result<(), Image
     }
 }
 
+/// Human-readable message rendered in the chrome toast slot when an image
+/// copy is dropped for being over `MAX_IMAGE_BYTES`. Pure helper so the wording
+/// stays unit-testable without spinning the poll thread.
+pub(crate) fn format_oversize_toast(e: &ImageTooLarge) -> String {
+    format!(
+        "image too large ({} KB), copy a smaller selection",
+        e.png_len / 1024
+    )
+}
+
 /// Decode PNG bytes to an arboard `ImageData` (RGBA8, owned).
 fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image::ImageError> {
     let dyn_img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
@@ -170,11 +182,16 @@ fn emit_offer_and_chunks(
 ///
 /// `outgoing_progress` / `outgoing_total` are updated as bytes are queued
 /// for the writer thread; the UI reads them to render a progress line.
+///
+/// `events_tx` is used to surface transient warnings to the UI — currently
+/// just the "image too large" toast. Reusing the existing UI event channel
+/// avoids adding a separate signalling path for one warning kind.
 pub fn spawn_poll_thread(
     state: ClipboardState,
     outgoing_tx: mpsc::Sender<Packet>,
     outgoing_progress: Arc<AtomicU64>,
     outgoing_total: Arc<AtomicU64>,
+    events_tx: mpsc::Sender<TransportEvent>,
 ) {
     thread::spawn(move || {
         let mut clip = match arboard::Clipboard::new() {
@@ -244,6 +261,7 @@ pub fn spawn_poll_thread(
                     e.png_len,
                     e.limit
                 );
+                let _ = events_tx.send(TransportEvent::Toast(format_oversize_toast(&e)));
                 // Don't update LastKind — user may shrink selection and retry,
                 // we want the next attempt to still be considered "new".
                 continue;
@@ -781,6 +799,56 @@ mod tests {
         let next_hash = hash_bytes(&original.bytes);
         let dedup_hits = matches!(state.get(), LastKind::Image(h) if h == next_hash);
         assert!(dedup_hits, "next poll with same RGBA must short-circuit");
+    }
+
+    #[test]
+    fn format_oversize_toast_includes_kb_and_hint() {
+        // The message rendered in the toast slot must:
+        // - report the encoded size in KB (the user thinks in MB-ish, KB
+        //   gives more precision near the 1 MB cap),
+        // - include an actionable hint so the user knows what to do.
+        let e = ImageTooLarge { png_len: 1_500 * 1024, limit: 1024 * 1024 };
+        let msg = format_oversize_toast(&e);
+        assert!(msg.contains("1500"), "KB count missing: {msg}");
+        assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
+        assert!(msg.contains("too large"), "leading prefix missing: {msg}");
+    }
+
+    #[test]
+    fn toast_emitted_on_oversized_image() {
+        // End-to-end signal flow: the size-check helper returns Err for an
+        // oversized payload, the calling code wraps the error in a toast
+        // string and pushes a TransportEvent::Toast onto the events channel.
+        // Verifies the wiring used inside spawn_poll_thread without spinning
+        // a real thread (which would need a window-server-attached arboard).
+        let original = synthetic_rgba_4x4();
+        let png = encode_rgba_to_png(&original).expect("encode");
+        // 32 bytes is well under the synthetic PNG length so this reliably
+        // exercises the oversize path.
+        let limit = 32usize;
+
+        let (events_tx, events_rx) = mpsc::channel::<TransportEvent>();
+
+        // Reproduce the production sequence: check_image_size → on Err
+        // build a Toast with format_oversize_toast and send through events_tx.
+        match check_image_size(png.len(), limit) {
+            Ok(()) => panic!("expected oversize, got Ok"),
+            Err(e) => {
+                events_tx
+                    .send(TransportEvent::Toast(format_oversize_toast(&e)))
+                    .expect("toast send");
+            }
+        }
+        drop(events_tx);
+
+        let event = events_rx.recv().expect("toast event");
+        match event {
+            TransportEvent::Toast(msg) => {
+                assert!(msg.contains("too large"), "toast missing prefix: {msg}");
+                assert!(msg.contains("smaller"), "toast missing hint: {msg}");
+            }
+            _ => panic!("expected TransportEvent::Toast, got something else"),
+        }
     }
 
     #[test]

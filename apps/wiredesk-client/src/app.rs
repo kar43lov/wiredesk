@@ -40,6 +40,11 @@ pub enum TransportEvent {
     ShellOutput(Vec<u8>),
     ShellExit(i32),
     ShellError(String),
+    /// Transient user-facing notification — surfaced as an inline toast in the
+    /// chrome panel for ~3 seconds. Used by the clipboard poll thread when an
+    /// oversize image is dropped (so the user knows their copy didn't make it
+    /// to the peer), but kept generic for any future single-line warning.
+    Toast(String),
 }
 
 pub struct WireDeskApp {
@@ -119,6 +124,12 @@ pub struct WireDeskApp {
     outgoing_total: Arc<AtomicU64>,
     incoming_progress: Arc<AtomicU64>,
     incoming_total: Arc<AtomicU64>,
+    /// Generic 3-second toast surfaced by `TransportEvent::Toast`. Currently
+    /// used by the clipboard poll thread to warn the user when a copied image
+    /// exceeds `MAX_IMAGE_BYTES` (Task 7b). Distinct from `save_toast`, which
+    /// belongs to the Settings panel — this one is chrome-wide so it shows up
+    /// regardless of whether the Settings collapse is open.
+    transient_toast: Option<(String, Instant)>,
 }
 
 // ---- UI palette / sizing constants ---------------------------------------
@@ -247,6 +258,7 @@ impl WireDeskApp {
             outgoing_total,
             incoming_progress,
             incoming_total,
+            transient_toast: None,
         }
     }
 
@@ -967,6 +979,9 @@ impl eframe::App for WireDeskApp {
                     self.shell_open = false;
                     self.shell_append_output(format!("\n[shell error: {msg}]\n").as_bytes());
                 }
+                TransportEvent::Toast(msg) => {
+                    self.transient_toast = Some((msg, Instant::now()));
+                }
             }
         }
 
@@ -1275,6 +1290,21 @@ impl eframe::App for WireDeskApp {
                 if when.elapsed() < Duration::from_secs(5) {
                     ui.colored_label(COLOR_WARNING, msg);
                 }
+            }
+            // Generic transient toast (Task 7b) — currently the
+            // "image too large" warning from the clipboard poll thread.
+            // Rendered in warning-orange to match the other inline alert
+            // hue. After the 3-second TTL elapses, drop the value so the
+            // chrome doesn't keep allocating layout space for an empty row.
+            let toast_expired = matches!(
+                &self.transient_toast,
+                Some((_, when)) if when.elapsed() >= Duration::from_secs(3)
+            );
+            if toast_expired {
+                self.transient_toast = None;
+            }
+            if let Some((msg, _)) = &self.transient_toast {
+                ui.colored_label(COLOR_WARNING, msg);
             }
         });
 

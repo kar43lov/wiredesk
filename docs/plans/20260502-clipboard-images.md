@@ -347,13 +347,13 @@ main.rs:
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 - Modify: `apps/wiredesk-client/src/main.rs` (если `events_tx` нужно дополнительно clone'нуть в poll-thread)
 
-- [ ] добавить `TransportEvent::Toast(String)` variant.
-- [ ] добавить (если нет) `WireDeskApp.transient_toast: Option<(String, Instant)>` + рендер в `update()` (3 сек, потом `take()`).
-- [ ] в `handle_event` обрабатывать `TransportEvent::Toast(msg)` → `self.transient_toast = Some((msg, Instant::now()))`.
-- [ ] в `clipboard.rs::spawn_poll_thread` принимать `events_tx: mpsc::Sender<TransportEvent>` (clone из main.rs) и при `check_image_size(png.len(), MAX_IMAGE_BYTES) == Err(...)` отправлять `TransportEvent::Toast(format!("image too large ({} KB), copy a smaller selection", png.len() / 1024))`.
-- [ ] unit-тест `toast_emitted_on_oversized_image`: synthetic case (через тестовый низкий лимит) → poll thread пушит `TransportEvent::Toast` в канал.
-- [ ] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
-- [ ] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- [x] добавить `TransportEvent::Toast(String)` variant.
+- [x] добавить (если нет) `WireDeskApp.transient_toast: Option<(String, Instant)>` + рендер в `update()` (3 сек, потом `take()`).
+- [x] в `handle_event` обрабатывать `TransportEvent::Toast(msg)` → `self.transient_toast = Some((msg, Instant::now()))`.
+- [x] в `clipboard.rs::spawn_poll_thread` принимать `events_tx: mpsc::Sender<TransportEvent>` (clone из main.rs) и при `check_image_size(png.len(), MAX_IMAGE_BYTES) == Err(...)` отправлять `TransportEvent::Toast(format!("image too large ({} KB), copy a smaller selection", png.len() / 1024))`.
+- [x] unit-тест `toast_emitted_on_oversized_image`: synthetic case (через тестовый низкий лимит) → poll thread пушит `TransportEvent::Toast` в канал.
+- [x] запустить `cargo test -p wiredesk-client` — все тесты зелёные.
+- [x] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 8: Host — start/finish логи для image-transfer
 

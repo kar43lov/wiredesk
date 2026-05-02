@@ -99,6 +99,10 @@ fn main() {
     let incoming_total = Arc::new(AtomicU64::new(0));
 
     // Reader thread — owns the other half. Just receives and dispatches.
+    // Clone `events_tx` ahead of moving the original into reader_thread so the
+    // clipboard poll thread can surface transient warnings (currently the
+    // oversized-image toast, Task 7b) through the same UI event channel.
+    let poll_events_tx = events_tx.clone();
     let reader_clipboard = clipboard_state.clone();
     let reader_incoming_progress = incoming_progress.clone();
     let reader_incoming_total = incoming_total.clone();
@@ -118,6 +122,7 @@ fn main() {
         outgoing_tx.clone(),
         outgoing_progress.clone(),
         outgoing_total.clone(),
+        poll_events_tx,
     );
 
     // Keyboard tap (macOS only — no-op elsewhere). Initially disabled;
