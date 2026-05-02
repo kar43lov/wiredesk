@@ -123,39 +123,66 @@ pub fn flip_nsscreen_y(ns_y: f32, ns_height: f32, primary_height: f32) -> f32 {
     primary_height - (ns_y + ns_height)
 }
 
-/// Build the user-facing identity label for a monitor: name + size in the
-/// form `"Studio Display (5120×2880)"`. Combining `localizedName` with the
-/// screen dimensions disambiguates two monitors with identical names — e.g.
-/// a dual Studio Display setup, where AppKit gives both the same
-/// `localizedName` and a name-only key would round-trip a "Display 2" pick
-/// back to "Display 1" on the next launch.
+/// Build the user-facing label for a monitor: name + size in the form
+/// `"Studio Display (5120×2880)"`. Used **only for ComboBox display** —
+/// what the user reads in Settings. May collide between two physically
+/// identical displays (same `localizedName`, same resolution, different
+/// origins); for persistence use [`monitor_identity`] instead.
 ///
-/// Used by both the Settings ComboBox label AND the persisted
-/// `preferred_monitor` value so the two are always in lock-step. The width
-/// and height come from the already-converted `frame.size()` (winit
-/// coordinates), which matches what the user sees in the ComboBox.
-///
-/// **Edge case:** if two monitors share both name AND size (very rare —
-/// would require two physically identical displays at identical
-/// resolutions), the labels collide and only one is reachable via the
-/// preference. Acceptable for MVP — adding NSScreen `deviceDescription`
-/// disambiguation is a follow-up.
+/// The width and height come from the already-converted `frame.size()`
+/// (winit coordinates), so the label matches what the user sees on screen.
 pub fn monitor_label(m: &MonitorInfo) -> String {
     let size = m.frame.size();
     format!("{} ({}×{})", m.name, size.x as u32, size.y as u32)
 }
 
-/// Resolve a stored `preferred_monitor` label against the live monitor list.
+/// Build the **persistence identity** for a monitor: name + size + origin
+/// in the form `"Studio Display (5120×2880 @ 0,0)"`. Used as the saved
+/// `preferred_monitor` value and as the lookup key in
+/// [`resolve_target_monitor`].
+///
+/// Including the global-coordinate origin disambiguates two physically
+/// identical displays (same name, same resolution) that a name-only or
+/// label-only key would collide on. macOS / NSScreen never lets two
+/// screens overlap at the same `(x, y)` — every connected display has
+/// a unique origin in the global coordinate space — so `(name, size,
+/// origin)` is a stable unique key. Origins come from the already-flipped
+/// winit coordinates, which is fine: they remain unique per display, and
+/// the round-trip Save → load → Settings → resolve uses the same value
+/// throughout.
+///
+/// Real-world case this fixes: dual Studio Display setup at `(0, 0)` and
+/// `(5120, 0)`. Pre-fix both displays produced
+/// `"Studio Display (5120×2880)"` and the saved preference always
+/// resolved to monitor 0. Post-fix the second display saves as
+/// `"Studio Display (5120×2880 @ 5120,0)"` and round-trips correctly.
+pub fn monitor_identity(m: &MonitorInfo) -> String {
+    let size = m.frame.size();
+    let origin = m.frame.min;
+    format!(
+        "{} ({}×{} @ {},{})",
+        m.name,
+        size.x as u32,
+        size.y as u32,
+        origin.x as i32,
+        origin.y as i32,
+    )
+}
+
+/// Resolve a stored `preferred_monitor` identity against the live monitor
+/// list.
 ///
 /// * `None` → caller wants "current display" semantics, return `None`.
-/// * `Some(label)` with no matching monitor → log a warning and return `None`
+/// * `Some(id)` with no matching monitor → log a warning and return `None`
 ///   (caller falls back to fullscreen on the active display). This happens
 ///   when the saved display has been unplugged, renamed, resolution-changed,
-///   or the user moved the config between machines.
-/// * `Some(label)` matching `monitor_label(m)` → that `MonitorInfo`.
+///   moved to a different physical position, or the user moved the config
+///   between machines.
+/// * `Some(id)` matching `monitor_identity(m)` → that `MonitorInfo`.
 ///
-/// Label-based (name + size) instead of name-only because two physical
-/// monitors can share `localizedName`; the size suffix disambiguates them.
+/// Identity-based (name + size + origin) — name-only or name+size collide
+/// on dual identical-display setups (e.g. two Studio Displays). Origin is
+/// guaranteed unique because NSScreen disallows overlapping frames.
 /// Index-based was tried earlier and rejected: NSScreen ordinals aren't
 /// stable across reboot / dock / hot-plug — a saved index stays in-range
 /// but silently points at a different physical display.
@@ -163,12 +190,12 @@ pub fn resolve_target_monitor<'a>(
     preferred: Option<&str>,
     monitors: &'a [MonitorInfo],
 ) -> Option<&'a MonitorInfo> {
-    let label = preferred?;
-    match monitors.iter().find(|m| monitor_label(m) == label) {
+    let id = preferred?;
+    match monitors.iter().find(|m| monitor_identity(m) == id) {
         Some(m) => Some(m),
         None => {
             log::warn!(
-                "preferred_monitor {label:?} not found among {} monitor(s)",
+                "preferred_monitor {id:?} not found among {} monitor(s)",
                 monitors.len()
             );
             None
@@ -200,10 +227,16 @@ mod tests {
             make_monitor(0, "Built-in", 0.0, 0.0, 1920.0, 1080.0),
             make_monitor(1, "Studio Display", 1920.0, 0.0, 5120.0, 2880.0),
         ];
-        assert!(resolve_target_monitor(Some("Unplugged Display (4096×2160)"), &monitors).is_none());
-        // Bare name no longer matches — must include the size suffix to
-        // disambiguate against duplicate names.
+        assert!(
+            resolve_target_monitor(Some("Unplugged Display (4096×2160 @ 0,0)"), &monitors)
+                .is_none()
+        );
+        // Bare name no longer matches — must include the full identity
+        // (name + size + origin) to resolve.
         assert!(resolve_target_monitor(Some("Studio Display"), &monitors).is_none());
+        // Old label-only format (without origin) also no longer matches:
+        // resolution is identity-based now to disambiguate identical displays.
+        assert!(resolve_target_monitor(Some("Studio Display (5120×2880)"), &monitors).is_none());
     }
 
     #[test]
@@ -213,12 +246,12 @@ mod tests {
             make_monitor(1, "Studio Display", 1920.0, 0.0, 5120.0, 2880.0),
         ];
 
-        let m0 = resolve_target_monitor(Some("Built-in (1920×1080)"), &monitors)
+        let m0 = resolve_target_monitor(Some("Built-in (1920×1080 @ 0,0)"), &monitors)
             .expect("Built-in present");
         assert_eq!(m0.index, 0);
         assert_eq!(m0.name, "Built-in");
 
-        let m1 = resolve_target_monitor(Some("Studio Display (5120×2880)"), &monitors)
+        let m1 = resolve_target_monitor(Some("Studio Display (5120×2880 @ 1920,0)"), &monitors)
             .expect("Studio Display present");
         assert_eq!(m1.index, 1);
         assert_eq!(m1.name, "Studio Display");
@@ -226,9 +259,9 @@ mod tests {
 
     #[test]
     fn monitor_label_format_matches_combo_box() {
-        // Combined identity string: localized name + size. Same shape on the
-        // ComboBox label and on the persisted preferred_monitor value so a
-        // round-trip through Save → load → Settings is byte-identical.
+        // User-facing label: localized name + size. This is what shows up
+        // in the ComboBox; the persisted value uses `monitor_identity` —
+        // see `monitor_identity_includes_origin`.
         let m = make_monitor(0, "Studio Display", 0.0, 0.0, 5120.0, 2880.0);
         assert_eq!(monitor_label(&m), "Studio Display (5120×2880)");
 
@@ -240,22 +273,63 @@ mod tests {
     }
 
     #[test]
+    fn monitor_identity_includes_origin() {
+        // Persistence identity: name + size + origin. Origin is the
+        // already-flipped winit coordinate (top-left, y-down) — fine for
+        // disambiguation as long as both Save and resolve use the same
+        // helper, which they do.
+        let m = make_monitor(0, "Studio Display", 0.0, 0.0, 5120.0, 2880.0);
+        assert_eq!(monitor_identity(&m), "Studio Display (5120×2880 @ 0,0)");
+
+        // Negative-y origin (display stacked above primary in winit space).
+        let m = make_monitor(1, "Studio Display", 0.0, -1440.0, 2560.0, 1440.0);
+        assert_eq!(monitor_identity(&m), "Studio Display (2560×1440 @ 0,-1440)");
+    }
+
+    #[test]
     fn resolve_target_monitor_disambiguates_duplicate_names() {
         // Two physically distinct monitors with the same `localizedName`
-        // (real-world case: dual Studio Display) — name-only resolution
-        // would always return the first one. Combining name with size
-        // makes the second selectable as long as it has a different
-        // resolution.
+        // and **different** resolutions (real-world case: dual external
+        // displays of different models that happen to share a localized
+        // name) — identity-based resolution must pick the right one.
         let monitors = vec![
             make_monitor(0, "Studio Display", 0.0, 0.0, 5120.0, 2880.0),
             make_monitor(1, "Studio Display", 5120.0, 0.0, 2560.0, 1440.0),
         ];
 
-        let m0 = resolve_target_monitor(Some("Studio Display (5120×2880)"), &monitors)
+        let m0 = resolve_target_monitor(Some("Studio Display (5120×2880 @ 0,0)"), &monitors)
             .expect("first Studio Display present");
         assert_eq!(m0.index, 0);
 
-        let m1 = resolve_target_monitor(Some("Studio Display (2560×1440)"), &monitors)
+        let m1 = resolve_target_monitor(Some("Studio Display (2560×1440 @ 5120,0)"), &monitors)
+            .expect("second Studio Display present");
+        assert_eq!(m1.index, 1);
+    }
+
+    #[test]
+    fn resolve_target_monitor_disambiguates_identical_displays() {
+        // The edge case the previous label-only key collided on: two
+        // **physically identical** displays (same name, same resolution)
+        // at different origins — e.g. dual Studio Display 5K side-by-side.
+        // Identity includes origin, so each saves and resolves distinctly.
+        let monitors = vec![
+            make_monitor(0, "Studio Display", 0.0, 0.0, 5120.0, 2880.0),
+            make_monitor(1, "Studio Display", 5120.0, 0.0, 5120.0, 2880.0),
+        ];
+
+        // Sanity: the two `monitor_label` strings collide (the old bug).
+        assert_eq!(monitor_label(&monitors[0]), monitor_label(&monitors[1]));
+        // But the identities don't.
+        assert_ne!(
+            monitor_identity(&monitors[0]),
+            monitor_identity(&monitors[1])
+        );
+
+        let m0 = resolve_target_monitor(Some("Studio Display (5120×2880 @ 0,0)"), &monitors)
+            .expect("first Studio Display present");
+        assert_eq!(m0.index, 0);
+
+        let m1 = resolve_target_monitor(Some("Studio Display (5120×2880 @ 5120,0)"), &monitors)
             .expect("second Studio Display present");
         assert_eq!(m1.index, 1);
     }

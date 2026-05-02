@@ -14,34 +14,41 @@ pub struct ClientConfig {
     pub width: u16,
     pub height: u16,
     pub client_name: String,
-    /// Combined identity string of the preferred fullscreen target —
-    /// `monitor_label(m)` format ("Studio Display (5120×2880)"). Combines
-    /// `NSScreen.localizedName` with the screen size so two monitors with
-    /// identical names (e.g. dual Studio Display) are still distinguishable.
-    /// `None` → use the display the window currently sits on.
-    /// `#[serde(default)]` on the struct makes a missing field deserialize as
-    /// `None`, so existing configs round-trip safely without migration.
+    /// Persisted identity of the preferred fullscreen target —
+    /// `monitor_identity(m)` format ("Studio Display (5120×2880 @ 0,0)").
+    /// Combines `NSScreen.localizedName` with the screen size **and** the
+    /// global-coordinate origin so two physically identical displays (same
+    /// name, same resolution — e.g. a dual Studio Display 5K setup) round-trip
+    /// distinctly. macOS doesn't allow two NSScreen frames to overlap, so
+    /// origin is always unique per connected display. `None` → use the
+    /// display the window currently sits on. `#[serde(default)]` on the
+    /// struct makes a missing field deserialize as `None`, so existing
+    /// configs round-trip safely without migration.
     ///
-    /// Stored as a label (not an `NSScreen::screens()` index) because ordinals
-    /// aren't stable across reboot / dock event / hot-plug — a saved index
-    /// stays in-range but silently points at a different physical display.
-    /// Label-based resolution survives reboots and re-orderings; if the user
-    /// renames the display in System Settings or changes its resolution, the
-    /// saved preference falls back to "active monitor" until they re-pick.
+    /// Stored as an identity string (not an `NSScreen::screens()` index)
+    /// because ordinals aren't stable across reboot / dock event / hot-plug
+    /// — a saved index stays in-range but silently points at a different
+    /// physical display. Identity-based resolution survives reboots and
+    /// re-orderings; if the user renames the display in System Settings,
+    /// changes its resolution, or moves it to a different physical position,
+    /// the saved preference falls back to "active monitor" until they
+    /// re-pick.
     ///
     /// **Backward compatibility:** uses a custom deserializer
-    /// (`deserialize_preferred_monitor`) that accepts either a string (current
-    /// format) or a TOML integer (legacy format from before the type was
-    /// `String` — silently discarded as `None`). Without this, upgrading an
-    /// old config would fail to parse and `load_from` would wipe ALL fields
-    /// (port/baud/size/name) back to defaults — losing the user's settings on
-    /// first run after upgrade.
+    /// (`deserialize_preferred_monitor`) that accepts either a string
+    /// (current format, including legacy label-only "Studio Display
+    /// (5120×2880)" values that simply fail to resolve and fall back to
+    /// "active monitor" — user re-picks once) or a TOML integer (very-early
+    /// format from before the type was `String` — silently discarded as
+    /// `None`). Without this, upgrading an old config would fail to parse
+    /// and `load_from` would wipe ALL fields (port/baud/size/name) back to
+    /// defaults — losing the user's settings on first run after upgrade.
     #[serde(deserialize_with = "deserialize_preferred_monitor")]
     pub preferred_monitor: Option<String>,
 }
 
 /// Custom deserializer for `preferred_monitor` that accepts either a string
-/// (current format, e.g. "Studio Display (5120×2880)") or a legacy TOML
+/// (current format, e.g. "Studio Display (5120×2880 @ 0,0)") or a legacy TOML
 /// integer (the field was `Option<usize>` in earlier builds — silently
 /// dropped as `None` so the user re-picks via Settings).
 ///

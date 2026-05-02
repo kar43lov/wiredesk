@@ -311,15 +311,18 @@ impl WireDeskApp {
                     }
                 });
 
-                // Fullscreen target monitor — saved as `preferred_monitor`
-                // using the combined label `monitor_label(m)` ("Studio
-                // Display (5120×2880)"). Default `None` keeps the legacy
-                // behaviour (fullscreen on the display the window currently
-                // sits on). Label-based so two monitors sharing `localizedName`
-                // are still distinguishable, and so a saved preference
-                // survives reboot / dock / hot-plug. Both the ComboBox label
-                // and the persisted value use the same `monitor_label`
-                // helper, so a Save → reload round-trip is byte-identical.
+                // Fullscreen target monitor. The ComboBox **displays** the
+                // user-friendly `monitor_label(m)` ("Studio Display
+                // (5120×2880)") while the **saved value** is the unique
+                // `monitor_identity(m)` ("Studio Display (5120×2880 @ 0,0)").
+                // Splitting display from storage lets two physically
+                // identical displays — same name, same resolution — coexist
+                // in a dual-monitor setup without one shadowing the other on
+                // restart (origin disambiguates them, and NSScreen never
+                // lets two displays overlap). Default `None` keeps the
+                // legacy "fullscreen on whichever display the window sits
+                // on" behaviour. Identity also survives reboot / dock /
+                // hot-plug as long as the same physical layout returns.
                 ui.horizontal(|ui| {
                     ui.label("Fullscreen monitor:");
                     let selected_text = match cfg.preferred_monitor.as_deref() {
@@ -327,18 +330,19 @@ impl WireDeskApp {
                         Some(saved) => {
                             match monitors
                                 .iter()
-                                .find(|m| monitor::monitor_label(m) == saved)
+                                .find(|m| monitor::monitor_identity(m) == saved)
                             {
                                 Some(m) => format!(
                                     "Display {} — {}",
                                     m.index + 1,
                                     monitor::monitor_label(m),
                                 ),
-                                // Saved label doesn't match any live display
-                                // (unplugged, renamed, or resolution changed
-                                // since last save). Show the saved label with
-                                // an "(unavailable)" hint so the user knows
-                                // something stale is selected.
+                                // Saved identity doesn't match any live
+                                // display (unplugged, renamed, resolution
+                                // changed, or moved to a different physical
+                                // position since last save). Show the saved
+                                // identity with an "(unavailable)" hint so
+                                // the user knows something stale is selected.
                                 None => format!("{saved} (unavailable)"),
                             }
                         }
@@ -357,13 +361,19 @@ impl WireDeskApp {
                                 dirty = true;
                             }
                             for m in &monitors {
-                                let label = monitor::monitor_label(m);
-                                let display_text =
-                                    format!("Display {} — {}", m.index + 1, label);
+                                // Friendly text for the dropdown row …
+                                let display_text = format!(
+                                    "Display {} — {}",
+                                    m.index + 1,
+                                    monitor::monitor_label(m),
+                                );
+                                // … but persist the unique identity so
+                                // identical displays don't collide.
+                                let identity = monitor::monitor_identity(m);
                                 if ui
                                     .selectable_value(
                                         &mut cfg.preferred_monitor,
-                                        Some(label),
+                                        Some(identity),
                                         display_text,
                                     )
                                     .changed()
