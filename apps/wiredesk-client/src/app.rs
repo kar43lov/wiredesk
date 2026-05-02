@@ -81,6 +81,13 @@ pub struct WireDeskApp {
     // live display. Carries its own TTL so it doesn't clobber `status_msg`
     // when a real disconnect message wants the same slot.
     monitor_fallback_msg: Option<(String, Instant)>,
+    /// Queued `OuterPosition` to restore after fullscreen exit. macOS
+    /// Spaces transitions take ~500ms and a position command sent during
+    /// the transition lands the window off-screen on a Space that the
+    /// user's display no longer shows. Holding the position here and
+    /// applying it from `update()` after the timer ensures macOS has
+    /// finished the transition before we move the window.
+    pending_position_restore: Option<(egui::Pos2, Instant)>,
     // Saved outer position before entering fullscreen on a non-active monitor.
     // Restored on fullscreen exit so the chrome window returns to where the
     // user originally had it. None when fullscreen wasn't entered via an
@@ -186,6 +193,7 @@ impl WireDeskApp {
             cached_monitors_at: None,
             monitor_fallback_msg: None,
             original_position: None,
+            pending_position_restore: None,
             runtime_preferred_monitor,
         }
     }
@@ -570,8 +578,31 @@ impl WireDeskApp {
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             if let Some(pos) = self.original_position.take() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                // Defer OuterPosition until macOS finishes the Spaces
+                // transition (~500ms). Sending it inline puts the window
+                // on a Space that's already disappearing → user can't find
+                // it without Mission Control. The pending state is drained
+                // in update() once the timer elapses.
+                self.pending_position_restore = Some((pos, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(700));
             }
+        }
+    }
+
+    /// Drain the pending `OuterPosition` after fullscreen exit if its
+    /// settle timer has elapsed. Called from `update()`.
+    fn drain_pending_position_restore(&mut self, ctx: &egui::Context) {
+        let Some((pos, when)) = self.pending_position_restore else {
+            return;
+        };
+        if when.elapsed() >= Duration::from_millis(600) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            self.pending_position_restore = None;
+        } else {
+            // Wake again at the deadline so we don't miss the window.
+            ctx.request_repaint_after(
+                Duration::from_millis(600).saturating_sub(when.elapsed()),
+            );
         }
     }
 
@@ -843,6 +874,7 @@ impl eframe::App for WireDeskApp {
         // the tap so Mac shortcuts (Cmd+V to paste etc.) work normally on
         // the Mac side. Resumes when window gets focus back.
         self.sync_tap_to_focus(ctx);
+        self.drain_pending_position_restore(ctx);
 
         // Drain TapEvents from the keyboard tap thread.
         let mut pending_tap_events: Vec<TapEvent> = Vec::new();
