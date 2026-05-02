@@ -4,6 +4,7 @@ mod config;
 mod input;
 mod keyboard_tap;
 mod monitor;
+mod status_bar;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -165,6 +166,17 @@ fn main() {
     // enable() is called when the user enters capture-mode.
     let tap_handle = keyboard_tap::start(outgoing_tx.clone(), tap_events_tx);
 
+    // Status bar item — same Arcs the egui status row reads from. Idle
+    // shows "W"; in-flight transfer shows "↑ N%" / "↓ N%". Initialised
+    // inside the eframe creator below to satisfy AppKit's main-thread
+    // invariant (eframe creator runs on the main thread on macOS).
+    let status_bar_counters = status_bar::StatusBarCounters {
+        outgoing_progress: outgoing_progress.clone(),
+        outgoing_total: outgoing_total.clone(),
+        incoming_progress: incoming_progress.clone(),
+        incoming_total: incoming_total.clone(),
+    };
+
     let app = WireDeskApp::new(
         cfg,
         events_rx,
@@ -186,10 +198,13 @@ fn main() {
         ..Default::default()
     };
 
+    // Move status bar counters into the creator closure — it runs on the
+    // main thread on macOS, satisfying NSStatusBar's threading invariant.
+    let creator_status_bar_counters = status_bar_counters;
     if let Err(e) = eframe::run_native(
         "WireDesk",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // egui's `include_image!` macro emits an ImageSource that needs a
             // registered loader at runtime — without this call the heading
             // image just renders as an "unable to load image" placeholder.
@@ -205,6 +220,12 @@ fn main() {
             unsafe {
                 force_dock_icon_from_bundle();
             }
+            // Stash the StatusBarHandle inside the egui app via a Box leak
+            // so it lives for the program's lifetime. The handle's only job
+            // is to keep the NSStatusItem alive — once dropped, AppKit
+            // removes the menu bar item.
+            let _handle = status_bar::init(creator_status_bar_counters);
+            std::mem::forget(_handle);
             Ok(Box::new(app))
         }),
     ) {
