@@ -5,7 +5,7 @@ use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
 
-use crate::clipboard::ClipboardSync;
+use crate::clipboard::{ClipboardSync, ProgressCounters};
 use crate::injector::InputInjector;
 use crate::shell::{ShellEvent, ShellProcess};
 
@@ -37,7 +37,29 @@ pub struct Session<T: Transport, I: InputInjector> {
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
+    /// Convenience ctor with default (zero-init) progress counters.
+    /// Used by the `#[cfg(test)]` fixtures; production wiring goes
+    /// through `with_counters` so the overlay sees the same atomics.
+    #[cfg(test)]
     pub fn new(transport: T, injector: I, host_name: String, screen_w: u16, screen_h: u16) -> Self {
+        Self::with_counters(
+            transport,
+            injector,
+            host_name,
+            screen_w,
+            screen_h,
+            ProgressCounters::default(),
+        )
+    }
+
+    pub fn with_counters(
+        transport: T,
+        injector: I,
+        host_name: String,
+        screen_w: u16,
+        screen_h: u16,
+        counters: ProgressCounters,
+    ) -> Self {
         let now = Instant::now();
         Self {
             transport,
@@ -50,7 +72,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_w,
             screen_h,
             shell: None,
-            clipboard: ClipboardSync::new(),
+            clipboard: ClipboardSync::with_counters(counters),
             client_name: None,
         }
     }

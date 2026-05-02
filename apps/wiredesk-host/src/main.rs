@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::{CommandFactory, Parser};
 
+use clipboard::ProgressCounters;
 use config::HostConfig;
 use session_thread::SessionStatus;
 
@@ -122,15 +123,23 @@ fn main() {
     log::info!("screen: {}x{}", cfg.width, cfg.height);
 
     let (status_tx, status_rx) = mpsc::channel();
-    let _session = session_thread::spawn(cfg.clone(), status_tx);
+
+    // Shared progress atomics — session thread writes; overlay UI thread
+    // (Windows) reads. Default-initialised so dev loop on macOS still gets
+    // a valid bundle (no overlay there, but Session needs the structure).
+    let counters = ProgressCounters::default();
+    let _session = session_thread::spawn(cfg.clone(), status_tx, counters.clone());
 
     let last_status = Arc::new(Mutex::new(SessionStatus::Waiting));
 
     #[cfg(windows)]
-    run_windows(cfg, status_rx, last_status);
+    run_windows(cfg, status_rx, last_status, counters);
 
     #[cfg(not(windows))]
-    run_dev_loop(status_rx, last_status);
+    {
+        let _ = counters; // unused in dev loop, keep clone for symmetry
+        run_dev_loop(status_rx, last_status);
+    }
 }
 
 #[cfg(not(windows))]
@@ -153,6 +162,7 @@ fn run_windows(
     cfg: HostConfig,
     status_rx: mpsc::Receiver<SessionStatus>,
     last: Arc<Mutex<SessionStatus>>,
+    counters: ProgressCounters,
 ) {
     use native_windows_gui as nwg;
 
@@ -206,6 +216,26 @@ fn run_windows(
             return;
         }
     };
+
+    log::info!("run_windows: building TransferOverlay");
+    // Overlay is purely cosmetic — failure to build it shouldn't take down
+    // the whole host. Wrap in Option so the absence is graceful.
+    let overlay = match ui::transfer_overlay::TransferOverlay::build(counters.clone()) {
+        Ok(o) => Some(o),
+        Err(e) => {
+            log::warn!("transfer overlay build failed: {e}; continuing without overlay");
+            None
+        }
+    };
+    let _overlay_event_handler = overlay.as_ref().map(|o| {
+        let timer_handle = o.borrow().timer_handle();
+        let overlay_clone = o.clone();
+        nwg::full_bind_event_handler(&timer_handle, move |evt, _evt_data, _handle| {
+            if matches!(evt, nwg::Event::OnTimerTick) {
+                overlay_clone.borrow().tick();
+            }
+        })
+    });
 
     log::info!("run_windows: building cross-thread Notice");
     let mut notice = nwg::Notice::default();
@@ -317,6 +347,10 @@ fn run_windows(
 
     nwg::unbind_event_handler(&event_handler);
     nwg::unbind_event_handler(&settings_event_handler);
+    if let Some(h) = _overlay_event_handler.as_ref() {
+        nwg::unbind_event_handler(h);
+    }
+    let _ = overlay; // keep alive until shutdown
 }
 
 // ---- Settings-window button handlers --------------------------------------

@@ -12,6 +12,8 @@
 //! background thread).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use wiredesk_protocol::message::{FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
@@ -170,15 +172,18 @@ pub struct ClipboardSync {
     received_total: u32,
     received: BTreeMap<u16, Vec<u8>>,
 
-    // Incoming progress counters — Host-side single-threaded, used for
-    // commit-clear semantics and conceptual symmetry with the Mac UI.
-    // Outgoing counters intentionally omitted: there is no UI to consume
-    // them and the synchronous "set total = progress = bytes.len()" pattern
-    // before sending replicated a bug already fixed Mac-side (M3).
-    #[allow(dead_code)]
-    incoming_progress: u64,
-    #[allow(dead_code)]
-    incoming_total: u64,
+    // Progress counters — atomics so the always-on-top overlay (separate
+    // UI thread) can poll without locking. Host stays single-threaded for
+    // mutation: only the session-thread bumps these.
+    //   - incoming_*: written by `on_offer` / `on_chunk` / `commit` /
+    //     `reset_reassembly`.
+    //   - outgoing_*: written by `poll()` (sets total when transfer starts,
+    //     bumps progress per chunk drained from the outbox; cleared once
+    //     progress reaches total or `reset()` runs).
+    incoming_progress: Arc<AtomicU64>,
+    incoming_total: Arc<AtomicU64>,
+    outgoing_progress: Arc<AtomicU64>,
+    outgoing_total: Arc<AtomicU64>,
 
     /// Codex iter2 D3: pending outbound messages from a started transfer.
     /// `poll()` builds the full offer+chunks list once, pushes everything
@@ -201,8 +206,19 @@ pub(crate) enum CommittedPayload {
     Image { width: usize, height: usize, bytes: Vec<u8> },
 }
 
+/// Bundle of progress atomics shared between `ClipboardSync` and any
+/// external observer (the always-on-top transfer overlay). All four counters
+/// are owned by the session thread; the overlay thread only reads them.
+#[derive(Clone, Default)]
+pub struct ProgressCounters {
+    pub outgoing_progress: Arc<AtomicU64>,
+    pub outgoing_total: Arc<AtomicU64>,
+    pub incoming_progress: Arc<AtomicU64>,
+    pub incoming_total: Arc<AtomicU64>,
+}
+
 impl ClipboardSync {
-    pub fn new() -> Self {
+    pub fn with_counters(counters: ProgressCounters) -> Self {
         Self {
             clip: arboard::Clipboard::new().ok(),
             last: LastKind::None,
@@ -211,8 +227,10 @@ impl ClipboardSync {
             expected_format: 0,
             received_total: 0,
             received: BTreeMap::new(),
-            incoming_progress: 0,
-            incoming_total: 0,
+            incoming_progress: counters.incoming_progress,
+            incoming_total: counters.incoming_total,
+            outgoing_progress: counters.outgoing_progress,
+            outgoing_total: counters.outgoing_total,
             pending_outbox: VecDeque::new(),
             #[cfg(test)]
             last_committed: None,
@@ -231,18 +249,32 @@ impl ClipboardSync {
             expected_format: 0,
             received_total: 0,
             received: BTreeMap::new(),
-            incoming_progress: 0,
-            incoming_total: 0,
+            incoming_progress: Arc::new(AtomicU64::new(0)),
+            incoming_total: Arc::new(AtomicU64::new(0)),
+            outgoing_progress: Arc::new(AtomicU64::new(0)),
+            outgoing_total: Arc::new(AtomicU64::new(0)),
             pending_outbox: VecDeque::new(),
             last_committed: None,
         }
     }
 
     /// Drain up to `MAX_MESSAGES_PER_POLL` messages from `pending_outbox`
-    /// into a fresh Vec. Returned to the caller in arrival order.
+    /// into a fresh Vec. Returned to the caller in arrival order. Any
+    /// `ClipChunk` removed from the queue bumps `outgoing_progress` so the
+    /// overlay sees per-chunk progress (matches Mac's writer-thread bump).
+    /// The counters are NOT cleared on completion — the overlay latches the
+    /// 100% state for ~1 s before fading out, and then the next transfer's
+    /// `outgoing_total` write replaces the value naturally.
     fn drain_outbox(&mut self) -> Vec<Message> {
         let n = self.pending_outbox.len().min(MAX_MESSAGES_PER_POLL);
-        self.pending_outbox.drain(..n).collect()
+        let drained: Vec<Message> = self.pending_outbox.drain(..n).collect();
+        for m in &drained {
+            if let Message::ClipChunk { data, .. } = m {
+                self.outgoing_progress
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+        }
+        drained
     }
 
     /// Called from session.tick(). Returns up to `MAX_MESSAGES_PER_POLL`
@@ -295,6 +327,13 @@ impl ClipboardSync {
                 }
 
                 log::info!("clipboard: sending text to peer ({} bytes)", bytes.len());
+                // Stamp totals BEFORE drain so the overlay's first read sees
+                // a non-zero total and renders the in-flight string. Reset
+                // progress to 0 — a previous transfer may have left it at
+                // its terminal value (we keep it there so the 100% latch
+                // works on the receiver side).
+                self.outgoing_total.store(bytes.len() as u64, Ordering::Relaxed);
+                self.outgoing_progress.store(0, Ordering::Relaxed);
                 self.pending_outbox
                     .extend(build_offer_and_chunks(FORMAT_TEXT_UTF8, bytes));
                 return self.drain_outbox();
@@ -348,6 +387,8 @@ impl ClipboardSync {
             "clipboard: sending image to peer ({} bytes)",
             png.len()
         );
+        self.outgoing_total.store(png.len() as u64, Ordering::Relaxed);
+        self.outgoing_progress.store(0, Ordering::Relaxed);
         self.pending_outbox
             .extend(build_offer_and_chunks(FORMAT_PNG_IMAGE, &png));
         self.drain_outbox()
@@ -376,8 +417,8 @@ impl ClipboardSync {
             self.expected_format = 0;
             self.received.clear();
             self.received_total = 0;
-            self.incoming_total = 0;
-            self.incoming_progress = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
             return;
         }
         // Bound peer-supplied total_len to local caps before allocating any
@@ -399,16 +440,16 @@ impl ClipboardSync {
             self.expected_format = 0;
             self.received.clear();
             self.received_total = 0;
-            self.incoming_total = 0;
-            self.incoming_progress = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
             return;
         }
         self.expected_len = total_len;
         self.expected_format = format;
         self.received.clear();
         self.received_total = 0;
-        self.incoming_total = total_len as u64;
-        self.incoming_progress = 0;
+        self.incoming_total.store(total_len as u64, Ordering::Relaxed);
+        self.incoming_progress.store(0, Ordering::Relaxed);
         log::debug!(
             "clipboard: incoming offer format={format} of {total_len} bytes"
         );
@@ -434,7 +475,8 @@ impl ClipboardSync {
             // saturating_add: a malicious peer could otherwise overflow u32
             // by spamming chunks past expected_len before the >= guard fires.
             self.received_total = self.received_total.saturating_add(added);
-            self.incoming_progress = self.incoming_progress.saturating_add(added as u64);
+            self.incoming_progress
+                .fetch_add(added as u64, Ordering::Relaxed);
         }
 
         if self.received_total >= self.expected_len {
@@ -468,6 +510,10 @@ impl ClipboardSync {
         self.reset_reassembly();
         self.pending_outbox.clear();
         self.last = LastKind::None;
+        // Drop sender-side overlay totals too: a session boundary should
+        // wipe the "Sending X" string, not leave a stale 100% banner.
+        self.outgoing_progress.store(0, Ordering::Relaxed);
+        self.outgoing_total.store(0, Ordering::Relaxed);
     }
 
     /// Cleanup that zeros reassembly state but preserves `self.last` (sender
@@ -488,8 +534,8 @@ impl ClipboardSync {
         self.expected_format = 0;
         self.received.clear();
         self.received_total = 0;
-        self.incoming_progress = 0;
-        self.incoming_total = 0;
+        self.incoming_progress.store(0, Ordering::Relaxed);
+        self.incoming_total.store(0, Ordering::Relaxed);
     }
 
     fn commit(&mut self) {
@@ -824,8 +870,8 @@ mod tests {
 
         assert_eq!(sync.expected_len, 0, "unknown format must not arm reassembly");
         assert_eq!(sync.expected_format, 0);
-        assert_eq!(sync.incoming_total, 0);
-        assert_eq!(sync.incoming_progress, 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
 
         // Follow-up chunks must be dropped by the expected_len==0 guard.
         for i in 0..16u16 {
@@ -860,8 +906,8 @@ mod tests {
         feed_offer(&mut sync, FORMAT_TEXT_UTF8, text.as_bytes());
 
         assert!(sync.last_committed.is_some());
-        assert_eq!(sync.incoming_progress, 0);
-        assert_eq!(sync.incoming_total, 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -873,8 +919,8 @@ mod tests {
 
         assert_eq!(sync.expected_len, 0);
         assert_eq!(sync.expected_format, 0);
-        assert_eq!(sync.incoming_total, 0);
-        assert_eq!(sync.incoming_progress, 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -884,8 +930,8 @@ mod tests {
 
         assert_eq!(sync.expected_len, 0);
         assert_eq!(sync.expected_format, 0);
-        assert_eq!(sync.incoming_total, 0);
-        assert_eq!(sync.incoming_progress, 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -901,8 +947,8 @@ mod tests {
         assert_eq!(sync.expected_len, 0);
         assert_eq!(sync.expected_format, 0);
         assert_eq!(sync.received_total, 0);
-        assert_eq!(sync.incoming_progress, 0);
-        assert_eq!(sync.incoming_total, 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -950,8 +996,8 @@ mod tests {
         assert_eq!(sync.expected_format, 0);
         assert_eq!(sync.received_total, 0);
         assert!(sync.received.is_empty());
-        assert_eq!(sync.incoming_progress, 0);
-        assert_eq!(sync.incoming_total, 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
 
         // --- (b) length mismatch (replace chunk 0 with shorter buf) ---
         let mut sync = ClipboardSync::new_for_test();
@@ -1163,11 +1209,11 @@ mod tests {
         sync.on_offer(FORMAT_TEXT_UTF8, 1024);
         sync.on_chunk(0, vec![b'a'; 256]);
         assert_eq!(sync.received_total, 256);
-        assert_eq!(sync.incoming_progress, 256);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 256);
 
         sync.on_chunk(0, vec![b'b'; 256]);
         assert_eq!(sync.received_total, 256, "duplicate index must not bump total");
-        assert_eq!(sync.incoming_progress, 256);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 256);
     }
 
     #[test]
@@ -1183,8 +1229,8 @@ mod tests {
         // resend (silent lost-update).
         sync.last = LastKind::Text(0xDEAD_BEEF);
         assert!(sync.received_total > 0);
-        assert!(sync.incoming_progress > 0);
-        assert!(sync.incoming_total > 0);
+        assert!(sync.incoming_progress.load(Ordering::Relaxed) > 0);
+        assert!(sync.incoming_total.load(Ordering::Relaxed) > 0);
 
         sync.reset();
 
@@ -1192,8 +1238,8 @@ mod tests {
         assert_eq!(sync.expected_format, 0);
         assert_eq!(sync.received_total, 0);
         assert!(sync.received.is_empty());
-        assert_eq!(sync.incoming_progress, 0);
-        assert_eq!(sync.incoming_total, 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
         assert!(matches!(sync.last, LastKind::None), "reset must clear sender dedup");
     }
 
@@ -1210,7 +1256,7 @@ mod tests {
 
         assert_eq!(sync.received.len(), 0, "chunks without offer must not buffer");
         assert_eq!(sync.received_total, 0);
-        assert_eq!(sync.incoming_progress, 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1228,7 +1274,7 @@ mod tests {
 
         assert_eq!(sync.received.len(), 0, "post-rejection chunks must not buffer");
         assert_eq!(sync.received_total, 0);
-        assert_eq!(sync.incoming_progress, 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
     }
 
     #[test]

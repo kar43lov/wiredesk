@@ -23,3 +23,8 @@ pub mod icons;
 pub mod settings_window;
 #[cfg(windows)]
 pub mod tray;
+
+// Pure helpers (`render_overlay_text`, `transfer_completed`) live in this
+// module so they can be unit-tested cross-platform; the `nwg`-driven
+// `TransferOverlay` struct is gated `#[cfg(windows)]` inside the module.
+pub mod transfer_overlay;

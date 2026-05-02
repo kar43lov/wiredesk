@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use wiredesk_core::error::WireDeskError;
 
+use crate::clipboard::ProgressCounters;
 use crate::config::HostConfig;
 use crate::session::{Session, SessionState};
 
@@ -41,23 +42,37 @@ impl SessionStatus {
 /// Returns a `JoinHandle` so the caller can keep the thread alive — the
 /// loop itself runs forever; on fatal error we log and sleep before
 /// retrying, mirroring the original `main.rs` semantics.
+///
+/// `counters` is shared with the always-on-top transfer overlay (Task 1).
+/// The session thread is the sole writer; the overlay thread only reads.
 #[cfg(target_os = "windows")]
-pub fn spawn(config: HostConfig, status_tx: mpsc::Sender<SessionStatus>) -> JoinHandle<()> {
+pub fn spawn(
+    config: HostConfig,
+    status_tx: mpsc::Sender<SessionStatus>,
+    counters: ProgressCounters,
+) -> JoinHandle<()> {
     use crate::injector::WindowsInjector;
-    spawn_with_injector(config, status_tx, |_| WindowsInjector::new())
+    spawn_with_injector(config, status_tx, counters, |_| WindowsInjector::new())
 }
 
 /// Non-Windows fallback for development on macOS / Linux: uses the mock
 /// injector. The actual SendInput happens only on Windows.
 #[cfg(not(target_os = "windows"))]
-pub fn spawn(config: HostConfig, status_tx: mpsc::Sender<SessionStatus>) -> JoinHandle<()> {
+pub fn spawn(
+    config: HostConfig,
+    status_tx: mpsc::Sender<SessionStatus>,
+    counters: ProgressCounters,
+) -> JoinHandle<()> {
     use crate::injector::MockInjector;
-    spawn_with_injector(config, status_tx, |_| Ok::<_, WireDeskError>(MockInjector::default()))
+    spawn_with_injector(config, status_tx, counters, |_| {
+        Ok::<_, WireDeskError>(MockInjector::default())
+    })
 }
 
 fn spawn_with_injector<I, F>(
     config: HostConfig,
     status_tx: mpsc::Sender<SessionStatus>,
+    counters: ProgressCounters,
     make_injector: F,
 ) -> JoinHandle<()>
 where
@@ -84,12 +99,13 @@ where
             }
         };
 
-        let mut sess = Session::new(
+        let mut sess = Session::with_counters(
             transport,
             injector,
             config.host_name.clone(),
             config.width,
             config.height,
+            counters,
         );
 
         let _ = status_tx.send(SessionStatus::Waiting);
