@@ -1,6 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -96,13 +94,6 @@ pub struct WireDeskApp {
     /// four passes during the first 10 seconds is enough.
     last_dock_icon_apply: Option<Instant>,
     dock_icon_apply_count: u8,
-    /// Set by the macOS NSEvent local monitor when the user presses
-    /// Cmd+Esc with WireDesk focused — even when capture is OFF (the
-    /// CGEventTap is gated on capturing, so we need this separate path
-    /// to get the toggle ON keystroke). Drained each `update()`.
-    toggle_capture_flag: Arc<AtomicBool>,
-    /// Set by NSEvent monitor for Cmd+Enter; same drain pattern.
-    toggle_fullscreen_flag: Arc<AtomicBool>,
     // Saved outer position before entering fullscreen on a non-active monitor.
     // Restored on fullscreen exit so the chrome window returns to where the
     // user originally had it. None when fullscreen wasn't entered via an
@@ -173,8 +164,6 @@ impl WireDeskApp {
         outgoing_tx: mpsc::Sender<Packet>,
         tap_events_rx: mpsc::Receiver<TapEvent>,
         tap_handle: TapHandle,
-        toggle_capture_flag: Arc<AtomicBool>,
-        toggle_fullscreen_flag: Arc<AtomicBool>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -213,8 +202,6 @@ impl WireDeskApp {
             pending_position_restore: None,
             last_dock_icon_apply: None,
             dock_icon_apply_count: 0,
-            toggle_capture_flag,
-            toggle_fullscreen_flag,
             runtime_preferred_monitor,
         }
     }
@@ -515,20 +502,22 @@ impl WireDeskApp {
     /// without disturbing the user's `capturing` intent.
     fn sync_tap_to_focus(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        let want_active = self.capturing && focused;
-        let is_active = self
-            .tap_handle
-            .as_ref()
-            .map(|h| h.is_enabled())
-            .unwrap_or(false);
-        if want_active != is_active {
-            if let Some(h) = self.tap_handle.as_ref() {
-                if want_active {
-                    h.enable();
-                } else {
-                    h.disable();
-                }
-            }
+        let Some(h) = self.tap_handle.as_ref() else {
+            return;
+        };
+        // Three states:
+        // - focused && capturing → ACTIVE: tap intercepts every key, forwards
+        //   to Host. Cmd+Esc inside emits ReleaseCapture; Cmd+Enter emits
+        //   ToggleFullscreen.
+        // - focused && !capturing → PASSIVE: tap watches Cmd+Esc / Cmd+Enter
+        //   only. Cmd+Esc emits EngageCapture; Cmd+Enter emits
+        //   ToggleFullscreen. Other keys pass through to macOS.
+        // - !focused → IDLE: tap doesn't intercept anything. Mac shortcuts
+        //   work normally regardless of capture state.
+        match (focused, self.capturing) {
+            (true, true) => h.enable(),
+            (true, false) => h.enable_passive(),
+            (false, _) => h.disable(),
         }
     }
 
@@ -946,26 +935,15 @@ impl eframe::App for WireDeskApp {
                         self.toggle_capture();
                     }
                 }
+                TapEvent::EngageCapture => {
+                    if !self.capturing {
+                        self.toggle_capture();
+                    }
+                }
                 TapEvent::ToggleFullscreen => {
                     self.toggle_fullscreen(ctx);
                 }
             }
-        }
-
-        // Toggle hotkeys (Cmd+Esc, Cmd+Enter) for the OUT-OF-CAPTURE path.
-        // When the CGEventTap is enabled (in-capture), it consumes these
-        // before AppKit dispatches them. When capture is off, eframe/winit
-        // drops the command-modifier bit on macOS by the time we sample
-        // input, so a separate AppKit-level path is needed:
-        // `ns_event_monitor` installs an
-        // `addLocalMonitorForEventsMatchingMask:` block that catches
-        // Cmd+Esc / Cmd+Enter at the moment AppKit receives them and sets
-        // the atomic flags below. Drain them once per frame.
-        if self.toggle_capture_flag.swap(false, Ordering::SeqCst) {
-            self.toggle_capture();
-        }
-        if self.toggle_fullscreen_flag.swap(false, Ordering::SeqCst) {
-            self.toggle_fullscreen(ctx);
         }
 
         let show_chrome = self.should_show_chrome();
@@ -1292,15 +1270,7 @@ mod tests {
             port: "/dev/null".into(),
             ..ClientConfig::default()
         };
-        WireDeskApp::new(
-            cfg,
-            ev_rx,
-            out_tx,
-            tap_rx,
-            tap_handle,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        )
+        WireDeskApp::new(cfg, ev_rx, out_tx, tap_rx, tap_handle)
     }
 
     #[test]

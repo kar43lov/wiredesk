@@ -49,8 +49,11 @@ fn is_release_capture(keycode: u16, flags: u64) -> bool {
 #[allow(dead_code)] // variants used in later tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TapEvent {
-    /// User pressed Ctrl+Alt+G inside capture-mode — release capture.
+    /// User pressed Cmd+Esc inside capture-mode — release capture.
     ReleaseCapture,
+    /// User pressed Cmd+Esc with capture OFF — engage capture.
+    /// Caught only in passive mode (capture-off but window focused).
+    EngageCapture,
     /// User pressed Cmd+Enter — toggle fullscreen.
     ToggleFullscreen,
 }
@@ -66,6 +69,12 @@ pub enum TapEvent {
 /// join handle for graceful shutdown via Drop.
 pub struct TapHandle {
     enabled: Arc<AtomicBool>,
+    /// Passive mode — tap is running but only watches for the toggle
+    /// hotkeys (Cmd+Esc → EngageCapture, Cmd+Enter → ToggleFullscreen).
+    /// Used when WireDesk is focused but capture is OFF, so the user can
+    /// engage capture from the keyboard. Other keystrokes pass through to
+    /// macOS (Cmd+V, Cmd+Tab etc. still work normally on the Mac side).
+    passive: Arc<AtomicBool>,
     prev_flags: Arc<AtomicU64>,
     outgoing_tx: mpsc::Sender<Packet>,
     #[cfg(target_os = "macos")]
@@ -75,7 +84,23 @@ pub struct TapHandle {
 impl TapHandle {
     /// Activate the tap — incoming key events are intercepted and forwarded.
     pub fn enable(&self) {
+        self.passive.store(false, Ordering::SeqCst);
         self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Switch the tap into passive mode: window is focused but capture is
+    /// OFF. Tap stays running and watches for Cmd+Esc / Cmd+Enter to
+    /// toggle modes — everything else passes through.
+    pub fn enable_passive(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+        self.passive.store(true, Ordering::SeqCst);
+    }
+
+    /// Is the tap in passive mode? (window focused, capture off, only
+    /// listening for Cmd+Esc / Cmd+Enter).
+    #[allow(dead_code)]
+    pub fn is_passive(&self) -> bool {
+        self.passive.load(Ordering::SeqCst)
     }
 
     /// Deactivate the tap. Emits KeyUp events for any modifiers that were
@@ -83,6 +108,7 @@ impl TapHandle {
     /// Ctrl/Shift/Alt pressed.
     pub fn disable(&self) {
         self.enabled.store(false, Ordering::SeqCst);
+        self.passive.store(false, Ordering::SeqCst);
         // Sticky-modifier cleanup. Whatever was in prev_flags is now released.
         let prev = self.prev_flags.swap(0, Ordering::SeqCst);
         for (sc, pressed) in cg_flag_change_to_scancodes(0, prev) {
@@ -143,6 +169,7 @@ pub fn start(
     _tap_events_tx: mpsc::Sender<TapEvent>,
 ) -> TapHandle {
     let enabled = Arc::new(AtomicBool::new(false));
+    let passive = Arc::new(AtomicBool::new(false));
     let prev_flags = Arc::new(AtomicU64::new(0));
 
     #[cfg(target_os = "macos")]
@@ -153,6 +180,7 @@ pub fn start(
             );
             return TapHandle {
                 enabled,
+                passive,
                 prev_flags,
                 outgoing_tx,
                 inner: None,
@@ -160,12 +188,14 @@ pub fn start(
         }
         let inner = macos::Inner::start(
             Arc::clone(&enabled),
+            Arc::clone(&passive),
             Arc::clone(&prev_flags),
             outgoing_tx.clone(),
             _tap_events_tx,
         );
         TapHandle {
             enabled,
+            passive,
             prev_flags,
             outgoing_tx,
             inner: Some(inner),
@@ -177,6 +207,7 @@ pub fn start(
         let _ = _tap_events_tx;
         TapHandle {
             enabled,
+            passive,
             prev_flags,
             outgoing_tx,
         }
@@ -248,6 +279,7 @@ mod macos {
     impl Inner {
         pub(super) fn start(
             enabled: Arc<AtomicBool>,
+            passive: Arc<AtomicBool>,
             prev_flags: Arc<AtomicU64>,
             outgoing_tx: mpsc::Sender<Packet>,
             tap_events_tx: mpsc::Sender<TapEvent>,
@@ -259,6 +291,7 @@ mod macos {
             let tap_port_for_cb = Arc::clone(&tap_port_addr);
 
             let enabled_cb = Arc::clone(&enabled);
+            let passive_cb = Arc::clone(&passive);
             let prev_flags_cb = Arc::clone(&prev_flags);
             let outgoing_cb = outgoing_tx.clone();
             let tap_events_cb = tap_events_tx.clone();
@@ -300,9 +333,38 @@ mod macos {
                                 return CallbackResult::Drop;
                             }
 
-                            // If tap is not enabled, let macOS handle the event
-                            // normally — we don't intercept outside capture-mode.
-                            if !enabled_cb.load(Ordering::SeqCst) {
+                            let is_active = enabled_cb.load(Ordering::SeqCst);
+                            let is_passive = passive_cb.load(Ordering::SeqCst);
+
+                            // Passive mode: window focused but capture is OFF.
+                            // Watch only for the toggle hotkeys (Cmd+Esc /
+                            // Cmd+Enter); pass everything else through to
+                            // macOS so the user's normal Mac shortcuts (Cmd+V,
+                            // Cmd+Tab etc.) still work.
+                            if !is_active && is_passive {
+                                if matches!(event_type, CGEventType::KeyDown) {
+                                    let kc = event.get_integer_value_field(
+                                        EventField::KEYBOARD_EVENT_KEYCODE,
+                                    ) as u16;
+                                    let flags = event.get_flags().bits();
+                                    if super::is_cmd_enter(kc, flags) {
+                                        let _ =
+                                            tap_events_cb.send(TapEvent::ToggleFullscreen);
+                                        return CallbackResult::Drop;
+                                    }
+                                    if super::is_release_capture(kc, flags) {
+                                        let _ =
+                                            tap_events_cb.send(TapEvent::EngageCapture);
+                                        return CallbackResult::Drop;
+                                    }
+                                }
+                                return CallbackResult::Keep;
+                            }
+
+                            // If tap is fully off (no focus), let macOS handle
+                            // the event normally — we don't intercept outside
+                            // capture-mode and outside passive-mode.
+                            if !is_active {
                                 return CallbackResult::Keep;
                             }
 

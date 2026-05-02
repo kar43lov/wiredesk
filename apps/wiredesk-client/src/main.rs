@@ -4,12 +4,8 @@ mod config;
 mod input;
 mod keyboard_tap;
 mod monitor;
-#[cfg(target_os = "macos")]
-mod ns_event_monitor;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -105,29 +101,7 @@ fn main() {
     // enable() is called when the user enters capture-mode.
     let tap_handle = keyboard_tap::start(outgoing_tx.clone(), tap_events_tx);
 
-    // Shared atomic flags driven by the macOS NSEvent local monitor.
-    // The monitor catches Cmd+Esc / Cmd+Enter at AppKit level (before
-    // winit/eframe key dispatch) so the toggle works even when the egui
-    // input pipeline drops the command-modifier bit. Empty flags on
-    // non-macOS — never set, never read.
-    let toggle_capture_flag = Arc::new(AtomicBool::new(false));
-    let toggle_fullscreen_flag = Arc::new(AtomicBool::new(false));
-
-    #[cfg(target_os = "macos")]
-    ns_event_monitor::install(
-        Arc::clone(&toggle_capture_flag),
-        Arc::clone(&toggle_fullscreen_flag),
-    );
-
-    let app = WireDeskApp::new(
-        cfg,
-        events_rx,
-        outgoing_tx,
-        tap_events_rx,
-        tap_handle,
-        toggle_capture_flag,
-        toggle_fullscreen_flag,
-    );
+    let app = WireDeskApp::new(cfg, events_rx, outgoing_tx, tap_events_rx, tap_handle);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
