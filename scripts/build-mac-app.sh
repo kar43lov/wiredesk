@@ -60,7 +60,25 @@ fi
 # Ensure binary is executable (cargo already does this, but be defensive).
 chmod +x "${APP_BUNDLE}/Contents/MacOS/${BIN_NAME}"
 
+# Ad-hoc codesign so macOS Dock / Launch Services treat the rebuild as a
+# distinct signed bundle. Without it, repeated builds at the same path
+# share a stale Dock-icon cache and the dock falls back to the generic
+# executable icon mid-run (especially after the Accessibility permission
+# prompt re-registers the app). Ad-hoc signing verifies nothing — it just
+# stamps each rebuild with a unique signing identity so caches invalidate
+# correctly.
+echo "==> Ad-hoc codesigning bundle…"
+codesign --force --deep --sign - "${APP_BUNDLE}" 2>&1 | grep -v "replacing existing signature" || true
+
+# Refresh Launch Services registration so Dock + Finder pick up the new
+# bundle metadata immediately rather than next mds reindex.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -f "${APP_BUNDLE}" 2>/dev/null || true
+fi
+
 echo
 echo "==> Done. Bundle: ${REPO_ROOT}/${APP_BUNDLE}"
 echo "   Open with: open '${APP_BUNDLE}'"
 echo "   First launch: Gatekeeper will block — right-click → Open, then confirm."
+echo "   If Dock icon stays generic: killall Dock"
