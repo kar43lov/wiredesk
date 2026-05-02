@@ -360,11 +360,11 @@ main.rs:
 **Files:**
 - Modify: `apps/wiredesk-host/src/clipboard.rs`
 
-- [ ] в `ClipboardSync::poll()` при создании ClipOffer{format=1} — `log::info!("clipboard: sending image to peer ({} bytes)", png.len())`.
-- [ ] в `commit()` для image-ветки — `log::info!("clipboard: received image from peer ({} bytes)", total)`.
-- [ ] не throttle'ить middle-of-transfer логи (нет UI, средний прогресс не нужен — start/finish достаточно).
-- [ ] запустить `cargo test -p wiredesk-host` — все тесты зелёные (новых тестов в Task 8 не требуется — start/finish логи покрыты косвенно через существующие image-roundtrip тесты Task 6).
-- [ ] запустить `cargo clippy -p wiredesk-host --all-targets -- -D warnings` — clean.
+- [x] в `ClipboardSync::poll()` при создании ClipOffer{format=1} — `log::info!("clipboard: sending image to peer ({} bytes)", png.len())`. [x] already implemented in Task 6 (`apps/wiredesk-host/src/clipboard.rs:251-254`).
+- [x] в `commit()` для image-ветки — `log::info!("clipboard: received image from peer ({} bytes)", total)`. [x] already implemented in Task 6 (`apps/wiredesk-host/src/clipboard.rs:354-357`, uses `buf.len()` — the encoded image byte count, equivalent to the plan's `total`).
+- [x] не throttle'ить middle-of-transfer логи (нет UI, средний прогресс не нужен — start/finish достаточно). [x] already implemented in Task 6 (only start/finish info logs present, no per-chunk logging in `on_chunk`).
+- [x] запустить `cargo test -p wiredesk-host` — все тесты зелёные (новых тестов в Task 8 не требуется — start/finish логи покрыты косвенно через существующие image-roundtrip тесты Task 6).
+- [x] запустить `cargo clippy -p wiredesk-host --all-targets -- -D warnings` — clean.
 
 ### Task 9: Verify acceptance criteria + final docs/move
 
@@ -374,17 +374,17 @@ main.rs:
 - Modify: `/Users/pgmac/.claude/projects/-Users-pgmac-Data-prjcts-wiredesk/memory/project_wiredesk.md`
 - Move: `docs/plans/20260502-clipboard-images.md` → `docs/plans/completed/20260502-clipboard-images.md`
 
-- [ ] запустить `cargo test --workspace` — все тесты зелёные. Записать total count в commit message.
-- [ ] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
-- [ ] запустить `cargo build --release --workspace` — собирается на macOS.
-- [ ] запустить `./scripts/build-mac-app.sh` — успешно создаёт `target/release/WireDesk.app`.
-- [ ] verify AC4 покрыт unit-тестом `image_too_large_skipped` (Task 4 + Task 6).
-- [ ] verify AC7 удовлетворён (тесты зелёные, новые roundtrip-тесты в `wiredesk-protocol`).
-- [ ] README.md: в секции «What WireDesk does» обновить bullet про clipboard — «Syncs clipboard text in both directions automatically» → «Syncs clipboard text **and PNG images** in both directions (images up to 1 MB encoded)».
-- [ ] CLAUDE.md: в секции «Clipboard sync» добавить параграф про image format=1, MAX_IMAGE_BYTES, hash от RGBA, status-line counter, edge cases (interleaved offers, reset on disconnect).
-- [ ] memory/project_wiredesk.md: обновить «Полный набор функций» — добавить пункт про image clipboard.
-- [ ] обновить test count в CLAUDE.md / README.md (174 теста → новое значение).
-- [ ] переместить план: `mkdir -p docs/plans/completed && mv docs/plans/20260502-clipboard-images.md docs/plans/completed/`.
+- [x] запустить `cargo test --workspace` — все тесты зелёные. Записать total count в commit message. (211 passed)
+- [x] запустить `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- [x] запустить `cargo build --release --workspace` — собирается на macOS.
+- [x] запустить `./scripts/build-mac-app.sh` — успешно создаёт `target/release/WireDesk.app`.
+- [x] verify AC4 покрыт unit-тестом `image_too_large_skipped` (Task 4 + Task 6).
+- [x] verify AC7 удовлетворён (тесты зелёные, новые roundtrip-тесты в `wiredesk-protocol`).
+- [x] README.md: в секции «What WireDesk does» обновить bullet про clipboard — «Syncs clipboard text in both directions automatically» → «Syncs clipboard text **and PNG images** in both directions (images up to 1 MB encoded)».
+- [x] CLAUDE.md: в секции «Clipboard sync» добавить параграф про image format=1, MAX_IMAGE_BYTES, hash от RGBA, status-line counter, edge cases (interleaved offers, reset on disconnect).
+- [x] memory/project_wiredesk.md: обновить «Полный набор функций» — добавить пункт про image clipboard.
+- [x] обновить test count в CLAUDE.md / README.md (174 теста → 211).
+- [x] переместить план: `mkdir -p docs/plans/completed && mv docs/plans/20260502-clipboard-images.md docs/plans/completed/`.
 
 ## Post-Completion
 
