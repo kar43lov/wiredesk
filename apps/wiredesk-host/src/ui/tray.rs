@@ -12,8 +12,7 @@ use std::rc::Rc;
 use native_windows_gui as nwg;
 
 use crate::session_thread::SessionStatus;
-use crate::ui::format::{self, StatusColor};
-use crate::ui::icons::{ICON_GRAY_BYTES, ICON_GREEN_BYTES, ICON_YELLOW_BYTES};
+use crate::ui::icons::{self, ICON_GRAY_BYTES, ICON_GREEN_BYTES, ICON_YELLOW_BYTES};
 
 #[derive(Default)]
 pub struct TrayUi {
@@ -99,16 +98,7 @@ impl TrayUi {
     }
 
     pub fn update_status(&mut self, status: &SessionStatus) -> Result<(), nwg::NwgError> {
-        let bytes = match format::status_color(status) {
-            StatusColor::Green => ICON_GREEN_BYTES,
-            StatusColor::Yellow => ICON_YELLOW_BYTES,
-            StatusColor::Gray => ICON_GRAY_BYTES,
-        };
-        let mut icon = nwg::Icon::default();
-        nwg::Icon::builder()
-            .source_bin(Some(bytes))
-            .strict(true)
-            .build(&mut icon)?;
+        let icon = icons::build_status_icon(status)?;
         self.tray.set_icon(&icon);
         self.tray.set_tip(&format!("WireDesk Host — {}", status.label()));
         Ok(())

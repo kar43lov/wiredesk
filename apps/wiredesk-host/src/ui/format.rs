@@ -69,6 +69,19 @@ pub enum DetectResult {
     NotFound,
 }
 
+/// Run a CH340 auto-detect against the system's USB serial ports right now.
+/// Wraps `serialport::available_ports()` (logging + treating any enumeration
+/// error as "no ports") and feeds the list into `detect_ch340_port`. Lives
+/// here so the UI event handler stays a pure dispatch — the IO + filter
+/// logic ships together as one unit-testable surface.
+pub fn detect_serial_port_now() -> DetectResult {
+    let ports = serialport::available_ports().unwrap_or_else(|e| {
+        log::warn!("serialport::available_ports failed: {e}");
+        Vec::new()
+    });
+    detect_ch340_port(&ports)
+}
+
 /// Filter the given port list for USB devices whose VID matches WCH
 /// (0x1A86). Pure helper — caller supplies `serialport::available_ports()`.
 /// Order in `Multiple` follows the order in which the OS reported the

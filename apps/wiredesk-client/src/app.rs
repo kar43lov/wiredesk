@@ -89,6 +89,41 @@ pub struct WireDeskApp {
     original_position: Option<egui::Pos2>,
 }
 
+// ---- UI palette / sizing constants ---------------------------------------
+// Names for the values that appear in more than one place or carry
+// non-obvious meaning. Single-use sizes stay inline at the call site.
+
+/// Warning-orange — used by the permission-restart hint and the per-monitor
+/// fullscreen-fallback banner. Same hue both times so the user perceives
+/// "warning" as a single visual signal across screens.
+const COLOR_WARNING: egui::Color32 = egui::Color32::from_rgb(220, 140, 60);
+
+/// Capture / "release input" red — used as the capture-banner tint and the
+/// `Release Input` button fill, so the visual cue follows the user from the
+/// chrome panel into the capture/fullscreen banner.
+const COLOR_CAPTURE_RED: egui::Color32 = egui::Color32::from_rgb(180, 60, 60);
+
+/// Idle "Capture Input" button blue — paired with `COLOR_CAPTURE_RED` as a
+/// state cue (blue idle → red capturing).
+const COLOR_CAPTURE_BLUE: egui::Color32 = egui::Color32::from_rgb(60, 110, 180);
+
+/// Capture banner font size — large enough to read across the room while
+/// the user is interacting with the Host monitor, not the Mac.
+const BANNER_FONT_SIZE: f32 = 20.0;
+
+/// Connection-state glyph (●) size in the chrome status row. Larger than
+/// egui's default so it visually matches the Win-side ImageFrame indicator.
+const STATUS_GLYPH_SIZE: f32 = 18.0;
+
+/// Heading icon (top-left WireDesk logo) edge length in the chrome panel.
+const HEADING_ICON_SIZE: f32 = 28.0;
+
+/// Minimum size of the primary capture toggle button, in egui points.
+const CAPTURE_BTN_MIN_SIZE: egui::Vec2 = egui::vec2(200.0, 32.0);
+
+/// Numbered-step glyph size on the Accessibility permission screen.
+const STEP_NUMBER_SIZE: f32 = 20.0;
+
 /// Static list of macOS Accessibility-permission setup steps shown on the
 /// permission screen. Pure helper so the texts can be unit-tested
 /// independently of any UI rendering — a copy-paste typo in step 1 (the
@@ -582,8 +617,8 @@ impl WireDeskApp {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{}", i + 1))
-                            .size(20.0)
+                        egui::RichText::new((i + 1).to_string())
+                            .size(STEP_NUMBER_SIZE)
                             .strong(),
                     );
                     ui.vertical(|ui| {
@@ -608,7 +643,7 @@ impl WireDeskApp {
                  wiredesk-client. The window detects the change but the \
                  tap won't activate without a fresh process.",
             )
-            .color(egui::Color32::from_rgb(220, 140, 60)),
+            .color(COLOR_WARNING),
         );
     }
 
@@ -620,8 +655,7 @@ impl WireDeskApp {
         // window is intercepting input. Sized large (20pt strong, white) so
         // it's readable from across the room when the user is interacting
         // with the Host monitor and not looking at the Mac display.
-        let banner_fill =
-            egui::Color32::from_rgb(180, 60, 60).linear_multiply(0.3);
+        let banner_fill = COLOR_CAPTURE_RED.linear_multiply(0.3);
         egui::Frame::group(ui.style())
             .fill(banner_fill)
             .show(ui, |ui| {
@@ -630,7 +664,7 @@ impl WireDeskApp {
                     |ui| {
                         ui.label(
                             egui::RichText::new("\u{25CF} CAPTURING — Cmd+Esc to release")
-                                .size(20.0)
+                                .size(BANNER_FONT_SIZE)
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         );
@@ -840,7 +874,7 @@ impl eframe::App for WireDeskApp {
                     egui::Image::new(egui::include_image!(
                         "../../../assets/icon-source.png"
                     ))
-                    .fit_to_exact_size(egui::vec2(28.0, 28.0)),
+                    .fit_to_exact_size(egui::vec2(HEADING_ICON_SIZE, HEADING_ICON_SIZE)),
                 );
                 ui.heading("WireDesk");
             });
@@ -858,7 +892,7 @@ impl eframe::App for WireDeskApp {
             let status_text = self.status_text();
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(
-                    egui::RichText::new("\u{25CF}").size(18.0).color(status_color),
+                    egui::RichText::new("\u{25CF}").size(STATUS_GLYPH_SIZE).color(status_color),
                 ));
                 ui.label(status_text);
             });
@@ -872,15 +906,15 @@ impl eframe::App for WireDeskApp {
             // (idle) and red (capturing) as a state cue, matching the
             // capture-banner palette in `render_capture_info`.
             let (btn_text, btn_fill) = if self.capturing {
-                ("Release Input", egui::Color32::from_rgb(180, 60, 60))
+                ("Release Input", COLOR_CAPTURE_RED)
             } else {
-                ("Capture Input", egui::Color32::from_rgb(60, 110, 180))
+                ("Capture Input", COLOR_CAPTURE_BLUE)
             };
             let capture_btn = egui::Button::new(
                 egui::RichText::new(btn_text).size(16.0).strong(),
             )
             .fill(btn_fill)
-            .min_size(egui::vec2(200.0, 32.0));
+            .min_size(CAPTURE_BTN_MIN_SIZE);
             if ui.add(capture_btn).clicked() {
                 self.toggle_capture();
             }
@@ -1049,7 +1083,7 @@ impl eframe::App for WireDeskApp {
             // then disappears on its own.
             if let Some((msg, when)) = &self.monitor_fallback_msg {
                 if when.elapsed() < Duration::from_secs(5) {
-                    ui.colored_label(egui::Color32::from_rgb(220, 140, 60), msg);
+                    ui.colored_label(COLOR_WARNING, msg);
                 }
             }
         });

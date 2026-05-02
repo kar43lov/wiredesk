@@ -15,8 +15,7 @@ use native_windows_gui as nwg;
 
 use crate::config::HostConfig;
 use crate::session_thread::SessionStatus;
-use crate::ui::format::StatusColor;
-use crate::ui::icons::{ICON_GRAY_BYTES, ICON_GREEN_BYTES, ICON_YELLOW_BYTES};
+use crate::ui::icons::{self, ICON_YELLOW_BYTES};
 use crate::ui::{autostart, format};
 
 // Window icon — title-bar / Alt-Tab. Loaded at runtime from the multi-size
@@ -392,16 +391,7 @@ impl SettingsWindow {
     /// `&mut self` because `nwg::Bitmap::builder` writes through a mut
     /// reference into our owned field.
     pub fn set_status(&mut self, status: &SessionStatus) {
-        let bytes = match format::status_color(status) {
-            StatusColor::Green => ICON_GREEN_BYTES,
-            StatusColor::Yellow => ICON_YELLOW_BYTES,
-            StatusColor::Gray => ICON_GRAY_BYTES,
-        };
-        if let Err(e) = nwg::Bitmap::builder()
-            .source_bin(Some(bytes))
-            .strict(true)
-            .build(&mut self.status_icon_bitmap)
-        {
+        if let Err(e) = icons::build_status_bitmap(status, &mut self.status_icon_bitmap) {
             log::warn!("status icon bitmap rebuild failed: {e}");
         } else {
             self.status_icon.set_bitmap(Some(&self.status_icon_bitmap));

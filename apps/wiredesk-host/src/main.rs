@@ -68,12 +68,11 @@ fn main() {
     // `None` — start without a lock rather than panic. Duplicate-launch is
     // a worse symptom than refusing to start, but on a check failure we'd
     // rather still come up.
-    let _instance_guard: Option<ui::single_instance::SingleInstanceGuard> =
-        match ui::single_instance::try_acquire_with_retry(
-            "WireDeskHostSingleton",
-            5,
-            100,
-        ) {
+    let _instance_guard = match ui::single_instance::try_acquire_with_retry(
+        "WireDeskHostSingleton",
+        5,
+        100,
+    ) {
             ui::single_instance::SingleInstanceResult::Acquired(g) => Some(g),
             ui::single_instance::SingleInstanceResult::AlreadyRunning => {
                 log::warn!("another wiredesk-host instance is already running");
@@ -266,7 +265,8 @@ fn run_windows(
         nwg::full_bind_event_handler(&settings_handle, move |evt, _evt_data, handle| {
             use nwg::Event as E;
             // Resolve which control fired this event without holding any
-            // borrow across the match arms.
+            // borrow across the match arms — the handlers below take their
+            // own borrows internally.
             let (is_save, is_copy_mac, is_restart, is_detect) = {
                 let s = settings_clone2.borrow();
                 (
@@ -279,129 +279,13 @@ fn run_windows(
             match evt {
                 E::OnButtonClick => {
                     if is_save {
-                        let s = settings_clone2.borrow();
-                        match s.read_form() {
-                            Ok(new_cfg) => {
-                                if let Err(e) = new_cfg.save() {
-                                    s.set_message(&format!("Save failed: {e}"));
-                                    return;
-                                }
-                                // Sync autostart with the checkbox.
-                                let want_startup = new_cfg.run_on_startup;
-                                let r = if want_startup {
-                                    ui::autostart::enable()
-                                } else {
-                                    ui::autostart::disable()
-                                };
-                                if let Err(e) = r {
-                                    s.set_message(&format!(
-                                        "Saved, but autostart toggle failed: {e}"
-                                    ));
-                                } else {
-                                    s.set_message("Saved. Restart WireDesk Host to apply.");
-                                }
-                                if let Ok(mut g) = cfg_holder.lock() {
-                                    *g = new_cfg;
-                                }
-                            }
-                            Err(e) => s.set_message(&e),
-                        }
+                        handle_save(&settings_clone2, &cfg_holder);
                     } else if is_copy_mac {
-                        let snapshot = cfg_holder.lock().ok().map(|g| g.clone());
-                        if let Some(c) = snapshot {
-                            let cmd = ui::format::format_mac_launch_command(&c);
-                            // `set_data_text` pumps the Win32 message loop —
-                            // grab a fresh borrow only for the arguments and
-                            // release before the call. Then re-borrow for the
-                            // status message.
-                            {
-                                let s = settings_clone2.borrow();
-                                nwg::Clipboard::set_data_text(&s.window, &cmd);
-                            }
-                            settings_clone2
-                                .borrow()
-                                .set_message("Copied Mac launch command to clipboard.");
-                        }
+                        handle_copy_mac(&settings_clone2, &cfg_holder);
                     } else if is_restart {
-                        // Save & Restart: persist config + autostart, then
-                        // spawn a fresh host process and stop our own event
-                        // loop. The new process retries the single-instance
-                        // mutex acquire (5×100ms in main.rs) so it'll wait
-                        // out our shutdown without an artificial sleep here.
-                        let s = settings_clone2.borrow();
-                        match s.read_form() {
-                            Ok(new_cfg) => {
-                                if let Err(e) = new_cfg.save() {
-                                    s.set_message(&format!("Save failed: {e}"));
-                                    return;
-                                }
-                                let want_startup = new_cfg.run_on_startup;
-                                let r = if want_startup {
-                                    ui::autostart::enable()
-                                } else {
-                                    ui::autostart::disable()
-                                };
-                                if let Err(e) = r {
-                                    s.set_message(&format!(
-                                        "Saved, but autostart toggle failed: {e}"
-                                    ));
-                                    return;
-                                }
-                                // Only update cfg_holder *after* spawn confirms —
-                                // if spawn fails, the running process keeps
-                                // serving the old config, so copy_mac_btn must
-                                // also keep formatting the old command.
-                                match std::env::current_exe() {
-                                    Ok(exe) => match std::process::Command::new(exe).spawn() {
-                                        Ok(_) => {
-                                            log::info!("restart: spawned new host process");
-                                            if let Ok(mut g) = cfg_holder.lock() {
-                                                *g = new_cfg;
-                                            }
-                                            nwg::stop_thread_dispatch();
-                                        }
-                                        Err(e) => {
-                                            s.set_message(&format!(
-                                                "Saved, but restart failed to spawn: {e}"
-                                            ));
-                                        }
-                                    },
-                                    Err(e) => {
-                                        s.set_message(&format!(
-                                            "Saved, but couldn't find own exe path: {e}"
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(e) => s.set_message(&e),
-                        }
+                        handle_restart(&settings_clone2, &cfg_holder);
                     } else if is_detect {
-                        // Enumerate USB serial ports and pick the lone CH340
-                        // (or report empty / multi). On enumeration failure we
-                        // treat it as "no ports" — the user can still type a
-                        // port manually.
-                        let ports = serialport::available_ports().unwrap_or_else(|e| {
-                            log::warn!("serialport::available_ports failed: {e}");
-                            Vec::new()
-                        });
-                        let s = settings_clone2.borrow();
-                        match ui::format::detect_ch340_port(&ports) {
-                            ui::format::DetectResult::Found(name) => {
-                                s.port_input.set_text(&name);
-                                s.set_message(&format!("Detected CH340 on {name}."));
-                            }
-                            ui::format::DetectResult::Multiple(names) => {
-                                s.set_message(&format!(
-                                    "Multiple CH340 found: {} — pick one.",
-                                    names.join(", ")
-                                ));
-                            }
-                            ui::format::DetectResult::NotFound => {
-                                s.set_message(
-                                    "No CH340/CH341 detected. Plug the cable in and retry.",
-                                );
-                            }
-                        }
+                        handle_detect(&settings_clone2);
                     }
                 }
                 E::OnWindowClose => {
@@ -417,5 +301,143 @@ fn run_windows(
 
     nwg::unbind_event_handler(&event_handler);
     nwg::unbind_event_handler(&settings_event_handler);
+}
+
+// ---- Settings-window button handlers --------------------------------------
+//
+// Each handler owns its own borrow lifecycle so the event-loop closure stays
+// a pure dispatch. They read the form, persist config / autostart, and write
+// status back via `set_message` — the same flow as before, just lifted out
+// of a 150-line `match` arm. Shared invariant: never hold a `borrow()` of
+// `settings` across an nwg call that pumps the Win32 message loop (e.g.
+// `Clipboard::set_data_text`), because the OnNotice tray handler may
+// re-enter `borrow_mut()` and abort the process.
+
+#[cfg(windows)]
+fn handle_save(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+    cfg_holder: &Arc<Mutex<HostConfig>>,
+) {
+    let s = settings.borrow();
+    match s.read_form() {
+        Ok(new_cfg) => {
+            if let Err(e) = new_cfg.save() {
+                s.set_message(&format!("Save failed: {e}"));
+                return;
+            }
+            // Sync autostart with the checkbox.
+            let r = if new_cfg.run_on_startup {
+                ui::autostart::enable()
+            } else {
+                ui::autostart::disable()
+            };
+            if let Err(e) = r {
+                s.set_message(&format!("Saved, but autostart toggle failed: {e}"));
+            } else {
+                s.set_message("Saved. Restart WireDesk Host to apply.");
+            }
+            if let Ok(mut g) = cfg_holder.lock() {
+                *g = new_cfg;
+            }
+        }
+        Err(e) => s.set_message(&e),
+    }
+}
+
+#[cfg(windows)]
+fn handle_copy_mac(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+    cfg_holder: &Arc<Mutex<HostConfig>>,
+) {
+    use native_windows_gui as nwg;
+    let snapshot = cfg_holder.lock().ok().map(|g| g.clone());
+    if let Some(c) = snapshot {
+        let cmd = ui::format::format_mac_launch_command(&c);
+        // `set_data_text` pumps the Win32 message loop — grab a fresh
+        // borrow only for the arguments and release before the call. Then
+        // re-borrow for the status message.
+        {
+            let s = settings.borrow();
+            nwg::Clipboard::set_data_text(&s.window, &cmd);
+        }
+        settings
+            .borrow()
+            .set_message("Copied Mac launch command to clipboard.");
+    }
+}
+
+#[cfg(windows)]
+fn handle_restart(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+    cfg_holder: &Arc<Mutex<HostConfig>>,
+) {
+    use native_windows_gui as nwg;
+    // Save & Restart: persist config + autostart, then spawn a fresh host
+    // process and stop our own event loop. The new process retries the
+    // single-instance mutex acquire (5×100ms in main.rs) so it'll wait
+    // out our shutdown without an artificial sleep here.
+    let s = settings.borrow();
+    let new_cfg = match s.read_form() {
+        Ok(c) => c,
+        Err(e) => {
+            s.set_message(&e);
+            return;
+        }
+    };
+    if let Err(e) = new_cfg.save() {
+        s.set_message(&format!("Save failed: {e}"));
+        return;
+    }
+    let r = if new_cfg.run_on_startup {
+        ui::autostart::enable()
+    } else {
+        ui::autostart::disable()
+    };
+    if let Err(e) = r {
+        s.set_message(&format!("Saved, but autostart toggle failed: {e}"));
+        return;
+    }
+    // Only update cfg_holder *after* spawn confirms — if spawn fails, the
+    // running process keeps serving the old config, so copy_mac_btn must
+    // also keep formatting the old command.
+    match std::env::current_exe() {
+        Ok(exe) => match std::process::Command::new(exe).spawn() {
+            Ok(_) => {
+                log::info!("restart: spawned new host process");
+                if let Ok(mut g) = cfg_holder.lock() {
+                    *g = new_cfg;
+                }
+                nwg::stop_thread_dispatch();
+            }
+            Err(e) => {
+                s.set_message(&format!("Saved, but restart failed to spawn: {e}"));
+            }
+        },
+        Err(e) => {
+            s.set_message(&format!("Saved, but couldn't find own exe path: {e}"));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_detect(
+    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
+) {
+    let s = settings.borrow();
+    match ui::format::detect_serial_port_now() {
+        ui::format::DetectResult::Found(name) => {
+            s.port_input.set_text(&name);
+            s.set_message(&format!("Detected CH340 on {name}."));
+        }
+        ui::format::DetectResult::Multiple(names) => {
+            s.set_message(&format!(
+                "Multiple CH340 found: {} — pick one.",
+                names.join(", ")
+            ));
+        }
+        ui::format::DetectResult::NotFound => {
+            s.set_message("No CH340/CH341 detected. Plug the cable in and retry.");
+        }
+    }
 }
 
