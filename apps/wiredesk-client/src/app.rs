@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -124,6 +124,13 @@ pub struct WireDeskApp {
     outgoing_total: Arc<AtomicU64>,
     incoming_progress: Arc<AtomicU64>,
     incoming_total: Arc<AtomicU64>,
+    /// Runtime image-clipboard toggles (Settings). Both flags share their
+    /// `Arc` with the poll thread (`send_images`) and the reader thread's
+    /// `IncomingClipboard` (`receive_images`) — toggling here takes effect on
+    /// the next poll tick / next incoming offer, no restart required. Text
+    /// clipboard sync is unaffected by either flag.
+    send_images: Arc<AtomicBool>,
+    receive_images: Arc<AtomicBool>,
     /// Generic 3-second toast surfaced by `TransportEvent::Toast`. Currently
     /// used by the clipboard poll thread to warn the user when a copied image
     /// exceeds `MAX_IMAGE_BYTES` (Task 7b). Distinct from `save_toast`, which
@@ -234,6 +241,8 @@ impl WireDeskApp {
         outgoing_total: Arc<AtomicU64>,
         incoming_progress: Arc<AtomicU64>,
         incoming_total: Arc<AtomicU64>,
+        send_images: Arc<AtomicBool>,
+        receive_images: Arc<AtomicBool>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -277,6 +286,8 @@ impl WireDeskApp {
             outgoing_total,
             incoming_progress,
             incoming_total,
+            send_images,
+            receive_images,
             transient_toast: None,
         }
     }
@@ -474,6 +485,42 @@ impl WireDeskApp {
                             }
                         });
                 });
+            });
+
+            // ---- Clipboard group ----
+            // Two independent toggles for image clipboard sync. Text always
+            // syncs (cheap, low-bandwidth). Each checkbox flips a runtime
+            // `Arc<AtomicBool>` shared with the poll thread (send) and
+            // IncomingClipboard (receive) — takes effect immediately, no
+            // restart needed. Save persists the values to config.toml.
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Clipboard").strong());
+                let mut send_imgs = cfg.send_images;
+                if ui
+                    .checkbox(&mut send_imgs, "Send images (Mac → Host)")
+                    .changed()
+                {
+                    cfg.send_images = send_imgs;
+                    self.send_images.store(send_imgs, Ordering::Relaxed);
+                    dirty = true;
+                }
+                let mut recv_imgs = cfg.receive_images;
+                if ui
+                    .checkbox(&mut recv_imgs, "Receive images (Host → Mac)")
+                    .changed()
+                {
+                    cfg.receive_images = recv_imgs;
+                    self.receive_images.store(recv_imgs, Ordering::Relaxed);
+                    dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Text clipboard always syncs. Toggle individual directions \
+                         for image sync (PNG, ≤1 MB encoded).",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
             });
 
             // ---- System group ----
@@ -1436,6 +1483,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
         )
     }
 

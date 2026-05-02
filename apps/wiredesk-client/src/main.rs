@@ -90,6 +90,12 @@ fn main() {
     let incoming_progress = Arc::new(AtomicU64::new(0));
     let incoming_total = Arc::new(AtomicU64::new(0));
 
+    // Runtime image-clipboard toggles (Settings panel). Initial values come
+    // from the loaded config; UI flips them at runtime — no restart required.
+    // Text clipboard is unaffected.
+    let send_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_images));
+    let receive_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_images));
+
     // Writer thread — owns one half of the port. Drains outgoing channel,
     // sends heartbeats, sends Hello on startup. UI never blocks because this
     // thread has zero shared locks with the egui thread.
@@ -130,6 +136,7 @@ fn main() {
     let reader_incoming_total = incoming_total.clone();
     let reader_outgoing_progress = outgoing_progress.clone();
     let reader_outgoing_total = outgoing_total.clone();
+    let reader_receive_images = receive_images.clone();
     thread::spawn(move || {
         reader_thread(
             reader_transport,
@@ -139,6 +146,7 @@ fn main() {
             reader_incoming_total,
             reader_outgoing_progress,
             reader_outgoing_total,
+            reader_receive_images,
         );
     });
 
@@ -146,7 +154,12 @@ fn main() {
     // Outgoing progress counters are updated by writer_thread now (M3 fix),
     // not by the poll thread, so the UI sees real wire-state progress
     // instead of an instant jump to 100% as packets queue.
-    clipboard::spawn_poll_thread(clipboard_state, outgoing_tx.clone(), poll_events_tx);
+    clipboard::spawn_poll_thread(
+        clipboard_state,
+        outgoing_tx.clone(),
+        poll_events_tx,
+        send_images.clone(),
+    );
 
     // Keyboard tap (macOS only — no-op elsewhere). Initially disabled;
     // enable() is called when the user enters capture-mode.
@@ -162,6 +175,8 @@ fn main() {
         outgoing_total,
         incoming_progress,
         incoming_total,
+        send_images,
+        receive_images,
     );
 
     let options = eframe::NativeOptions {
@@ -300,6 +315,7 @@ fn writer_thread(
 /// arriving between event-emit and the next egui frame would have its freshly
 /// stored `incoming_total` wiped to 0, blanking the status line for the rest
 /// of the transfer.
+#[allow(clippy::too_many_arguments)]
 fn reader_thread(
     mut transport: Box<dyn Transport>,
     events_tx: mpsc::Sender<TransportEvent>,
@@ -308,6 +324,7 @@ fn reader_thread(
     incoming_total: Arc<AtomicU64>,
     outgoing_progress: Arc<AtomicU64>,
     outgoing_total: Arc<AtomicU64>,
+    receive_images: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -331,6 +348,7 @@ fn reader_thread(
         clipboard_state.clone(),
         incoming_progress,
         incoming_total,
+        receive_images,
     );
     loop {
         match transport.recv() {

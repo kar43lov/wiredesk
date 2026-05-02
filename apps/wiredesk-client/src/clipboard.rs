@@ -7,7 +7,7 @@
 //! back what we just received (loop avoidance).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -278,6 +278,7 @@ pub fn spawn_poll_thread(
     state: ClipboardState,
     outgoing_tx: mpsc::Sender<Packet>,
     events_tx: mpsc::Sender<TransportEvent>,
+    send_images: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let mut clip = match arboard::Clipboard::new() {
@@ -329,6 +330,11 @@ pub fn spawn_poll_thread(
             }
 
             // 2) Try image. arboard returns RGBA8.
+            // Runtime toggle (Settings → Send images): when off, we skip the
+            // get_image() probe entirely — text continues to sync as before.
+            if !send_images.load(Ordering::Relaxed) {
+                continue;
+            }
             let img = match clip.get_image() {
                 Ok(i) => i,
                 Err(_) => continue, // not an image either; idle
@@ -393,6 +399,10 @@ pub struct IncomingClipboard {
     /// leave the progress display stuck.
     incoming_progress: Arc<AtomicU64>,
     incoming_total: Arc<AtomicU64>,
+    /// Runtime toggle (Settings → Receive images): when off, image offers
+    /// (`format=FORMAT_PNG_IMAGE`) are rejected on receipt. Text offers
+    /// continue to be processed normally.
+    receive_images: Arc<AtomicBool>,
     /// Test-only sink for the last successfully committed payload. Lets unit
     /// tests assert on what would have been written to the local clipboard
     /// without depending on the host platform's actual clipboard backend
@@ -415,6 +425,7 @@ impl IncomingClipboard {
         state: ClipboardState,
         incoming_progress: Arc<AtomicU64>,
         incoming_total: Arc<AtomicU64>,
+        receive_images: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state,
@@ -425,6 +436,7 @@ impl IncomingClipboard {
             clip: arboard::Clipboard::new().ok(),
             incoming_progress,
             incoming_total,
+            receive_images,
             #[cfg(test)]
             last_committed: None,
         }
@@ -444,6 +456,7 @@ impl IncomingClipboard {
             clip: None,
             incoming_progress: Arc::new(AtomicU64::new(0)),
             incoming_total: Arc::new(AtomicU64::new(0)),
+            receive_images: Arc::new(AtomicBool::new(true)),
             last_committed: None,
         }
     }
@@ -468,6 +481,20 @@ impl IncomingClipboard {
         if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE {
             log::warn!(
                 "clipboard: incoming offer with unsupported format {format}, ignoring"
+            );
+            self.expected_len = 0;
+            self.expected_format = 0;
+            self.received.clear();
+            self.received_total = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
+            return;
+        }
+        // Runtime toggle (Settings → Receive images): drop incoming image
+        // offers when the user disabled image receive. Text offers continue.
+        if format == FORMAT_PNG_IMAGE && !self.receive_images.load(Ordering::Relaxed) {
+            log::info!(
+                "clipboard: incoming image offer ({total_len} bytes) ignored — receive_images disabled"
             );
             self.expected_len = 0;
             self.expected_format = 0;

@@ -45,6 +45,19 @@ pub struct ClientConfig {
     /// defaults — losing the user's settings on first run after upgrade.
     #[serde(deserialize_with = "deserialize_preferred_monitor")]
     pub preferred_monitor: Option<String>,
+    /// Send images from Mac → Host. When false, the poll thread skips
+    /// `get_image()` entirely (text continues to sync as before). Useful to
+    /// isolate one direction during diagnostics or when image sync misbehaves.
+    #[serde(default = "default_true")]
+    pub send_images: bool,
+    /// Accept incoming images from Host → Mac. When false, incoming
+    /// `ClipOffer{format=PNG_IMAGE}` is rejected on receipt (state stays clean).
+    #[serde(default = "default_true")]
+    pub receive_images: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Custom deserializer for `preferred_monitor` that accepts either a string
@@ -87,6 +100,8 @@ impl Default for ClientConfig {
             height: 1440,
             client_name: "wiredesk-client".to_string(),
             preferred_monitor: None,
+            send_images: true,
+            receive_images: true,
         }
     }
 }
@@ -180,6 +195,8 @@ mod tests {
         assert_eq!(cfg.height, 1440);
         assert_eq!(cfg.client_name, "wiredesk-client");
         assert!(cfg.preferred_monitor.is_none());
+        assert!(cfg.send_images);
+        assert!(cfg.receive_images);
     }
 
     #[test]
@@ -191,6 +208,8 @@ mod tests {
             height: 1080,
             client_name: "test-client".to_string(),
             preferred_monitor: None,
+            send_images: true,
+            receive_images: true,
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -311,6 +330,8 @@ mod tests {
             height: 720,
             client_name: "from-toml".to_string(),
             preferred_monitor: None,
+            send_images: true,
+            receive_images: true,
         }
     }
 
