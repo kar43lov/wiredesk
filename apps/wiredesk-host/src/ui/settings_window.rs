@@ -79,6 +79,7 @@ pub struct SettingsWindow {
     // removed — close-X provides the same affordance (UX-audit N3).
     pub bar_frame: nwg::Frame,
     pub bar_layout: nwg::GridLayout,
+    pub quit_btn: nwg::Button,
     pub restart_btn: nwg::Button,
     pub save_btn: nwg::Button,
 
@@ -261,6 +262,10 @@ impl SettingsWindow {
                 .flags(nwg::FrameFlags::VISIBLE)
                 .build(&mut s.bar_frame)?;
             nwg::Button::builder()
+                .text("&Quit")
+                .parent(&s.bar_frame)
+                .build(&mut s.quit_btn)?;
+            nwg::Button::builder()
                 .text("Re&start")
                 .parent(&s.bar_frame)
                 .build(&mut s.restart_btn)?;
@@ -309,16 +314,17 @@ impl SettingsWindow {
                 .child_item(nwg::GridLayoutItem::new(&s.copy_mac_btn, 0, 1, 3, 1))
                 .build(&s.system_layout)?;
 
-            // Button-bar internal grid: 3 cols × 1 row. Col 0 is a spacer
-            // (no child) so the two buttons get pushed to the right; cols 1
-            // and 2 hold the action buttons in [Save&Restart][Save] order.
+            // Button-bar internal grid: 4 cols × 1 row. Col 0 holds Quit
+            // on the left (destructive, separated from Save group), col 1
+            // is a spacer so Restart/Save are right-aligned.
             nwg::GridLayout::builder()
                 .parent(&s.bar_frame)
-                .max_column(Some(3))
+                .max_column(Some(4))
                 .spacing(4)
                 .margin([0, 0, 0, 0])
-                .child(1, 0, &s.restart_btn)
-                .child(2, 0, &s.save_btn)
+                .child(0, 0, &s.quit_btn)
+                .child(2, 0, &s.restart_btn)
+                .child(3, 0, &s.save_btn)
                 .build(&s.bar_layout)?;
 
             // ---- Outer grid: status row + 3 groups (title + frame) +

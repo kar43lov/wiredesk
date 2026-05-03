@@ -235,11 +235,21 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 ### Shell-over-serial
 
 Опциональный канал терминала на том же serial:
-- Client → `ShellOpen { shell }` — Host спавнит подпроцесс (powershell/cmd на Windows, bash/zsh на Unix).
+- Client → `ShellOpen { shell }` — Host спавнит подпроцесс с `Stdio::piped()` (powershell/cmd на Windows, bash/zsh на Unix). На Win добавлен `CREATE_NO_WINDOW` чтобы child не показывал console window.
 - `ShellInput { data }` — байты в stdin подпроцесса.
 - `ShellOutput { data }` — байты из stdout/stderr, чанки по 480 байт.
 - `ShellClose` — закрывает stdin (EOF); `ShellExit { code }` — на выходе процесса.
-- Line-based MVP без PTY: vim, sudo с паролем не работают. SSH с key-based auth работает.
+- Line-based MVP **без PTY**. PowerShell `-NoExit` игнорирует EOF на stdin → ShellClose теперь делает `sh.close()` **и** force `kill()` чтобы host's slot гарантированно освобождался. На re-Hello host тоже kill'ает leftover shell. Term шлёт `Disconnect` после `ShellClose` чтобы host не ждал heartbeat timeout.
+- Без PTY: vim/htop/sudo с паролем работают только частично; ssh нужен с `-tt` или `RequestTTY force` в `~/.ssh/config` иначе remote bash идёт non-interactive (нет `.bashrc`/PS1/alias'ов). Полный TTY ждёт ConPTY-рефактора через `portable-pty`.
+
+**Два frontend'а к этому каналу:**
+- **GUI shell-panel** в `wiredesk-client` (Settings collapsing → Terminal). Командная строка с `id_salt("shell_input")`. После Enter автоматический `request_focus()` чтобы поле не теряло фокус (без этого — `lost_focus()`-pattern, и пользователь должен кликать перед каждой следующей командой). При первом open `shell_just_opened` flag запрашивает focus на следующем frame'е.
+- **`wiredesk-term`** CLI (отдельный бинарь). Raw-mode bridge для Ghostty/iTerm. Serial-port расщеплён через `Transport::try_clone()` на independent reader/writer handles — reader thread больше не держит mutex на blocking recv'е, stdin keystrokes доходят без latency. **Три потока**: reader (owns reader handle), main (stdin → cooked-mode buffer → writer.lock), heartbeat (`Heartbeat` каждые 2s через writer.lock). Все три держат общий `stop: AtomicBool`.
+  - **Cooked-mode line discipline на client'е** (стандарт для serial-bridge без PTY на той стороне): `line_buf: Vec<u8>` копит байты, `line_cells: usize` (display-cell count, считается по lead-byte'ам UTF-8). Printable byte → append + local echo. `0x7F` (Backspace) → `pop_utf8_char` (UTF-8 aware! Russian "д" = 2 bytes erased atomically) + `\b \b` локально, **не** forward на host. `\r` → erase locally-echoed (`\b \b` × line_cells) чтобы host's echo не дублировал, отправить `line_buf + b'\n'`. `0x03/0x04` (Ctrl+C/D) — bypass буфера, immediate forward. Без этого PS in pipe-mode echo'ит только `\x20` на BS → trailing space, видимо ломая всю последующую typing.
+  - **Output translation `\n → \r\n`** на reader thread'е через `translate_output_for_terminal(input, last_was_cr)` — Linux/SSH'd output использует bare `\n`, raw-mode terminal без line discipline даёт лестницу вправо. State `last_was_cr` carries across chunks (CRLF spanning packet boundary не expand'ится в CRCRLF).
+  - Banner после handshake — `format_connected_banner(host_name, w, h)` (pure helper, тесты).
+  - Hotkey cheatsheet печатается после banner'а: `Ctrl+]` exit (telnet/nc convention — позволяет forward'ить Ctrl+C/Ctrl+D на host'а).
+- GUI и CLI **взаимоисключающие** — оба открывают serial-порт. Multiplex-daemon вне scope MVP.
 
 ### Key design decisions
 
@@ -256,6 +266,10 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 - **Aspect ratio correction** в `InputMapper::normalize_mouse` — letterbox/pillarbox для разной геометрии окна и Host.
 - **Cancel-кнопки на progress bars** (UI helper `render_progress_row`, Mac). `outgoing_cancel`/`incoming_cancel: Arc<AtomicBool>` shared с writer/reader threads. Writer drop'ает queued ClipOffer/ClipChunk без записи на провод и self-arms flag после non-clip packet или timeout (queue empty). Reader на первом ClipChunk при cancel=true делает `incoming_clip.reset()` + drop, flag clear'ится на следующем ClipOffer. Лог компактный — один summary INFO в start, один в end с counter'ом (per-chunk даёт 700+ строк за 180 KB image cancel). Без protocol message: Host видит partial offer, self-correct'ится на следующем ClipOffer'е.
 - **Self-relaunch helper** `apps/wiredesk-client/src/restart.rs`. На macOS spawn'ит `open -n WireDesk.app` если бинарь внутри bundle, иначе spawn'ит `current_exe`. Затем `std::process::exit(0)`. Используется Save & Restart кнопкой в Settings (Mac). Аналогичный pattern на Win — Restart entry в tray menu делает `Command::new(current_exe).spawn() + nwg::stop_thread_dispatch()`.
+- **Second-instance показывает Settings** существующего host'а (вместо MessageBox + exit). Win32 named auto-reset event `WireDeskHostShowSettings` (см. `ui::single_instance::create_show_settings_event` / `signal_show_settings`). Первый процесс CreateEvent + spawn wait-thread, второй — OpenEvent + SetEvent + exit. Wait-thread поднимает `show_settings_pending: AtomicBool` и **piggybacks** на existing status-bridge `nwg::Notice` через `notice.sender().notice()` — nwg 1.0.13 panic'ит на втором Notice anywhere в дереве (см. `feedback_nwg_gotchas.md` #4). OnNotice handler в начале arm'а делает `swap → false` на pending flag и поднимает Settings.
+- **`Message::ClipDecline { format }` (proto type 0x23)** — receiver просит sender'а abandon transfer. `IncomingClipboard::on_offer` возвращает `Some(Message::ClipDecline)` когда rejectит из-за settings toggle (`receive_text=false` / `receive_images=false`); reader thread форвардит decline через outgoing_tx. Sender (host: `ClipboardSync::cancel_outgoing()` дренит `pending_outbox`; client: set `outgoing_cancel: AtomicBool` который writer thread наблюдает) — drop'ает все pending chunks. Без этого toggle-off вызывал ~75 sec wire-saturation на 1 MB image (host всё равно шлёт chunks), что starved'ил TX (mouse / heartbeats) → false-positive heartbeat timeout disconnect.
+- **CREATE_NO_WINDOW для shell child** в `apps/wiredesk-host/src/shell.rs`. Win-host с `windows_subsystem = "windows"` — без console; default child создаёт свою console window. Flag (0x0800_0000) на `Command::creation_flags` подавляет это так что ShellOpen не показывает PowerShell window на host'ской HDMI-capture.
+- **Embed app icon в .exe** через `winresource` build-dependency. `apps/wiredesk-host/build.rs` gating через `HOST` env triple (only Windows host has `rc.exe`/`windres`) — Mac dev cross-checks compile clean но без icon resource section. Производственная сборка на Win показывает WireDesk-иконку в taskbar/Alt+Tab/Explorer.
 
 ### Известные ограничения
 
@@ -267,8 +281,9 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 - **Save+Restart pattern**: changes в settings UI требуют перезапуск процесса (нет live-reconnect supervisor'а). Это компромисс ради простоты — race conditions с открытым serial-портом и работающей session избегаются.
 - **Mac autostart** — не реализован (только manual launch из дока / Spotlight). Login Items / launchctl plist — follow-up.
 - **Code signing / нотарификация .app** — не делается. Gatekeeper при первом запуске требует «правый-клик → Open» и подтверждение.
-- **Single-instance focus**: при втором запуске host'а на Windows показывается message box и выход. «Поднять» существующее окно tray-приложения требует named pipe IPC — не реализовано (overkill для solo-MVP).
-- **App icon в taskbar / Alt+Tab на Windows** — при сборке с macOS dev-машины (без `x86_64-w64-mingw32-windres`) `embed-resource` не используется; иконка прокидывается только через `nwg::Window::builder().icon(...)` runtime-load из `app-icon.ico`. Это даёт иконку в title-bar Settings-окна, но **не** в taskbar / Alt+Tab — там остаётся generic Rust binary иконка. Полное решение — пересобрать на Windows-машине (или установить `mingw-w64`) с включённым `embed-resource` путём в `build.rs`.
+- **Single-instance** на Win'е: при втором запуске exe — открывается Settings существующего процесса (через named auto-reset event), второй процесс молча выходит.
+- **App icon в .exe** embed'ится только при сборке **на Windows** (rc.exe / windres needed). При cross-compile с macOS — иконка отсутствует. Полное решение — собирать на Win-машине; build.rs sets cargo warning если иконку не удалось встроить.
+- **Shell без PTY**: vim, htop, sudo с паролем, git interactive editor, ssh без `-tt` (или `RequestTTY force` в `~/.ssh/config`) — broken или partial. Полный TTY ждёт ConPTY-рефактора через `portable-pty` (см. `~/.claude/projects/.../memory/project_conpty_followup.md`).
 
 ## Hardware setup
 

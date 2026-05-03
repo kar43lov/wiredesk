@@ -601,7 +601,14 @@ impl IncomingClipboard {
         }
     }
 
-    pub fn on_offer(&mut self, format: u8, total_len: u32) {
+    /// Returns `Some(Message::ClipDecline)` when the offer is rejected
+    /// for a *peer-policy* reason (Settings toggle disabled). The caller
+    /// (reader thread) is expected to forward that decline back to the
+    /// sender so the sender can drop its outbox and stop saturating the
+    /// link with chunks the receiver will silently discard. Unsupported
+    /// formats and over-cap offers don't trigger a decline — those are
+    /// "the peer is broken" cases, not "the peer didn't ask for this".
+    pub fn on_offer(&mut self, format: u8, total_len: u32) -> Option<Message> {
         // Abort an in-progress reassembly if a new offer arrives mid-transfer.
         // Sender is single-threaded so this is a real signal (peer
         // started a fresh payload) — not a race.
@@ -628,13 +635,13 @@ impl IncomingClipboard {
             self.received_total = 0;
             self.incoming_total.store(0, Ordering::Relaxed);
             self.incoming_progress.store(0, Ordering::Relaxed);
-            return;
+            return None;
         }
         // Runtime toggle (Settings → Receive images): drop incoming image
         // offers when the user disabled image receive. Text offers continue.
         if format == FORMAT_TEXT_UTF8 && !self.receive_text.load(Ordering::Relaxed) {
             log::info!(
-                "clipboard: incoming text offer ({total_len} bytes) ignored — receive_text disabled"
+                "clipboard: incoming text offer ({total_len} bytes) declined — receive_text disabled"
             );
             self.expected_len = 0;
             self.expected_format = 0;
@@ -642,11 +649,11 @@ impl IncomingClipboard {
             self.received_total = 0;
             self.incoming_total.store(0, Ordering::Relaxed);
             self.incoming_progress.store(0, Ordering::Relaxed);
-            return;
+            return Some(Message::ClipDecline { format });
         }
         if format == FORMAT_PNG_IMAGE && !self.receive_images.load(Ordering::Relaxed) {
             log::info!(
-                "clipboard: incoming image offer ({total_len} bytes) ignored — receive_images disabled"
+                "clipboard: incoming image offer ({total_len} bytes) declined — receive_images disabled"
             );
             self.expected_len = 0;
             self.expected_format = 0;
@@ -654,7 +661,7 @@ impl IncomingClipboard {
             self.received_total = 0;
             self.incoming_total.store(0, Ordering::Relaxed);
             self.incoming_progress.store(0, Ordering::Relaxed);
-            return;
+            return Some(Message::ClipDecline { format });
         }
         // Bound peer-supplied total_len to local caps before allocating any
         // state. Without this a malicious or buggy peer could ask us to
@@ -677,7 +684,7 @@ impl IncomingClipboard {
             self.received_total = 0;
             self.incoming_total.store(0, Ordering::Relaxed);
             self.incoming_progress.store(0, Ordering::Relaxed);
-            return;
+            return None;
         }
         self.expected_len = total_len;
         self.expected_format = format;
@@ -686,6 +693,7 @@ impl IncomingClipboard {
         self.incoming_total.store(total_len as u64, Ordering::Relaxed);
         self.incoming_progress.store(0, Ordering::Relaxed);
         log::info!("clipboard.recv START format={format} total={total_len} bytes");
+        None
     }
 
     pub fn on_chunk(&mut self, index: u16, data: Vec<u8>) {

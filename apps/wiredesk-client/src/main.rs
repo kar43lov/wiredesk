@@ -157,10 +157,13 @@ fn main() {
     let reader_receive_images = receive_images.clone();
     let reader_receive_text = receive_text.clone();
     let reader_incoming_cancel = incoming_cancel.clone();
+    let reader_outgoing_cancel = outgoing_cancel.clone();
+    let reader_outgoing_tx = outgoing_tx.clone();
     thread::spawn(move || {
         reader_thread(
             reader_transport,
             events_tx,
+            reader_outgoing_tx,
             reader_clipboard,
             reader_incoming_progress,
             reader_incoming_total,
@@ -169,6 +172,7 @@ fn main() {
             reader_receive_images,
             reader_receive_text,
             reader_incoming_cancel,
+            reader_outgoing_cancel,
         );
     });
 
@@ -468,6 +472,7 @@ fn writer_thread(
 fn reader_thread(
     mut transport: Box<dyn Transport>,
     events_tx: mpsc::Sender<TransportEvent>,
+    outgoing_tx: mpsc::Sender<Packet>,
     clipboard_state: clipboard::ClipboardState,
     incoming_progress: Arc<AtomicU64>,
     incoming_total: Arc<AtomicU64>,
@@ -476,6 +481,7 @@ fn reader_thread(
     receive_images: Arc<std::sync::atomic::AtomicBool>,
     receive_text: Arc<std::sync::atomic::AtomicBool>,
     incoming_cancel: Arc<std::sync::atomic::AtomicBool>,
+    outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -539,7 +545,27 @@ fn reader_thread(
                     }
                     cancel_seen = false;
                     cancel_drop_count = 0;
-                    incoming_clip.on_offer(format, total_len);
+                    if let Some(decline) = incoming_clip.on_offer(format, total_len) {
+                        // Tell host to drop its outbox — without this it
+                        // would keep streaming chunks we're going to
+                        // discard, saturating RX and starving TX
+                        // (mouse / heartbeats can't squeeze through).
+                        let _ = outgoing_tx.send(Packet::new(decline, 0));
+                    }
+                }
+                Message::ClipDecline { format } => {
+                    // Host doesn't want our offer (its receive_* toggle
+                    // is off, or it tripped a size cap). Set the
+                    // outgoing-cancel flag so writer_thread drops the
+                    // queued ClipOffer/ClipChunk packets instead of
+                    // pumping them onto the wire to be discarded.
+                    log::info!(
+                        "clipboard: host declined our offer (format={format}); aborting send"
+                    );
+                    outgoing_cancel.store(true, Ordering::Release);
+                    let _ = events_tx.send(TransportEvent::Toast(
+                        "Host declined the clipboard transfer".into(),
+                    ));
                 }
                 Message::ClipChunk { index, data } => {
                     if incoming_cancel.load(Ordering::Acquire) {

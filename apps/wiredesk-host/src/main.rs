@@ -80,12 +80,13 @@ fn main() {
             ui::single_instance::SingleInstanceResult::Acquired(g) => g,
             ui::single_instance::SingleInstanceResult::AlreadyRunning => {
                 log::warn!("another wiredesk-host instance is already running");
+                // Instead of nagging with a message box, ask the running
+                // process to surface its Settings window so a double-click
+                // on the .exe behaves like "open the app I already have".
                 #[cfg(windows)]
                 {
-                    let _ = native_windows_gui::init();
-                    native_windows_gui::simple_message(
-                        "WireDesk",
-                        "WireDesk Host is already running — check the tray icon.",
+                    let _ = ui::single_instance::signal_show_settings(
+                        ui::single_instance::SHOW_SETTINGS_EVENT_NAME,
                     );
                 }
                 #[cfg(not(windows))]
@@ -179,13 +180,13 @@ fn run_windows(
         );
     }
 
-    log::info!("run_windows: nwg::init");
+    log::debug!("run_windows: nwg::init");
     if let Err(e) = nwg::init() {
         fatal("nwg::init", e);
         return;
     }
 
-    log::info!("run_windows: setting default font (Segoe UI 16px)");
+    log::debug!("run_windows: setting default font (Segoe UI 16px)");
     // Segoe UI is the standard Win11 dialog font. nwg's Font::size is in
     // pixels, not points — 16px ≈ 9pt at 96 DPI, matching the system default.
     // Set this BEFORE building any windows so all controls inherit it.
@@ -202,7 +203,7 @@ fn run_windows(
 
     let log_dir = logging::log_dir();
 
-    log::info!("run_windows: building TrayUi (log_dir={})", log_dir.display());
+    log::debug!("run_windows: building TrayUi (log_dir={})", log_dir.display());
     let tray = match ui::tray::TrayUi::build(log_dir) {
         Ok(t) => t,
         Err(e) => {
@@ -211,7 +212,7 @@ fn run_windows(
         }
     };
 
-    log::info!("run_windows: building SettingsWindow");
+    log::debug!("run_windows: building SettingsWindow");
     let settings = match ui::settings_window::SettingsWindow::build(&cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -231,14 +232,14 @@ fn run_windows(
     // Counters keep flowing through `ProgressCounters` for the Mac
     // status bar / progress bar to consume — this only removes the
     // host's own visualization.
-    log::info!("run_windows: TransferOverlay disabled (focus interference workaround)");
+    log::debug!("run_windows: TransferOverlay disabled (focus interference workaround)");
     let _ = &counters; // silence unused-variable when overlay is off
     let overlay: Option<std::rc::Rc<std::cell::RefCell<ui::transfer_overlay::TransferOverlay>>> =
         None;
     let _overlay_event_handler: Option<nwg::EventHandler> = None;
     let _ = (&overlay, &_overlay_event_handler);
 
-    log::info!("run_windows: building cross-thread Notice");
+    log::debug!("run_windows: building cross-thread Notice");
     let mut notice = nwg::Notice::default();
     if let Err(e) = nwg::Notice::builder()
         .parent(&tray.borrow().window)
@@ -250,6 +251,42 @@ fn run_windows(
 
     let _bridge = ui::status_bridge::spawn(status_rx, last.clone(), notice.sender());
 
+    // Cross-process "show settings" pipe: a second-instance launch
+    // fires SetEvent on the named event; this thread blocks on
+    // WaitForSingleObject and pokes the existing status-bridge
+    // Notice via `notice.sender().notice()` after raising a shared
+    // pending flag. The OnNotice handler then checks both the
+    // status-bridge state AND the pending flag.
+    //
+    // We piggyback on the existing Notice instead of creating a
+    // second one because nwg 1.0.13 panics on a second Notice
+    // anywhere in the same window tree (observed on both
+    // MessageWindow and a regular Window as parent — the bind
+    // check rejects "Cannot bind control with an handle of type").
+    let show_settings_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(windows)]
+    let _show_event_thread = {
+        match ui::single_instance::create_show_settings_event(
+            ui::single_instance::SHOW_SETTINGS_EVENT_NAME,
+        ) {
+            Some(handle) => {
+                let sender = notice.sender();
+                let pending = show_settings_pending.clone();
+                Some(std::thread::spawn(move || loop {
+                    if !handle.wait() {
+                        break;
+                    }
+                    pending.store(true, std::sync::atomic::Ordering::Release);
+                    sender.notice();
+                }))
+            }
+            None => {
+                log::warn!("create_show_settings_event failed — second-instance launch will be silent");
+                None
+            }
+        }
+    };
+
     // Wire events. nwg's full_bind_event_handler pushes events to a closure
     // that gets RawEvent + control handle; we dispatch manually.
     let tray_handle = tray.borrow().window.handle;
@@ -258,6 +295,7 @@ fn run_windows(
     let tray_clone = tray.clone();
     let settings_clone = settings.clone();
     let last_clone = last.clone();
+    let show_settings_pending_clone = show_settings_pending.clone();
 
     // Tray icon does NOT raise WM_LBUTTONDBLCLK as a distinct nwg event —
     // it only delivers WM_LBUTTONUP / WM_LBUTTONDOWN as
@@ -280,12 +318,21 @@ fn run_windows(
         use nwg::MousePressEvent as MP;
         match evt {
             E::OnNotice => {
-                // Status bridge fired. Two independent updates:
-                //   1) pending notification (transient balloon, doesn't
+                // Status bridge fired. The Notice multiplexes three signals:
+                //   1) cross-process "show settings" (set by the wait
+                //      thread for the named event when a second-instance
+                //      launch fires SetEvent),
+                //   2) pending notification (transient balloon, doesn't
                 //      change persistent UI state),
-                //   2) persistent status (tray icon color + settings row).
-                // Take the notification first under a brief lock, drop it,
-                // then read persistent under a fresh lock for the icon.
+                //   3) persistent status (tray icon color + settings row).
+                // Handle (1) first so a stacked event still surfaces it,
+                // then drop into the existing notification + persistent
+                // pipeline.
+                if show_settings_pending_clone
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    settings_clone.borrow().show();
+                }
                 let notification = if let Ok(mut g) = last_clone.lock() {
                     g.pending_notification.take()
                 } else {
@@ -407,6 +454,7 @@ fn run_windows(
                     handle == s.copy_mac_btn.handle,
                     handle == s.restart_btn.handle,
                     handle == s.detect_btn.handle,
+                    handle == s.quit_btn.handle,
                 ),
                 Err(_) => {
                     log::debug!(
@@ -415,7 +463,7 @@ fn run_windows(
                     return;
                 }
             };
-            let (is_save, is_copy_mac, is_restart, is_detect) = probe;
+            let (is_save, is_copy_mac, is_restart, is_detect, is_quit) = probe;
             match evt {
                 E::OnButtonClick => {
                     if is_save {
@@ -426,6 +474,11 @@ fn run_windows(
                         handle_restart(&settings_clone2, &cfg_holder);
                     } else if is_detect {
                         handle_detect(&settings_clone2);
+                    } else if is_quit {
+                        // Same effect as the tray's Quit menu — drop out
+                        // of the nwg event loop. Drop'ed guards (mutex,
+                        // session thread join handle, etc.) clean up.
+                        nwg::stop_thread_dispatch();
                     }
                 }
                 E::OnWindowClose => {

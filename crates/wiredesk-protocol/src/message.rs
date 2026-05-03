@@ -25,6 +25,11 @@ pub enum MessageType {
     ClipOffer = 0x20,
     ClipChunk = 0x21,
     ClipAck = 0x22,
+    /// Receiver doesn't want this offer (e.g. Settings → Receive
+    /// images is off). Sender drops the in-flight outbox so the
+    /// link doesn't stay saturated with chunks the peer will
+    /// silently discard.
+    ClipDecline = 0x23,
     // System
     Heartbeat = 0x30,
     Error = 0x31,
@@ -52,6 +57,7 @@ impl TryFrom<u8> for MessageType {
             0x20 => Ok(Self::ClipOffer),
             0x21 => Ok(Self::ClipChunk),
             0x22 => Ok(Self::ClipAck),
+            0x23 => Ok(Self::ClipDecline),
             0x30 => Ok(Self::Heartbeat),
             0x31 => Ok(Self::Error),
             0x32 => Ok(Self::Disconnect),
@@ -78,6 +84,11 @@ pub enum Message {
     ClipOffer { format: u8, total_len: u32 },
     ClipChunk { index: u16, data: Vec<u8> },
     ClipAck { index: u16 },
+    /// Receiver tells sender to abandon a clipboard transfer (e.g.
+    /// `receive_images` toggle is off). `format` echoes the format
+    /// from the offer that was rejected, so the sender knows which
+    /// outbox to drop.
+    ClipDecline { format: u8 },
     Heartbeat,
     Error { code: u16, msg: String },
     Disconnect,
@@ -101,6 +112,7 @@ impl Message {
             Self::ClipOffer { .. } => MessageType::ClipOffer,
             Self::ClipChunk { .. } => MessageType::ClipChunk,
             Self::ClipAck { .. } => MessageType::ClipAck,
+            Self::ClipDecline { .. } => MessageType::ClipDecline,
             Self::Heartbeat => MessageType::Heartbeat,
             Self::Error { .. } => MessageType::Error,
             Self::Disconnect => MessageType::Disconnect,
@@ -155,6 +167,9 @@ impl Message {
             }
             Self::ClipAck { index } => {
                 buf.extend_from_slice(&index.to_le_bytes());
+            }
+            Self::ClipDecline { format } => {
+                buf.push(*format);
             }
             Self::Heartbeat | Self::Disconnect | Self::ShellClose => {}
             Self::Error { code, msg } => {
@@ -242,6 +257,10 @@ impl Message {
                 Ok(Self::ClipAck {
                     index: u16::from_le_bytes([payload[0], payload[1]]),
                 })
+            }
+            MessageType::ClipDecline => {
+                ensure_min_len(payload, 1)?;
+                Ok(Self::ClipDecline { format: payload[0] })
             }
             MessageType::Heartbeat => Ok(Self::Heartbeat),
             MessageType::Disconnect => Ok(Self::Disconnect),
@@ -397,6 +416,8 @@ mod tests {
     #[test]
     fn roundtrip_clip_ack() {
         roundtrip(&Message::ClipAck { index: 42 });
+        roundtrip(&Message::ClipDecline { format: FORMAT_PNG_IMAGE });
+        roundtrip(&Message::ClipDecline { format: FORMAT_TEXT_UTF8 });
     }
 
     #[test]

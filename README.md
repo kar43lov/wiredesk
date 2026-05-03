@@ -148,9 +148,38 @@ wiredesk-term --shell powershell
 wiredesk-term --shell cmd
 ```
 
-Press **Ctrl+]** in `wiredesk-term` to quit and restore the local terminal.
+On launch you'll see a banner with the host name and screen size plus a hotkey cheatsheet:
 
-`wiredesk-client` and `wiredesk-term` are mutually exclusive — they share the same serial port. Run one or the other depending on whether you need the GUI or just a shell.
+```
+wiredesk-term: connected to 'wiredesk-host' (2560×1440). Press Ctrl+] to quit.
+
+  Hotkeys (handled locally):
+    Ctrl+]   exit wiredesk-term and restore your terminal
+
+  Forwarded to host shell:
+    Ctrl+C   interrupt the running command on host
+    Ctrl+D   send EOF to host stdin (closes the shell)
+    others   pass through to host as typed
+```
+
+The CLI runs a small **cooked-mode line discipline** so backspace, UTF-8 input (Russian / non-ASCII) and Enter all behave as you'd expect even though the host shell isn't a real TTY. A 2-second heartbeat keeps idle interactive sessions alive — you can step away from the keyboard and come back to a still-live shell. Linux output (bare `\n`) is translated to CRLF locally, so `ssh` to a remote box doesn't render in a staircase.
+
+For a shorter command alias, drop this in `~/.zshrc` / `~/.bashrc`:
+
+```bash
+alias wd='wiredesk-term'
+```
+
+**SSH to remote Linux through `wd`:** by default the host shell is a pipe, not a TTY, so plain `ssh dev` makes the remote bash run non-interactive (no `.bashrc`, no prompt, no aliases). Use `ssh -tt dev` to force PTY allocation on the remote, or add this to `~/.ssh/config`:
+
+```
+Host dev
+    RequestTTY force
+```
+
+Full TTY support on the host side itself (so `vim`, `htop`, `git commit`-editor, `psql` password prompts work locally on the host's shell) is a planned ConPTY refactor — out of MVP scope.
+
+`wiredesk-client` and `wiredesk-term` are **mutually exclusive** — they share the same serial port. Quit the GUI app before launching the CLI (or vice versa); whichever starts second will fail to open the port. Simultaneous GUI + CLI requires a multiplexing daemon, which is intentionally not in this MVP's scope.
 
 ## Protocol
 
@@ -179,7 +208,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, shell-over-serial. Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → System (Karabiner swap, Save & Restart) and Clipboard (4 send/receive × text/image toggles). Win host: tray agent (nwg) with auto-detect CH340, Restart entry in the tray menu, Save & Restart from the Settings window, balloon notification on oversize image, double-click on tray icon opens Settings. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. 147 client + 93 host tests passing.
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode bridge in Ghostty/iTerm with cooked-mode line discipline, UTF-8 backspace, hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → System (Karabiner swap, Save & Restart) and Clipboard (4 send/receive × text/image toggles). Win host: tray agent (nwg) with auto-detect CH340, **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. 148 client + 93 host + 17 term + 50 protocol tests passing.
 
 ## License
 

@@ -62,6 +62,19 @@ impl ShellProcess {
             cmd.args(&argv[1..]);
         }
 
+        // Suppress the new console window the OS would otherwise pop up
+        // for any child of a windows_subsystem=windows process. Without
+        // this, every ShellOpen flashes a PowerShell window on the
+        // Host's actual display — confusing if the user is watching
+        // through the HDMI capture and never asked for a local UI.
+        // The flag is a no-op everywhere except on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

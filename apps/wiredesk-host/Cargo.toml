@@ -26,6 +26,7 @@ tempfile = "3"
 
 [build-dependencies]
 embed-manifest = "1"
+winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
