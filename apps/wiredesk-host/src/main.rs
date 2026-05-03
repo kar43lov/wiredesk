@@ -180,13 +180,13 @@ fn run_windows(
         );
     }
 
-    log::info!("run_windows: nwg::init");
+    log::debug!("run_windows: nwg::init");
     if let Err(e) = nwg::init() {
         fatal("nwg::init", e);
         return;
     }
 
-    log::info!("run_windows: setting default font (Segoe UI 16px)");
+    log::debug!("run_windows: setting default font (Segoe UI 16px)");
     // Segoe UI is the standard Win11 dialog font. nwg's Font::size is in
     // pixels, not points — 16px ≈ 9pt at 96 DPI, matching the system default.
     // Set this BEFORE building any windows so all controls inherit it.
@@ -203,7 +203,7 @@ fn run_windows(
 
     let log_dir = logging::log_dir();
 
-    log::info!("run_windows: building TrayUi (log_dir={})", log_dir.display());
+    log::debug!("run_windows: building TrayUi (log_dir={})", log_dir.display());
     let tray = match ui::tray::TrayUi::build(log_dir) {
         Ok(t) => t,
         Err(e) => {
@@ -212,7 +212,7 @@ fn run_windows(
         }
     };
 
-    log::info!("run_windows: building SettingsWindow");
+    log::debug!("run_windows: building SettingsWindow");
     let settings = match ui::settings_window::SettingsWindow::build(&cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -232,14 +232,14 @@ fn run_windows(
     // Counters keep flowing through `ProgressCounters` for the Mac
     // status bar / progress bar to consume — this only removes the
     // host's own visualization.
-    log::info!("run_windows: TransferOverlay disabled (focus interference workaround)");
+    log::debug!("run_windows: TransferOverlay disabled (focus interference workaround)");
     let _ = &counters; // silence unused-variable when overlay is off
     let overlay: Option<std::rc::Rc<std::cell::RefCell<ui::transfer_overlay::TransferOverlay>>> =
         None;
     let _overlay_event_handler: Option<nwg::EventHandler> = None;
     let _ = (&overlay, &_overlay_event_handler);
 
-    log::info!("run_windows: building cross-thread Notice");
+    log::debug!("run_windows: building cross-thread Notice");
     let mut notice = nwg::Notice::default();
     if let Err(e) = nwg::Notice::builder()
         .parent(&tray.borrow().window)
