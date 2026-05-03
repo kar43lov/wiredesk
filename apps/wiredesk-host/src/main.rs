@@ -217,35 +217,23 @@ fn run_windows(
         }
     };
 
-    log::info!("run_windows: building TransferOverlay");
-    // Overlay is purely cosmetic — failure to build it (Err OR panic from
-    // a brittle nwg corner) shouldn't take down the whole host. Catch
-    // panics with `catch_unwind` so a borked nwg combination only loses
-    // the overlay, not the entire tray agent.
-    let overlay = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ui::transfer_overlay::TransferOverlay::build(counters.clone())
-    })) {
-        Ok(Ok(o)) => Some(o),
-        Ok(Err(e)) => {
-            log::warn!("transfer overlay build failed: {e}; continuing without overlay");
-            None
-        }
-        Err(_panic) => {
-            // The actual panic message has already been logged via
-            // `install_panic_hook`. Just note here that we're soldiering on.
-            log::warn!("transfer overlay panicked during build; continuing without overlay");
-            None
-        }
-    };
-    let _overlay_event_handler = overlay.as_ref().map(|o| {
-        let timer_handle = o.borrow().timer_handle();
-        let overlay_clone = o.clone();
-        nwg::full_bind_event_handler(&timer_handle, move |evt, _evt_data, _handle| {
-            if matches!(evt, nwg::Event::OnTimerTick) {
-                overlay_clone.borrow().tick();
-            }
-        })
-    });
+    // TransferOverlay disabled — even when hidden, the topmost popup
+    // window interfered with z-order/focus on the user's setup (Total
+    // Commander couldn't be activated, mouse input froze when TC took
+    // focus). The progress UI lives on the Mac client only for now;
+    // host-side surfacing is reserved for a follow-up that uses a
+    // less-intrusive mechanism (tray tooltip update, balloon
+    // notification, or a non-topmost minimal status window).
+    //
+    // Counters keep flowing through `ProgressCounters` for the Mac
+    // status bar / progress bar to consume — this only removes the
+    // host's own visualization.
+    log::info!("run_windows: TransferOverlay disabled (focus interference workaround)");
+    let _ = &counters; // silence unused-variable when overlay is off
+    let overlay: Option<std::rc::Rc<std::cell::RefCell<ui::transfer_overlay::TransferOverlay>>> =
+        None;
+    let _overlay_event_handler: Option<nwg::EventHandler> = None;
+    let _ = (&overlay, &_overlay_event_handler);
 
     log::info!("run_windows: building cross-thread Notice");
     let mut notice = nwg::Notice::default();
