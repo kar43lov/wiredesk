@@ -108,7 +108,10 @@ fn run(args: &Args) -> Result<i32> {
     let mut reader: Box<dyn Transport> = reader;
 
     // Send Hello on the writer, drain HelloAck on the reader.
-    handshake(&writer, &mut reader, &args.name)?;
+    // In --exec mode keep the banner + cheatsheet quiet — that
+    // output is for interactive users, not for AI agents reading
+    // stderr.
+    handshake(&writer, &mut reader, &args.name, args.exec.is_some())?;
 
     // Open shell on Host
     {
@@ -359,6 +362,37 @@ fn run_oneshot(
             }
         }
 
+        // CRITICAL: prompts arrive WITHOUT a trailing newline — the
+        // shell positions the cursor right after `> ` / `$ ` / `➜ `
+        // and waits for input. The line-walker above only sees
+        // `\n`-terminated lines, so it would never trigger on a
+        // prompt by itself. Inspect the partial leftover in
+        // `pending` and treat it as a prompt match if it looks
+        // like one. On match we transition state and clear the
+        // partial — its bytes have served their purpose.
+        match state {
+            OneShotState::AwaitingHostPrompt
+                if is_powershell_prompt(pending.trim_end()) =>
+            {
+                if let Some(alias) = ssh {
+                    send_text(&writer, &format!("ssh -tt {alias}\r"))?;
+                    state = OneShotState::AwaitingRemotePrompt;
+                } else {
+                    send_text(&writer, &payload)?;
+                    state = OneShotState::AwaitingSentinel;
+                }
+                pending.clear();
+            }
+            OneShotState::AwaitingRemotePrompt
+                if is_remote_prompt(pending.trim_end()) =>
+            {
+                send_text(&writer, &payload)?;
+                state = OneShotState::AwaitingSentinel;
+                pending.clear();
+            }
+            _ => {}
+        }
+
         if exit_code.is_some() {
             break;
         }
@@ -517,6 +551,7 @@ fn handshake(
     writer: &Arc<Mutex<Box<dyn Transport>>>,
     reader: &mut Box<dyn Transport>,
     client_name: &str,
+    quiet: bool,
 ) -> Result<()> {
     {
         let mut t = writer
@@ -541,8 +576,10 @@ fn handshake(
         match reader.recv() {
             Ok(p) => match p.message {
                 Message::HelloAck { host_name, screen_w, screen_h, .. } => {
-                    eprintln!("{}", format_connected_banner(&host_name, screen_w, screen_h));
-                    eprint!("{}", format_hotkey_cheatsheet());
+                    if !quiet {
+                        eprintln!("{}", format_connected_banner(&host_name, screen_w, screen_h));
+                        eprint!("{}", format_hotkey_cheatsheet());
+                    }
                     return Ok(());
                 }
                 Message::Error { code, msg } => {
