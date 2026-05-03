@@ -12,3 +12,4 @@ log.workspace = true
 env_logger.workspace = true
 clap.workspace = true
 crossterm = "0.28"
+uuid = { version = "1", features = ["v4"] }
