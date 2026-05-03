@@ -345,15 +345,31 @@ fn run_windows(
             // Resolve which control fired this event without holding any
             // borrow across the match arms — the handlers below take their
             // own borrows internally.
-            let (is_save, is_copy_mac, is_restart, is_detect) = {
-                let s = settings_clone2.borrow();
-                (
+            //
+            // CRITICAL: use `try_borrow()` instead of `borrow()`. nwg's
+            // `set_status` / `set_text` calls during the OnNotice tray
+            // handler (which holds `settings_clone.borrow_mut()`) pump Win32
+            // messages, and a re-entrant settings event arrives mid-pump
+            // → second borrow on a borrowed RefCell → panic → process
+            // crash. Bailing out of the re-entrant event is harmless: nwg
+            // will re-fire the original interaction once the outer borrow
+            // drops, OR the event was a phantom (e.g., focus shifts during
+            // status-bar updates) we don't need to handle.
+            let probe = match settings_clone2.try_borrow() {
+                Ok(s) => (
                     handle == s.save_btn.handle,
                     handle == s.copy_mac_btn.handle,
                     handle == s.restart_btn.handle,
                     handle == s.detect_btn.handle,
-                )
+                ),
+                Err(_) => {
+                    log::debug!(
+                        "settings_event_handler skipped: settings RefCell busy (re-entrant)"
+                    );
+                    return;
+                }
             };
+            let (is_save, is_copy_mac, is_restart, is_detect) = probe;
             match evt {
                 E::OnButtonClick => {
                     if is_save {
