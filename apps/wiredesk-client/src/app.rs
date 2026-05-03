@@ -131,6 +131,8 @@ pub struct WireDeskApp {
     /// clipboard sync is unaffected by either flag.
     send_images: Arc<AtomicBool>,
     receive_images: Arc<AtomicBool>,
+    send_text: Arc<AtomicBool>,
+    receive_text: Arc<AtomicBool>,
     /// Generic 3-second toast surfaced by `TransportEvent::Toast`. Currently
     /// used by the clipboard poll thread to warn the user when a copied image
     /// exceeds `MAX_IMAGE_BYTES` (Task 7b). Distinct from `save_toast`, which
@@ -243,6 +245,8 @@ impl WireDeskApp {
         incoming_total: Arc<AtomicU64>,
         send_images: Arc<AtomicBool>,
         receive_images: Arc<AtomicBool>,
+        send_text: Arc<AtomicBool>,
+        receive_text: Arc<AtomicBool>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -288,6 +292,8 @@ impl WireDeskApp {
             incoming_total,
             send_images,
             receive_images,
+            send_text,
+            receive_text,
             transient_toast: None,
         }
     }
@@ -513,10 +519,29 @@ impl WireDeskApp {
                     self.receive_images.store(recv_imgs, Ordering::Relaxed);
                     dirty = true;
                 }
+                let mut send_txt = cfg.send_text;
+                if ui
+                    .checkbox(&mut send_txt, "Send text (Mac → Host)")
+                    .changed()
+                {
+                    cfg.send_text = send_txt;
+                    self.send_text.store(send_txt, Ordering::Relaxed);
+                    dirty = true;
+                }
+                let mut recv_txt = cfg.receive_text;
+                if ui
+                    .checkbox(&mut recv_txt, "Receive text (Host → Mac)")
+                    .changed()
+                {
+                    cfg.receive_text = recv_txt;
+                    self.receive_text.store(recv_txt, Ordering::Relaxed);
+                    dirty = true;
+                }
                 ui.label(
                     egui::RichText::new(
-                        "Text clipboard always syncs. Toggle individual directions \
-                         for image sync (PNG, ≤1 MB encoded).",
+                        "Toggle individual directions per content type. \
+                         Useful when an app like Whispr Flow keeps writing \
+                         transcribed text into the clipboard.",
                     )
                     .small()
                     .color(egui::Color32::GRAY),
@@ -1509,6 +1534,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
         )

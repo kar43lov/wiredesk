@@ -96,6 +96,8 @@ fn main() {
     // Text clipboard is unaffected.
     let send_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_images));
     let receive_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_images));
+    let send_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_text));
+    let receive_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_text));
 
     // Writer thread — owns one half of the port. Drains outgoing channel,
     // sends heartbeats, sends Hello on startup. UI never blocks because this
@@ -138,6 +140,7 @@ fn main() {
     let reader_outgoing_progress = outgoing_progress.clone();
     let reader_outgoing_total = outgoing_total.clone();
     let reader_receive_images = receive_images.clone();
+    let reader_receive_text = receive_text.clone();
     thread::spawn(move || {
         reader_thread(
             reader_transport,
@@ -148,6 +151,7 @@ fn main() {
             reader_outgoing_progress,
             reader_outgoing_total,
             reader_receive_images,
+            reader_receive_text,
         );
     });
 
@@ -160,6 +164,7 @@ fn main() {
         outgoing_tx.clone(),
         poll_events_tx,
         send_images.clone(),
+        send_text.clone(),
     );
 
     // Keyboard tap (macOS only — no-op elsewhere). Initially disabled;
@@ -189,6 +194,8 @@ fn main() {
         incoming_total,
         send_images,
         receive_images,
+        send_text,
+        receive_text,
     );
 
     let options = eframe::NativeOptions {
@@ -346,6 +353,7 @@ fn reader_thread(
     outgoing_progress: Arc<AtomicU64>,
     outgoing_total: Arc<AtomicU64>,
     receive_images: Arc<std::sync::atomic::AtomicBool>,
+    receive_text: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -370,6 +378,7 @@ fn reader_thread(
         incoming_progress,
         incoming_total,
         receive_images,
+        receive_text,
     );
     loop {
         match transport.recv() {

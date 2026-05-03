@@ -28,39 +28,53 @@ const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap for text
 /// from raw dimensions.
 pub(crate) const MAX_IMAGE_BYTES: usize = 1024 * 1024; // 1 MB encoded
 
-/// Type-tagged hash of the most recent clipboard content owned/observed by us.
-/// Used to suppress re-sending what we just wrote (loop avoidance) while
-/// keeping text and image dedup independent — copying text after an image
-/// (or vice versa) does not get blocked by the wrong-kind hash.
+/// Hashes of the most recent clipboard content we observed/wrote, kept
+/// in **independent slots per kind**. Without per-kind slots an alternating
+/// text/image clipboard (e.g., a Whispr Flow dictation app writes text
+/// while a screenshot stays on the OS clipboard) would loop: each text
+/// write erases the image hash → next poll sees image as "new" → resends.
+/// Bug captured in `2026-05-03 09:24` log session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum LastKind {
-    #[default]
-    None,
-    Text(u64),
-    /// Wired-up by the image send path (Task 4) and receive path (Task 5).
-    Image(u64),
+pub(crate) struct LastSeen {
+    pub text: Option<u64>,
+    /// Successfully sent/received image hash (over RGBA bytes).
+    pub image: Option<u64>,
     /// RGBA hash of the most recent image rejected by the size cap. Lets the
     /// poll thread short-circuit the expensive RGBA→PNG re-encode (and the
     /// repeated toast emission) for the same buffer on every 500 ms tick —
     /// AC4 expects one toast per oversize event, not one per poll.
-    OversizeImage(u64),
+    pub oversize_image: Option<u64>,
 }
 
-impl LastKind {
-    /// True when this state has stamped the given RGBA hash either as a
-    /// successfully-sent/received image (loop-avoidance dedup) or as an
-    /// oversize-rejected image (CPU-saving short-circuit). Used by the poll
-    /// path to skip the expensive RGBA→PNG re-encode for the same buffer.
+impl LastSeen {
+    /// True when the given RGBA hash matches either the last sent/received
+    /// image OR the last oversize-rejected image. Poll path uses this to
+    /// skip the expensive RGBA→PNG re-encode for the same buffer.
     pub(crate) fn matches_image_hash(&self, hash: u64) -> bool {
-        matches!(self, LastKind::Image(h) | LastKind::OversizeImage(h) if *h == hash)
+        self.image == Some(hash) || self.oversize_image == Some(hash)
+    }
+
+    pub(crate) fn matches_text_hash(&self, hash: u64) -> bool {
+        self.text == Some(hash)
     }
 }
 
-/// Shared state: last known clipboard kind+hash. Updated when we either set or
-/// read the local clipboard.
+/// Legacy enum kept for unit tests that still use `state.set(LastKind::*)`.
+/// Production code uses `LastSeen` and the per-kind setters directly.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // some variants are no longer used after the LastSeen split
+pub(crate) enum LastKind {
+    None,
+    Text(u64),
+    Image(u64),
+    OversizeImage(u64),
+}
+
+/// Shared state: per-kind hashes of the last observed clipboard content.
 #[derive(Clone, Default)]
 pub struct ClipboardState {
-    last: Arc<Mutex<LastKind>>,
+    last: Arc<Mutex<LastSeen>>,
 }
 
 impl ClipboardState {
@@ -68,16 +82,44 @@ impl ClipboardState {
         Self::default()
     }
 
-    pub(crate) fn get(&self) -> LastKind {
+    pub(crate) fn get(&self) -> LastSeen {
         *self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub(crate) fn set(&self, kind: LastKind) {
+    pub(crate) fn set_text(&self, hash: u64) {
         let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        *g = kind;
+        g.text = Some(hash);
     }
 
-    /// Clear the sender-side dedup hash. Called from the reader thread on
+    pub(crate) fn set_image(&self, hash: u64) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        g.image = Some(hash);
+        // A successful image send/receive also clears any prior
+        // oversize-stamp for the same buffer — the buffer's now considered
+        // delivered, not rejected. (Different hash → no-op.)
+        if g.oversize_image == Some(hash) {
+            g.oversize_image = None;
+        }
+    }
+
+    pub(crate) fn set_oversize_image(&self, hash: u64) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        g.oversize_image = Some(hash);
+    }
+
+    /// Test-only legacy setter. Maps `LastKind` variants onto the per-kind
+    /// `LastSeen` slots so existing tests don't have to rewrite call sites.
+    #[cfg(test)]
+    pub(crate) fn set(&self, kind: LastKind) {
+        match kind {
+            LastKind::None => self.reset(),
+            LastKind::Text(h) => self.set_text(h),
+            LastKind::Image(h) => self.set_image(h),
+            LastKind::OversizeImage(h) => self.set_oversize_image(h),
+        }
+    }
+
+    /// Clear ALL sender-side dedup hashes. Called from the reader thread on
     /// disconnect / new HelloAck / transport error so that a mid-transfer
     /// abort doesn't leave a stale stamp — otherwise the very next poll-tick
     /// after reconnect would see the same OS-clipboard content, match the
@@ -86,7 +128,7 @@ impl ClipboardState {
     /// thinks the other doesn't have it) — better than a lost update.
     pub fn reset(&self) {
         let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        *g = LastKind::None;
+        *g = LastSeen::default();
     }
 }
 
@@ -293,6 +335,7 @@ pub fn spawn_poll_thread(
     outgoing_tx: mpsc::Sender<Packet>,
     events_tx: mpsc::Sender<TransportEvent>,
     send_images: Arc<AtomicBool>,
+    send_text: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let mut clip = match arboard::Clipboard::new() {
@@ -304,88 +347,84 @@ pub fn spawn_poll_thread(
         };
 
         // Startup pre-stamp: whatever's already on the clipboard when the
-        // app launches gets its hash recorded as `LastKind::*` WITHOUT
-        // being sent to the peer. Without this, every restart re-uploads
-        // the user's current clipboard contents (including any image
-        // copied during a previous session) — surprising and wastes
-        // bandwidth. The user's next genuine Cmd+C produces a different
-        // hash and triggers normal sync. Image hash is over RGBA bytes
-        // (consistent with the runtime poll path).
-        match clip.get_text() {
-            Ok(text) if !text.is_empty() => {
-                state.set(LastKind::Text(hash_text(&text)));
+        // app launches gets its hash recorded as `LastSeen.{text,image}`
+        // WITHOUT being sent to the peer. Without this, every restart
+        // re-uploads the user's current clipboard contents (including
+        // any image copied during a previous session). The user's NEXT
+        // genuine Cmd+C produces a different hash and triggers normal
+        // sync. Image hash is over RGBA bytes (consistent with the
+        // runtime poll path). Stamp BOTH text and image — the OS
+        // clipboard can hold both (NSPasteboard supports multiple types
+        // for one copy).
+        if let Ok(text) = clip.get_text() {
+            if !text.is_empty() {
+                state.set_text(hash_text(&text));
                 log::info!(
                     "clipboard: pre-stamped existing text ({} bytes) — not sending on startup",
                     text.len()
                 );
             }
-            _ => {
-                if let Ok(img) = clip.get_image() {
-                    state.set(LastKind::Image(hash_bytes(&img.bytes)));
-                    log::info!(
-                        "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
-                        img.width,
-                        img.height
-                    );
-                }
-            }
+        }
+        if let Ok(img) = clip.get_image() {
+            state.set_image(hash_bytes(&img.bytes));
+            log::info!(
+                "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
+                img.width,
+                img.height
+            );
         }
 
         loop {
             thread::sleep(CLIP_POLL_INTERVAL);
 
-            // 1) Try text first. Empty/error → fall through to image.
-            //
-            // TODO: probe image even when text exists (codex C3). macOS
-            // Cmd+C on rich selections (web page with text + image) puts
-            // BOTH on the clipboard; we currently only forward the text.
-            // Two-phase probe in the same tick would need LastKind split
-            // into independent text and image hashes — non-trivial scope,
-            // deferred. See `c3_rich_selection_image_dropped` ignored test.
-            match clip.get_text() {
-                Ok(text) if !text.is_empty() => {
-                    let hash = hash_text(&text);
-                    if matches!(state.get(), LastKind::Text(h) if h == hash) {
-                        continue;
+            // 1) Probe text. Independent dedup slot (`LastSeen.text`) so
+            // an alternating text/image clipboard (Whispr Flow + a
+            // standing screenshot) doesn't loop. Runtime toggle gates
+            // the path entirely.
+            if send_text.load(Ordering::Relaxed) {
+                if let Ok(text) = clip.get_text() {
+                    if !text.is_empty() {
+                        let hash = hash_text(&text);
+                        if !state.get().matches_text_hash(hash) {
+                            state.set_text(hash);
+                            let bytes = text.as_bytes();
+                            if bytes.len() > MAX_CLIPBOARD_BYTES {
+                                log::warn!(
+                                    "clipboard: skipping push — {} bytes exceeds limit",
+                                    bytes.len()
+                                );
+                            } else {
+                                log::debug!(
+                                    "clipboard: pushing {} bytes to host",
+                                    bytes.len()
+                                );
+                                emit_offer_and_chunks(
+                                    &outgoing_tx,
+                                    FORMAT_TEXT_UTF8,
+                                    bytes,
+                                );
+                            }
+                        }
                     }
-                    // Codex iter3 E2 (acceptable): sender dedup is set on
-                    // enqueue, not on successful send. If transport fails
-                    // mid-transfer, retry happens only when clipboard
-                    // content changes again. Acceptable: heartbeat covers
-                    // disconnect within 6s, app restart clears state.
-                    state.set(LastKind::Text(hash));
-
-                    let bytes = text.as_bytes();
-                    if bytes.len() > MAX_CLIPBOARD_BYTES {
-                        log::warn!(
-                            "clipboard: skipping push — {} bytes exceeds limit",
-                            bytes.len()
-                        );
-                        continue;
-                    }
-
-                    log::debug!("clipboard: pushing {} bytes to host", bytes.len());
-                    emit_offer_and_chunks(&outgoing_tx, FORMAT_TEXT_UTF8, bytes);
-                    continue;
                 }
-                _ => {} // fall through to image probe
             }
 
-            // 2) Try image. arboard returns RGBA8.
-            // Runtime toggle (Settings → Send images): when off, we skip the
-            // get_image() probe entirely — text continues to sync as before.
+            // 2) Probe image. Independent dedup slot. Runtime toggle gates.
+            // Note: probing both text AND image in the same tick (instead
+            // of falling through only on text-empty) is intentional — the
+            // OS clipboard can hold both. This closes the codex C3 gap.
             if !send_images.load(Ordering::Relaxed) {
                 continue;
             }
             let img = match clip.get_image() {
                 Ok(i) => i,
-                Err(_) => continue, // not an image either; idle
+                Err(_) => continue, // not an image
             };
 
             let hash = hash_bytes(&img.bytes);
             // Short-circuit BEFORE the expensive RGBA→PNG encode for both:
-            // - already-sent images (LastKind::Image),
-            // - already-rejected oversized images (LastKind::OversizeImage).
+            // - already-sent images (LastSeen.image),
+            // - already-rejected oversized images (LastSeen.oversize_image).
             // Otherwise every 500 ms tick re-encodes (~30-150 ms CPU) and
             // re-emits the toast for the SAME oversize buffer.
             if state.get().matches_image_hash(hash) {
@@ -410,7 +449,7 @@ pub fn spawn_poll_thread(
                 // Stamp the RGBA hash so the next 500 ms tick short-circuits
                 // for the same image. A new RGBA (user re-copied) gives a new
                 // hash and re-tries the encode path.
-                state.set(LastKind::OversizeImage(hash));
+                state.set_oversize_image(hash);
                 continue;
             }
 
@@ -418,7 +457,7 @@ pub fn spawn_poll_thread(
             // not on successful send. If transport fails mid-transfer, retry
             // happens only when clipboard content changes again. Acceptable:
             // heartbeat covers disconnect within 6s, app restart clears state.
-            state.set(LastKind::Image(hash));
+            state.set_image(hash);
 
             log::debug!("clipboard: pushing image to host ({} encoded bytes)", png.len());
             emit_offer_and_chunks(&outgoing_tx, FORMAT_PNG_IMAGE, &png);
@@ -445,6 +484,9 @@ pub struct IncomingClipboard {
     /// (`format=FORMAT_PNG_IMAGE`) are rejected on receipt. Text offers
     /// continue to be processed normally.
     receive_images: Arc<AtomicBool>,
+    /// Runtime toggle (Settings → Receive text): when off, text offers
+    /// (`format=FORMAT_TEXT_UTF8`) are rejected on receipt.
+    receive_text: Arc<AtomicBool>,
     /// Test-only sink for the last successfully committed payload. Lets unit
     /// tests assert on what would have been written to the local clipboard
     /// without depending on the host platform's actual clipboard backend
@@ -468,6 +510,7 @@ impl IncomingClipboard {
         incoming_progress: Arc<AtomicU64>,
         incoming_total: Arc<AtomicU64>,
         receive_images: Arc<AtomicBool>,
+        receive_text: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state,
@@ -479,6 +522,7 @@ impl IncomingClipboard {
             incoming_progress,
             incoming_total,
             receive_images,
+            receive_text,
             #[cfg(test)]
             last_committed: None,
         }
@@ -499,6 +543,7 @@ impl IncomingClipboard {
             incoming_progress: Arc::new(AtomicU64::new(0)),
             incoming_total: Arc::new(AtomicU64::new(0)),
             receive_images: Arc::new(AtomicBool::new(true)),
+            receive_text: Arc::new(AtomicBool::new(true)),
             last_committed: None,
         }
     }
@@ -534,6 +579,18 @@ impl IncomingClipboard {
         }
         // Runtime toggle (Settings → Receive images): drop incoming image
         // offers when the user disabled image receive. Text offers continue.
+        if format == FORMAT_TEXT_UTF8 && !self.receive_text.load(Ordering::Relaxed) {
+            log::info!(
+                "clipboard: incoming text offer ({total_len} bytes) ignored — receive_text disabled"
+            );
+            self.expected_len = 0;
+            self.expected_format = 0;
+            self.received.clear();
+            self.received_total = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
+            return;
+        }
         if format == FORMAT_PNG_IMAGE && !self.receive_images.load(Ordering::Relaxed) {
             log::info!(
                 "clipboard: incoming image offer ({total_len} bytes) ignored — receive_images disabled"
@@ -713,7 +770,7 @@ impl IncomingClipboard {
                     }
                 }
                 if wrote_ok {
-                    self.state.set(LastKind::Text(hash));
+                    self.state.set_text(hash);
                 }
             }
             Err(e) => log::warn!("clipboard: incoming bytes not valid UTF-8: {e}"),
@@ -759,7 +816,7 @@ impl IncomingClipboard {
             }
         }
         if wrote_ok {
-            self.state.set(LastKind::Image(hash));
+            self.state.set_image(hash);
         }
     }
 }
@@ -813,7 +870,8 @@ mod tests {
     #[test]
     fn last_kind_default_is_none() {
         let state = ClipboardState::new();
-        assert!(matches!(state.get(), LastKind::None));
+        let s = state.get();
+        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
     }
 
     #[test]
@@ -821,23 +879,41 @@ mod tests {
         // Codex iter4 F1: `reset()` is the disconnect-side hook that drops
         // sender dedup. Without it, after a transfer aborts mid-stream the
         // hash stays stamped and the post-reconnect tick dedups → silent
-        // lost-update. Verify each LastKind variant collapses to None.
+        // lost-update. Verify each slot collapses to None.
         let state = ClipboardState::new();
 
-        state.set(LastKind::Text(0xAABB_CCDD));
-        assert!(matches!(state.get(), LastKind::Text(_)));
+        state.set_text(0xAABB_CCDD);
+        assert_eq!(state.get().text, Some(0xAABB_CCDD));
         state.reset();
-        assert!(matches!(state.get(), LastKind::None));
+        assert!(state.get().text.is_none());
 
-        state.set(LastKind::Image(0x1122_3344));
-        assert!(matches!(state.get(), LastKind::Image(_)));
+        state.set_image(0x1122_3344);
+        assert_eq!(state.get().image, Some(0x1122_3344));
         state.reset();
-        assert!(matches!(state.get(), LastKind::None));
+        assert!(state.get().image.is_none());
 
-        state.set(LastKind::OversizeImage(0x9999));
-        assert!(matches!(state.get(), LastKind::OversizeImage(_)));
+        state.set_oversize_image(0x9999);
+        assert_eq!(state.get().oversize_image, Some(0x9999));
         state.reset();
-        assert!(matches!(state.get(), LastKind::None));
+        assert!(state.get().oversize_image.is_none());
+    }
+
+    #[test]
+    fn text_and_image_slots_are_independent() {
+        // Regression for the Whispr Flow loop: stamping text must NOT
+        // erase the image hash (or vice versa). Without this the poll
+        // thread bounces between text and image dedup forever.
+        let state = ClipboardState::new();
+        state.set_text(0x1111);
+        state.set_image(0x2222);
+        let s = state.get();
+        assert_eq!(s.text, Some(0x1111));
+        assert_eq!(s.image, Some(0x2222));
+
+        state.set_text(0x3333); // text update
+        let s = state.get();
+        assert_eq!(s.text, Some(0x3333));
+        assert_eq!(s.image, Some(0x2222), "image hash must survive text update");
     }
 
     #[test]
@@ -857,10 +933,11 @@ mod tests {
         state.reset();
 
         // post-reconnect tick: same OS-clipboard content. Without reset, the
-        // probe `matches!(state.get(), LastKind::Text(h) if h == hash)` would
-        // be true and the resend would be skipped. With reset, it's None.
-        let dedup_would_skip = matches!(state.get(), LastKind::Text(h) if h == hash);
-        assert!(!dedup_would_skip, "reset must re-arm the sender for resend after reconnect");
+        // text hash slot would still match. With reset, it's None.
+        assert!(
+            !state.get().matches_text_hash(hash),
+            "reset must re-arm the sender for resend after reconnect"
+        );
     }
 
     #[test]
@@ -1109,7 +1186,7 @@ mod tests {
 
         // LastKind must be Image — guards against the receiver echoing back
         // the image we just wrote ourselves.
-        assert!(matches!(state.get(), LastKind::Image(_)));
+        assert!(state.get().image.is_some());
     }
 
     #[test]
@@ -1126,7 +1203,7 @@ mod tests {
             CommittedPayload::Text(s) => assert_eq!(s, text),
             other => panic!("expected text, got {other:?}"),
         }
-        assert!(matches!(state.get(), LastKind::Text(_)));
+        assert!(state.get().text.is_some());
     }
 
     #[test]
@@ -1141,7 +1218,8 @@ mod tests {
         feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &garbage);
 
         assert!(incoming.last_committed.is_none(), "no payload should commit");
-        assert!(matches!(state.get(), LastKind::None));
+        let s = state.get();
+        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
         // After failed commit the receiver must be ready for a new offer.
         assert_eq!(incoming.expected_len, 0);
         assert_eq!(incoming.expected_format, 0);
@@ -1159,7 +1237,8 @@ mod tests {
         feed_offer(&mut incoming, FORMAT_TEXT_UTF8, &invalid);
 
         assert!(incoming.last_committed.is_none(), "no payload should commit");
-        assert!(matches!(state.get(), LastKind::None));
+        let s = state.get();
+        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
         assert_eq!(incoming.expected_len, 0);
         assert_eq!(incoming.expected_format, 0);
     }
@@ -1174,7 +1253,8 @@ mod tests {
         feed_offer(&mut incoming, 0xFE, b"opaque");
 
         assert!(incoming.last_committed.is_none());
-        assert!(matches!(state.get(), LastKind::None));
+        let s = state.get();
+        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
     }
 
     /// Codex C3 deferred: marker test documenting the rich-selection gap.
@@ -1287,8 +1367,9 @@ mod tests {
         feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &png);
 
         let img_hash = hash_bytes(&original.bytes);
-        assert!(
-            matches!(state.get(), LastKind::Image(h) if h == img_hash),
+        assert_eq!(
+            state.get().image,
+            Some(img_hash),
             "state must hold the image's RGBA hash for loop avoidance"
         );
 

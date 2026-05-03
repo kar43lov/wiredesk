@@ -54,6 +54,15 @@ pub struct ClientConfig {
     /// `ClipOffer{format=PNG_IMAGE}` is rejected on receipt (state stays clean).
     #[serde(default = "default_true")]
     pub receive_images: bool,
+    /// Send text from Mac → Host. Useful to disable when an app like
+    /// Whispr Flow / dictation tools writes transcribed text into the
+    /// macOS clipboard on every utterance — without this toggle every
+    /// dictation message turns into a clipboard sync.
+    #[serde(default = "default_true")]
+    pub send_text: bool,
+    /// Accept incoming text from Host → Mac.
+    #[serde(default = "default_true")]
+    pub receive_text: bool,
 }
 
 fn default_true() -> bool {
@@ -102,6 +111,8 @@ impl Default for ClientConfig {
             preferred_monitor: None,
             send_images: true,
             receive_images: true,
+            send_text: true,
+            receive_text: true,
         }
     }
 }
@@ -210,6 +221,8 @@ mod tests {
             preferred_monitor: None,
             send_images: true,
             receive_images: true,
+            send_text: true,
+            receive_text: true,
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -332,6 +345,8 @@ mod tests {
             preferred_monitor: None,
             send_images: true,
             receive_images: true,
+            send_text: true,
+            receive_text: true,
         }
     }
 
