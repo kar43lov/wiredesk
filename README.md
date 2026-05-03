@@ -193,7 +193,9 @@ wd --exec --ssh prod-mup "docker ps"
 wd --exec --ssh prod-mup "tail -100 /var/log/syslog"
 ```
 
-This skips raw mode and the interactive bridge entirely. The CLI sends the command wrapped in a sentinel (`<cmd>; "__WD_DONE_<uuid>__$LASTEXITCODE"` for PS, `<cmd>; echo "__WD_DONE_<uuid>__$?"` for bash post-ssh), reads the host's output until the sentinel line is seen, strips the prompt / banner / echoed command, and exits with the same code the command produced. Default timeout 30 s, override with `--timeout SECONDS`. Timeout returns exit 124 (`timeout(1)` convention).
+This skips raw mode and the interactive bridge entirely. The CLI sends the command wrapped in a UUID-tagged sentinel and reads the host's output until that sentinel line is seen, strips the prompt / banner / echoed command, and exits with the same code the command produced.
+
+PS-only wrapper sets `$LASTEXITCODE=0; $ErrorActionPreference='Stop'` and wraps the user command in `try { … } catch { $LASTEXITCODE=1 }` so cmdlet successes return 0, terminating errors return 1, and external commands propagate their actual exit codes. SSH path sandwiches the user command between an explicit `__WD_READY_<uuid>__` marker (lower bound for output-slicing) and the `__WD_DONE_<uuid>__$?` sentinel (upper bound + exit code). Default timeout 30 s, override with `--timeout SECONDS`. Timeout returns exit 124 (`timeout(1)` convention). See `docs/wd-exec-usage.md` for the full reference (exit codes, gotchas, examples for AI agents through Bash-tool).
 
 For sub-second persistent SSH (so consecutive `--ssh prod-mup` calls don't re-handshake every time), set up OpenSSH ControlMaster on the host's `~/.ssh/config`:
 
