@@ -103,9 +103,15 @@ fn run(args: &Args) -> Result<()> {
     let _ = terminal::disable_raw_mode();
     eprintln!("\nwiredesk-term: disconnected");
 
-    // Best-effort: tell the host to close the shell.
+    // Best-effort: tell the host to close the shell AND that we're
+    // disconnecting. ShellClose alone wouldn't reliably free the host's
+    // shell slot if the remote process ignores stdin EOF (PowerShell
+    // -NoExit), and without Disconnect the host only notices we're
+    // gone via the 6 s heartbeat timeout — long enough that a fast
+    // relaunch hits "shell already open".
     if let Ok(mut t) = writer.lock() {
         let _ = t.send(&Packet::new(Message::ShellClose, 0));
+        let _ = t.send(&Packet::new(Message::Disconnect, 0));
     }
 
     result

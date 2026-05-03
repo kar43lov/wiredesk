@@ -350,9 +350,17 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
 
             (SessionState::Connected, Message::ShellClose) => {
+                // Close stdin first so the shell sees EOF — bash/zsh
+                // (and most well-behaved CLIs) exit cleanly. PowerShell
+                // launched with -NoExit ignores stdin EOF and keeps
+                // running, leaving `self.shell` stuck at `Some(...)`
+                // which then makes the *next* ShellOpen fail with
+                // "shell already open". Force-kill after the close so
+                // the slot is always free when the client re-opens.
                 if let Some(sh) = self.shell.as_ref() {
                     sh.close();
                 }
+                self.shell_kill();
             }
 
             (SessionState::Connected, Message::Disconnect) => {
@@ -366,10 +374,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
             (_, Message::Hello { .. }) => {
                 // Re-handshake from any state — drop in-flight clipboard
-                // reassembly so a half-finished transfer doesn't leak across
-                // sessions.
+                // reassembly so a half-finished transfer doesn't leak
+                // across sessions, AND kill any leftover shell so the
+                // new client's ShellOpen doesn't bounce off "shell
+                // already open" (typical when the previous wiredesk-term
+                // exited too fast for heartbeat-timeout to fire).
                 self.injector.release_all().ok();
                 self.clipboard.reset();
+                self.shell_kill();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
                 self.handle_packet(packet)?;
