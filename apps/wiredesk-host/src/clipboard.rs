@@ -161,6 +161,33 @@ fn build_offer_and_chunks(format: u8, payload: &[u8]) -> Vec<Message> {
     msgs
 }
 
+/// Hash the current clipboard content so the first poll-tick after startup
+/// short-circuits via the `LastKind` dedup. Without this, a host restart
+/// re-uploads whatever the user already had on the Win clipboard.
+fn stamp_initial(clip: Option<&mut arboard::Clipboard>) -> LastKind {
+    let Some(clip) = clip else {
+        return LastKind::None;
+    };
+    if let Ok(text) = clip.get_text() {
+        if !text.is_empty() {
+            log::info!(
+                "clipboard: pre-stamped existing text ({} bytes) — not sending on startup",
+                text.len()
+            );
+            return LastKind::Text(hash_text(&text));
+        }
+    }
+    if let Ok(img) = clip.get_image() {
+        log::info!(
+            "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
+            img.width,
+            img.height
+        );
+        return LastKind::Image(hash_bytes(&img.bytes));
+    }
+    LastKind::None
+}
+
 pub struct ClipboardSync {
     clip: Option<arboard::Clipboard>,
     last: LastKind,
@@ -225,9 +252,16 @@ pub struct ProgressCounters {
 
 impl ClipboardSync {
     pub fn with_counters(counters: ProgressCounters) -> Self {
+        let mut clip = arboard::Clipboard::new().ok();
+        // Pre-stamp existing clipboard content so a fresh host process
+        // doesn't try to push whatever the user happened to leave on the
+        // Win clipboard from a previous session (or from a foreign app).
+        // Only the user's NEXT explicit Cmd+C produces a different hash
+        // and triggers a real outbound sync.
+        let initial_last = stamp_initial(clip.as_mut());
         Self {
-            clip: arboard::Clipboard::new().ok(),
-            last: LastKind::None,
+            clip,
+            last: initial_last,
             last_poll: Instant::now(),
             expected_len: 0,
             expected_format: 0,

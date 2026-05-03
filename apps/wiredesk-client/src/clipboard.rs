@@ -303,6 +303,34 @@ pub fn spawn_poll_thread(
             }
         };
 
+        // Startup pre-stamp: whatever's already on the clipboard when the
+        // app launches gets its hash recorded as `LastKind::*` WITHOUT
+        // being sent to the peer. Without this, every restart re-uploads
+        // the user's current clipboard contents (including any image
+        // copied during a previous session) — surprising and wastes
+        // bandwidth. The user's next genuine Cmd+C produces a different
+        // hash and triggers normal sync. Image hash is over RGBA bytes
+        // (consistent with the runtime poll path).
+        match clip.get_text() {
+            Ok(text) if !text.is_empty() => {
+                state.set(LastKind::Text(hash_text(&text)));
+                log::info!(
+                    "clipboard: pre-stamped existing text ({} bytes) — not sending on startup",
+                    text.len()
+                );
+            }
+            _ => {
+                if let Ok(img) = clip.get_image() {
+                    state.set(LastKind::Image(hash_bytes(&img.bytes)));
+                    log::info!(
+                        "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
+                        img.width,
+                        img.height
+                    );
+                }
+            }
+        }
+
         loop {
             thread::sleep(CLIP_POLL_INTERVAL);
 
