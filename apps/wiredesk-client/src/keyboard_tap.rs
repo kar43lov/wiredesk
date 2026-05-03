@@ -431,7 +431,16 @@ mod macos {
                                         };
                                         let _ = outgoing_cb.send(Packet::new(msg, 0));
                                     }
-                                    CallbackResult::Drop
+                                    // Pass-through to macOS so modifier-only
+                                    // hotkey apps (Whispr Flow's Ctrl+Option,
+                                    // push-to-talk dictation tools, etc.)
+                                    // still trigger while WireDesk is in
+                                    // capture mode. The modifier alone is
+                                    // harmless for native shortcuts —
+                                    // letter keys are still intercepted on
+                                    // KeyDown so combos like Cmd+C don't
+                                    // fire on Mac.
+                                    CallbackResult::Keep
                                 }
                                 _ => CallbackResult::Keep,
                             }
