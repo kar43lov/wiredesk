@@ -364,6 +364,12 @@ fn writer_thread(
     }
 
     let mut last_heartbeat = Instant::now();
+    // Per-cancel-batch counter. We log a single INFO at the start of a
+    // cancel sweep and another summary INFO when it ends — emitting one
+    // line per dropped chunk floods the log (an 80 KB image is ~320
+    // chunks, a 500 KB image is ~2000).
+    let mut cancel_drop_count: u32 = 0;
+    let mut cancel_active = false;
 
     loop {
         let timeout = HEARTBEAT_INTERVAL
@@ -380,17 +386,25 @@ fn writer_thread(
                 if is_clip && cancelling {
                     // User pressed Cancel mid-transfer. Drop the queued
                     // clip packet without writing it to the wire so Host
-                    // never sees the rest of the offer. Counters are
-                    // cleared by the UI thread; here we just keep eating
-                    // packets until the next non-clip packet (or queue
-                    // drains naturally) — at which point we clear the
-                    // flag so the next ClipOffer flows normally.
-                    log::info!("clipboard.send CANCELLED — dropping queued clip packet");
+                    // never sees the rest of the offer.
+                    if !cancel_active {
+                        log::info!("clipboard.send CANCELLED — dropping queued packets");
+                        cancel_active = true;
+                        cancel_drop_count = 0;
+                    }
+                    cancel_drop_count = cancel_drop_count.saturating_add(1);
                     continue;
                 }
                 if cancelling && !is_clip {
                     // Drained the cancelled batch. Re-arm for next transfer.
                     outgoing_cancel.store(false, Ordering::Release);
+                    if cancel_active {
+                        log::info!(
+                            "clipboard.send cancel complete ({cancel_drop_count} packets dropped)"
+                        );
+                        cancel_active = false;
+                        cancel_drop_count = 0;
+                    }
                 }
                 if let Err(e) = transport.send(&packet) {
                     log::error!("send error: {e}");
@@ -411,6 +425,13 @@ fn writer_thread(
                 // safe to clear the flag.
                 if outgoing_cancel.load(Ordering::Acquire) {
                     outgoing_cancel.store(false, Ordering::Release);
+                }
+                if cancel_active {
+                    log::info!(
+                        "clipboard.send cancel complete ({cancel_drop_count} packets dropped)"
+                    );
+                    cancel_active = false;
+                    cancel_drop_count = 0;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -470,6 +491,11 @@ fn reader_thread(
         receive_images,
         receive_text,
     );
+    // Cancel-batch state — same role as the writer-side counters: log a
+    // single START and a single END line per cancel sweep instead of one
+    // per dropped chunk.
+    let mut cancel_seen = false;
+    let mut cancel_drop_count: u32 = 0;
     loop {
         match transport.recv() {
             Ok(p) => match p.message {
@@ -495,19 +521,32 @@ fn reader_thread(
                     let _ = events_tx.send(TransportEvent::Heartbeat);
                 }
                 Message::ClipOffer { format, total_len } => {
-                    if incoming_cancel.swap(false, Ordering::AcqRel) {
-                        // Stale cancel from before this offer — clear and
-                        // accept the new offer normally.
+                    if incoming_cancel.swap(false, Ordering::AcqRel) && cancel_seen {
+                        log::info!(
+                            "clipboard.recv cancel complete ({cancel_drop_count} chunks dropped)"
+                        );
                     }
+                    cancel_seen = false;
+                    cancel_drop_count = 0;
                     incoming_clip.on_offer(format, total_len);
                 }
                 Message::ClipChunk { index, data } => {
                     if incoming_cancel.load(Ordering::Acquire) {
-                        log::info!("clipboard.recv CANCELLED — dropping chunk {index}");
-                        incoming_clip.reset();
-                        // Keep the flag set: more chunks from the same offer
+                        // Drop chunks of the cancelled offer silently after
+                        // logging the first one — an 80 KB image is ~320
+                        // chunks and per-chunk INFO floods the log.
+                        if !cancel_seen {
+                            log::info!(
+                                "clipboard.recv CANCELLED — dropping chunks (first idx {index})"
+                            );
+                            incoming_clip.reset();
+                            cancel_seen = true;
+                            cancel_drop_count = 0;
+                        }
+                        cancel_drop_count = cancel_drop_count.saturating_add(1);
+                        // Flag stays set: more chunks from the same offer
                         // are still on the wire, drop them too. Cleared on
-                        // next ClipOffer (above).
+                        // the next ClipOffer (above).
                         continue;
                     }
                     incoming_clip.on_chunk(index, data);
