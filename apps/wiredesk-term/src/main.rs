@@ -120,6 +120,41 @@ fn format_connected_banner(host_name: &str, screen_w: u16, screen_h: u16) -> Str
     )
 }
 
+/// Inline cheat sheet printed once after the connection banner. Lists
+/// every key combo the local terminal interprets specially so the user
+/// doesn't have to dig through docs to learn that Ctrl+] is the exit
+/// hotkey (telnet/nc convention) and that Ctrl+C / Ctrl+D pass through
+/// to the remote shell. Pure helper so it can be unit-tested.
+fn format_hotkey_cheatsheet() -> String {
+    let mut s = String::new();
+    s.push_str("\r\n");
+    s.push_str("  Hotkeys (handled locally):\r\n");
+    s.push_str("    Ctrl+]   exit wiredesk-term and restore your terminal\r\n");
+    s.push_str("\r\n");
+    s.push_str("  Forwarded to host shell:\r\n");
+    s.push_str("    Ctrl+C   interrupt the running command on host\r\n");
+    s.push_str("    Ctrl+D   send EOF to host stdin (closes the shell)\r\n");
+    s.push_str("    others   pass through to host as typed\r\n");
+    s
+}
+
+/// Emit the standard "erase the previous character" sequence
+/// `\x08 \x20 \x08` (cursor left, space, cursor left) for each `0x7F`
+/// (macOS DEL = Backspace in raw mode) byte found in `chunk`. All other
+/// bytes are dropped — interactive shells echo printable stdin themselves
+/// through stdout, so duplicating those locally produces doubled
+/// characters. PowerShell in pipe mode does NOT produce a full erase
+/// sequence in response to 0x7F (no PSReadLine), hence this helper.
+fn local_echo_for_backspace(chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &b in chunk {
+        if b == 0x7F {
+            out.extend_from_slice(b"\x08 \x08");
+        }
+    }
+    out
+}
+
 /// Translate the byte stream we just read from stdin into what the host
 /// shell expects on its stdin pipe. The only translation is `\r → \n`:
 /// macOS raw mode delivers Enter as a bare CR (0x0D), but PowerShell /
@@ -174,6 +209,7 @@ fn handshake(
             Ok(p) => match p.message {
                 Message::HelloAck { host_name, screen_w, screen_h, .. } => {
                     eprintln!("{}", format_connected_banner(&host_name, screen_w, screen_h));
+                    eprint!("{}", format_hotkey_cheatsheet());
                     return Ok(());
                 }
                 Message::Error { code, msg } => {
@@ -232,14 +268,20 @@ fn bridge_loop(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                // No local echo at all. Interactive shells (PowerShell
-                // -NoExit / cmd /Q / bash -i) echo printable stdin
-                // bytes through stdout AND emit a full erase sequence
-                // (\x08\x20\x08) for Backspace via PSReadLine /
-                // readline. Doubling either of those locally produces
-                // visible artefacts (extra characters or trailing
-                // spaces). Forward the chunk verbatim and let the
-                // shell drive what the user sees.
+                // Selective local echo for Backspace only. PowerShell
+                // in pipe mode (no TTY) doesn't run PSReadLine — it
+                // doesn't echo a full erase sequence in response to
+                // 0x7F. Without help, Backspace was visibly leaving
+                // a stray space behind. Emit \x08\x20\x08 (cursor
+                // left, overwrite with space, cursor left) locally.
+                // Printable bytes are still echoed by the shell
+                // itself, so we do NOT mirror them.
+                let echo = local_echo_for_backspace(chunk);
+                if !echo.is_empty() {
+                    let mut out = io::stdout().lock();
+                    let _ = out.write_all(&echo);
+                    let _ = out.flush();
+                }
                 let host_payload = translate_input_for_host(chunk);
                 if let Ok(mut t) = writer.lock() {
                     if let Err(e) = t.send(&Packet::new(
@@ -358,6 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn local_echo_backspace_emits_erase_sequence() {
+        let s = local_echo_for_backspace(b"\x7F");
+        assert_eq!(s, b"\x08 \x08");
+    }
+
+    #[test]
+    fn local_echo_backspace_ignores_printable() {
+        let s = local_echo_for_backspace(b"dir");
+        assert!(s.is_empty(), "expected empty echo, got {s:?}");
+    }
+
+    #[test]
+    fn local_echo_backspace_handles_multiple() {
+        let s = local_echo_for_backspace(b"a\x7F\x7F");
+        assert_eq!(s, b"\x08 \x08\x08 \x08");
+    }
+
+    #[test]
     fn translate_for_host_replaces_cr_with_lf() {
         // Raw-mode Enter is bare CR; host shells (PowerShell, cmd, bash)
         // need LF to terminate a line. Without this PowerShell
@@ -375,6 +435,20 @@ mod tests {
         let mut expected = "дир".as_bytes().to_vec();
         expected.push(b'\n');
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn cheatsheet_lists_exit_hotkey() {
+        let s = format_hotkey_cheatsheet();
+        assert!(s.contains("Ctrl+]"), "cheatsheet must mention exit hotkey");
+        assert!(s.contains("exit"), "cheatsheet must say what Ctrl+] does");
+    }
+
+    #[test]
+    fn cheatsheet_lists_forwarded_hotkeys() {
+        let s = format_hotkey_cheatsheet();
+        assert!(s.contains("Ctrl+C"), "cheatsheet must mention Ctrl+C");
+        assert!(s.contains("Ctrl+D"), "cheatsheet must mention Ctrl+D");
     }
 
     #[test]
