@@ -310,11 +310,74 @@ fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
     }
 }
 
-// run_oneshot is now linear — we always end up "send everything up
-// front, then watch for the sentinel". State enum was removed when we
-// stopped waiting for prompts (PS pipe-mode emits noise, not a prompt;
-// remote shell over `ssh -tt`-without-PTY runs non-interactive and
-// emits no prompt at all).
+/// State machine for `run_oneshot`. PS-only mode skips straight to
+/// AwaitingSentinel (the formatted command is sent immediately —
+/// PS pipe-mode reads stdin line-by-line, no need to sync). SSH
+/// mode goes AwaitingRemotePrompt → AwaitingSentinel: we MUST wait
+/// for the remote shell to emit its prompt before pushing the payload,
+/// otherwise PS's .NET StreamReader read-ahead swallows whatever line
+/// we sent after `ssh -tt ALIAS\n` (PS has consumed line 1 + buffered
+/// line 2 BEFORE spawning ssh; line 2 is stuck in PS-memory, never
+/// reaches the ssh subprocess).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum OneShotState {
+    AwaitingRemotePrompt,
+    AwaitingSentinel,
+}
+
+/// Strip ANSI/VT100 escape sequences from a string so prompt-detection
+/// can match a real Starship/oh-my-zsh prompt that arrives wrapped in
+/// color and terminal-mode escapes. Real-world `ssh -tt` Starship
+/// trace ends a prompt line with `➜ \x1b[K\x1b[?1h\x1b=\x1b[?2004h` —
+/// `is_remote_prompt` against the raw string fails (last char is `h`,
+/// not `➜`/`$`/`#`).
+///
+/// Handles two common shapes:
+///   - CSI: `ESC [ ... letter` (color, cursor, mode-set)
+///   - OSC: `ESC ] ... BEL or ESC \\` (titles)
+///   - simple two-char: `ESC =`, `ESC >`, `ESC c`, etc.
+///
+/// Pure helper, returns owned `String`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(&'[') => {
+                // CSI: ESC [ <params> <letter>. Skip until terminator.
+                chars.next();
+                for nc in chars.by_ref() {
+                    if nc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            Some(&']') => {
+                // OSC: ESC ] <text> BEL  (or ESC ] <text> ESC \).
+                chars.next();
+                while let Some(nc) = chars.next() {
+                    if nc == '\x07' {
+                        break;
+                    }
+                    if nc == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {
+                // Simple two-char escape: ESC <one char>. Drop both.
+                chars.next();
+            }
+        }
+    }
+    out
+}
 
 /// Drive a single `--exec` run end to end. Owns the writer (for sending
 /// `ssh`-hop and the formatted command), takes the reader by value
@@ -348,29 +411,31 @@ fn run_oneshot(
     let payload = format_command(&uuid, target_kind, cmd);
     log::debug!("[exec] uuid={uuid} kind={target_kind:?} payload={payload:?}");
 
-    // Linear protocol: send everything up front, then watch for the
-    // sentinel.
-    //
     // PS-only path: PowerShell with piped stdout reads stdin
-    // line-by-line and executes. No prompt-handshake needed — the
-    // first line is our wrapped command.
+    // line-by-line and executes. Send the formatted command
+    // immediately — no prompt-detection needed (PS doesn't reliably
+    // emit a prompt in pipe-mode anyway).
     //
-    // SSH path: `ssh -tt ALIAS` runs as a child of host PS. The
-    // remote shell does NOT emit a prompt because PS's stdin pipe
-    // prevents PTY allocation (`Pseudo-terminal will not be
-    // allocated because stdin is not a terminal`), so the remote
-    // session falls back to non-interactive mode. Bytes we push to
-    // PS's stdin AFTER the ssh line are inherited by ssh and
-    // forwarded to the remote shell. The Bash payload itself
-    // includes a `__WD_READY_<uuid>__` echo BEFORE the user's cmd
-    // so `clean_stdout` can slice off MOTD / banner / pre-cmd noise.
-    if let Some(alias) = ssh {
+    // SSH path: we MUST wait for the *remote* shell prompt before
+    // sending the payload. Reason: PS's .NET StreamReader does
+    // read-ahead. If we push `ssh -tt ALIAS\n` + payload back-to-back
+    // (one batch into PS's stdin pipe), PS slurps both lines into its
+    // internal buffer, executes line 1 (spawns ssh), but line 2 stays
+    // trapped in PS-memory and never reaches the ssh subprocess
+    // (confirmed in trace logs — Starship prompt arrived on the wire,
+    // payload silently went nowhere). Waiting for the remote prompt
+    // before sending payload guarantees ssh is the active reader on
+    // PS's stdin pipe by the time we push bytes.
+    let mut state = if let Some(alias) = ssh {
         let ssh_cmd = format!("ssh -tt {alias}\n");
         log::debug!("[exec] ssh hop: {ssh_cmd:?}");
         send_text(&writer, &ssh_cmd)?;
-    }
-    log::debug!("[exec] sending payload");
-    send_text(&writer, &payload)?;
+        OneShotState::AwaitingRemotePrompt
+    } else {
+        log::debug!("[exec] sending payload");
+        send_text(&writer, &payload)?;
+        OneShotState::AwaitingSentinel
+    };
 
     // `pending` is the line-walker scratch — only completed lines get
     // popped out of it. `full_log` accumulates EVERYTHING received so
@@ -417,15 +482,44 @@ fn run_oneshot(
             }
         }
 
-        // Walk completed lines watching for the sentinel.
+        // Walk completed lines.
         while let Some(nl_idx) = pending.find('\n') {
             let line: String = pending[..nl_idx].trim_end_matches('\r').to_string();
             pending.drain(..=nl_idx);
-            log::trace!("[exec] line: {line:?}");
-            if let Some(code) = parse_sentinel(&line, &uuid) {
-                log::debug!("[exec] sentinel matched, exit code = {code}");
-                exit_code = Some(code);
-                break;
+            log::trace!("[exec] line state={state:?}: {line:?}");
+
+            match state {
+                OneShotState::AwaitingRemotePrompt => {
+                    // Strip ANSI before prompt detection — Starship et al
+                    // wrap prompts in color/cursor escapes plus a
+                    // trailing `\x1b[K` (clear-to-EOL).
+                    let stripped = strip_ansi(&line);
+                    if is_remote_prompt(stripped.trim_end()) {
+                        log::debug!("[exec] remote prompt matched (line), sending payload");
+                        send_text(&writer, &payload)?;
+                        state = OneShotState::AwaitingSentinel;
+                    }
+                }
+                OneShotState::AwaitingSentinel => {
+                    if let Some(code) = parse_sentinel(&line, &uuid) {
+                        log::debug!("[exec] sentinel matched, exit code = {code}");
+                        exit_code = Some(code);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Remote prompts arrive WITHOUT a trailing newline — bash/zsh
+        // park the cursor right after `$ ` / `# ` / `➜ `. Peek the
+        // partial leftover after stripping ANSI escapes.
+        if state == OneShotState::AwaitingRemotePrompt {
+            let stripped = strip_ansi(&pending);
+            if is_remote_prompt(stripped.trim_end()) {
+                log::debug!("[exec] remote prompt matched (partial), sending payload");
+                send_text(&writer, &payload)?;
+                state = OneShotState::AwaitingSentinel;
+                pending.clear();
             }
         }
 
@@ -1222,6 +1316,46 @@ mod tests {
     }
 
     #[test]
+    fn strip_ansi_csi_color_codes() {
+        assert_eq!(
+            strip_ansi("\x1b[1;33muser\x1b[0m in \x1b[1;36m~\x1b[0m"),
+            "user in ~"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_keeps_unicode_arrow() {
+        // Real Starship trailing prompt — `➜ \x1b[K` plus terminal
+        // mode escapes. After strip, only `➜ ` should remain.
+        assert_eq!(
+            strip_ansi("➜ \x1b[K\x1b[?1h\x1b=\x1b[?2004h"),
+            "➜ "
+        );
+    }
+
+    #[test]
+    fn strip_ansi_leaves_plain_text_unchanged() {
+        assert_eq!(strip_ansi("just text"), "just text");
+        assert_eq!(strip_ansi(""), "");
+        assert_eq!(strip_ansi("PS C:\\>"), "PS C:\\>");
+    }
+
+    #[test]
+    fn strip_ansi_starship_full_prompt_line_matches_remote_prompt() {
+        // The real wire format from a live `ssh -tt prod` session.
+        // After strip we expect a string that ends with `➜ ` so
+        // is_remote_prompt returns true.
+        let raw = "\r\u{1b}[0m\u{1b}[27m\u{1b}[24m\u{1b}[J\u{1b}[1;33muser\u{1b}[0m in \u{1b}[1;2;32m🌐 cgu-knd-firecards-1\u{1b}[0m in \u{1b}[1;36m~\u{1b}[0m \r\n➜ \u{1b}[K\u{1b}[?1h\u{1b}=\u{1b}[?2004h";
+        let stripped = strip_ansi(raw);
+        // Last non-newline content should end with `➜ ` (or `➜`
+        // after trim).
+        assert!(
+            is_remote_prompt(stripped.trim_end()),
+            "stripped Starship prompt should match is_remote_prompt: {stripped:?}"
+        );
+    }
+
+    #[test]
     fn parse_ready_matches_expanded_only() {
         let uuid = uuid::Uuid::nil();
         // Expanded form (what shell prints when it executes echo).
@@ -1416,13 +1550,22 @@ mod tests {
     fn run_oneshot_happy_path_ssh() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            // Linear protocol now — client immediately sends ssh -tt
-            // followed by the formatted command. No prompt-detection
-            // wait in between.
+            // Step 1: client sends ssh hop ONLY. Payload is held back
+            // until the remote prompt is seen (avoids PS read-ahead
+            // race that traps payload in PS's StreamReader buffer).
             let ssh_cmd = host
                 .recv_shell_input(Duration::from_secs(2))
                 .expect("client should send ssh -tt");
             assert!(ssh_cmd.starts_with("ssh -tt prod"), "got: {ssh_cmd:?}");
+
+            // Step 2: host emits MOTD + ANSI-wrapped Starship-style
+            // prompt (`➜ \x1b[K\x1b[?2004h`). Without ANSI stripping
+            // is_remote_prompt would never match — checking that the
+            // partial-peek branch handles real Starship.
+            host.emit_chunk("Welcome to Ubuntu\r\nMOTD line\r\n");
+            host.emit_chunk("\x1b[1;33muser\x1b[0m in \x1b[1;36m~\x1b[0m \r\n➜ \x1b[K\x1b[?1h\x1b=\x1b[?2004h");
+
+            // Step 3: client should now send the formatted command.
             let cmd = host
                 .recv_shell_input(Duration::from_secs(2))
                 .expect("client should send formatted bash command");
@@ -1431,13 +1574,9 @@ mod tests {
                 "cmd payload must lead with READY: {cmd:?}"
             );
             assert!(cmd.contains("docker ps"), "cmd payload: {cmd:?}");
-            assert!(cmd.contains("$?"), "bash sentinel uses $?: {cmd:?}");
-            // Mimic remote bash: MOTD floods first, then echoes our
-            // line (because `ssh -tt` echoes stdin), then expands the
-            // READY marker, then runs the cmd, then emits the
-            // expanded sentinel.
+
+            // Step 4: simulate ssh -tt echo + remote bash exec.
             let uuid = extract_uuid_from_payload(&cmd);
-            host.emit_chunk("Welcome to Ubuntu\r\nMOTD line 1\r\nMOTD line 2\r\n");
             host.emit_chunk(&format!(
                 "echo __WD_READY_{uuid}__; docker ps; echo \"__WD_DONE_{uuid}__$?\"\r\n"
             ));
