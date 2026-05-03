@@ -120,23 +120,6 @@ fn format_connected_banner(host_name: &str, screen_w: u16, screen_h: u16) -> Str
     )
 }
 
-/// For each `0x7F` byte (macOS DEL = Backspace in raw mode) in `chunk`,
-/// emit the standard "erase the previous character" sequence
-/// `\x08 \x20 \x08` (cursor left, overwrite with space, cursor left
-/// again). Everything else is dropped — interactive host shells echo
-/// printable stdin back through stdout, so we don't want to mirror
-/// them locally and produce doubled characters. Pure helper so the
-/// behaviour is unit-tested without touching stdout.
-fn local_echo_for_backspace(chunk: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for &b in chunk {
-        if b == 0x7F {
-            out.extend_from_slice(b"\x08 \x08");
-        }
-    }
-    out
-}
-
 /// Translate the byte stream we just read from stdin into what the host
 /// shell expects on its stdin pipe. The only translation is `\r → \n`:
 /// macOS raw mode delivers Enter as a bare CR (0x0D), but PowerShell /
@@ -249,20 +232,14 @@ fn bridge_loop(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                // Selective local echo. Interactive shells echo
-                // *printable* stdin bytes back through stdout, so we
-                // don't double-print those. But they swallow control
-                // bytes like 0x7F (macOS Backspace) silently — the
-                // host shell erases its buffer correctly, the user
-                // just sees nothing happen locally. Compute the
-                // erase sequence for each Backspace and emit it now;
-                // skip everything else.
-                let echo = local_echo_for_backspace(chunk);
-                if !echo.is_empty() {
-                    let mut out = io::stdout().lock();
-                    let _ = out.write_all(&echo);
-                    let _ = out.flush();
-                }
+                // No local echo at all. Interactive shells (PowerShell
+                // -NoExit / cmd /Q / bash -i) echo printable stdin
+                // bytes through stdout AND emit a full erase sequence
+                // (\x08\x20\x08) for Backspace via PSReadLine /
+                // readline. Doubling either of those locally produces
+                // visible artefacts (extra characters or trailing
+                // spaces). Forward the chunk verbatim and let the
+                // shell drive what the user sees.
                 let host_payload = translate_input_for_host(chunk);
                 if let Ok(mut t) = writer.lock() {
                     if let Err(e) = t.send(&Packet::new(
@@ -378,27 +355,6 @@ mod tests {
         let s = format_connected_banner("h", 0, 0);
         assert!(s.contains("'h'"));
         assert!(s.contains("0×0"));
-    }
-
-    #[test]
-    fn local_echo_backspace_emits_erase_sequence() {
-        let s = local_echo_for_backspace(b"\x7F");
-        assert_eq!(s, b"\x08 \x08");
-    }
-
-    #[test]
-    fn local_echo_backspace_ignores_printable() {
-        // Printable bytes are echoed by the host shell itself; we must
-        // not duplicate them locally.
-        let s = local_echo_for_backspace(b"dir");
-        assert!(s.is_empty(), "expected empty echo, got {s:?}");
-    }
-
-    #[test]
-    fn local_echo_backspace_handles_multiple_in_chunk() {
-        // Holding Backspace can deliver several DELs in one stdin read.
-        let s = local_echo_for_backspace(b"a\x7F\x7Fb\x7F");
-        assert_eq!(s, b"\x08 \x08\x08 \x08\x08 \x08");
     }
 
     #[test]
