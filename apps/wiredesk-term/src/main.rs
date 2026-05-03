@@ -51,25 +51,50 @@ struct Args {
     /// Client display name
     #[arg(long, default_value = "wiredesk-term")]
     name: String,
+
+    /// Run COMMAND non-interactively on the host shell, print clean
+    /// stdout, exit with the command's exit code. When set, all the
+    /// interactive bridge machinery (raw mode, stdin pump,
+    /// cooked-mode line discipline) is skipped.
+    #[arg(long, value_name = "COMMAND")]
+    exec: Option<String>,
+
+    /// When --exec is set, first chain `ssh -tt ALIAS` on the host
+    /// shell, wait for the remote prompt, and run COMMAND there.
+    /// Strip remote MOTD / SSH banner from stdout so the agent sees
+    /// only the command's output. Use OpenSSH ControlMaster in
+    /// `~/.ssh/config` on the host for sub-second persistent SSH.
+    #[arg(long, value_name = "ALIAS")]
+    ssh: Option<String>,
+
+    /// Seconds to wait for the sentinel before giving up and
+    /// returning exit code 124 (the same convention as `timeout(1)`).
+    #[arg(long, default_value = "30")]
+    timeout: u64,
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = Args::parse();
 
-    if let Err(e) = run(&args) {
-        // Make sure we always restore the terminal before printing the error.
-        let _ = terminal::disable_raw_mode();
-        eprintln!("\nwiredesk-term error: {e}");
-        std::process::exit(1);
+    match run(&args) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            // Make sure we always restore the terminal before printing the error.
+            let _ = terminal::disable_raw_mode();
+            eprintln!("\nwiredesk-term error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run(args: &Args) -> Result<()> {
-    eprintln!(
-        "wiredesk-term: connecting to {} @ {} baud (Ctrl+] to quit)",
-        args.port, args.baud
-    );
+fn run(args: &Args) -> Result<i32> {
+    if args.exec.is_none() {
+        eprintln!(
+            "wiredesk-term: connecting to {} @ {} baud (Ctrl+] to quit)",
+            args.port, args.baud
+        );
+    }
 
     let writer = SerialTransport::open(&args.port, args.baud)?;
     // Split the port into independent reader/writer handles so a
@@ -94,14 +119,21 @@ fn run(args: &Args) -> Result<()> {
         ))?;
     }
 
-    // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
-    terminal::enable_raw_mode().map_err(|e| WireDeskError::Input(format!("raw mode: {e}")))?;
-
-    let result = bridge_loop(writer.clone(), reader);
-
-    // Restore terminal regardless of how the loop exited.
-    let _ = terminal::disable_raw_mode();
-    eprintln!("\nwiredesk-term: disconnected");
+    // Branch: --exec runs the non-interactive sentinel-driven path
+    // (no raw mode, no stdin, return command's exit code). Default
+    // path is the interactive bridge.
+    let result_code = if let Some(cmd) = &args.exec {
+        run_oneshot(writer.clone(), reader, cmd, args.ssh.as_deref(), args.timeout)
+    } else {
+        // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
+        terminal::enable_raw_mode()
+            .map_err(|e| WireDeskError::Input(format!("raw mode: {e}")))?;
+        let r = bridge_loop(writer.clone(), reader).map(|_| 0);
+        // Restore terminal regardless of how the loop exited.
+        let _ = terminal::disable_raw_mode();
+        eprintln!("\nwiredesk-term: disconnected");
+        r
+    };
 
     // Best-effort: tell the host to close the shell AND that we're
     // disconnecting. ShellClose alone wouldn't reliably free the host's
@@ -114,7 +146,7 @@ fn run(args: &Args) -> Result<()> {
         let _ = t.send(&Packet::new(Message::Disconnect, 0));
     }
 
-    result
+    result_code
 }
 
 /// Format the post-handshake banner. Pure helper so the format is unit-tested
@@ -183,6 +215,298 @@ fn pop_utf8_char(buf: &mut Vec<u8>) -> bool {
         }
     }
     true
+}
+
+/// Which host shell flavour we're targeting when formatting the
+/// sentinel-bearing command. The host always runs PowerShell; when
+/// `--ssh` chains us to a remote box we typically end up in bash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Bash variant used after `--ssh` lands a remote prompt.
+enum ShellKind {
+    PowerShell,
+    Bash,
+}
+
+/// Build the `<command>; <emit-sentinel>` payload for `run_oneshot`.
+///
+/// PowerShell variant wraps the command in `try { … } catch …` so that
+/// a *terminating* error (`Get-Item /nonexistent`, mistyped cmdlet)
+/// still falls through to the sentinel-emit. Without that, a
+/// terminating error skips the trailing statement and run_oneshot
+/// hangs to `--timeout` (exit 124) instead of returning a clean
+/// non-zero exit.
+///
+/// Bash continues past non-zero `exit` of any single command in a
+/// `;`-list, so a plain `cmd; echo "<sentinel>"` is enough.
+fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
+    match kind {
+        ShellKind::PowerShell => format!(
+            "try {{ {cmd} }} catch {{ $LASTEXITCODE = 1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\r"
+        ),
+        ShellKind::Bash => format!("{cmd}; echo \"__WD_DONE_{uuid}__$?\"\r"),
+    }
+}
+
+/// State machine for `run_oneshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // names mirror state semantics intentionally
+enum OneShotState {
+    /// Waiting for the host PowerShell prompt to appear in the buffer.
+    AwaitingHostPrompt,
+    /// `--ssh` is set, host prompt already seen, sent `ssh -tt ALIAS`,
+    /// now waiting for the remote shell prompt.
+    AwaitingRemotePrompt,
+    /// Target prompt seen, formatted command sent, looking for the
+    /// expanded sentinel line.
+    AwaitingSentinel,
+}
+
+/// Drive a single `--exec` run end to end. Owns the writer (for sending
+/// `ssh`-hop and the formatted command), takes the reader by value
+/// (synchronous polling — no separate reader thread, since we don't
+/// also pump stdin like `bridge_loop` does). Heartbeat thread shares
+/// the writer mutex so the host's idle timeout doesn't kick us off
+/// during a slow command.
+///
+/// Returns the exit code that should propagate to `process::exit`:
+/// - `Ok(N)` where N is the command's exit code (0–255 typical).
+/// - `Ok(124)` on timeout (matches `timeout(1)` convention).
+/// - `Err(...)` on a transport / handshake error (caller turns into exit 1).
+fn run_oneshot(
+    writer: Arc<Mutex<Box<dyn Transport>>>,
+    mut reader: Box<dyn Transport>,
+    cmd: &str,
+    ssh: Option<&str>,
+    timeout_secs: u64,
+) -> Result<i32> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let hb_stop = stop.clone();
+    let hb_writer = writer.clone();
+    let heartbeat = thread::spawn(move || heartbeat_thread(hb_writer, hb_stop));
+
+    let uuid = uuid::Uuid::new_v4();
+    let target_kind = if ssh.is_some() {
+        ShellKind::Bash
+    } else {
+        ShellKind::PowerShell
+    };
+    let payload = format_command(&uuid, target_kind, cmd);
+
+    let mut state = OneShotState::AwaitingHostPrompt;
+    // `pending` is the line-walker scratch — only completed lines get
+    // popped out of it. `full_log` accumulates EVERYTHING received so
+    // `clean_stdout` at the end has the whole conversation to slice
+    // (last prompt → drop, echo'ed sentinel-cmd → drop, expanded
+    // sentinel → drop). Without `full_log` we'd lose the prompt/echo
+    // delimiters once they're drained.
+    let mut pending = String::new();
+    let mut full_log = String::new();
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_secs(timeout_secs);
+
+    let mut exit_code: Option<i32> = None;
+
+    while started.elapsed() < max_wait {
+        match reader.recv() {
+            Ok(p) => {
+                if let Message::ShellOutput { data } = p.message {
+                    let text = String::from_utf8_lossy(&data);
+                    pending.push_str(&text);
+                    full_log.push_str(&text);
+                }
+                // Other message types (Heartbeat, etc.) are ignored here.
+            }
+            Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => {
+                // No data this tick — re-check overall timeout below.
+            }
+            Err(e) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = heartbeat.join();
+                return Err(e);
+            }
+        }
+
+        // Walk completed lines (anything terminated by '\n'); leftover
+        // partial line stays in `pending`.
+        while let Some(nl_idx) = pending.find('\n') {
+            let line: String = pending[..nl_idx].trim_end_matches('\r').to_string();
+            pending.drain(..=nl_idx);
+
+            match state {
+                OneShotState::AwaitingHostPrompt => {
+                    if is_powershell_prompt(&line) {
+                        if let Some(alias) = ssh {
+                            send_text(&writer, &format!("ssh -tt {alias}\r"))?;
+                            state = OneShotState::AwaitingRemotePrompt;
+                        } else {
+                            send_text(&writer, &payload)?;
+                            state = OneShotState::AwaitingSentinel;
+                        }
+                    }
+                }
+                OneShotState::AwaitingRemotePrompt => {
+                    if is_remote_prompt(&line) {
+                        send_text(&writer, &payload)?;
+                        state = OneShotState::AwaitingSentinel;
+                    }
+                }
+                OneShotState::AwaitingSentinel => {
+                    if let Some(code) = parse_sentinel(&line, &uuid) {
+                        exit_code = Some(code);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if exit_code.is_some() {
+            break;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = heartbeat.join();
+
+    match exit_code {
+        Some(code) => {
+            let cleaned = clean_stdout(&full_log, &uuid);
+            if !cleaned.is_empty() {
+                use std::io::Write;
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let _ = out.write_all(cleaned.as_bytes());
+                // Add trailing newline so caller shells see a clean line.
+                let _ = out.write_all(b"\n");
+            }
+            Ok(code)
+        }
+        None => {
+            eprintln!(
+                "wiredesk-term: --exec timeout after {}s (no sentinel from host)",
+                timeout_secs
+            );
+            Ok(124)
+        }
+    }
+}
+
+/// Send a text payload as a `ShellInput` packet through the shared
+/// writer mutex. Centralises the lock/encode boilerplate so the
+/// state-machine code in `run_oneshot` reads cleaner.
+fn send_text(writer: &Arc<Mutex<Box<dyn Transport>>>, s: &str) -> Result<()> {
+    let mut t = writer
+        .lock()
+        .map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
+    t.send(&Packet::new(
+        Message::ShellInput { data: s.as_bytes().to_vec() },
+        0,
+    ))
+}
+
+/// Slice the accumulated output buffer down to *just* what `<cmd>`
+/// produced. The wire-stream of one `run_oneshot` execution roughly
+/// looks like:
+///
+/// ```text
+/// [host MOTD / SSH banner / pre-prompt noise]
+/// PS C:\…> | ➜ | user@host$         <- last prompt before our cmd
+/// [echoed command with sentinel format string]   <- only in --ssh path
+/// [actual stdout of <cmd>]
+/// __WD_DONE_<uuid>__<exit_code>      <- expanded sentinel
+/// ```
+///
+/// We:
+///  1. Find the *last* prompt-line (host or remote) before the
+///     sentinel; slice everything after it.
+///  2. Find the sentinel line; slice everything before it.
+///  3. If a line in between contains literal `__WD_DONE_<uuid>__$`
+///     (i.e. the *unexpanded* sentinel — host echoing our stdin),
+///     drop it. Asymmetry: PS host in pipe-mode without PSReadLine
+///     does NOT echo stdin → no echoed line in PS-only path → this
+///     step is a no-op there. With `ssh -tt` the remote shell DOES
+///     echo, and the format string surfaces.
+///  4. Trim trailing newlines for tidy stdout.
+///
+/// Pure helper, returns owned `String`.
+fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
+    let lines: Vec<&str> = buf.split('\n').collect();
+
+    // Find sentinel line index (first match).
+    let sentinel_idx = lines
+        .iter()
+        .position(|l| parse_sentinel(l, uuid).is_some());
+    let upper = sentinel_idx.unwrap_or(lines.len());
+
+    // Find last prompt line strictly *before* the sentinel.
+    let prompt_idx = lines[..upper]
+        .iter()
+        .rposition(|l| is_powershell_prompt(l) || is_remote_prompt(l));
+    let lower = prompt_idx.map(|i| i + 1).unwrap_or(0);
+
+    // Stdin-echo line literal — present in --ssh path because remote
+    // shell echoes stdin. Filter it out.
+    let echo_marker = format!("__WD_DONE_{uuid}__$");
+    let kept: Vec<&str> = lines[lower..upper]
+        .iter()
+        .copied()
+        .filter(|l| !l.contains(&echo_marker))
+        .collect();
+
+    let mut out = kept.join("\n");
+    // Trim trailing newlines / whitespace lines for tidy display.
+    while out.ends_with('\n') || out.ends_with('\r') {
+        out.pop();
+    }
+    out
+}
+
+/// Parse a single line for our sentinel marker. Returns `Some(exit_code)`
+/// only when the line is **exactly** `__WD_DONE_<our-uuid>__<digits>`,
+/// modulo trailing whitespace. Crucially the digit-class match is what
+/// disambiguates the *expanded* sentinel (e.g. `__WD_DONE_xxx__0`) from
+/// the *stdin echo* of the format-string (e.g. `…__WD_DONE_xxx__$LASTEXITCODE`)
+/// — the literal `$LASTEXITCODE` / `$?` won't parse as `i32`.
+///
+/// UUID is included in the match so a third party emitting a sentinel
+/// with a *different* UUID can't fool us.
+fn parse_sentinel(line: &str, uuid: &uuid::Uuid) -> Option<i32> {
+    let prefix = format!("__WD_DONE_{uuid}__");
+    let rest = line.trim().strip_prefix(&prefix)?;
+    rest.parse::<i32>().ok()
+}
+
+/// `true` when `line` looks like a Windows PowerShell prompt:
+/// `PS X:\…> ` or `PS C:\Users\User\path>`. Used by `run_oneshot` to
+/// know when the host shell is ready to accept the formatted command.
+/// Tolerates trailing whitespace / partial-buffer noise from the wire
+/// by trimming first.
+fn is_powershell_prompt(line: &str) -> bool {
+    let s = line.trim_end();
+    if !s.starts_with("PS ") {
+        return false;
+    }
+    // Drive letter check: 4th char must be uppercase ASCII letter, 5th `:`.
+    let bytes = s.as_bytes();
+    if bytes.len() < 6 {
+        return false;
+    }
+    if !bytes[3].is_ascii_uppercase() || bytes[4] != b':' {
+        return false;
+    }
+    s.ends_with('>')
+}
+
+/// `true` when `line` looks like a remote shell prompt (the kind that
+/// follows a successful `ssh -tt` hop). Recognises the common endings:
+/// `$ ` (plain bash), `# ` (root bash), and Starship's `➜` glyph. Other
+/// custom prompts can be added later if needed; the user can also
+/// override via a future `--prompt-regex` flag if false-negatives bite.
+fn is_remote_prompt(line: &str) -> bool {
+    let s = line.trim_end();
+    if s.is_empty() {
+        return false;
+    }
+    s.ends_with('$') || s.ends_with('#') || s.ends_with('➜')
 }
 
 /// Send Hello on the writer, drain HelloAck on the reader. Reader is
@@ -610,6 +934,465 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "heartbeat_thread should exit quickly when stop is already true (took {elapsed:?})"
         );
+    }
+
+    // is_powershell_prompt — recognise the host shell prompt so
+    // run_oneshot knows when to send the formatted command.
+
+    #[test]
+    fn is_powershell_prompt_classic() {
+        assert!(is_powershell_prompt("PS C:\\>"));
+        assert!(is_powershell_prompt("PS C:\\Users\\User>"));
+        assert!(is_powershell_prompt("PS C:\\Users\\User> "));
+    }
+
+    #[test]
+    fn is_powershell_prompt_other_drives() {
+        assert!(is_powershell_prompt("PS D:\\Projects\\foo>"));
+        assert!(is_powershell_prompt("PS Z:\\>"));
+    }
+
+    #[test]
+    fn is_powershell_prompt_rejects_non_prompt() {
+        assert!(!is_powershell_prompt(""));
+        assert!(!is_powershell_prompt("PS"));
+        assert!(!is_powershell_prompt("PS >"));
+        assert!(!is_powershell_prompt("bash$"));
+        assert!(!is_powershell_prompt("> ls"));
+        assert!(!is_powershell_prompt("PS c:\\>")); // lowercase drive — reject
+    }
+
+    // is_remote_prompt — recognise the bash/zsh/Starship prompt that
+    // shows up after `ssh -tt prod-mup` succeeds.
+
+    #[test]
+    fn is_remote_prompt_bash_user() {
+        assert!(is_remote_prompt("user@host:~$"));
+        assert!(is_remote_prompt("user@host:~$ "));
+    }
+
+    #[test]
+    fn is_remote_prompt_bash_root() {
+        assert!(is_remote_prompt("root@host:/#"));
+        assert!(is_remote_prompt("root@host:/# "));
+    }
+
+    #[test]
+    fn is_remote_prompt_starship() {
+        // Starship renders cwd on a separate info-line; the prompt
+        // cursor line is just `➜ `. Real-world traces showed both
+        // shapes coming over the wire — the bare arrow and the
+        // whole prefix-then-arrow on a single line.
+        assert!(is_remote_prompt("➜"));
+        assert!(is_remote_prompt("➜ "));
+        assert!(is_remote_prompt("karlovpg in 🌐 knd02 in ~ ➜ "));
+    }
+
+    // format_command — payload generation for both shell flavours.
+
+    #[test]
+    fn format_command_powershell_wraps_in_try_catch() {
+        let uuid = uuid::Uuid::nil();
+        let s = format_command(&uuid, ShellKind::PowerShell, "Get-ChildItem");
+        assert!(
+            s.contains("try { Get-ChildItem }"),
+            "PS payload must wrap cmd in try/catch: {s}"
+        );
+        assert!(
+            s.contains("catch { $LASTEXITCODE = 1 }"),
+            "PS payload must set $LASTEXITCODE on terminating error: {s}"
+        );
+        assert!(
+            s.contains("$LASTEXITCODE"),
+            "PS sentinel must use $LASTEXITCODE: {s}"
+        );
+        assert!(s.ends_with('\r'), "payload must end with CR for host stdin: {s}");
+    }
+
+    #[test]
+    fn format_command_bash_appends_sentinel() {
+        let uuid = uuid::Uuid::nil();
+        let s = format_command(&uuid, ShellKind::Bash, "docker ps");
+        assert!(s.starts_with("docker ps; echo "), "bash payload prefix: {s}");
+        assert!(
+            s.contains("$?"),
+            "bash sentinel must reference $?: {s}"
+        );
+        assert!(
+            !s.contains("$LASTEXITCODE"),
+            "bash payload must NOT use $LASTEXITCODE: {s}"
+        );
+        assert!(s.ends_with('\r'));
+    }
+
+    #[test]
+    fn format_command_uuid_in_payload() {
+        let uuid_a = uuid::Uuid::nil();
+        let uuid_b = uuid::Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef);
+        let a1 = format_command(&uuid_a, ShellKind::Bash, "ls");
+        let a2 = format_command(&uuid_a, ShellKind::Bash, "ls");
+        let b = format_command(&uuid_b, ShellKind::Bash, "ls");
+        assert_eq!(a1, a2, "same UUID + same args should be deterministic");
+        assert_ne!(a1, b, "different UUID → different payload");
+        assert!(a1.contains(&uuid_a.to_string()));
+        assert!(b.contains(&uuid_b.to_string()));
+    }
+
+    // parse_sentinel — expand-sentinel vs stdin-echo disambiguation.
+
+    // run_oneshot integration tests via SplitPair (mpsc-backed
+    // pair that, unlike MockTransport, gives run_oneshot two
+    // independent halves matching the production wiring).
+
+    use std::sync::mpsc;
+    use wiredesk_protocol::cobs;
+
+    /// Write-only Transport half: pushes COBS-encoded packets into a
+    /// host-bound mpsc channel.
+    struct ClientWriter {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+    impl Transport for ClientWriter {
+        fn send(&mut self, packet: &Packet) -> Result<()> {
+            let raw = packet.to_bytes()?;
+            let encoded = cobs::encode(&raw);
+            self.tx
+                .send(encoded)
+                .map_err(|_| WireDeskError::Transport("split-pair closed".into()))
+        }
+        fn recv(&mut self) -> Result<Packet> {
+            unreachable!("ClientWriter is write-only")
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "split-pair-writer"
+        }
+        fn try_clone(&self) -> Result<Box<dyn Transport>> {
+            Err(WireDeskError::Transport("ClientWriter cannot clone".into()))
+        }
+    }
+
+    /// Read-only Transport half: pulls COBS-encoded packets from a
+    /// host-fed mpsc channel. Translates `recv_timeout` to the
+    /// `recv timeout` error string SerialTransport produces, so
+    /// `run_oneshot`'s timeout-error filter works the same way.
+    struct ClientReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+    }
+    impl Transport for ClientReader {
+        fn send(&mut self, _packet: &Packet) -> Result<()> {
+            unreachable!("ClientReader is read-only")
+        }
+        fn recv(&mut self) -> Result<Packet> {
+            match self.rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(encoded) => {
+                    let raw = cobs::decode(&encoded)
+                        .map_err(|e| WireDeskError::Protocol(format!("cobs: {e}")))?;
+                    Packet::from_bytes(&raw)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err(WireDeskError::Transport("recv timeout".into()))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(WireDeskError::Transport("split-pair closed".into()))
+                }
+            }
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "split-pair-reader"
+        }
+        fn try_clone(&self) -> Result<Box<dyn Transport>> {
+            Err(WireDeskError::Transport("ClientReader cannot clone".into()))
+        }
+    }
+
+    /// Host-side full-duplex helper. Used by tests to script the
+    /// "host" responding to handshake + ShellOpen + prompt + cmd
+    /// + sentinel.
+    struct HostSide {
+        tx_to_client: mpsc::Sender<Vec<u8>>,
+        rx_from_client: mpsc::Receiver<Vec<u8>>,
+    }
+    impl HostSide {
+        fn send(&self, msg: Message) {
+            let p = Packet::new(msg, 0);
+            let raw = p.to_bytes().expect("encode");
+            let encoded = cobs::encode(&raw);
+            self.tx_to_client.send(encoded).expect("host send");
+        }
+        fn emit_chunk(&self, text: &str) {
+            self.send(Message::ShellOutput {
+                data: text.as_bytes().to_vec(),
+            });
+        }
+        fn recv_with_timeout(&self, timeout: Duration) -> Option<Packet> {
+            let encoded = self.rx_from_client.recv_timeout(timeout).ok()?;
+            let raw = cobs::decode(&encoded).ok()?;
+            Packet::from_bytes(&raw).ok()
+        }
+        /// Drain client packets until we hit a `ShellInput` or timeout.
+        /// Skips Heartbeat / ShellClose / Disconnect.
+        fn recv_shell_input(&self, timeout: Duration) -> Option<String> {
+            let deadline = std::time::Instant::now() + timeout;
+            while std::time::Instant::now() < deadline {
+                let remaining = deadline - std::time::Instant::now();
+                if let Some(p) = self.recv_with_timeout(remaining) {
+                    if let Message::ShellInput { data } = p.message {
+                        return Some(String::from_utf8_lossy(&data).to_string());
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    fn make_split_pair() -> (
+        Arc<Mutex<Box<dyn Transport>>>,
+        Box<dyn Transport>,
+        HostSide,
+    ) {
+        let (c2h_tx, c2h_rx) = mpsc::channel();
+        let (h2c_tx, h2c_rx) = mpsc::channel();
+        let writer: Box<dyn Transport> = Box::new(ClientWriter { tx: c2h_tx });
+        let reader: Box<dyn Transport> = Box::new(ClientReader { rx: h2c_rx });
+        let writer = Arc::new(Mutex::new(writer));
+        let host = HostSide {
+            tx_to_client: h2c_tx,
+            rx_from_client: c2h_rx,
+        };
+        (writer, reader, host)
+    }
+
+    // Tests call `run_oneshot` directly (bypassing `run()`), so
+    // there is no Hello/HelloAck/ShellOpen exchange to mock —
+    // the host script just emits the host prompt and proceeds.
+
+    #[test]
+    fn run_oneshot_happy_path_powershell() {
+        let (writer, reader, host) = make_split_pair();
+        let host_thread = thread::spawn(move || {
+            host.emit_chunk("PS C:\\Users\\User>\r\n");
+            // Wait for the formatted command from the client.
+            let cmd = host
+                .recv_shell_input(Duration::from_secs(2))
+                .expect("client should send formatted command");
+            assert!(cmd.contains("Get-ChildItem"), "cmd payload: {cmd:?}");
+            assert!(cmd.contains("__WD_DONE_"));
+            assert!(cmd.contains("$LASTEXITCODE"));
+            // Echo the command back (PS pipe-mode actually doesn't,
+            // but echoing here is a no-op: clean_stdout will simply
+            // not find the literal echo line and skip the echo strip).
+            host.emit_chunk("file1\r\nfile2\r\n");
+            // Pull the UUID from the cmd payload to build the expanded
+            // sentinel.
+            let uuid = extract_uuid_from_payload(&cmd);
+            host.emit_chunk(&format!("__WD_DONE_{uuid}__0\r\n"));
+        });
+
+        let code = run_oneshot(writer, reader, "Get-ChildItem", None, 5)
+            .expect("run_oneshot ok");
+        assert_eq!(code, 0);
+        host_thread.join().expect("host thread");
+    }
+
+    #[test]
+    fn run_oneshot_happy_path_ssh() {
+        let (writer, reader, host) = make_split_pair();
+        let host_thread = thread::spawn(move || {
+            host.emit_chunk("PS C:\\>\r\n");
+            // Client should now send `ssh -tt prod\r`.
+            let ssh_cmd = host
+                .recv_shell_input(Duration::from_secs(2))
+                .expect("client should send ssh -tt");
+            assert!(ssh_cmd.starts_with("ssh -tt prod"), "got: {ssh_cmd:?}");
+            // Emit MOTD + remote prompt.
+            host.emit_chunk("Welcome to Ubuntu\r\nMOTD line\r\n➜ \r\n");
+            // Client should send the formatted bash command.
+            let cmd = host
+                .recv_shell_input(Duration::from_secs(2))
+                .expect("client should send formatted bash command");
+            assert!(cmd.contains("docker ps"), "cmd payload: {cmd:?}");
+            assert!(cmd.contains("$?"), "bash sentinel uses $?: {cmd:?}");
+            // Mimic remote bash echoing the command line + emitting
+            // output + expanded sentinel.
+            let uuid = extract_uuid_from_payload(&cmd);
+            host.emit_chunk(&format!(
+                "docker ps; echo \"__WD_DONE_{uuid}__$?\"\r\nrow1\r\nrow2\r\n__WD_DONE_{uuid}__0\r\n"
+            ));
+        });
+
+        let code = run_oneshot(writer, reader, "docker ps", Some("prod"), 5)
+            .expect("run_oneshot ok");
+        assert_eq!(code, 0);
+        host_thread.join().expect("host thread");
+    }
+
+    #[test]
+    fn run_oneshot_timeout_returns_124() {
+        let (writer, reader, host) = make_split_pair();
+        let host_thread = thread::spawn(move || {
+            host.emit_chunk("PS C:\\>\r\n");
+            // Consume the cmd but never emit a sentinel.
+            let _cmd = host.recv_shell_input(Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(2_000));
+        });
+
+        let code = run_oneshot(writer, reader, "Start-Sleep 60", None, 1)
+            .expect("run_oneshot ok");
+        assert_eq!(code, 124, "expected timeout exit code");
+        host_thread.join().expect("host thread");
+    }
+
+    #[test]
+    fn run_oneshot_propagates_nonzero_exit() {
+        let (writer, reader, host) = make_split_pair();
+        let host_thread = thread::spawn(move || {
+            host.emit_chunk("PS C:\\>\r\n");
+            let cmd = host
+                .recv_shell_input(Duration::from_secs(2))
+                .expect("cmd");
+            let uuid = extract_uuid_from_payload(&cmd);
+            host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
+        });
+
+        let code = run_oneshot(writer, reader, "exit 7", None, 5).expect("ok");
+        assert_eq!(code, 7);
+        host_thread.join().expect("host thread");
+    }
+
+    /// Extract the UUID embedded in the `format_command` payload so
+    /// the host-side test thread can build the matching expanded
+    /// sentinel.
+    fn extract_uuid_from_payload(payload: &str) -> String {
+        let marker = "__WD_DONE_";
+        let start = payload.find(marker).expect("uuid marker") + marker.len();
+        let after = &payload[start..];
+        let end = after.find("__").expect("uuid end");
+        after[..end].to_string()
+    }
+
+    // clean_stdout — strip prompts, echoed sentinel, and the
+    // expanded sentinel from the accumulated wire output.
+
+    #[test]
+    fn clean_stdout_ps_only_mode() {
+        let uuid = uuid::Uuid::nil();
+        let buf = format!(
+            "Some pre-prompt noise\nPS C:\\Users\\User>\nactual line 1\nactual line 2\n__WD_DONE_{uuid}__0\n"
+        );
+        assert_eq!(clean_stdout(&buf, &uuid), "actual line 1\nactual line 2");
+    }
+
+    #[test]
+    fn clean_stdout_ssh_mode_strips_echo() {
+        let uuid = uuid::Uuid::nil();
+        let buf = format!(
+            "MOTD line\n➜ \ndocker ps; echo \"__WD_DONE_{uuid}__$?\"\nrow1\nrow2\n__WD_DONE_{uuid}__0\n"
+        );
+        let out = clean_stdout(&buf, &uuid);
+        assert!(!out.contains("__WD_DONE"), "echoed sentinel must be stripped: {out:?}");
+        assert!(!out.contains("docker ps;"), "echoed cmd line should be gone: {out:?}");
+        assert_eq!(out, "row1\nrow2");
+    }
+
+    #[test]
+    fn clean_stdout_no_prompt_returns_pre_sentinel() {
+        // If no prompt was ever observed (edge case — host emitted only
+        // the sentinel), we keep everything before the sentinel.
+        let uuid = uuid::Uuid::nil();
+        let buf = format!("output line\n__WD_DONE_{uuid}__0\n");
+        assert_eq!(clean_stdout(&buf, &uuid), "output line");
+    }
+
+    #[test]
+    fn clean_stdout_uuid_disambiguates() {
+        // Two sentinels in buffer with different UUIDs; only ours
+        // is treated as the cut-off.
+        let ours = uuid::Uuid::nil();
+        let theirs = uuid::Uuid::from_u128(1);
+        let buf = format!(
+            "PS C:\\>\nleftover from earlier\n__WD_DONE_{theirs}__0\nour output\n__WD_DONE_{ours}__0\n"
+        );
+        let out = clean_stdout(&buf, &ours);
+        assert!(out.contains("our output"));
+        // The `theirs` sentinel is not stripped — it's part of "before our cut",
+        // so it shows up in the result. That's acceptable: we're scoped to
+        // *our* sentinel; if a stray sentinel from another agent shows up
+        // earlier in the buffer we don't claim authority over it.
+        assert!(out.contains(&theirs.to_string()));
+    }
+
+    #[test]
+    fn clean_stdout_no_sentinel_returns_post_prompt() {
+        // Defensive: helper called before sentinel arrived (caller
+        // would normally only invoke after a match, but still).
+        let uuid = uuid::Uuid::nil();
+        let buf = "PS C:\\>\nstuff\n";
+        assert_eq!(clean_stdout(buf, &uuid), "stuff");
+    }
+
+    #[test]
+    fn parse_sentinel_matches_zero() {
+        let uuid = uuid::Uuid::nil();
+        let s = format!("__WD_DONE_{uuid}__0");
+        assert_eq!(parse_sentinel(&s, &uuid), Some(0));
+    }
+
+    #[test]
+    fn parse_sentinel_matches_nonzero() {
+        let uuid = uuid::Uuid::nil();
+        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__7"), &uuid), Some(7));
+        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__124"), &uuid), Some(124));
+        // Tolerate trailing whitespace / CR.
+        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__9\r"), &uuid), Some(9));
+    }
+
+    #[test]
+    fn parse_sentinel_rejects_stdin_echo() {
+        // Host PS echoing the format-string back: literal $LASTEXITCODE.
+        let uuid = uuid::Uuid::nil();
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__$LASTEXITCODE"), &uuid),
+            None
+        );
+        // Bash echo: literal $?
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__$?"), &uuid),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_sentinel_rejects_other_uuid() {
+        let ours = uuid::Uuid::nil();
+        let theirs = uuid::Uuid::from_u128(1);
+        let line = format!("__WD_DONE_{theirs}__0");
+        assert_eq!(parse_sentinel(&line, &ours), None);
+    }
+
+    #[test]
+    fn parse_sentinel_rejects_garbage() {
+        let uuid = uuid::Uuid::nil();
+        assert_eq!(parse_sentinel("", &uuid), None);
+        assert_eq!(parse_sentinel("hello world", &uuid), None);
+        assert_eq!(parse_sentinel("__WD_DONE__0", &uuid), None);
+        // Wrong tail format.
+        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__"), &uuid), None);
+        // Non-numeric tail.
+        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__abc"), &uuid), None);
+    }
+
+    #[test]
+    fn is_remote_prompt_rejects_non_prompt() {
+        assert!(!is_remote_prompt(""));
+        assert!(!is_remote_prompt("Welcome to Ubuntu 20.04.6 LTS"));
+        assert!(!is_remote_prompt("karlovpg in 🌐 knd02 in ~"));
+        assert!(!is_remote_prompt("PS C:\\>"));
     }
 }
 

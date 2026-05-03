@@ -179,6 +179,35 @@ Host dev
 
 Full TTY support on the host side itself (so `vim`, `htop`, `git commit`-editor, `psql` password prompts work locally on the host's shell) is a planned ConPTY refactor — out of MVP scope.
 
+### Run a single command (`--exec` mode)
+
+For scripts and AI-agents that just need "execute one command, give me stdout, give me the exit code", use `--exec`:
+
+```bash
+# On host PowerShell:
+wd --exec "Get-ChildItem"
+wd --exec "exit 7"     # exits with 7
+
+# Through SSH to a remote box:
+wd --exec --ssh prod-mup "docker ps"
+wd --exec --ssh prod-mup "tail -100 /var/log/syslog"
+```
+
+This skips raw mode and the interactive bridge entirely. The CLI sends the command wrapped in a sentinel (`<cmd>; "__WD_DONE_<uuid>__$LASTEXITCODE"` for PS, `<cmd>; echo "__WD_DONE_<uuid>__$?"` for bash post-ssh), reads the host's output until the sentinel line is seen, strips the prompt / banner / echoed command, and exits with the same code the command produced. Default timeout 30 s, override with `--timeout SECONDS`. Timeout returns exit 124 (`timeout(1)` convention).
+
+For sub-second persistent SSH (so consecutive `--ssh prod-mup` calls don't re-handshake every time), set up OpenSSH ControlMaster on the host's `~/.ssh/config`:
+
+```
+Host prod-mup
+    HostName 10.x.x.x
+    User <user>
+    ControlMaster auto
+    ControlPath C:/Users/User/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+The first `wd --exec --ssh prod-mup ...` call creates the multiplexed connection; the next ten minutes of calls re-use it. No daemon required on the WireDesk side.
+
 `wiredesk-client` and `wiredesk-term` are **mutually exclusive** — they share the same serial port. Quit the GUI app before launching the CLI (or vice versa); whichever starts second will fail to open the port. Simultaneous GUI + CLI requires a multiplexing daemon, which is intentionally not in this MVP's scope.
 
 ## Protocol
