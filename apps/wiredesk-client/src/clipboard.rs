@@ -241,20 +241,34 @@ pub(crate) fn apply_outgoing_progress(
     outgoing_total: &Arc<AtomicU64>,
 ) {
     match msg {
-        Message::ClipOffer { total_len, .. } => {
+        Message::ClipOffer { format, total_len } => {
             outgoing_total.store(*total_len as u64, Ordering::Relaxed);
             outgoing_progress.store(0, Ordering::Relaxed);
+            log::info!("clipboard.send START format={format} total={total_len} bytes");
         }
         Message::ClipChunk { data, .. } => {
-            let new_progress = outgoing_progress
-                .fetch_add(data.len() as u64, Ordering::Relaxed)
-                + data.len() as u64;
+            let prev = outgoing_progress.fetch_add(data.len() as u64, Ordering::Relaxed);
+            let new_progress = prev + data.len() as u64;
+            let total = outgoing_total.load(Ordering::Relaxed);
+            // Milestone logging — every 25% of total.
+            if total > 0 {
+                let prev_q = (prev * 4) / total;
+                let new_q = (new_progress * 4) / total;
+                if new_q > prev_q {
+                    log::info!(
+                        "clipboard.send {}/{} bytes ({}%)",
+                        new_progress,
+                        total,
+                        (new_progress * 100) / total
+                    );
+                }
+            }
             // Codex C4: when the last chunk hits the total, zero both
             // counters so the status-line stops showing "Sending clipboard
             // — 1024/1024 KB (100%)" until the next transfer or
             // disconnect. Without this the UI sticks at 100% indefinitely.
-            let total = outgoing_total.load(Ordering::Relaxed);
             if total > 0 && new_progress >= total {
+                log::info!("clipboard.send DONE {} bytes", new_progress);
                 outgoing_total.store(0, Ordering::Relaxed);
                 outgoing_progress.store(0, Ordering::Relaxed);
             }
@@ -533,7 +547,7 @@ impl IncomingClipboard {
         self.received_total = 0;
         self.incoming_total.store(total_len as u64, Ordering::Relaxed);
         self.incoming_progress.store(0, Ordering::Relaxed);
-        log::debug!("clipboard: incoming offer format={format} of {total_len} bytes");
+        log::info!("clipboard.recv START format={format} total={total_len} bytes");
     }
 
     pub fn on_chunk(&mut self, index: u16, data: Vec<u8>) {
@@ -543,7 +557,7 @@ impl IncomingClipboard {
         // - chunks arrive after a successful commit() zeroed expected_len.
         // Without this guard, BTreeMap::insert grows unbounded (memory leak).
         if self.expected_len == 0 {
-            log::debug!("clipboard: chunk received without active offer, dropping");
+            log::warn!("clipboard.recv chunk idx={index} dropped (no active offer)");
             return;
         }
 
@@ -555,12 +569,32 @@ impl IncomingClipboard {
         if self.received.insert(index, data).is_none() {
             // saturating_add: a malicious peer could otherwise overflow u32
             // by spamming chunks past expected_len before the >= guard fires.
+            let prev_total = self.received_total;
             self.received_total = self.received_total.saturating_add(added);
             self.incoming_progress
                 .fetch_add(added as u64, Ordering::Relaxed);
+            // Milestone logging — every 25% of expected_len. Helps diagnose
+            // mid-transfer stalls without spamming the log on every chunk.
+            if self.expected_len > 0 {
+                let prev_q = (prev_total * 4) / self.expected_len.max(1);
+                let new_q = (self.received_total * 4) / self.expected_len.max(1);
+                if new_q > prev_q {
+                    log::info!(
+                        "clipboard.recv {}/{} bytes ({}%)",
+                        self.received_total,
+                        self.expected_len,
+                        (self.received_total * 100) / self.expected_len.max(1)
+                    );
+                }
+            }
         }
 
         if self.received_total >= self.expected_len {
+            log::info!(
+                "clipboard.recv DONE {} bytes ({} chunks) → commit",
+                self.received_total,
+                self.received.len()
+            );
             self.commit();
         }
     }
