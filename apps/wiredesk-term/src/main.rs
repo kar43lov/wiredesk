@@ -52,12 +52,15 @@ struct Args {
     #[arg(long, default_value = "wiredesk-term")]
     name: String,
 
-    /// Run COMMAND non-interactively on the host shell, print clean
-    /// stdout, exit with the command's exit code. When set, all the
-    /// interactive bridge machinery (raw mode, stdin pump,
-    /// cooked-mode line discipline) is skipped.
-    #[arg(long, value_name = "COMMAND")]
-    exec: Option<String>,
+    /// Run a single command non-interactively on the host shell,
+    /// print clean stdout, exit with the command's exit code. When
+    /// set, all the interactive bridge machinery (raw mode, stdin
+    /// pump, cooked-mode line discipline) is skipped. The command
+    /// itself comes as the *positional* COMMAND argument so the
+    /// natural shape `wd --exec --ssh ALIAS "docker ps"` works
+    /// without clap eating the next flag as `--exec`'s value.
+    #[arg(long)]
+    exec: bool,
 
     /// When --exec is set, first chain `ssh -tt ALIAS` on the host
     /// shell, wait for the remote prompt, and run COMMAND there.
@@ -71,6 +74,10 @@ struct Args {
     /// returning exit code 124 (the same convention as `timeout(1)`).
     #[arg(long, default_value = "30")]
     timeout: u64,
+
+    /// Command to run when --exec is set. Ignored otherwise.
+    #[arg(value_name = "COMMAND")]
+    command: Option<String>,
 }
 
 fn main() {
@@ -89,7 +96,25 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<i32> {
-    if args.exec.is_none() {
+    // Validate --exec / COMMAND coupling before opening serial — fast
+    // fail with a clear message, no half-opened state.
+    if args.exec && args.command.is_none() {
+        return Err(WireDeskError::Input(
+            "--exec requires a COMMAND positional argument, e.g. `wd --exec \"echo hello\"`".into(),
+        ));
+    }
+    if !args.exec && args.command.is_some() {
+        return Err(WireDeskError::Input(
+            "COMMAND is only valid together with --exec".into(),
+        ));
+    }
+    if args.ssh.is_some() && !args.exec {
+        return Err(WireDeskError::Input(
+            "--ssh is only valid together with --exec".into(),
+        ));
+    }
+
+    if !args.exec {
         eprintln!(
             "wiredesk-term: connecting to {} @ {} baud (Ctrl+] to quit)",
             args.port, args.baud
@@ -111,7 +136,7 @@ fn run(args: &Args) -> Result<i32> {
     // In --exec mode keep the banner + cheatsheet quiet — that
     // output is for interactive users, not for AI agents reading
     // stderr.
-    handshake(&writer, &mut reader, &args.name, args.exec.is_some())?;
+    handshake(&writer, &mut reader, &args.name, args.exec)?;
 
     // Open shell on Host
     {
@@ -125,7 +150,9 @@ fn run(args: &Args) -> Result<i32> {
     // Branch: --exec runs the non-interactive sentinel-driven path
     // (no raw mode, no stdin, return command's exit code). Default
     // path is the interactive bridge.
-    let result_code = if let Some(cmd) = &args.exec {
+    let result_code = if args.exec {
+        // Validation above guarantees command is Some().
+        let cmd = args.command.as_deref().expect("validated above");
         run_oneshot(writer.clone(), reader, cmd, args.ssh.as_deref(), args.timeout)
     } else {
         // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
@@ -257,8 +284,18 @@ enum ShellKind {
 /// for the same reason (see `bridge_loop`'s line-flush).
 fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
     match kind {
+        // `$ErrorActionPreference='Stop'` flips PS *non-terminating*
+        // errors into terminating ones for the duration of this line.
+        // Without it, `Get-Item /nonexistent` writes to the error
+        // stream, returns control, and the catch block never fires —
+        // `$LASTEXITCODE` stays 0 → `--exec` returns 0 for an
+        // obviously-failed command (the original AC2a regression).
+        // Setting it inline keeps the scope local: assignments inside
+        // an expression-statement only apply until the statement
+        // separator. `$ErrorActionPreference` resets back to whatever
+        // PS had before once the line ends.
         ShellKind::PowerShell => format!(
-            "$LASTEXITCODE=0; try {{ {cmd} }} catch {{ $LASTEXITCODE=1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
+            "$LASTEXITCODE=0; $ErrorActionPreference='Stop'; try {{ {cmd} }} catch {{ $LASTEXITCODE=1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
         ),
         ShellKind::Bash => format!("{cmd}; echo \"__WD_DONE_{uuid}__$?\"\n"),
     }
