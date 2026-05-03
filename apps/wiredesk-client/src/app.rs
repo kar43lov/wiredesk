@@ -910,6 +910,32 @@ impl WireDeskApp {
                 );
             });
 
+        // Clipboard transfer progress bars — visible inside capture / fullscreen
+        // because the macOS menu bar is hidden in fullscreen and chrome panel
+        // is collapsed. Without these, an active transfer is invisible to the
+        // user once they engage capture. Render only when a transfer is in
+        // flight (format_progress returns None when total == 0).
+        let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
+        let out_tot = self.outgoing_total.load(Ordering::Relaxed);
+        let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
+        let inc_tot = self.incoming_total.load(Ordering::Relaxed);
+        let any_active = out_tot > 0 || inc_tot > 0;
+        if any_active {
+            ui.add_space(8.0);
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(out_cur, out_tot),
+                format_progress("Sending clipboard", out_cur, out_tot),
+            ) {
+                ui.add(egui::ProgressBar::new(ratio).text(text));
+            }
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(inc_cur, inc_tot),
+                format_progress("Receiving clipboard", inc_cur, inc_tot),
+            ) {
+                ui.add(egui::ProgressBar::new(ratio).text(text));
+            }
+        }
+
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             ui.heading("WireDesk — input forwarded to Host");
