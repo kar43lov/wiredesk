@@ -45,6 +45,37 @@ pub struct ClientConfig {
     /// defaults — losing the user's settings on first run after upgrade.
     #[serde(deserialize_with = "deserialize_preferred_monitor")]
     pub preferred_monitor: Option<String>,
+    /// Send images from Mac → Host. When false, the poll thread skips
+    /// `get_image()` entirely (text continues to sync as before). Useful to
+    /// isolate one direction during diagnostics or when image sync misbehaves.
+    #[serde(default = "default_true")]
+    pub send_images: bool,
+    /// Accept incoming images from Host → Mac. When false, incoming
+    /// `ClipOffer{format=PNG_IMAGE}` is rejected on receipt (state stays clean).
+    #[serde(default = "default_true")]
+    pub receive_images: bool,
+    /// Send text from Mac → Host. Useful to disable when an app like
+    /// Whispr Flow / dictation tools writes transcribed text into the
+    /// macOS clipboard on every utterance — without this toggle every
+    /// dictation message turns into a clipboard sync.
+    #[serde(default = "default_true")]
+    pub send_text: bool,
+    /// Accept incoming text from Host → Mac.
+    #[serde(default = "default_true")]
+    pub receive_text: bool,
+    /// Compensate Karabiner-Elements `left_command ↔ left_option` swap when
+    /// forwarding modifiers and detecting local hotkeys. With Karabiner
+    /// remapping the two keys at the HID level (so the same physical
+    /// keyboard works identically on macOS and Windows), our CGEventTap
+    /// sees Cmd where the user pressed Option and vice versa — Cmd+V then
+    /// arrives on Host as Alt+V instead of the paste combo. Enabling this
+    /// re-swaps modifiers locally so Host gets the user-intended scancodes.
+    #[serde(default)]
+    pub swap_option_command: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Custom deserializer for `preferred_monitor` that accepts either a string
@@ -87,6 +118,11 @@ impl Default for ClientConfig {
             height: 1440,
             client_name: "wiredesk-client".to_string(),
             preferred_monitor: None,
+            send_images: true,
+            receive_images: true,
+            send_text: true,
+            receive_text: true,
+            swap_option_command: false,
         }
     }
 }
@@ -180,6 +216,8 @@ mod tests {
         assert_eq!(cfg.height, 1440);
         assert_eq!(cfg.client_name, "wiredesk-client");
         assert!(cfg.preferred_monitor.is_none());
+        assert!(cfg.send_images);
+        assert!(cfg.receive_images);
     }
 
     #[test]
@@ -191,6 +229,11 @@ mod tests {
             height: 1080,
             client_name: "test-client".to_string(),
             preferred_monitor: None,
+            send_images: true,
+            receive_images: true,
+            send_text: true,
+            receive_text: true,
+            swap_option_command: false,
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -311,6 +354,11 @@ mod tests {
             height: 720,
             client_name: "from-toml".to_string(),
             preferred_monitor: None,
+            send_images: true,
+            receive_images: true,
+            send_text: true,
+            receive_text: true,
+            swap_option_command: false,
         }
     }
 

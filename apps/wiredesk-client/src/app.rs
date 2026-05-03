@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,11 @@ pub enum TransportEvent {
     ShellOutput(Vec<u8>),
     ShellExit(i32),
     ShellError(String),
+    /// Transient user-facing notification — surfaced as an inline toast in the
+    /// chrome panel for ~3 seconds. Used by the clipboard poll thread when an
+    /// oversize image is dropped (so the user knows their copy didn't make it
+    /// to the peer), but kept generic for any future single-line warning.
+    Toast(String),
 }
 
 pub struct WireDeskApp {
@@ -106,6 +113,43 @@ pub struct WireDeskApp {
     // "Save & Restart" contract for port/baud/etc. Stays fixed for the
     // process lifetime; user must restart to pick up a new value.
     runtime_preferred_monitor: Option<String>,
+    // Clipboard transfer progress counters. Shared with the clipboard
+    // poll thread (outgoing) and the reader thread's IncomingClipboard
+    // (incoming). Zero means "no transfer in flight"; non-zero `total`
+    // unlocks the "Sending/Receiving image — N/M KB (P%)" status line.
+    // Reset to zero on `TransportEvent::Disconnected` so a half-finished
+    // transfer doesn't leave the progress display stuck after the link
+    // drops.
+    outgoing_progress: Arc<AtomicU64>,
+    outgoing_total: Arc<AtomicU64>,
+    incoming_progress: Arc<AtomicU64>,
+    incoming_total: Arc<AtomicU64>,
+    /// Runtime image-clipboard toggles (Settings). Both flags share their
+    /// `Arc` with the poll thread (`send_images`) and the reader thread's
+    /// `IncomingClipboard` (`receive_images`) — toggling here takes effect on
+    /// the next poll tick / next incoming offer, no restart required. Text
+    /// clipboard sync is unaffected by either flag.
+    send_images: Arc<AtomicBool>,
+    receive_images: Arc<AtomicBool>,
+    send_text: Arc<AtomicBool>,
+    receive_text: Arc<AtomicBool>,
+    /// Karabiner-Elements `left_command ↔ left_option` compensation. Shared
+    /// with the keyboard tap thread; flipping the Settings checkbox takes
+    /// effect on the next FlagsChanged / KeyDown the tap sees.
+    swap_option_command: Arc<AtomicBool>,
+    /// User-pressed Cancel for the outgoing transfer. Shared with the
+    /// writer thread, which drops queued ClipOffer/ClipChunk packets while
+    /// the flag is set and re-arms it once the stale batch drains.
+    outgoing_cancel: Arc<AtomicBool>,
+    /// Same shape, for the incoming transfer. The reader thread drops
+    /// further chunks of the current offer and resets reassembly state.
+    incoming_cancel: Arc<AtomicBool>,
+    /// Generic 3-second toast surfaced by `TransportEvent::Toast`. Currently
+    /// used by the clipboard poll thread to warn the user when a copied image
+    /// exceeds `MAX_IMAGE_BYTES` (Task 7b). Distinct from `save_toast`, which
+    /// belongs to the Settings panel — this one is chrome-wide so it shows up
+    /// regardless of whether the Settings collapse is open.
+    transient_toast: Option<(String, Instant)>,
 }
 
 // ---- UI palette / sizing constants ---------------------------------------
@@ -143,6 +187,79 @@ const CAPTURE_BTN_MIN_SIZE: egui::Vec2 = egui::vec2(200.0, 32.0);
 /// Numbered-step glyph size on the Accessibility permission screen.
 const STEP_NUMBER_SIZE: f32 = 20.0;
 
+/// Render a clipboard-transfer progress fragment for the chrome status row.
+///
+/// Returns `None` when there's no active transfer (`total == 0`) so the
+/// caller can skip rendering altogether — this is the common case once the
+/// poll thread has zeroed counters after a finished send. When a transfer is
+/// in flight, returns a string like `"Sending clipboard — 340/780 KB (43%)"` so
+/// the user can see that something is moving across the wire.
+///
+/// `current` is clamped to `total` so a brief race (writer thread atomically
+/// adding before total wraps in tests) never produces "1100%".
+///
+/// Codex iter3 E5: unit selection — sub-KB transfers (short Cmd+C of a few
+/// dozen chars) used to render as "0/0 KB" because of integer division. Now
+/// we switch to raw bytes when `total < 1024`, and KB otherwise.
+pub fn format_progress(action: &str, current: u64, total: u64) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let cur = current.min(total);
+    let pct = (cur * 100) / total;
+    if total < 1024 {
+        Some(format!("{action} — {cur}/{total} B ({pct}%)"))
+    } else {
+        let cur_kb = cur / 1024;
+        let tot_kb = total / 1024;
+        Some(format!("{action} — {cur_kb}/{tot_kb} KB ({pct}%)"))
+    }
+}
+
+/// Compute fill ratio for a clipboard progress bar.
+///
+/// Returns `Some(ratio)` in 0.0..=1.0 when a transfer is active (`total > 0`),
+/// or `None` when idle. Overshoot is clamped to 1.0.
+/// Render a progress bar with an inline Cancel button on its right.
+/// Clicking the button flips `cancel_flag` to true; the writer/reader
+/// thread observes the flag and drops the in-flight clipboard packets,
+/// then re-arms the flag itself once the stale batch is drained. The
+/// caller decides whether the bar should appear at all (None ratio →
+/// no row); we only render once we know there's something to show.
+fn render_progress_row(
+    ui: &mut egui::Ui,
+    ratio: f32,
+    text: &str,
+    cancel_flag: &Arc<AtomicBool>,
+    progress_atomic: &Arc<AtomicU64>,
+    total_atomic: &Arc<AtomicU64>,
+) {
+    ui.horizontal(|ui| {
+        let bar_width = ui.available_width() - 70.0;
+        ui.add_sized(
+            [bar_width.max(120.0), 18.0],
+            egui::ProgressBar::new(ratio).text(text),
+        );
+        if ui
+            .small_button("✕ Cancel")
+            .on_hover_text("Abort this transfer")
+            .clicked()
+        {
+            cancel_flag.store(true, Ordering::Release);
+            progress_atomic.store(0, Ordering::Relaxed);
+            total_atomic.store(0, Ordering::Relaxed);
+        }
+    });
+}
+
+pub fn progress_ratio(current: u64, total: u64) -> Option<f32> {
+    if total == 0 {
+        return None;
+    }
+    let cur = current.min(total);
+    Some(cur as f32 / total as f32)
+}
+
 /// Static list of macOS Accessibility-permission setup steps shown on the
 /// permission screen. Pure helper so the texts can be unit-tested
 /// independently of any UI rendering — a copy-paste typo in step 1 (the
@@ -158,12 +275,24 @@ pub fn permission_steps() -> &'static [&'static str] {
 }
 
 impl WireDeskApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_config: ClientConfig,
         events_rx: mpsc::Receiver<TransportEvent>,
         outgoing_tx: mpsc::Sender<Packet>,
         tap_events_rx: mpsc::Receiver<TapEvent>,
         tap_handle: TapHandle,
+        outgoing_progress: Arc<AtomicU64>,
+        outgoing_total: Arc<AtomicU64>,
+        incoming_progress: Arc<AtomicU64>,
+        incoming_total: Arc<AtomicU64>,
+        send_images: Arc<AtomicBool>,
+        receive_images: Arc<AtomicBool>,
+        send_text: Arc<AtomicBool>,
+        receive_text: Arc<AtomicBool>,
+        swap_option_command: Arc<AtomicBool>,
+        outgoing_cancel: Arc<AtomicBool>,
+        incoming_cancel: Arc<AtomicBool>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -203,6 +332,18 @@ impl WireDeskApp {
             last_dock_icon_apply: None,
             dock_icon_apply_count: 0,
             runtime_preferred_monitor,
+            outgoing_progress,
+            outgoing_total,
+            incoming_progress,
+            incoming_total,
+            send_images,
+            receive_images,
+            send_text,
+            receive_text,
+            swap_option_command,
+            outgoing_cancel,
+            incoming_cancel,
+            transient_toast: None,
         }
     }
 
@@ -240,6 +381,7 @@ impl WireDeskApp {
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
         let mut dirty = false;
         let mut want_save = false;
+        let mut want_save_and_restart = false;
         let mut want_reset = false;
         let mut want_refresh_ports = false;
         let available_ports = self.available_ports.clone();
@@ -401,6 +543,61 @@ impl WireDeskApp {
                 });
             });
 
+            // ---- Clipboard group ----
+            // Two independent toggles for image clipboard sync. Text always
+            // syncs (cheap, low-bandwidth). Each checkbox flips a runtime
+            // `Arc<AtomicBool>` shared with the poll thread (send) and
+            // IncomingClipboard (receive) — takes effect immediately, no
+            // restart needed. Save persists the values to config.toml.
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Clipboard").strong());
+                let mut send_imgs = cfg.send_images;
+                if ui
+                    .checkbox(&mut send_imgs, "Send images (Mac → Host)")
+                    .changed()
+                {
+                    cfg.send_images = send_imgs;
+                    self.send_images.store(send_imgs, Ordering::Relaxed);
+                    dirty = true;
+                }
+                let mut recv_imgs = cfg.receive_images;
+                if ui
+                    .checkbox(&mut recv_imgs, "Receive images (Host → Mac)")
+                    .changed()
+                {
+                    cfg.receive_images = recv_imgs;
+                    self.receive_images.store(recv_imgs, Ordering::Relaxed);
+                    dirty = true;
+                }
+                let mut send_txt = cfg.send_text;
+                if ui
+                    .checkbox(&mut send_txt, "Send text (Mac → Host)")
+                    .changed()
+                {
+                    cfg.send_text = send_txt;
+                    self.send_text.store(send_txt, Ordering::Relaxed);
+                    dirty = true;
+                }
+                let mut recv_txt = cfg.receive_text;
+                if ui
+                    .checkbox(&mut recv_txt, "Receive text (Host → Mac)")
+                    .changed()
+                {
+                    cfg.receive_text = recv_txt;
+                    self.receive_text.store(recv_txt, Ordering::Relaxed);
+                    dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Toggle individual directions per content type. \
+                         Useful when an app like Whispr Flow keeps writing \
+                         transcribed text into the clipboard.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            });
+
             // ---- System group ----
             ui.group(|ui| {
                 ui.label(egui::RichText::new("System").strong());
@@ -416,10 +613,36 @@ impl WireDeskApp {
                         dirty = true;
                     }
                 });
+                let mut swap_oc = cfg.swap_option_command;
+                if ui
+                    .checkbox(&mut swap_oc, "Swap ⌥/⌘ on Host (Karabiner-Elements compensation)")
+                    .changed()
+                {
+                    cfg.swap_option_command = swap_oc;
+                    self.swap_option_command.store(swap_oc, Ordering::Relaxed);
+                    dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Enable if you remap left_command ↔ left_option in \
+                         Karabiner-Elements so the same physical keyboard \
+                         works on macOS and Windows. Without this WireDesk \
+                         forwards Cmd+V as Alt+V to Host. Cmd+Esc / Cmd+Enter \
+                         keep firing on the same physical key you press today.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
             });
 
             ui.horizontal(|ui| {
                 let save_enabled = self.config_dirty || dirty;
+                if ui
+                    .add_enabled(save_enabled, egui::Button::new("Save && Restart"))
+                    .clicked()
+                {
+                    want_save_and_restart = true;
+                }
                 if ui
                     .add_enabled(save_enabled, egui::Button::new("Save"))
                     .clicked()
@@ -456,6 +679,18 @@ impl WireDeskApp {
                         "Saved. Restart WireDesk to apply.".to_string(),
                         Instant::now(),
                     ));
+                }
+                Err(e) => {
+                    self.save_toast =
+                        Some((format!("Save failed: {e}"), Instant::now()));
+                }
+            }
+        }
+        if want_save_and_restart {
+            match self.pending_config.save() {
+                Ok(()) => {
+                    self.config_dirty = false;
+                    crate::restart::restart_app();
                 }
                 Err(e) => {
                     self.save_toast =
@@ -788,6 +1023,46 @@ impl WireDeskApp {
                 );
             });
 
+        // Clipboard transfer progress bars — visible inside capture / fullscreen
+        // because the macOS menu bar is hidden in fullscreen and chrome panel
+        // is collapsed. Without these, an active transfer is invisible to the
+        // user once they engage capture. Render only when a transfer is in
+        // flight (format_progress returns None when total == 0).
+        let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
+        let out_tot = self.outgoing_total.load(Ordering::Relaxed);
+        let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
+        let inc_tot = self.incoming_total.load(Ordering::Relaxed);
+        let any_active = out_tot > 0 || inc_tot > 0;
+        if any_active {
+            ui.add_space(8.0);
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(out_cur, out_tot),
+                format_progress("Sending clipboard", out_cur, out_tot),
+            ) {
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.outgoing_cancel,
+                    &self.outgoing_progress,
+                    &self.outgoing_total,
+                );
+            }
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(inc_cur, inc_tot),
+                format_progress("Receiving clipboard", inc_cur, inc_tot),
+            ) {
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.incoming_cancel,
+                    &self.incoming_progress,
+                    &self.incoming_total,
+                );
+            }
+        }
+
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             ui.heading("WireDesk — input forwarded to Host");
@@ -892,11 +1167,26 @@ impl eframe::App for WireDeskApp {
                     self.screen_h = screen_h;
                     self.mapper.set_screen_size(screen_w, screen_h);
                     self.status_msg = format!("connected to {}", self.host_name);
+                    // Counter reset for re-handshake-without-prior-Disconnect
+                    // is owned by `reader_thread` now (Codex iter5): clearing
+                    // counters from the UI thread on Connected raced with a
+                    // peer ClipOffer arriving in the same frame and wiped the
+                    // freshly stored `incoming_total` mid-transfer. The reader
+                    // already zeroes both directions at HelloAck before
+                    // emitting this event, so the status row starts clean.
                 }
                 TransportEvent::Disconnected(reason) => {
                     self.state = ConnectionState::Disconnected;
                     self.capturing = false;
                     self.status_msg = format!("disconnected: {reason}");
+                    // Drop any in-flight clipboard progress — the wire is
+                    // gone, the receiver will reset its IncomingClipboard
+                    // separately, and a stale "Sending image — 30%" line in
+                    // the status row would mislead the user.
+                    self.outgoing_progress.store(0, Ordering::Relaxed);
+                    self.outgoing_total.store(0, Ordering::Relaxed);
+                    self.incoming_progress.store(0, Ordering::Relaxed);
+                    self.incoming_total.store(0, Ordering::Relaxed);
                 }
                 TransportEvent::ClipboardFromHost(text) => {
                     self.clipboard_text = text;
@@ -914,6 +1204,9 @@ impl eframe::App for WireDeskApp {
                 TransportEvent::ShellError(msg) => {
                     self.shell_open = false;
                     self.shell_append_output(format!("\n[shell error: {msg}]\n").as_bytes());
+                }
+                TransportEvent::Toast(msg) => {
+                    self.transient_toast = Some((msg, Instant::now()));
                 }
             }
         }
@@ -974,6 +1267,13 @@ impl eframe::App for WireDeskApp {
                 return;
             }
 
+            // Wrap chrome content in a ScrollArea so the Settings panel
+            // can grow past the window's initial height — the user can
+            // either resize the window or scroll without losing buttons
+            // (Save / Save & Restart / Reset) below the fold.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // 28px icon next to the heading — branding consistency with
                 // the Win host title-bar icon. egui downscales the 1024×1024
@@ -1010,6 +1310,54 @@ impl eframe::App for WireDeskApp {
             });
 
             ui.label(format!("Serial: {}", self.runtime_serial_port));
+
+            // Clipboard progress line — only renders when a transfer is
+            // active. Outgoing and incoming are both possible at the same
+            // time (peer copies an image while we copy text); show both in
+            // a single row so the chrome layout stays compact.
+            // Codex C4: labels are intentionally generic ("clipboard", not
+            // "image") — the same counters track text and image transfers
+            // and a text Cmd+C briefly flashed "Sending image — 0/512 B"
+            // before being dropped. The status-line consumer only knows
+            // bytes/total, not the format (which lives one layer down in
+            // the Message::ClipOffer that's already long-since enqueued).
+            // Visual progress bars per direction. ProgressBar fills from
+            // left as bytes hit the wire; text inside the bar shows
+            // "Sending/Receiving clipboard — N/M KB (P%)". Bars only render
+            // when their respective transfer is active (total > 0).
+            let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
+            let out_tot = self.outgoing_total.load(Ordering::Relaxed);
+            let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
+            let inc_tot = self.incoming_total.load(Ordering::Relaxed);
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(out_cur, out_tot),
+                format_progress("Sending clipboard", out_cur, out_tot),
+            ) {
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.outgoing_cancel,
+                    &self.outgoing_progress,
+                    &self.outgoing_total,
+                );
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            if let (Some(ratio), Some(text)) = (
+                progress_ratio(inc_cur, inc_tot),
+                format_progress("Receiving clipboard", inc_cur, inc_tot),
+            ) {
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.incoming_cancel,
+                    &self.incoming_progress,
+                    &self.incoming_total,
+                );
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+
             ui.separator();
 
             // Capture toggle — primary action, prominent. RichText size
@@ -1198,6 +1546,22 @@ impl eframe::App for WireDeskApp {
                     ui.colored_label(COLOR_WARNING, msg);
                 }
             }
+            // Generic transient toast (Task 7b) — currently the
+            // "image too large" warning from the clipboard poll thread.
+            // Rendered in warning-orange to match the other inline alert
+            // hue. After the 3-second TTL elapses, drop the value so the
+            // chrome doesn't keep allocating layout space for an empty row.
+            if self
+                .transient_toast
+                .as_ref()
+                .is_some_and(|(_, when)| when.elapsed() >= Duration::from_secs(3))
+            {
+                self.transient_toast = None;
+            }
+            if let Some((msg, _)) = &self.transient_toast {
+                ui.colored_label(COLOR_WARNING, msg);
+            }
+                }); // ScrollArea
         });
 
         // Handle captured input — push to outgoing channel (non-blocking).
@@ -1279,12 +1643,40 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::channel();
         let (_ev_tx, ev_rx) = mpsc::channel();
         let (tap_tx, tap_rx) = mpsc::channel();
-        let tap_handle = keyboard_tap::start(out_tx.clone(), tap_tx);
+        let swap_flag = Arc::new(AtomicBool::new(false));
+        let (synth_tx, _synth_rx) = mpsc::channel();
+        let (kick_tx, _kick_rx) = mpsc::channel();
+        let tap_handle = keyboard_tap::start(
+            out_tx.clone(),
+            tap_tx,
+            swap_flag.clone(),
+            synth_tx,
+            kick_tx,
+        );
+        let outgoing_cancel = Arc::new(AtomicBool::new(false));
+        let incoming_cancel = Arc::new(AtomicBool::new(false));
         let cfg = ClientConfig {
             port: "/dev/null".into(),
             ..ClientConfig::default()
         };
-        WireDeskApp::new(cfg, ev_rx, out_tx, tap_rx, tap_handle)
+        WireDeskApp::new(
+            cfg,
+            ev_rx,
+            out_tx,
+            tap_rx,
+            tap_handle,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            swap_flag,
+            outgoing_cancel,
+            incoming_cancel,
+        )
     }
 
     #[test]
@@ -1366,6 +1758,87 @@ mod tests {
     #[test]
     fn permission_steps_first_mentions_system_settings() {
         assert!(permission_steps()[0].contains("System Settings"));
+    }
+
+    #[test]
+    fn format_progress_active() {
+        // Mid-transfer. KB rounding via integer division, percentage as
+        // floor((cur*100)/total). 340 KiB / 780 KiB ≈ 43.5% → 43%.
+        // Codex C4: label is "Sending clipboard" (generic) — "image" was
+        // wrong for text transfers and confused users.
+        let s = format_progress("Sending clipboard", 340 * 1024, 780 * 1024).expect("active");
+        assert!(s.contains("Sending clipboard"), "action prefix missing: {s}");
+        assert!(s.contains("340"), "current KB missing: {s}");
+        assert!(s.contains("780"), "total KB missing: {s}");
+        assert!(s.contains("43%"), "percentage missing: {s}");
+    }
+
+    #[test]
+    fn format_progress_idle() {
+        // total == 0 → no progress to show.
+        assert!(format_progress("Sending clipboard", 0, 0).is_none());
+        // total == 0 with stale `current` from a prior transfer should also
+        // hide — the writer thread should already have zeroed both, but
+        // belt-and-braces against ordering races.
+        assert!(format_progress("Sending clipboard", 256, 0).is_none());
+    }
+
+    #[test]
+    fn format_progress_complete() {
+        // Boundary: cur == total exactly → 100%.
+        let s = format_progress("Receiving clipboard", 1024, 1024).expect("active");
+        assert!(s.contains("100%"), "expected 100% at boundary: {s}");
+    }
+
+    #[test]
+    fn format_progress_clamps_overshoot() {
+        // Defensive: if `current` somehow exceeds `total` (atomic ordering
+        // race in tests), don't render >100%.
+        let s = format_progress("Sending clipboard", 2048, 1024).expect("active");
+        assert!(s.contains("100%"), "overshoot must clamp to 100%: {s}");
+    }
+
+    #[test]
+    fn format_progress_sub_kb_uses_bytes() {
+        // Codex iter3 E5: a short Cmd+C (e.g. 50-byte string) used to
+        // render as "0/0 KB" because of integer division. Now totals
+        // under 1 KiB render in raw bytes.
+        let s = format_progress("Sending clipboard", 25, 50).expect("active");
+        assert!(s.contains("25/50 B"), "expected raw bytes for sub-KB: {s}");
+        assert!(s.contains("50%"), "percentage missing: {s}");
+        assert!(!s.contains("KB"), "must not say KB for sub-KB total: {s}");
+    }
+
+    #[test]
+    fn format_progress_exactly_1kb_uses_kb() {
+        // Boundary: total == 1024 → KB units (the `< 1024` predicate).
+        let s = format_progress("Sending clipboard", 512, 1024).expect("active");
+        assert!(s.contains("KB"), "1 KiB total must use KB units: {s}");
+        assert!(s.contains("0/1 KB"), "expected 0/1 KB at 512/1024: {s}");
+    }
+
+    #[test]
+    fn progress_ratio_idle_returns_none() {
+        assert!(progress_ratio(0, 0).is_none());
+        assert!(progress_ratio(256, 0).is_none());
+    }
+
+    #[test]
+    fn progress_ratio_active_in_unit_range() {
+        let r = progress_ratio(256, 1024).expect("active");
+        assert!((r - 0.25).abs() < f32::EPSILON, "expected 0.25, got {r}");
+    }
+
+    #[test]
+    fn progress_ratio_complete_is_one() {
+        let r = progress_ratio(1024, 1024).expect("active");
+        assert!((r - 1.0).abs() < f32::EPSILON, "expected 1.0, got {r}");
+    }
+
+    #[test]
+    fn progress_ratio_overshoot_clamped() {
+        let r = progress_ratio(2048, 1024).expect("active");
+        assert!((r - 1.0).abs() < f32::EPSILON, "overshoot must clamp to 1.0, got {r}");
     }
 
     #[test]

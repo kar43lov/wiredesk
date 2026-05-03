@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WireDesk — утилита для удалённого управления мышью, клавиатурой и clipboard на Windows-машине через serial-соединение (без сети). Видео — отдельно через HDMI capture card.
 
-Контекст: на Host (Windows 11) стоит ПО "Континент", которое блокирует все сетевые интерфейсы. Serial (COM-порт) не блокируется.
+Контекст: на Host (Windows 11) стоит «Континент-АП» (СКЗИ), который через WFP-фильтры на уровне ядра блокирует **всю IP-связь** мимо своего туннеля — включая локальный LAN (Wi-Fi, Ethernet) и любой USB CDC NCM / Plugable bridge cable / Thunderbolt Networking, потому что все они создают сетевой интерфейс. Подтверждено живым тестом 2026-05-02 (см. `docs/briefs/ft232h-upgrade.md`): Win и Mac в одной Wi-Fi 192.168.1.0/24, route table показывает default через Wi-Fi, но `ping 192.168.1.98` → `General failure`, `Test-NetConnection ... -Port 5001` → `TcpTestSucceeded: False`. Допустимы только non-network каналы: USB CDC ACM (текущий serial), WinUSB / libusb bulk, USB HID — Континент их не трогает.
 
-**Статус:** MVP работает end-to-end. Соединение, мышь, клавиатура (включая кириллицу), переключение языка через Cmd+Space, двунаправленный буфер обмена через Cmd+C/Cmd+V (системные шорткаты перехватываются на macOS-уровне через CGEventTap), fullscreen по Cmd+Enter с per-monitor selection и auto-engage/release capture — проверено живьём. Launcher UI: tray-агент на Windows (nwg) с auto-detect CH340 + Save & Restart, `.app` bundle на macOS, TOML config на обеих сторонах, file logging + autostart + single-instance на Windows. 174 теста проходят.
+**Статус:** MVP+ работает end-to-end. Соединение, мышь, клавиатура (включая кириллицу), переключение языка через Cmd+Space, двунаправленный буфер обмена через Cmd+C/Cmd+V (текст + PNG-картинки до 1 MB encoded; LRU text history + раздельные slots per-format гасят Whispr-Flow / clipboard-manager echo loops; системные шорткаты перехватываются на macOS-уровне через CGEventTap, FlagsChanged events pass-through так что Ctrl+Option-style modifier-only hotkeys работают и в capture mode). **Karabiner-Elements `left_command ↔ left_option` compensation** через Settings toggle — physical events swap'аются перед forward'ом, hotkey detection accept'ает либо Cmd, либо Option flag. **Synthetic Cmd+V dispatcher** (Whispr Flow): synthetic events детектятся через `EVENT_SOURCE_STATE_ID`, очередятся в `synth_tx`, dispatcher ждёт окончания Mac→Host clipboard sync (4s max + 400ms grace) перед emit'ом — Host paste'ит actual recognized text, не previous. Tap kicks poll thread на synthetic для немедленного pickup'а нового clipboard'а; CLIP_POLL_INTERVAL 200ms. Fullscreen по Cmd+Enter с per-monitor selection и auto-engage/release capture. Mac UI: progress bars с **Cancel-кнопкой** в окне и в capture banner, NSStatusItem в menu bar (W / ↑% / ↓%), Settings → System (`Swap ⌥/⌘`, `Save & Restart`) и Clipboard 4-checkbox toggle, ScrollArea для длинного Settings. Win host: tray-agent (nwg) с **Restart** entry, Save & Restart, balloon notification на oversize image, double-click tray открывает Settings. **Adaptive heartbeat timeout** 6s/30s — продлевается во время clipboard transfer'а чтобы heartbeat не тонул в chunk traffic'е. 147 client + 93 host тестов проходят.
 
 ## Build & Test
 
@@ -179,10 +179,22 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 ### Clipboard sync
 
 Симметрично на обеих сторонах:
-- Polling раз в 500мс через `arboard::Clipboard::get_text()`.
-- Хэш последнего известного содержимого — защита от петли (когда мы сами записали входящий текст в локальный clipboard).
-- ClipOffer { format=0 UTF-8 text, total_len } + N×ClipChunk { index, data ≤ 256B }, лимит 256 KB на буфер.
-- Сборка через `BTreeMap<u16, Vec<u8>>` — устойчиво к out-of-order (хотя serial доставляет по порядку).
+- Polling раз в 500мс. **Probing text + image в одном tick'е** — OS clipboard может содержать оба формата (typical Cmd+C на rich content). Каждый dedup'ится в свой slot независимо.
+- **Два формата:** `FORMAT_TEXT_UTF8 = 0` (UTF-8 строка, лимит 256 KB), `FORMAT_PNG_IMAGE = 1` (PNG-encoded RGBA, лимит `MAX_IMAGE_BYTES = 1 MB` после encode). Константы — в `wiredesk-protocol::message`.
+- ClipOffer { format, total_len } + N×ClipChunk { index, data ≤ 256B }. Сборка через `BTreeMap<u16, Vec<u8>>` — устойчиво к out-of-order.
+- **Loop avoidance — `LastSeen` struct** с раздельными слотами per-type: `text_history: VecDeque<u64>` (LRU, последние 4 hash'а), `image: Option<u64>`, `oversize_image: Option<u64>`. Mac `Arc<Mutex<LastSeen>>`, Host plain field. Single-slot enum (старый `LastKind`) ломался: (a) text-write erased image hash → loop, (b) Whispr-style inject pattern (save→write→paste→restore) re-shлёт `prev` после каждого цикла. LRU text-history покрывает Whispr `prev → new → prev → newer → prev` без resend'ов. Хэш для image считается **от RGBA bytes**, не от encoded PNG: round-trip arboard PNG↔RGBA нестабилен (NSPasteboard TIFF round-trip меняет байты).
+- **Pre-stamp on startup.** При создании poll thread (Mac) и `ClipboardSync::with_counters` (Host) текущий clipboard читается, hash стампится в `LastSeen` БЕЗ отправки. Без этого каждый restart re-uploads то что юзер оставил в clipboard от прошлой сессии.
+- **Image encode/decode:** `image 0.25` (`default-features=false, features=["png"]`), helpers `encode_rgba_to_png` / `decode_png_to_rgba` дублируются на обеих сторонах. Encode в poll thread (~50–150 ms). Decode имеет `Limits::max_alloc = 64 MB` + post-decode проверка `(w*h*4) ≤ 64 MB` (PNG-bomb защита: палеточный 8K×8K decode'ит в 256 MB RGBA).
+- **Settings → Clipboard panel** (Mac UI): 4 независимых runtime-toggle через `Arc<AtomicBool>` — `send_images`, `receive_images`, `send_text`, `receive_text`. Без рестарта. Полезно для apps вроде Whispr Flow / Maccy которые часто пишут в clipboard.
+- **Status UI на Mac:** (1) `format_progress("Sending clipboard", cur, total)` рендерится как `egui::ProgressBar` с inline текстом — в chrome panel И в capture banner (для fullscreen где menu bar скрыт macOS). (2) `NSStatusItem` справа от часов через `objc2-app-kit::NSStatusBar::systemStatusBar` + `dispatch_async_f` на main queue. Idle: «W», active: «↑43%» / «↓67%». Click handler — TODO (custom NSObject subclass через `objc2::declare_class!` нужен).
+- **Tray balloon notification (Win)** при oversize: `SessionStatus::Notification(String)` slot в `StatusState` — отдельно от persistent `Connected/Waiting/Disconnected`, не overwrites tray icon color и settings status row. Surface через `nwg::TrayNotification::show(msg, title, WARNING_ICON|LARGE_ICON, None)`.
+- **Tray double-click → Settings (Win):** nwg 1.0.13 не имеет нативного double-click event для tray. Workaround: `OnMousePress(MousePressLeftUp)` + `Cell<Option<Instant>>` tracking previous up — два up в окне 500ms = double-click.
+- **Pass-through modifier-only events в capture mode.** `CGEventType::FlagsChanged` callback теперь возвращает `Keep` (не `Drop`) после forward'а scancodes на Host. Это позволяет Whispr Flow / push-to-talk dictation apps trigger'нуться на Ctrl+Option, при этом letter keys всё ещё intercept'ятся через `KeyDown` → Drop.
+- **Edge case: interleaved offers.** Новый ClipOffer пришёл во время незавершённой reassembly → `log::warn!("incoming offer aborted previous reassembly")` + `received.clear()` + reset counters.
+- **Edge case: peer disconnect.** При `TransportEvent::Disconnected` (Mac) или потере связи (Host) — `IncomingClipboard::reset()` обнуляет expected_len / format / received / counters. Sender'ская `last_kind` сохраняется (после reconnect не нужно повторно слать тот же контент).
+- **Edge case: oversized peer offer.** `on_offer` отвергает `total_len > MAX_*` ДО reassembly arming — без этого peer мог запросить 4GB allocation в `Vec::with_capacity` через корраптный/враждебный offer.
+- **Edge case: non-contiguous chunks / length mismatch.** `commit()` проверяет (a) chunk indices contiguous 0..N, (b) reassembled `buf.len() == expected_len`. Иначе log warn + reset. Защита от silent corruption.
+- **TransferOverlay (Win) отключён** в main.rs. Topmost popup-window даже invisible забирал z-order у других окон (Total Commander не активировался кликом). Прогресс на host'е — только в логе + balloon notification на oversize.
 - Mac side: `apps/wiredesk-client/src/clipboard.rs`. Host side: `apps/wiredesk-host/src/clipboard.rs`. Не вынесено в общий crate — duplication приемлема.
 
 ### Keyboard hijack (macOS)
@@ -234,17 +246,23 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 - **Scancodes, not VK codes** — ввод как hardware scancodes, работает независимо от раскладки Host (включая кириллицу).
 - **Extended scancodes** (0xE0xx) — в SendInput требуют `KEYEVENTF_EXTENDEDKEY` flag.
 - **Cmd → Ctrl** mapping в `egui_modifiers_to_u8` и `cg_flag_change_to_scancodes`. Win-key combos (Win+Space, Win+L) — через CGEventTap они теперь работают напрямую (Cmd+Space на Mac → Win+Space на Host), но кнопки в UI оставлены как fallback для случая когда permission ещё не granted.
+- **Synthetic vs physical events.** Tap callback читает `EventField::EVENT_SOURCE_STATE_ID` (1=HIDSystemState→physical, 0=CombinedSessionState→synthetic). Karabiner-Elements remap'ит на HID-уровне → physical events приходят post-Karabiner. Synthetic CGEventPost (Whispr Flow, TextExpander) bypass'ает Karabiner и несёт литеральный modifier intent. Swap toggle применяется только к physical; synthetic forward'ится со standard mapping'ом + ad-hoc modifier wrap (synthetic'е приходят без preceding FlagsChanged, иначе Host видит orphan letter scancodes).
+- **Karabiner ⌥/⌘ swap toggle.** `swap_option_command: bool` config поднимает `cg_flag_change_to_scancodes_swapped` для FlagsChanged forward'а и `disable()` cleanup'а — Cmd flag → Alt scancode, Option flag → Ctrl scancode. Hotkey detection (`is_cmd_enter`/`is_release_capture`) при swap=true принимает либо `CG_FLAG_COMMAND`, либо `CG_FLAG_ALT` (но не оба) — Cmd+Esc/Cmd+Enter работают на той же физической кнопке независимо от того remap'нута ли клавиатура.
+- **Synthetic Cmd+V dispatcher** (`apps/wiredesk-client/src/main.rs`). Whispr Flow's Cmd+V опережает Mac→Host clipboard sync — Host paste'ит prev. Решение: tap не emit'ит synthetic Cmd+V напрямую — упаковывает в `SyntheticCombo` (`Vec<Packet>` из modifier-press + key-press) и push'ит в `synth_tx`. Dispatcher thread ждёт пока poll thread сбросит `outgoing_text_in_flight=false` (max 4s), плюс grace 400ms (для Host commit), потом emit'ит. Дополнительно tap kicks poll через `poll_kick_tx` mpsc channel — poll wakes immediately и читает clipboard, не дожидаясь sleep'а. CLIP_POLL_INTERVAL 200ms.
+- **Adaptive heartbeat timeout (host)**. `Session::heartbeat_timeout()` возвращает 30s когда `clipboard.transfer_in_flight()` (есть active reassembly или непустой `pending_outbox`), иначе 6s. CH340 bidirectional saturation топит heartbeats peer'а во время image transfer'а и строгий 6s давал false-positive disconnect'ы.
 - **115200 baud, не 921600** — на дешёвых CH340 с Dupont-проводами 921600 даёт single-bit corruption (видели "bad magic" с XOR 0x80). 115200 надёжно. Bandwidth budget ~11 KB/s, реально ~1 KB/s для ввода + редкие всплески под clipboard/shell.
 - **Leading 0x00 + drain on open** — серьёзный фикс для startup transient: при открытии порта CH340 выпускает мусорный байт, который иначе склеивается с первым кадром. Решено в `SerialTransport::send` (ведущий 0x00) + `SerialTransport::open` (drain OS буфера).
 - **MockTransport** — mpsc, протокол-тесты без железа. `try_clone` для Mock возвращает ошибку (не нужно в тестах).
 - **Aspect ratio correction** в `InputMapper::normalize_mouse` — letterbox/pillarbox для разной геометрии окна и Host.
+- **Cancel-кнопки на progress bars** (UI helper `render_progress_row`, Mac). `outgoing_cancel`/`incoming_cancel: Arc<AtomicBool>` shared с writer/reader threads. Writer drop'ает queued ClipOffer/ClipChunk без записи на провод и self-arms flag после non-clip packet или timeout (queue empty). Reader на первом ClipChunk при cancel=true делает `incoming_clip.reset()` + drop, flag clear'ится на следующем ClipOffer. Лог компактный — один summary INFO в start, один в end с counter'ом (per-chunk даёт 700+ строк за 180 KB image cancel). Без protocol message: Host видит partial offer, self-correct'ится на следующем ClipOffer'е.
+- **Self-relaunch helper** `apps/wiredesk-client/src/restart.rs`. На macOS spawn'ит `open -n WireDesk.app` если бинарь внутри bundle, иначе spawn'ит `current_exe`. Затем `std::process::exit(0)`. Используется Save & Restart кнопкой в Settings (Mac). Аналогичный pattern на Win — Restart entry в tray menu делает `Command::new(current_exe).spawn() + nwg::stop_thread_dispatch()`.
 
 ### Известные ограничения
 
 - **Ctrl+Alt+Del** через SendInput не сработает на Windows (защищено ядром, нужен SAS API в SYSTEM-сервисе или Group Policy `SoftwareSASGeneration`). Кнопка в UI есть, но ничего не делает реально. Альтернативы — Win+L (lock), Ctrl+Shift+Esc (Task Manager).
 - **macOS Secure Input** — поля паролей в любом приложении на Mac отключают CGEventTap системно. Capture-mode перестаёт работать пока окно с паролем активно. Workaround — переключиться в другое окно перед стартом capture.
 - **Accessibility permission** требуется и привязана к binary path. После перекомпиляции в новую папку — заново добавить в System Settings → Privacy & Security → Accessibility.
-- **Картинки/файлы в clipboard** — не передаются, только текст.
+- **Файлы (file URLs / CF_HDROP)** — не передаются. Картинки PNG передаются (≤1 MB encoded; FullHD-скриншот ~50–100 сек на 11 KB/s wire).
 - **Видео** — никогда. Ставь HDMI capture card отдельно.
 - **Save+Restart pattern**: changes в settings UI требуют перезапуск процесса (нет live-reconnect supervisor'а). Это компромисс ради простоты — race conditions с открытым serial-портом и работающей session избегаются.
 - **Mac autostart** — не реализован (только manual launch из дока / Spotlight). Login Items / launchctl plist — follow-up.
@@ -261,6 +279,25 @@ Host USB-Serial ←→ null-modem (TX-RX crossed, GND-GND, VCC isolated) ←→ 
 
 CH340 USB-to-TTL кабели: красный=VCC (изолировать), синий=GND, зелёный=TX, белый=RX. Полная инструкция: `docs/setup.md`.
 
+## Channel speed upgrade — pre-decided plan
+
+Брейншторм 2026-05-02 (session "improve-FT232H") зафиксировал: текущий канал CH340 @ 115200 baud (~11 KB/s) — узкое место для clipboard'а (1 МБ картинка едет ~90 сек). Возможные пути ускорения проанализированы и ранжированы по effort/impact, см. `docs/briefs/ft232h-upgrade.md`.
+
+| План | Что | Effort | Impact | Confidence | Статус |
+|---|---|---|---|---|---|
+| **A** (выбран) | CH340 → FT232H breakout, baud 115200 → 3 000 000 (до 12 Mbps на FT4232H) | ~1 день, ~$30 железа | ×100, clipboard 1MB <2 сек | **high** | ждёт покупки железа |
+| **B** (Plan B) | WinUSB через Pi Zero 2W в gadget mode как мост, custom USB device class | 2–3 недели, ~$25 | ~30 MB/s, потенциально видео | medium | активируется если A флакает |
+| **C** (отклонён) | Thunderbolt AIC + TB DMA peer-to-peer вне TCP/IP стека | 1–2 месяца, дорого | 20+ Gbps, экзотика | low | отклонён: нет TB-header'а на B760M, undocumented API |
+| **D** (отклонён) | Не делать ничего | 0 | 0 | high | отклонён: clipboard-боль ощутима |
+
+**Закрытые тупики** (зачем-то проверены, чтобы не возвращались в будущих сессиях):
+- TCP/UDP по Wi-Fi/Ethernet/Thunderbolt Networking/USB CDC NCM/Plugable bridge cable — **все режутся WFP-фильтрами Континента** на уровне ядра, route-table обманчива. Нет смысла пробовать ни одно из них как канал WireDesk.
+- Thunderbolt в принципе — Host-материнка MAXSUN MS-Challenger B760M не имеет TB-header'а, AIC без него работать не будет. Mac mini M4 имеет 3×TB4 40 Gbps, но это бесполезно при отсутствии TB на Win.
+
+**Что делать когда железо приедет:** см. секцию "Первые шаги" в брифе. Никаких архитектурных изменений в коде — только правка `baud` в `config.toml` обеих сторон.
+
 ## Plan
 
 `docs/plans/wiredesk-mvp.md` — full MVP plan with protocol spec, etapes, and risk analysis.
+
+`docs/briefs/ft232h-upgrade.md` — бриф апгрейда канала (готов к /planning:make когда железо будет).

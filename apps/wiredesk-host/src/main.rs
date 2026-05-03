@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::{CommandFactory, Parser};
 
+use clipboard::ProgressCounters;
 use config::HostConfig;
 use session_thread::SessionStatus;
 
@@ -122,28 +123,39 @@ fn main() {
     log::info!("screen: {}x{}", cfg.width, cfg.height);
 
     let (status_tx, status_rx) = mpsc::channel();
-    let _session = session_thread::spawn(cfg.clone(), status_tx);
 
-    let last_status = Arc::new(Mutex::new(SessionStatus::Waiting));
+    // Shared progress atomics — session thread writes; overlay UI thread
+    // (Windows) reads. Default-initialised so dev loop on macOS still gets
+    // a valid bundle (no overlay there, but Session needs the structure).
+    let counters = ProgressCounters::default();
+    let _session = session_thread::spawn(cfg.clone(), status_tx, counters.clone());
+
+    let last_status = Arc::new(Mutex::new(ui::status_bridge::StatusState::default()));
 
     #[cfg(windows)]
-    run_windows(cfg, status_rx, last_status);
+    run_windows(cfg, status_rx, last_status, counters);
 
     #[cfg(not(windows))]
-    run_dev_loop(status_rx, last_status);
+    {
+        let _ = counters; // unused in dev loop, keep clone for symmetry
+        run_dev_loop(status_rx, last_status);
+    }
 }
 
 #[cfg(not(windows))]
 fn run_dev_loop(
     status_rx: mpsc::Receiver<SessionStatus>,
-    last: Arc<Mutex<SessionStatus>>,
+    last: Arc<Mutex<ui::status_bridge::StatusState>>,
 ) {
     let _bridge = ui::status_bridge::spawn_no_notice(status_rx, last.clone());
     log::info!("session thread spawned; running dev-mode foreground loop (no tray)");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
         if let Ok(g) = last.lock() {
-            log::info!("session status: {}", g.label());
+            log::info!(
+                "session status: {}",
+                g.persistent.to_session_status().label()
+            );
         }
     }
 }
@@ -152,7 +164,8 @@ fn run_dev_loop(
 fn run_windows(
     cfg: HostConfig,
     status_rx: mpsc::Receiver<SessionStatus>,
-    last: Arc<Mutex<SessionStatus>>,
+    last: Arc<Mutex<ui::status_bridge::StatusState>>,
+    counters: ProgressCounters,
 ) {
     use native_windows_gui as nwg;
 
@@ -207,6 +220,24 @@ fn run_windows(
         }
     };
 
+    // TransferOverlay disabled — even when hidden, the topmost popup
+    // window interfered with z-order/focus on the user's setup (Total
+    // Commander couldn't be activated, mouse input froze when TC took
+    // focus). The progress UI lives on the Mac client only for now;
+    // host-side surfacing is reserved for a follow-up that uses a
+    // less-intrusive mechanism (tray tooltip update, balloon
+    // notification, or a non-topmost minimal status window).
+    //
+    // Counters keep flowing through `ProgressCounters` for the Mac
+    // status bar / progress bar to consume — this only removes the
+    // host's own visualization.
+    log::info!("run_windows: TransferOverlay disabled (focus interference workaround)");
+    let _ = &counters; // silence unused-variable when overlay is off
+    let overlay: Option<std::rc::Rc<std::cell::RefCell<ui::transfer_overlay::TransferOverlay>>> =
+        None;
+    let _overlay_event_handler: Option<nwg::EventHandler> = None;
+    let _ = (&overlay, &_overlay_event_handler);
+
     log::info!("run_windows: building cross-thread Notice");
     let mut notice = nwg::Notice::default();
     if let Err(e) = nwg::Notice::builder()
@@ -228,26 +259,82 @@ fn run_windows(
     let settings_clone = settings.clone();
     let last_clone = last.clone();
 
+    // Tray icon does NOT raise WM_LBUTTONDBLCLK as a distinct nwg event —
+    // it only delivers WM_LBUTTONUP / WM_LBUTTONDOWN as
+    // `OnMousePress(MousePressLeftUp/Down)`. Track the previous left-up
+    // timestamp and treat two left-ups within `DOUBLE_CLICK_WINDOW` as a
+    // double-click. Win32's default double-click window is 500 ms (via
+    // `GetDoubleClickTime`); we hard-code that here — querying the API
+    // would just add a syscall to a hot path that's already user-driven.
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+    const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+    let last_left_up_for_handler: Cell<Option<Instant>> = Cell::new(None);
+
     // CRITICAL: don't hold a `tray_clone.borrow()` across the whole match —
     // `OnNotice` arm needs `borrow_mut()` to update the icon, and a second
     // borrow on a RefCell already-borrowed → panic → process abort. Take
     // the borrow lazily inside each arm.
     let event_handler = nwg::full_bind_event_handler(&tray_handle, move |evt, _evt_data, handle| {
         use nwg::Event as E;
+        use nwg::MousePressEvent as MP;
         match evt {
             E::OnNotice => {
-                // Status bridge fired — update tray icon + settings status.
-                if let Ok(g) = last_clone.lock() {
-                    if let Err(e) = tray_clone.borrow_mut().update_status(&g) {
+                // Status bridge fired. Two independent updates:
+                //   1) pending notification (transient balloon, doesn't
+                //      change persistent UI state),
+                //   2) persistent status (tray icon color + settings row).
+                // Take the notification first under a brief lock, drop it,
+                // then read persistent under a fresh lock for the icon.
+                let notification = if let Ok(mut g) = last_clone.lock() {
+                    g.pending_notification.take()
+                } else {
+                    None
+                };
+                if let Some(msg) = notification {
+                    if let Err(e) = tray_clone
+                        .borrow_mut()
+                        .update_status(&SessionStatus::Notification(msg))
+                    {
+                        log::warn!("tray balloon failed: {e}");
+                    }
+                }
+                let persistent = last_clone
+                    .lock()
+                    .ok()
+                    .map(|g| g.persistent.to_session_status());
+                if let Some(s) = persistent {
+                    if let Err(e) = tray_clone.borrow_mut().update_status(&s) {
                         log::warn!("tray icon update failed: {e}");
                     }
-                    settings_clone.borrow_mut().set_status(&g);
+                    settings_clone.borrow_mut().set_status(&s);
                 }
             }
             E::OnContextMenu => {
                 let t = tray_clone.borrow();
                 if handle == t.tray.handle {
                     t.show_popup();
+                }
+            }
+            E::OnMousePress(MP::MousePressLeftUp) => {
+                // Synthetic double-click detection. Only react when the
+                // event came from the tray icon — `MousePressLeftUp` also
+                // fires for left-clicks on the popup menu host window.
+                let is_tray = {
+                    let t = tray_clone.borrow();
+                    handle == t.tray.handle
+                };
+                if !is_tray {
+                    return;
+                }
+                let now = Instant::now();
+                let prev = last_left_up_for_handler.replace(Some(now));
+                let is_double = matches!(prev, Some(p) if now.duration_since(p) <= DOUBLE_CLICK_WINDOW);
+                if is_double {
+                    // Reset so a third quick click doesn't immediately
+                    // count as another double-click.
+                    last_left_up_for_handler.set(None);
+                    settings_clone.borrow().show();
                 }
             }
             E::OnMenuItemSelected => {
@@ -257,6 +344,27 @@ fn run_windows(
                     settings_clone.borrow().show();
                 } else if handle == t.menu_open_logs.handle {
                     t.open_logs();
+                } else if handle == t.menu_restart.handle {
+                    drop(t);
+                    // Spawn a fresh host process, then ask the current
+                    // event loop to exit. Same pattern as Save & Restart
+                    // in the Settings window — single-instance retry-loop
+                    // covers the brief window where both processes hold
+                    // the named mutex.
+                    match std::env::current_exe() {
+                        Ok(exe) => match std::process::Command::new(exe).spawn() {
+                            Ok(_) => {
+                                log::info!("restart: spawned new host process from tray");
+                                nwg::stop_thread_dispatch();
+                            }
+                            Err(e) => {
+                                log::warn!("restart from tray: spawn failed: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("restart from tray: current_exe failed: {e}");
+                        }
+                    }
                 } else if handle == t.menu_quit.handle {
                     nwg::stop_thread_dispatch();
                 }
@@ -283,15 +391,31 @@ fn run_windows(
             // Resolve which control fired this event without holding any
             // borrow across the match arms — the handlers below take their
             // own borrows internally.
-            let (is_save, is_copy_mac, is_restart, is_detect) = {
-                let s = settings_clone2.borrow();
-                (
+            //
+            // CRITICAL: use `try_borrow()` instead of `borrow()`. nwg's
+            // `set_status` / `set_text` calls during the OnNotice tray
+            // handler (which holds `settings_clone.borrow_mut()`) pump Win32
+            // messages, and a re-entrant settings event arrives mid-pump
+            // → second borrow on a borrowed RefCell → panic → process
+            // crash. Bailing out of the re-entrant event is harmless: nwg
+            // will re-fire the original interaction once the outer borrow
+            // drops, OR the event was a phantom (e.g., focus shifts during
+            // status-bar updates) we don't need to handle.
+            let probe = match settings_clone2.try_borrow() {
+                Ok(s) => (
                     handle == s.save_btn.handle,
                     handle == s.copy_mac_btn.handle,
                     handle == s.restart_btn.handle,
                     handle == s.detect_btn.handle,
-                )
+                ),
+                Err(_) => {
+                    log::debug!(
+                        "settings_event_handler skipped: settings RefCell busy (re-entrant)"
+                    );
+                    return;
+                }
             };
+            let (is_save, is_copy_mac, is_restart, is_detect) = probe;
             match evt {
                 E::OnButtonClick => {
                     if is_save {
@@ -317,6 +441,10 @@ fn run_windows(
 
     nwg::unbind_event_handler(&event_handler);
     nwg::unbind_event_handler(&settings_event_handler);
+    if let Some(h) = _overlay_event_handler.as_ref() {
+        nwg::unbind_event_handler(h);
+    }
+    let _ = overlay; // keep alive until shutdown
 }
 
 // ---- Settings-window button handlers --------------------------------------

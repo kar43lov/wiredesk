@@ -5,12 +5,23 @@ use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
 
-use crate::clipboard::ClipboardSync;
+use crate::clipboard::{ClipboardSync, ProgressCounters};
 use crate::injector::InputInjector;
 use crate::shell::{ShellEvent, ShellProcess};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(6); // 3 missed heartbeats
+/// Heartbeat timeout while the link is idle. 3 missed heartbeats — fast
+/// enough for the user to notice an unplugged cable but loose enough to
+/// tolerate a single dropped CRC.
+const HEARTBEAT_TIMEOUT_IDLE: Duration = Duration::from_secs(6);
+/// Heartbeat timeout while a clipboard transfer is in flight (incoming
+/// reassembly armed or outgoing chunks queued). At 11 KB/s an 80–500 KB
+/// image takes 7–45 s on the wire, during which the strict 6 s timeout
+/// would falsely fire — the peer is busy receiving chunks and its
+/// heartbeats can be queued behind ours. ×5 the idle timeout: enough
+/// slack for ~3 MB of in-flight payload before we treat silence as a
+/// real disconnect.
+const HEARTBEAT_TIMEOUT_BUSY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -37,7 +48,29 @@ pub struct Session<T: Transport, I: InputInjector> {
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
+    /// Convenience ctor with default (zero-init) progress counters.
+    /// Used by the `#[cfg(test)]` fixtures; production wiring goes
+    /// through `with_counters` so the overlay sees the same atomics.
+    #[cfg(test)]
     pub fn new(transport: T, injector: I, host_name: String, screen_w: u16, screen_h: u16) -> Self {
+        Self::with_counters(
+            transport,
+            injector,
+            host_name,
+            screen_w,
+            screen_h,
+            ProgressCounters::default(),
+        )
+    }
+
+    pub fn with_counters(
+        transport: T,
+        injector: I,
+        host_name: String,
+        screen_w: u16,
+        screen_h: u16,
+        counters: ProgressCounters,
+    ) -> Self {
         let now = Instant::now();
         Self {
             transport,
@@ -50,7 +83,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_w,
             screen_h,
             shell: None,
-            clipboard: ClipboardSync::new(),
+            clipboard: ClipboardSync::with_counters(counters),
             client_name: None,
         }
     }
@@ -66,6 +99,39 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     #[cfg(test)]
     pub fn state(&self) -> SessionState {
         self.state
+    }
+
+    #[cfg(test)]
+    pub fn clipboard_state(&self) -> &ClipboardSync {
+        &self.clipboard
+    }
+
+    /// Drain any transient warning the clipboard layer queued up since the
+    /// last call (e.g., "image too large"). The session thread forwards
+    /// this to the tray UI as a balloon notification.
+    pub fn take_clipboard_warning(&mut self) -> Option<String> {
+        self.clipboard.take_warning()
+    }
+
+    /// Test-only: rewind `last_heartbeat_recv` so the next tick() sees the
+    /// heartbeat-timeout branch and drives the disconnect cleanup path.
+    #[cfg(test)]
+    pub fn force_heartbeat_timeout(&mut self) {
+        // Use the busy timeout so the rewind triggers regardless of which
+        // branch the runtime check picks.
+        self.last_heartbeat_recv =
+            Instant::now() - HEARTBEAT_TIMEOUT_BUSY - Duration::from_secs(1);
+    }
+
+    /// Effective heartbeat timeout — extended while a clipboard transfer
+    /// is in flight to avoid false-positive disconnects when the wire is
+    /// saturated by chunk traffic.
+    fn heartbeat_timeout(&self) -> Duration {
+        if self.clipboard.transfer_in_flight() {
+            HEARTBEAT_TIMEOUT_BUSY
+        } else {
+            HEARTBEAT_TIMEOUT_IDLE
+        }
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -93,11 +159,12 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
         // Check heartbeat timeout
         if self.state == SessionState::Connected
-            && self.last_heartbeat_recv.elapsed() >= HEARTBEAT_TIMEOUT
+            && self.last_heartbeat_recv.elapsed() >= self.heartbeat_timeout()
         {
             log::warn!("heartbeat timeout — disconnecting");
             self.injector.release_all()?;
             self.shell_kill();
+            self.clipboard.reset();
             self.state = SessionState::WaitingForHello;
             self.client_name = None;
             return Ok(false);
@@ -229,8 +296,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.injector.key_up(*scancode, *modifiers)?;
             }
 
-            (SessionState::Connected, Message::ClipOffer { total_len, .. }) => {
-                self.clipboard.on_offer(*total_len);
+            (SessionState::Connected, Message::ClipOffer { format, total_len }) => {
+                self.clipboard.on_offer(*format, *total_len);
             }
 
             (SessionState::Connected, Message::ClipChunk { index, data }) => {
@@ -277,13 +344,17 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 log::info!("client disconnected");
                 self.injector.release_all()?;
                 self.shell_kill();
+                self.clipboard.reset();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
             }
 
             (_, Message::Hello { .. }) => {
-                // Re-handshake from any state
+                // Re-handshake from any state — drop in-flight clipboard
+                // reassembly so a half-finished transfer doesn't leak across
+                // sessions.
                 self.injector.release_all().ok();
+                self.clipboard.reset();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
                 self.handle_packet(packet)?;
@@ -403,5 +474,69 @@ mod tests {
         // Should get a new HELLO_ACK
         let ack = client.recv().unwrap();
         assert!(matches!(ack.message, Message::HelloAck { .. }));
+    }
+
+    /// Bring `session` to Connected and seed an in-flight reassembly
+    /// (one ClipOffer + one ClipChunk). Returns the live client transport
+    /// so the caller can keep driving messages.
+    fn setup_with_partial_reassembly() -> (Session<MockTransport, MockInjector>, MockTransport) {
+        let (mut session, mut client) = setup();
+        client.send(&Packet::new(
+            Message::Hello { version: 1, client_name: "test".into() },
+            0,
+        )).unwrap();
+        session.tick().unwrap();
+        let _ack = client.recv().unwrap();
+
+        // Push a partial reassembly: 1024-byte text offer + one 256-byte chunk.
+        client.send(&Packet::new(Message::ClipOffer { format: 0, total_len: 1024 }, 1)).unwrap();
+        session.tick().unwrap();
+        client.send(&Packet::new(Message::ClipChunk { index: 0, data: vec![b'a'; 256] }, 2)).unwrap();
+        session.tick().unwrap();
+
+        assert_eq!(session.clipboard_state().expected_len(), 1024,
+            "precondition: in-flight reassembly must be active");
+        (session, client)
+    }
+
+    #[test]
+    fn heartbeat_timeout_resets_clipboard() {
+        // Heartbeat-timeout branch must drop in-flight reassembly so a
+        // half-finished transfer doesn't leak into the next session.
+        let (mut session, _client) = setup_with_partial_reassembly();
+
+        session.force_heartbeat_timeout();
+        let _ = session.tick(); // returns Ok(false) once the timeout fires
+
+        assert_eq!(session.clipboard_state().expected_len(), 0,
+            "heartbeat timeout must reset clipboard reassembly");
+    }
+
+    #[test]
+    fn disconnect_resets_clipboard() {
+        // Message::Disconnect must drop in-flight reassembly.
+        let (mut session, mut client) = setup_with_partial_reassembly();
+
+        client.send(&Packet::new(Message::Disconnect, 3)).unwrap();
+        session.tick().unwrap();
+
+        assert_eq!(session.clipboard_state().expected_len(), 0,
+            "Disconnect must reset clipboard reassembly");
+    }
+
+    #[test]
+    fn rehandshake_resets_clipboard() {
+        // A fresh Hello during an active session must drop in-flight
+        // reassembly so the new session starts clean.
+        let (mut session, mut client) = setup_with_partial_reassembly();
+
+        client.send(&Packet::new(
+            Message::Hello { version: 1, client_name: "second".into() },
+            3,
+        )).unwrap();
+        session.tick().unwrap();
+
+        assert_eq!(session.clipboard_state().expected_len(), 0,
+            "re-handshake must reset clipboard reassembly");
     }
 }

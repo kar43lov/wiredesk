@@ -21,6 +21,7 @@ pub struct TrayUi {
     pub menu: nwg::Menu,
     pub menu_show_settings: nwg::MenuItem,
     pub menu_open_logs: nwg::MenuItem,
+    pub menu_restart: nwg::MenuItem,
     pub menu_separator: nwg::MenuSeparator,
     pub menu_quit: nwg::MenuItem,
 
@@ -86,6 +87,10 @@ impl TrayUi {
                 .text("Open Logs")
                 .parent(&s.menu)
                 .build(&mut s.menu_open_logs)?;
+            nwg::MenuItem::builder()
+                .text("Restart")
+                .parent(&s.menu)
+                .build(&mut s.menu_restart)?;
             nwg::MenuSeparator::builder()
                 .parent(&s.menu)
                 .build(&mut s.menu_separator)?;
@@ -98,6 +103,18 @@ impl TrayUi {
     }
 
     pub fn update_status(&mut self, status: &SessionStatus) -> Result<(), nwg::NwgError> {
+        // `Notification` is transient — surface as a balloon and don't touch
+        // the persistent icon/tooltip. Today only fires on "image too large".
+        if let SessionStatus::Notification(msg) = status {
+            self.tray.show(
+                msg,
+                Some("WireDesk"),
+                Some(nwg::TrayNotificationFlags::WARNING_ICON
+                    | nwg::TrayNotificationFlags::LARGE_ICON),
+                None,
+            );
+            return Ok(());
+        }
         let icon = icons::build_status_icon(status)?;
         self.tray.set_icon(&icon);
         self.tray.set_tip(&format!("WireDesk Host — {}", status.label()));
