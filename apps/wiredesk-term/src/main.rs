@@ -138,42 +138,22 @@ fn format_hotkey_cheatsheet() -> String {
     s
 }
 
-/// Emit the standard "erase the previous character" sequence
-/// `\x08 \x20 \x08` (cursor left, space, cursor left) for each `0x7F`
-/// (macOS DEL = Backspace in raw mode) byte found in `chunk`. All other
-/// bytes are dropped — interactive shells echo printable stdin themselves
-/// through stdout, so duplicating those locally produces doubled
-/// characters. PowerShell in pipe mode does NOT produce a full erase
-/// sequence in response to 0x7F (no PSReadLine), hence this helper.
-fn local_echo_for_backspace(chunk: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for &b in chunk {
-        if b == 0x7F {
-            out.extend_from_slice(b"\x08 \x08");
+/// Pop the last whole UTF-8 char from `buf`. Returns `true` if anything
+/// was popped, `false` if the buffer was already empty. Required because
+/// our cooked-mode line buffer holds raw bytes — popping just one byte
+/// would split a Russian "д" (0xD0 0xB4) and corrupt the line. We walk
+/// backward over continuation bytes (0b10xxxxxx) until we hit the lead.
+fn pop_utf8_char(buf: &mut Vec<u8>) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    while let Some(&last) = buf.last() {
+        buf.pop();
+        if (last & 0xC0) != 0x80 {
+            return true;
         }
     }
-    out
-}
-
-/// Translate the byte stream we just read from stdin into what the host
-/// shell expects on its stdin pipe. The only translation is `\r → \n`:
-/// macOS raw mode delivers Enter as a bare CR (0x0D), but PowerShell /
-/// cmd / bash on the host treat the line as terminated only when they
-/// see an LF (0x0A). Without this fix you can type `dir<Enter>` and the
-/// command just sits in the host's read buffer forever.
-///
-/// Bytes other than `\r` pass through unchanged — including 0x7F which
-/// the host shell handles as its own backspace.
-fn translate_input_for_host(chunk: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunk.len());
-    for &b in chunk {
-        if b == b'\r' {
-            out.push(b'\n');
-        } else {
-            out.push(b);
-        }
-    }
-    out
+    true
 }
 
 /// Send Hello on the writer, drain HelloAck on the reader. Reader is
@@ -254,10 +234,28 @@ fn bridge_loop(
     });
 
     // Main thread: read stdin and forward bytes as ShellInput.
-    // Set stdin to non-blocking? On macOS we can rely on raw mode + a buffered read.
+    //
+    // We run a small "cooked mode" line discipline locally — the host
+    // shell (PowerShell pipe-mode without PSReadLine) only echoes the
+    // *space* portion of an erase sequence, leaving a trailing
+    // visible space and de-syncing the cursor. So instead of
+    // forwarding bytes one-by-one we accumulate a line in `line_buf`,
+    // local-echo printable bytes ourselves, and only flush the line
+    // to host on Enter. Just before the flush we erase the local-
+    // echoed characters with `\b \b` × N so the host's own echo paints
+    // the line exactly once. Backspace pops a UTF-8 char from the
+    // buffer (so Russian д = 2 bytes erases as one keystroke), Ctrl+C
+    // / Ctrl+D bypass the buffer and hit the host immediately as
+    // signals/EOF.
     let stdin = io::stdin();
     let mut stdin_lock = stdin.lock();
     let mut buf = [0u8; 256];
+    let mut line_buf: Vec<u8> = Vec::new();
+    // Number of *display cells* currently on screen for line_buf —
+    // not byte count. ASCII byte = 1 cell, UTF-8 multi-byte char
+    // also typically = 1 cell. We track this so erase-on-flush emits
+    // the right number of `\b \b` triples.
+    let mut line_cells: usize = 0;
 
     while !stop.load(Ordering::Relaxed) {
         match stdin_lock.read(&mut buf) {
@@ -268,34 +266,93 @@ fn bridge_loop(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                // Selective local echo for Backspace only. PowerShell
-                // in pipe mode (no TTY) doesn't run PSReadLine — it
-                // doesn't echo a full erase sequence in response to
-                // 0x7F. Without help, Backspace was visibly leaving
-                // a stray space behind. Emit \x08\x20\x08 (cursor
-                // left, overwrite with space, cursor left) locally.
-                // Printable bytes are still echoed by the shell
-                // itself, so we do NOT mirror them.
-                let echo = local_echo_for_backspace(chunk);
-                if !echo.is_empty() {
+
+                // Per-byte processing. We handle Backspace and Enter
+                // here without going to the host; printable bytes are
+                // both echoed locally and held in line_buf.
+                let mut send_now: Option<Vec<u8>> = None;
+                let mut local_echo: Vec<u8> = Vec::new();
+                let mut byte_idx = 0;
+                while byte_idx < chunk.len() {
+                    let b = chunk[byte_idx];
+                    match b {
+                        0x7F => {
+                            // Backspace: pop one UTF-8 char from line_buf,
+                            // erase locally if anything was popped.
+                            if pop_utf8_char(&mut line_buf) {
+                                line_cells = line_cells.saturating_sub(1);
+                                local_echo.extend_from_slice(b"\x08 \x08");
+                            }
+                            byte_idx += 1;
+                        }
+                        b'\r' | b'\n' => {
+                            // Enter: erase what we locally echoed so the
+                            // host's own echo doesn't double the line,
+                            // then flush the line + LF to host.
+                            for _ in 0..line_cells {
+                                local_echo.extend_from_slice(b"\x08 \x08");
+                            }
+                            let mut payload = std::mem::take(&mut line_buf);
+                            payload.push(b'\n');
+                            send_now = Some(payload);
+                            line_cells = 0;
+                            byte_idx += 1;
+                            break;
+                        }
+                        0x03 | 0x04 => {
+                            // Ctrl+C / Ctrl+D — forward immediately,
+                            // bypass the line buffer. Buffer keeps its
+                            // half-typed state; user can still finish
+                            // the line if Ctrl+C was a no-op on host.
+                            send_now = Some(vec![b]);
+                            byte_idx += 1;
+                            break;
+                        }
+                        _ => {
+                            // Append to buffer, echo locally. We assume
+                            // ASCII / UTF-8 input — multi-byte starts
+                            // here, continuation bytes will fall through
+                            // and be appended too on the next iteration.
+                            // Cell count is bumped only on a *new char*
+                            // (lead byte), not on continuation bytes.
+                            let is_continuation = (b & 0xC0) == 0x80;
+                            line_buf.push(b);
+                            local_echo.push(b);
+                            if !is_continuation {
+                                line_cells += 1;
+                            }
+                            byte_idx += 1;
+                        }
+                    }
+                }
+
+                if !local_echo.is_empty() {
                     let mut out = io::stdout().lock();
-                    let _ = out.write_all(&echo);
+                    let _ = out.write_all(&local_echo);
                     let _ = out.flush();
                 }
-                let host_payload = translate_input_for_host(chunk);
-                if let Ok(mut t) = writer.lock() {
-                    if let Err(e) = t.send(&Packet::new(
-                        Message::ShellInput { data: host_payload },
-                        0,
-                    )) {
-                        eprintln!("\r\nwiredesk-term: send error: {e}");
+
+                if let Some(payload) = send_now {
+                    if let Ok(mut t) = writer.lock() {
+                        if let Err(e) = t.send(&Packet::new(
+                            Message::ShellInput { data: payload },
+                            0,
+                        )) {
+                            eprintln!("\r\nwiredesk-term: send error: {e}");
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    } else {
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
-                } else {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
                 }
+
+                // Anything past the byte that triggered send_now (e.g.
+                // text typed after Ctrl+C in the same chunk) has not
+                // been processed. Realistically stdin reads are aligned
+                // to keystrokes, so this is not a hot edge case.
+                let _ = byte_idx;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
@@ -400,41 +457,45 @@ mod tests {
     }
 
     #[test]
-    fn local_echo_backspace_emits_erase_sequence() {
-        let s = local_echo_for_backspace(b"\x7F");
-        assert_eq!(s, b"\x08 \x08");
+    fn pop_utf8_char_on_empty_buffer() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(!pop_utf8_char(&mut buf));
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn local_echo_backspace_ignores_printable() {
-        let s = local_echo_for_backspace(b"dir");
-        assert!(s.is_empty(), "expected empty echo, got {s:?}");
+    fn pop_utf8_char_pops_single_ascii() {
+        let mut buf = b"abc".to_vec();
+        assert!(pop_utf8_char(&mut buf));
+        assert_eq!(buf, b"ab");
     }
 
     #[test]
-    fn local_echo_backspace_handles_multiple() {
-        let s = local_echo_for_backspace(b"a\x7F\x7F");
-        assert_eq!(s, b"\x08 \x08\x08 \x08");
+    fn pop_utf8_char_pops_two_byte_cyrillic() {
+        // Russian "д" is 0xD0 0xB4 — 2 bytes, 1 char. Popping must
+        // remove BOTH bytes, otherwise next typed char + leftover
+        // continuation byte produces invalid UTF-8 in the line buffer.
+        let mut buf = "abд".as_bytes().to_vec();
+        assert_eq!(buf.len(), 4);
+        assert!(pop_utf8_char(&mut buf));
+        assert_eq!(buf, b"ab");
     }
 
     #[test]
-    fn translate_for_host_replaces_cr_with_lf() {
-        // Raw-mode Enter is bare CR; host shells (PowerShell, cmd, bash)
-        // need LF to terminate a line. Without this PowerShell
-        // buffers `dir<Enter>` forever and never executes.
-        let s = translate_input_for_host(b"dir\r");
-        assert_eq!(s, b"dir\n");
+    fn pop_utf8_char_pops_three_byte_emoji_lead() {
+        // "€" is 0xE2 0x82 0xAC — 3 bytes. Pop removes all three.
+        let mut buf = "a€".as_bytes().to_vec();
+        assert_eq!(buf.len(), 4);
+        assert!(pop_utf8_char(&mut buf));
+        assert_eq!(buf, b"a");
     }
 
     #[test]
-    fn translate_for_host_passes_through_non_cr_bytes() {
-        // Backspace, printable ASCII, UTF-8 — all unchanged.
-        let s = translate_input_for_host(b"a\x7Fb");
-        assert_eq!(s, b"a\x7Fb");
-        let s = translate_input_for_host("дир\r".as_bytes());
-        let mut expected = "дир".as_bytes().to_vec();
-        expected.push(b'\n');
-        assert_eq!(s, expected);
+    fn pop_utf8_char_pops_to_empty() {
+        let mut buf = "д".as_bytes().to_vec();
+        assert_eq!(buf.len(), 2);
+        assert!(pop_utf8_char(&mut buf));
+        assert!(buf.is_empty());
     }
 
     #[test]
