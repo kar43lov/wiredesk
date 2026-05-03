@@ -253,36 +253,30 @@ fn run_windows(
 
     // Cross-process "show settings" pipe: a second-instance launch
     // fires SetEvent on the named event; this thread blocks on
-    // WaitForSingleObject and bumps a separate Notice that the UI
-    // thread picks up to surface the Settings window.
+    // WaitForSingleObject and pokes the existing status-bridge
+    // Notice via `notice.sender().notice()` after raising a shared
+    // pending flag. The OnNotice handler then checks both the
+    // status-bridge state AND the pending flag.
     //
-    // CRITICAL: parent must NOT be the same `MessageWindow` that
-    // already holds the status-bridge Notice — nwg 1.0.13 panics
-    // "Cannot bind control with an handle of type" when a second
-    // Notice tries to attach to a MessageWindow that already has
-    // one. We piggyback on the Settings window instead (a regular
-    // nwg::Window), which accepts an arbitrary number of child
-    // controls.
-    log::info!("run_windows: building show-settings Notice");
-    let mut show_notice = nwg::Notice::default();
-    if let Err(e) = nwg::Notice::builder()
-        .parent(&settings.borrow().window)
-        .build(&mut show_notice)
-    {
-        fatal("show Notice::build", e);
-        return;
-    }
+    // We piggyback on the existing Notice instead of creating a
+    // second one because nwg 1.0.13 panics on a second Notice
+    // anywhere in the same window tree (observed on both
+    // MessageWindow and a regular Window as parent — the bind
+    // check rejects "Cannot bind control with an handle of type").
+    let show_settings_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(windows)]
     let _show_event_thread = {
         match ui::single_instance::create_show_settings_event(
             ui::single_instance::SHOW_SETTINGS_EVENT_NAME,
         ) {
             Some(handle) => {
-                let sender = show_notice.sender();
+                let sender = notice.sender();
+                let pending = show_settings_pending.clone();
                 Some(std::thread::spawn(move || loop {
                     if !handle.wait() {
                         break;
                     }
+                    pending.store(true, std::sync::atomic::Ordering::Release);
                     sender.notice();
                 }))
             }
@@ -297,23 +291,11 @@ fn run_windows(
     // that gets RawEvent + control handle; we dispatch manually.
     let tray_handle = tray.borrow().window.handle;
     let settings_handle = settings.borrow().window.handle;
-    let show_notice_handle = show_notice.handle;
-
-    // Cross-process show-settings notice: bumped from the wait thread
-    // when a second instance fires SetEvent on the named event.
-    let show_settings_clone = settings.clone();
-    let _show_event_handler = nwg::full_bind_event_handler(
-        &show_notice_handle,
-        move |evt, _evt_data, _handle| {
-            if matches!(evt, nwg::Event::OnNotice) {
-                show_settings_clone.borrow().show();
-            }
-        },
-    );
 
     let tray_clone = tray.clone();
     let settings_clone = settings.clone();
     let last_clone = last.clone();
+    let show_settings_pending_clone = show_settings_pending.clone();
 
     // Tray icon does NOT raise WM_LBUTTONDBLCLK as a distinct nwg event —
     // it only delivers WM_LBUTTONUP / WM_LBUTTONDOWN as
@@ -336,12 +318,21 @@ fn run_windows(
         use nwg::MousePressEvent as MP;
         match evt {
             E::OnNotice => {
-                // Status bridge fired. Two independent updates:
-                //   1) pending notification (transient balloon, doesn't
+                // Status bridge fired. The Notice multiplexes three signals:
+                //   1) cross-process "show settings" (set by the wait
+                //      thread for the named event when a second-instance
+                //      launch fires SetEvent),
+                //   2) pending notification (transient balloon, doesn't
                 //      change persistent UI state),
-                //   2) persistent status (tray icon color + settings row).
-                // Take the notification first under a brief lock, drop it,
-                // then read persistent under a fresh lock for the icon.
+                //   3) persistent status (tray icon color + settings row).
+                // Handle (1) first so a stacked event still surfaces it,
+                // then drop into the existing notification + persistent
+                // pipeline.
+                if show_settings_pending_clone
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    settings_clone.borrow().show();
+                }
                 let notification = if let Ok(mut g) = last_clone.lock() {
                     g.pending_notification.take()
                 } else {
