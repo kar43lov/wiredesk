@@ -1645,11 +1645,13 @@ mod tests {
         let (tap_tx, tap_rx) = mpsc::channel();
         let swap_flag = Arc::new(AtomicBool::new(false));
         let (synth_tx, _synth_rx) = mpsc::channel();
+        let (kick_tx, _kick_rx) = mpsc::channel();
         let tap_handle = keyboard_tap::start(
             out_tx.clone(),
             tap_tx,
             swap_flag.clone(),
             synth_tx,
+            kick_tx,
         );
         let outgoing_cancel = Arc::new(AtomicBool::new(false));
         let incoming_cancel = Arc::new(AtomicBool::new(false));

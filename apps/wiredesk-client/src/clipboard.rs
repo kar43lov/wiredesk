@@ -18,7 +18,7 @@ use wiredesk_protocol::packet::Packet;
 
 use crate::app::TransportEvent;
 
-const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CHUNK_SIZE: usize = 256;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap for text
 /// Maximum encoded PNG size we will push to the peer. Larger payloads are
@@ -357,6 +357,12 @@ pub(crate) fn apply_outgoing_progress(
 /// sync is in flight on the wire; the synthetic-combo dispatcher holds
 /// Whispr-Flow-style synthetic Cmd+V until this clears (plus a small grace)
 /// so the paste lands on the *new* clipboard, not the previous one.
+///
+/// `poll_kick_rx` lets the keyboard tap wake this thread immediately on
+/// detection of a synthetic Cmd+V (e.g. Whispr Flow paste). Without the
+/// kick, Whispr can fire its Cmd+V while we're mid-`thread::sleep`, miss
+/// the next 500/200 ms tick, and the dispatcher's wait-for-in-flight gate
+/// never trips for the *current* clipboard write.
 pub fn spawn_poll_thread(
     state: ClipboardState,
     outgoing_tx: mpsc::Sender<Packet>,
@@ -364,6 +370,7 @@ pub fn spawn_poll_thread(
     send_images: Arc<AtomicBool>,
     send_text: Arc<AtomicBool>,
     outgoing_text_in_flight: Arc<AtomicBool>,
+    poll_kick_rx: mpsc::Receiver<()>,
 ) {
     thread::spawn(move || {
         let mut clip = match arboard::Clipboard::new() {
@@ -403,7 +410,14 @@ pub fn spawn_poll_thread(
         }
 
         loop {
-            thread::sleep(CLIP_POLL_INTERVAL);
+            // Sleep up to CLIP_POLL_INTERVAL, but wake immediately if the
+            // keyboard tap signals that a synthetic Cmd+V just fired —
+            // we need to read the freshly-updated clipboard before the
+            // dispatcher's wait-on-in-flight gate has a chance to rely
+            // on stale state. Drain any extra kicks queued during the
+            // active poll cycle so we don't poll twice in a row.
+            let _ = poll_kick_rx.recv_timeout(CLIP_POLL_INTERVAL);
+            while poll_kick_rx.try_recv().is_ok() {}
 
             // Clear the in-flight flag at the start of each tick. By now
             // the previous text-send (if any) has been drained from

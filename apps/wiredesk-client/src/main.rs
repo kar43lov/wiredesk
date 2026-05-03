@@ -182,6 +182,10 @@ fn main() {
     let outgoing_text_in_flight =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (synth_tx, synth_rx) = std::sync::mpsc::channel::<keyboard_tap::SyntheticCombo>();
+    // Wake-up channel: keyboard tap nudges the poll thread on synthetic
+    // Cmd+V so we don't wait the full poll interval before noticing the
+    // clipboard write Whispr Flow just made.
+    let (poll_kick_tx, poll_kick_rx) = std::sync::mpsc::channel::<()>();
 
     // Clipboard poll thread — pushes Mac clipboard changes to host.
     // Outgoing progress counters are updated by writer_thread now (M3 fix),
@@ -194,6 +198,7 @@ fn main() {
         send_images.clone(),
         send_text.clone(),
         outgoing_text_in_flight.clone(),
+        poll_kick_rx,
     );
 
     // Synthetic dispatcher thread — see comment above. Holds each combo
@@ -204,8 +209,13 @@ fn main() {
         let in_flight = outgoing_text_in_flight.clone();
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-            const GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+            // Wider envelope than the original guess: Whispr's cloud
+            // round-trip can stretch the gap between text-write and
+            // Cmd+V well past 1 s, and the grace must outlast both Mac
+            // poll period and Host commit. 4 s wait + 400 ms grace
+            // covers ~99 % of dictation runs at 11 KB/s wire.
+            const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+            const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
             const POLL: std::time::Duration = std::time::Duration::from_millis(25);
             while let Ok(combo) = synth_rx.recv() {
                 let start = std::time::Instant::now();
@@ -227,6 +237,7 @@ fn main() {
         tap_events_tx,
         swap_option_command.clone(),
         synth_tx,
+        poll_kick_tx,
     );
 
     // Status bar item — same Arcs the egui status row reads from. Idle

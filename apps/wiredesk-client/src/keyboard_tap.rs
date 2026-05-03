@@ -213,6 +213,7 @@ pub fn start(
     _tap_events_tx: mpsc::Sender<TapEvent>,
     swap_om_cmd: Arc<AtomicBool>,
     synth_tx: mpsc::Sender<SyntheticCombo>,
+    poll_kick_tx: mpsc::Sender<()>,
 ) -> TapHandle {
     let enabled = Arc::new(AtomicBool::new(false));
     let passive = Arc::new(AtomicBool::new(false));
@@ -241,6 +242,7 @@ pub fn start(
             outgoing_tx.clone(),
             _tap_events_tx,
             synth_tx,
+            poll_kick_tx,
         );
         TapHandle {
             enabled,
@@ -256,6 +258,7 @@ pub fn start(
     {
         let _ = _tap_events_tx;
         let _ = synth_tx;
+        let _ = poll_kick_tx;
         TapHandle {
             enabled,
             passive,
@@ -340,6 +343,7 @@ mod macos {
             outgoing_tx: mpsc::Sender<Packet>,
             tap_events_tx: mpsc::Sender<TapEvent>,
             synth_tx: mpsc::Sender<super::SyntheticCombo>,
+            poll_kick_tx: mpsc::Sender<()>,
         ) -> Self {
             let runloop = Arc::new(Mutex::new(None::<CFRunLoop>));
             let runloop_for_thread = Arc::clone(&runloop);
@@ -354,6 +358,7 @@ mod macos {
             let outgoing_cb = outgoing_tx.clone();
             let tap_events_cb = tap_events_tx.clone();
             let synth_tx_cb = synth_tx.clone();
+            let poll_kick_cb = poll_kick_tx.clone();
 
             let join = thread::Builder::new()
                 .name("wiredesk-keyboard-tap".into())
@@ -488,6 +493,14 @@ mod macos {
                                     // swap) because Karabiner doesn't
                                     // touch CGEventPost'ed events.
                                     if !is_physical {
+                                        // Wake the clipboard poll thread now —
+                                        // Whispr Flow writes the clipboard
+                                        // immediately before its synthetic
+                                        // Cmd+V, so kicking on KeyDown lets
+                                        // the poll catch the new content
+                                        // before the dispatcher's wait gate.
+                                        let _ = poll_kick_cb.send(());
+
                                         let mut combo: super::SyntheticCombo =
                                             Vec::new();
                                         if (flags & super::CG_MODIFIER_MASK) != 0 {
@@ -708,11 +721,16 @@ mod tests {
         tx
     }
 
+    fn make_kick_tx() -> mpsc::Sender<()> {
+        let (tx, _rx) = mpsc::channel();
+        tx
+    }
+
     #[test]
     fn handle_starts_disabled() {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx());
+        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
         assert!(!h.is_enabled());
     }
 
@@ -720,7 +738,7 @@ mod tests {
     fn enable_disable_toggles_flag() {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx());
+        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
         h.enable();
         assert!(h.is_enabled());
         h.disable();
@@ -731,7 +749,7 @@ mod tests {
     fn drop_does_not_panic() {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let _h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx());
+        let _h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
     }
 
     #[test]
@@ -743,7 +761,7 @@ mod tests {
     fn disable_emits_keyup_for_held_modifiers() {
         let (out_tx, out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx());
+        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
 
         // Pretend Cmd + Shift were held at the moment of disable.
         h.prev_flags
@@ -769,7 +787,7 @@ mod tests {
     fn disable_when_no_modifiers_is_silent() {
         let (out_tx, out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx());
+        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
 
         h.disable();
         assert!(out_rx.try_recv().is_err(), "no modifiers held → no KeyUp packets");
@@ -783,7 +801,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
         let swap = Arc::new(AtomicBool::new(true));
-        let h = start(out_tx, tap_tx, swap, make_synth_tx());
+        let h = start(out_tx, tap_tx, swap, make_synth_tx(), make_kick_tx());
 
         h.prev_flags.store(CG_FLAG_COMMAND, Ordering::SeqCst);
         h.disable();
