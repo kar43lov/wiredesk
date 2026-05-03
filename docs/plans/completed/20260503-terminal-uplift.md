@@ -126,43 +126,43 @@ Pure helper `format_connected_banner(host_name: &str, w: u16, h: u16) -> String`
 **Files:**
 - Modify: `apps/wiredesk-client/src/app.rs`
 
-- [ ] добавить поле `shell_just_opened: bool` в `WireDeskApp` (рядом с `shell_open`).
-- [ ] инициализировать `false` в `WireDeskApp::new` и тестовом `make_app`.
-- [ ] в `shell_open_request` (line ~907) ставить `self.shell_just_opened = true` когда `shell_open` переходит из `false` в `true`.
-- [ ] в render shell input (line ~1505): дать `id_salt("shell_input")` TextEdit'у. После `if want_send` (после Enter): вызвать `resp.request_focus()`. Если `self.shell_just_opened` истинен — `resp.request_focus()` и сбросить флаг в `false`.
-- [ ] написать unit-тест `shell_just_opened_set_on_open` в `app.rs::tests`: вызвать `shell_open_request` дважды (первый — false→true, второй — true→true) и проверить что флаг устанавливается только на первом переходе. Если floor-нюансы делают это hard — fall back на live-only AC.
-- [ ] `cargo test -p wiredesk-client` — должен проходить, перед task 2.
+- [x] добавить поле `shell_just_opened: bool` в `WireDeskApp` (рядом с `shell_open`).
+- [x] инициализировать `false` в `WireDeskApp::new` и тестовом `make_app`.
+- [x] в `shell_open_request` (line ~907) ставить `self.shell_just_opened = true` когда `shell_open` переходит из `false` в `true`.
+- [x] в render shell input (line ~1505): дать `id_salt("shell_input")` TextEdit'у. После `if want_send` (после Enter): вызвать `resp.request_focus()`. Если `self.shell_just_opened` истинен — `resp.request_focus()` и сбросить флаг в `false`.
+- [x] написать unit-тест `shell_open_sets_just_opened_flag` в `app.rs::tests`: вызвать `shell_open_request` дважды (первый — false→true, второй — true→true) и проверить что флаг устанавливается только на первом переходе.
+- [x] `cargo test -p wiredesk-client` — 148 passed.
 
 ### Task 2: wiredesk-term — heartbeat thread
 
 **Files:**
 - Modify: `apps/wiredesk-term/src/main.rs`
 
-- [ ] в `bridge_loop` (line ~144) после `let stop = ...` и перед `reader_thread` spawn — spawn'нуть `heartbeat_thread(transport.clone(), stop.clone())`.
-- [ ] функция `heartbeat_thread(transport, stop)`: while !stop, `thread::sleep(2s)` (короткими intervalами по 100ms чтобы быстро выйти на stop), затем `transport.lock().send(Heartbeat)`. Игнорировать send-error'ы (heartbeat best-effort).
-- [ ] в shutdown-блоке `bridge_loop` дождаться heartbeat-thread'а через `.join()` после reader-thread'а.
-- [ ] написать unit-тест с `MockTransport`: запустить heartbeat, подождать 2.5 сек, остановить; проверить что мок получил минимум 1 Heartbeat-packet. Использовать `wiredesk-transport::mock` если он есть; иначе скип с note и покрыть live-тестом.
-- [ ] `cargo test -p wiredesk-term` — должен проходить, перед task 3.
+- [x] в `bridge_loop` (line ~144) после `let stop = ...` и перед `reader_thread` spawn — spawn'нуть `heartbeat_thread(transport.clone(), stop.clone())`.
+- [x] функция `heartbeat_thread(transport, stop)`: while !stop, `thread::sleep(2s)` (короткими intervalами по 100ms чтобы быстро выйти на stop), затем `transport.lock().send(Heartbeat)`. Игнорировать send-error'ы (heartbeat best-effort).
+- [x] в shutdown-блоке `bridge_loop` дождаться heartbeat-thread'а через `.join()` после reader-thread'а.
+- [x] написать unit-тест с `MockTransport`: запустить heartbeat, подождать 2.5 сек, остановить; проверить что мок получил минимум 1 Heartbeat-packet. Также добавлен второй тест на быстрый exit при stop=true.
+- [x] `cargo test -p wiredesk-term` — 2 passed.
 
 ### Task 3: wiredesk-term — startup banner с host_name + screen size
 
 **Files:**
 - Modify: `apps/wiredesk-term/src/main.rs`
 
-- [ ] добавить pure helper `format_connected_banner(host_name: &str, w: u16, h: u16) -> String` возвращающий `"connected to 'X' (W×H). Press Ctrl+] to quit."`.
-- [ ] в `handshake` после `HelloAck { host_name, screen_w, screen_h, .. }` использовать этот helper для `eprintln!`.
-- [ ] написать unit-тесты: `format_banner_typical_resolution`, `format_banner_zero_size_does_not_panic`.
-- [ ] `cargo test -p wiredesk-term` — должен проходить, перед task 4.
+- [x] добавить pure helper `format_connected_banner(host_name: &str, w: u16, h: u16) -> String` возвращающий `"connected to 'X' (W×H). Press Ctrl+] to quit."`.
+- [x] в `handshake` после `HelloAck { host_name, screen_w, screen_h, .. }` использовать этот helper для `eprintln!`.
+- [x] написать unit-тесты: `format_banner_typical_resolution`, `format_banner_zero_size_does_not_panic`, плюс `format_banner_unicode_host_name`.
+- [x] `cargo test -p wiredesk-term` — 5 passed.
 
 ### Task 4: Verify acceptance criteria (live)
 
-- [ ] AC1 — открыть Terminal panel в GUI client'е → курсор сразу в input field, можно печатать без клика.
-- [ ] AC2 — ввести `dir` + Enter → ответ → следующая команда без клика.
-- [ ] AC3 — попытаться запустить `wiredesk-term` при работающем GUI → один из них fail'ит на serial-port-busy (acceptable).
-- [ ] AC4 — закрыть GUI, запустить `wiredesk-term` → баннер с host_name+size, ввести команду, ждать > 30 сек, ввести ещё → должно работать.
-- [ ] AC5 — Ctrl+] → graceful exit, terminal restored cleanly, host log показывает ShellClose.
-- [ ] `cargo test --workspace` — финальный прогон.
-- [ ] `cargo clippy --workspace -- -D warnings` — чисто.
+- [ ] AC1 — открыть Terminal panel в GUI client'е → курсор сразу в input field, можно печатать без клика. *(live, ждёт пользователя)*
+- [ ] AC2 — ввести `dir` + Enter → ответ → следующая команда без клика. *(live)*
+- [ ] AC3 — попытаться запустить `wiredesk-term` при работающем GUI → один из них fail'ит на serial-port-busy (acceptable). *(live)*
+- [ ] AC4 — закрыть GUI, запустить `wiredesk-term` → баннер с host_name+size, ввести команду, ждать > 30 сек, ввести ещё → должно работать. *(live)*
+- [ ] AC5 — Ctrl+] → graceful exit, terminal restored cleanly, host log показывает ShellClose. *(live)*
+- [x] `cargo test --workspace` — client 148 + host 93 (single-thread; parallel SIGABRT — pre-existing flaky FFI host race) + term 5.
+- [x] `cargo clippy --workspace -- -D warnings` — чисто.
 
 ### Task 5: Update documentation
 
@@ -170,9 +170,9 @@ Pure helper `format_connected_banner(host_name: &str, w: u16, h: u16) -> String`
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
-- [ ] README: новая секция «Run from your terminal» (или дополнить существующую `Client (macOS) — terminal only`) с примером alias `alias wd='wiredesk-term'`, пометкой про взаимоисключение с GUI client'ом.
-- [ ] CLAUDE.md: упомянуть `format_connected_banner` helper в Architecture / Module map. Добавить gotcha про heartbeat-thread и mutex.
-- [ ] Перенести этот план в `docs/plans/completed/`.
+- [x] README: дополнена существующая `Client (macOS) — terminal only` — banner-описание, heartbeat note, alias `alias wd='wiredesk-term'`, пометка про взаимоисключение и daemon-multiplex out-of-scope.
+- [x] CLAUDE.md: секция Shell-over-serial расширена — два frontend'а (GUI panel с focus-fix, CLI с тремя потоками), `format_connected_banner` helper, gotcha про heartbeat-thread + общий mutex.
+- [x] План перенесён в `docs/plans/completed/`.
 
 ## Post-Completion
 

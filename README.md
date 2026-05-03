@@ -148,9 +148,17 @@ wiredesk-term --shell powershell
 wiredesk-term --shell cmd
 ```
 
-Press **Ctrl+]** in `wiredesk-term` to quit and restore the local terminal.
+On launch you'll see a banner with the host name and screen size, e.g. `wiredesk-term: connected to 'wiredesk-host' (2560×1440). Press Ctrl+] to quit.` The CLI sends a 2-second heartbeat to the host so an idle interactive session survives the host's idle-timeout — you can step away from the keyboard and come back to a still-live shell.
 
-`wiredesk-client` and `wiredesk-term` are mutually exclusive — they share the same serial port. Run one or the other depending on whether you need the GUI or just a shell.
+Press **Ctrl+]** to quit and restore the local terminal.
+
+For a shorter command alias, drop this in `~/.zshrc` / `~/.bashrc`:
+
+```bash
+alias wd='wiredesk-term'
+```
+
+`wiredesk-client` and `wiredesk-term` are **mutually exclusive** — they share the same serial port. Quit the GUI app before launching the CLI (or vice versa); whichever starts second will fail to open the port. Simultaneous GUI + CLI requires a multiplexing daemon, which is intentionally not in this MVP's scope.
 
 ## Protocol
 

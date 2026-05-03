@@ -137,6 +137,11 @@ pub struct WireDeskApp {
     /// with the keyboard tap thread; flipping the Settings checkbox takes
     /// effect on the next FlagsChanged / KeyDown the tap sees.
     swap_option_command: Arc<AtomicBool>,
+    /// One-shot flag set when the Terminal panel transitions to open.
+    /// Consumed by the next render frame to give the shell input field
+    /// focus without the user having to click into it. Without this the
+    /// user has to click before typing the first command.
+    shell_just_opened: bool,
     /// User-pressed Cancel for the outgoing transfer. Shared with the
     /// writer thread, which drops queued ClipOffer/ClipChunk packets while
     /// the flag is set and re-arms it once the stale batch drains.
@@ -320,6 +325,7 @@ impl WireDeskApp {
             shell_output: String::new(),
             shell_input: String::new(),
             shell_kind: String::new(),
+            shell_just_opened: false,
             pending_config: initial_config,
             config_dirty: false,
             save_toast: None,
@@ -912,6 +918,10 @@ impl WireDeskApp {
         self.shell_send(Message::ShellOpen { shell: kind });
         self.shell_open = true;
         self.shell_output.clear();
+        // Tell the next render frame to grab keyboard focus for the
+        // shell input — otherwise the user has to click into the field
+        // before typing their first command.
+        self.shell_just_opened = true;
     }
 
     fn shell_close_request(&mut self) {
@@ -1506,6 +1516,7 @@ impl eframe::App for WireDeskApp {
                     ui.horizontal(|ui| {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.shell_input)
+                                .id_salt("shell_input")
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
                                 .hint_text("type a command, Enter to send"),
@@ -1514,6 +1525,15 @@ impl eframe::App for WireDeskApp {
                             && ui.input(|i: &egui::InputState| i.key_pressed(egui::Key::Enter));
                         if enter_pressed && !self.shell_input.is_empty() {
                             want_send = true;
+                            // Pressing Enter takes focus away from a
+                            // singleline TextEdit. Reclaim it now so the
+                            // next command can be typed without clicking
+                            // back into the field.
+                            resp.request_focus();
+                        }
+                        if self.shell_just_opened {
+                            resp.request_focus();
+                            self.shell_just_opened = false;
                         }
                     });
                 }
@@ -1697,6 +1717,30 @@ mod tests {
         let mut app = make_app();
         app.fullscreen = true;
         assert!(!app.should_show_chrome());
+    }
+
+    #[test]
+    fn shell_open_sets_just_opened_flag() {
+        let mut app = make_app();
+        assert!(!app.shell_open);
+        assert!(!app.shell_just_opened);
+
+        app.shell_open_request();
+        assert!(app.shell_open, "shell_open should flip to true");
+        assert!(
+            app.shell_just_opened,
+            "shell_just_opened should be set so the next render frame can grab focus"
+        );
+
+        // Idempotency: calling open again while already open must not
+        // re-arm the flag (otherwise focus would jump on every redraw
+        // that happens to call shell_open_request a second time).
+        app.shell_just_opened = false;
+        app.shell_open_request();
+        assert!(
+            !app.shell_just_opened,
+            "second shell_open_request while open must NOT re-arm the flag"
+        );
     }
 
     #[test]

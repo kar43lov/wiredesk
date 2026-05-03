@@ -241,6 +241,11 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 - `ShellClose` — закрывает stdin (EOF); `ShellExit { code }` — на выходе процесса.
 - Line-based MVP без PTY: vim, sudo с паролем не работают. SSH с key-based auth работает.
 
+**Два frontend'а к этому каналу:**
+- **GUI shell-panel** в `wiredesk-client` (Settings collapsing → Terminal). Простой ввод-вывод, командная строка с `id_salt("shell_input")`. После Enter автоматический `request_focus()` чтобы поле не теряло фокус (без этого — `lost_focus()`-pattern, и пользователь должен кликать перед каждой следующей командой). При первом open `shell_just_opened` flag запрашивает focus на следующем frame'е.
+- **`wiredesk-term`** CLI (отдельный бинарь). Raw-mode bridge для Ghostty/iTerm. **Три потока**: reader (serial→stdout), main (stdin→serial), heartbeat (Heartbeat packet раз в `HEARTBEAT_INTERVAL=2s` через тот же `Arc<Mutex<Transport>>`) — без heartbeat'а host разрывал idle-сессию по 6 s `HEARTBEAT_TIMEOUT_IDLE`. Все три держат общий `stop: AtomicBool` для shutdown. Banner после handshake — `format_connected_banner(host_name, w, h)` (pure helper, отдельные unit-тесты — typo regression в user-visible строке иначе только живьём ловится).
+- GUI и CLI **взаимоисключающие** — оба открывают serial-порт. Multiplex-daemon вне scope MVP.
+
 ### Key design decisions
 
 - **Scancodes, not VK codes** — ввод как hardware scancodes, работает независимо от раскладки Host (включая кириллицу).
