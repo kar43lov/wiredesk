@@ -138,6 +138,29 @@ fn format_hotkey_cheatsheet() -> String {
     s
 }
 
+/// Convert bare LFs (Unix-style line endings) into CRLF for a raw-mode
+/// terminal. The local terminal is in raw mode (no line discipline),
+/// so a bare `\n` only moves the cursor down — column stays where it
+/// was. SSH'd Linux output, `cat foo.txt` on bash, anything Unix uses
+/// bare `\n`, producing the staircase effect. We track `last_was_cr`
+/// across chunks so a CRLF that happens to span a chunk boundary
+/// isn't expanded to CRCRLF.
+///
+/// Returns the translated bytes; updates `last_was_cr` to the value
+/// after processing the last byte.
+fn translate_output_for_terminal(input: &[u8], last_was_cr: &mut bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for &b in input {
+        if b == b'\n' && !*last_was_cr {
+            out.extend_from_slice(b"\r\n");
+        } else {
+            out.push(b);
+        }
+        *last_was_cr = b == b'\r';
+    }
+    out
+}
+
 /// Pop the last whole UTF-8 char from `buf`. Returns `true` if anything
 /// was popped, `false` if the buffer was already empty. Required because
 /// our cooked-mode line buffer holds raw bytes — popping just one byte
@@ -457,6 +480,50 @@ mod tests {
     }
 
     #[test]
+    fn translate_output_bare_lf_becomes_crlf() {
+        let mut last_cr = false;
+        let s = translate_output_for_terminal(b"line1\nline2\n", &mut last_cr);
+        assert_eq!(s, b"line1\r\nline2\r\n");
+        assert!(!last_cr);
+    }
+
+    #[test]
+    fn translate_output_existing_crlf_unchanged() {
+        let mut last_cr = false;
+        let s = translate_output_for_terminal(b"line1\r\nline2\r\n", &mut last_cr);
+        assert_eq!(s, b"line1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn translate_output_crlf_across_chunk_boundary_no_double_cr() {
+        // Chunk 1 ends with \r, chunk 2 starts with \n — must NOT
+        // emit \r\r\n.
+        let mut last_cr = false;
+        let s1 = translate_output_for_terminal(b"line1\r", &mut last_cr);
+        assert_eq!(s1, b"line1\r");
+        assert!(last_cr);
+        let s2 = translate_output_for_terminal(b"\nline2", &mut last_cr);
+        assert_eq!(s2, b"\nline2");
+        assert!(!last_cr);
+    }
+
+    #[test]
+    fn translate_output_lone_cr_passes_through() {
+        // Some progress-bar UIs use \r alone for "rewrite this line".
+        let mut last_cr = false;
+        let s = translate_output_for_terminal(b"50%\r100%", &mut last_cr);
+        assert_eq!(s, b"50%\r100%");
+    }
+
+    #[test]
+    fn translate_output_empty_input() {
+        let mut last_cr = false;
+        let s = translate_output_for_terminal(b"", &mut last_cr);
+        assert!(s.is_empty());
+        assert!(!last_cr);
+    }
+
+    #[test]
     fn pop_utf8_char_on_empty_buffer() {
         let mut buf: Vec<u8> = Vec::new();
         assert!(!pop_utf8_char(&mut buf));
@@ -542,13 +609,21 @@ mod tests {
 
 fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
     let stdout = io::stdout();
+    // Cross-chunk state for LF→CRLF translation. The local terminal
+    // is in raw mode, so a bare \n only moves the cursor down — it
+    // doesn't return to column 0. Linux / SSH output uses bare \n,
+    // which produced staircase output ("Welcome..." sliding right
+    // line by line). We insert \r before any \n that wasn't already
+    // preceded by \r, even across chunk boundaries.
+    let mut last_was_cr = false;
     while !stop.load(Ordering::Relaxed) {
         let pkt = transport.recv();
         match pkt {
             Ok(p) => match p.message {
                 Message::ShellOutput { data } => {
+                    let translated = translate_output_for_terminal(&data, &mut last_was_cr);
                     let mut out = stdout.lock();
-                    let _ = out.write_all(&data);
+                    let _ = out.write_all(&translated);
                     let _ = out.flush();
                 }
                 Message::ShellExit { code } => {
