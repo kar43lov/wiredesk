@@ -297,21 +297,24 @@ fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
         ShellKind::PowerShell => format!(
             "$LASTEXITCODE=0; $ErrorActionPreference='Stop'; try {{ {cmd} }} catch {{ $LASTEXITCODE=1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
         ),
-        ShellKind::Bash => format!("{cmd}; echo \"__WD_DONE_{uuid}__$?\"\n"),
+        // Bash sandwich: READY marker BEFORE the command and DONE
+        // sentinel AFTER. READY is the lower-bound that lets
+        // clean_stdout slice off MOTD / SSH banner / prompt fragments
+        // — without it, `ssh -tt prod-mup` (which falls back to
+        // *non-interactive* remote shell when PS's stdin pipe blocks
+        // PTY allocation, so no prompt ever arrives) would dump the
+        // whole motd into the user's stdout.
+        ShellKind::Bash => format!(
+            "echo __WD_READY_{uuid}__; {cmd}; echo \"__WD_DONE_{uuid}__$?\"\n"
+        ),
     }
 }
 
-/// State machine for `run_oneshot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)] // names mirror state semantics intentionally
-enum OneShotState {
-    /// `--ssh` is set, sent `ssh -tt ALIAS`, now waiting for the
-    /// remote shell prompt before pushing the formatted command.
-    AwaitingRemotePrompt,
-    /// Formatted command already sent, looking for the expanded
-    /// sentinel line.
-    AwaitingSentinel,
-}
+// run_oneshot is now linear — we always end up "send everything up
+// front, then watch for the sentinel". State enum was removed when we
+// stopped waiting for prompts (PS pipe-mode emits noise, not a prompt;
+// remote shell over `ssh -tt`-without-PTY runs non-interactive and
+// emits no prompt at all).
 
 /// Drive a single `--exec` run end to end. Owns the writer (for sending
 /// `ssh`-hop and the formatted command), takes the reader by value
@@ -345,36 +348,33 @@ fn run_oneshot(
     let payload = format_command(&uuid, target_kind, cmd);
     log::debug!("[exec] uuid={uuid} kind={target_kind:?} payload={payload:?}");
 
-    // PowerShell with stdout piped (`-NoLogo -NoExit`, our spawn flags)
-    // emits the prompt over the wire on startup but does NOT wait for
-    // any "ready" handshake — it just runs whatever lines arrive on
-    // stdin in order. Since the prompt isn't load-bearing for us
-    // (we already know the shell is up because handshake completed),
-    // skip prompt-detection in PS-only mode and push the formatted
-    // command immediately.
+    // Linear protocol: send everything up front, then watch for the
+    // sentinel.
     //
-    // In `--ssh` mode we still wait for the *remote* prompt — `ssh -tt`
-    // forces a TTY on the remote side and the remote shell DOES emit
-    // a prompt over the wire that signals "remote shell ready". Without
-    // waiting we'd race the ssh handshake and our cmd would land
-    // either in PS (before ssh starts) or get eaten as part of MOTD.
-    let mut state = if let Some(alias) = ssh {
+    // PS-only path: PowerShell with piped stdout reads stdin
+    // line-by-line and executes. No prompt-handshake needed — the
+    // first line is our wrapped command.
+    //
+    // SSH path: `ssh -tt ALIAS` runs as a child of host PS. The
+    // remote shell does NOT emit a prompt because PS's stdin pipe
+    // prevents PTY allocation (`Pseudo-terminal will not be
+    // allocated because stdin is not a terminal`), so the remote
+    // session falls back to non-interactive mode. Bytes we push to
+    // PS's stdin AFTER the ssh line are inherited by ssh and
+    // forwarded to the remote shell. The Bash payload itself
+    // includes a `__WD_READY_<uuid>__` echo BEFORE the user's cmd
+    // so `clean_stdout` can slice off MOTD / banner / pre-cmd noise.
+    if let Some(alias) = ssh {
         let ssh_cmd = format!("ssh -tt {alias}\n");
-        log::debug!("[exec] sending ssh hop: {ssh_cmd:?}");
+        log::debug!("[exec] ssh hop: {ssh_cmd:?}");
         send_text(&writer, &ssh_cmd)?;
-        OneShotState::AwaitingRemotePrompt
-    } else {
-        log::debug!("[exec] sending formatted command immediately");
-        send_text(&writer, &payload)?;
-        OneShotState::AwaitingSentinel
-    };
+    }
+    log::debug!("[exec] sending payload");
+    send_text(&writer, &payload)?;
 
     // `pending` is the line-walker scratch — only completed lines get
     // popped out of it. `full_log` accumulates EVERYTHING received so
-    // `clean_stdout` at the end has the whole conversation to slice
-    // (last prompt → drop, echo'ed sentinel-cmd → drop, expanded
-    // sentinel → drop). Without `full_log` we'd lose the prompt/echo
-    // delimiters once they're drained.
+    // `clean_stdout` at the end has the whole conversation to slice.
     let mut pending = String::new();
     let mut full_log = String::new();
     let started = std::time::Instant::now();
@@ -396,9 +396,6 @@ fn run_oneshot(
                 }
                 Message::ShellExit { code } => {
                     log::debug!("[exec] recv ShellExit code={code} — host shell died");
-                    // Host shell exited before sentinel — bail with that
-                    // code rather than waiting for a sentinel that will
-                    // never come.
                     exit_code = Some(code);
                     break;
                 }
@@ -420,41 +417,16 @@ fn run_oneshot(
             }
         }
 
-        // Walk completed lines (anything terminated by '\n'); leftover
-        // partial line stays in `pending`.
+        // Walk completed lines watching for the sentinel.
         while let Some(nl_idx) = pending.find('\n') {
             let line: String = pending[..nl_idx].trim_end_matches('\r').to_string();
             pending.drain(..=nl_idx);
-            log::trace!("[exec] line state={state:?}: {line:?}");
-
-            match state {
-                OneShotState::AwaitingRemotePrompt => {
-                    if is_remote_prompt(&line) {
-                        log::debug!("[exec] remote prompt matched, sending payload");
-                        send_text(&writer, &payload)?;
-                        state = OneShotState::AwaitingSentinel;
-                    }
-                }
-                OneShotState::AwaitingSentinel => {
-                    if let Some(code) = parse_sentinel(&line, &uuid) {
-                        log::debug!("[exec] sentinel matched, exit code = {code}");
-                        exit_code = Some(code);
-                        break;
-                    }
-                }
+            log::trace!("[exec] line: {line:?}");
+            if let Some(code) = parse_sentinel(&line, &uuid) {
+                log::debug!("[exec] sentinel matched, exit code = {code}");
+                exit_code = Some(code);
+                break;
             }
-        }
-
-        // Remote prompts arrive WITHOUT a trailing newline — bash/zsh
-        // park the cursor right after `$ ` / `# ` / `➜ ` waiting for
-        // input. The line-walker only handles `\n`-terminated lines,
-        // so we also peek at the partial leftover.
-        if state == OneShotState::AwaitingRemotePrompt
-            && is_remote_prompt(pending.trim_end())
-        {
-            send_text(&writer, &payload)?;
-            state = OneShotState::AwaitingSentinel;
-            pending.clear();
         }
 
         if exit_code.is_some() {
@@ -501,29 +473,43 @@ fn send_text(writer: &Arc<Mutex<Box<dyn Transport>>>, s: &str) -> Result<()> {
     ))
 }
 
+/// `true` when `line` is the literal expanded READY marker we emit at
+/// the start of the Bash payload (just before the user's command), so
+/// `clean_stdout` can slice off MOTD / SSH banner / `ssh -tt` warning
+/// from the actual command output. The remote shell echoes our stdin
+/// in `ssh -tt` mode, so the *unexpanded* literal `echo __WD_READY_<uuid>__`
+/// also surfaces — `parse_ready` only matches the *expanded* form
+/// (no `echo ` prefix).
+fn parse_ready(line: &str, uuid: &uuid::Uuid) -> bool {
+    line.trim() == format!("__WD_READY_{uuid}__")
+}
+
 /// Slice the accumulated output buffer down to *just* what `<cmd>`
 /// produced. The wire-stream of one `run_oneshot` execution roughly
 /// looks like:
 ///
 /// ```text
 /// [host MOTD / SSH banner / pre-prompt noise]
-/// PS C:\…> | ➜ | user@host$         <- last prompt before our cmd
+/// __WD_READY_<uuid>__              <- only in --ssh (Bash) path
 /// [echoed command with sentinel format string]   <- only in --ssh path
 /// [actual stdout of <cmd>]
-/// __WD_DONE_<uuid>__<exit_code>      <- expanded sentinel
+/// __WD_DONE_<uuid>__<exit_code>    <- expanded sentinel
 /// ```
 ///
-/// We:
-///  1. Find the *last* prompt-line (host or remote) before the
-///     sentinel; slice everything after it.
-///  2. Find the sentinel line; slice everything before it.
-///  3. If a line in between contains literal `__WD_DONE_<uuid>__$`
-///     (i.e. the *unexpanded* sentinel — host echoing our stdin),
-///     drop it. Asymmetry: PS host in pipe-mode without PSReadLine
-///     does NOT echo stdin → no echoed line in PS-only path → this
-///     step is a no-op there. With `ssh -tt` the remote shell DOES
-///     echo, and the format string surfaces.
-///  4. Trim trailing newlines for tidy stdout.
+/// Lower bound:
+///  1. If READY marker is present (Bash payload, --ssh path) — slice
+///     everything after it. This is the robust path.
+///  2. Else, fall back to the last prompt line (PS-only path; no
+///     prompt is fine since PS doesn't echo stdin and the only
+///     pre-cmd noise is the prompt itself which doesn't have a `\n`,
+///     so slice from beginning).
+///
+/// Upper bound: the sentinel line. Sentinel itself is dropped.
+///
+/// Within the slice, lines containing `__WD_DONE_<uuid>__$` (the
+/// *unexpanded* sentinel — remote bash echoing our stdin under
+/// `ssh -tt`) and `__WD_READY_<uuid>__` (the unexpanded READY echo,
+/// same reason) are filtered out.
 ///
 /// Pure helper, returns owned `String`.
 fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
@@ -535,23 +521,43 @@ fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
         .position(|l| parse_sentinel(l, uuid).is_some());
     let upper = sentinel_idx.unwrap_or(lines.len());
 
-    // Find last prompt line strictly *before* the sentinel.
-    let prompt_idx = lines[..upper]
+    // Lower bound: prefer READY marker, fall back to last prompt.
+    let ready_idx = lines[..upper]
         .iter()
-        .rposition(|l| is_powershell_prompt(l) || is_remote_prompt(l));
-    let lower = prompt_idx.map(|i| i + 1).unwrap_or(0);
+        .position(|l| parse_ready(l, uuid));
+    let lower = if let Some(idx) = ready_idx {
+        idx + 1
+    } else {
+        let prompt_idx = lines[..upper]
+            .iter()
+            .rposition(|l| is_powershell_prompt(l) || is_remote_prompt(l));
+        prompt_idx.map(|i| i + 1).unwrap_or(0)
+    };
 
-    // Stdin-echo line literal — present in --ssh path because remote
-    // shell echoes stdin. Filter it out.
-    let echo_marker = format!("__WD_DONE_{uuid}__$");
+    // Stdin-echo line literals — present in --ssh path because remote
+    // shell echoes stdin. Filter both DONE and READY echoes.
+    let done_echo = format!("__WD_DONE_{uuid}__$");
+    let ready_echo = format!("__WD_READY_{uuid}__");
     let kept: Vec<&str> = lines[lower..upper]
         .iter()
         .copied()
-        .filter(|l| !l.contains(&echo_marker))
+        .filter(|l| {
+            // Drop the unexpanded echoed sentinel formatter.
+            if l.contains(&done_echo) {
+                return false;
+            }
+            // Drop the unexpanded echoed READY emitter (the line
+            // contains literal `echo __WD_READY_<uuid>__` — the
+            // *expanded* one already served as our lower bound and
+            // is not in this slice).
+            if l.contains("echo ") && l.contains(&ready_echo) {
+                return false;
+            }
+            true
+        })
         .collect();
 
     let mut out = kept.join("\n");
-    // Trim trailing newlines / whitespace lines for tidy display.
     while out.ends_with('\n') || out.ends_with('\r') {
         out.pop();
     }
@@ -1183,7 +1189,11 @@ mod tests {
     fn format_command_bash_appends_sentinel() {
         let uuid = uuid::Uuid::nil();
         let s = format_command(&uuid, ShellKind::Bash, "docker ps");
-        assert!(s.starts_with("docker ps; echo "), "bash payload prefix: {s}");
+        assert!(
+            s.starts_with("echo __WD_READY_"),
+            "bash payload must start with READY emitter: {s}"
+        );
+        assert!(s.contains("docker ps;"), "bash payload must contain cmd: {s}");
         assert!(
             s.contains("$?"),
             "bash sentinel must reference $?: {s}"
@@ -1193,6 +1203,41 @@ mod tests {
             "bash payload must NOT use $LASTEXITCODE: {s}"
         );
         assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_command_bash_includes_ready_marker() {
+        // Regression: READY marker before the cmd is what makes
+        // clean_stdout slice MOTD / `ssh -tt` PTY warning / banner
+        // off the output. Without it, --ssh stdout includes ~30 lines
+        // of Ubuntu welcome text per call.
+        let uuid = uuid::Uuid::nil();
+        let s = format_command(&uuid, ShellKind::Bash, "ls");
+        let ready_marker = format!("__WD_READY_{uuid}__");
+        assert!(s.contains(&ready_marker), "missing READY marker: {s}");
+        // READY must precede the user command.
+        let ready_pos = s.find(&ready_marker).unwrap();
+        let cmd_pos = s.find("ls;").unwrap();
+        assert!(ready_pos < cmd_pos, "READY must come before cmd: {s}");
+    }
+
+    #[test]
+    fn parse_ready_matches_expanded_only() {
+        let uuid = uuid::Uuid::nil();
+        // Expanded form (what shell prints when it executes echo).
+        assert!(parse_ready(&format!("__WD_READY_{uuid}__"), &uuid));
+        assert!(parse_ready(&format!("  __WD_READY_{uuid}__  "), &uuid));
+        // Stdin echo from `ssh -tt` (literal `echo …`) — must NOT match.
+        assert!(!parse_ready(
+            &format!("echo __WD_READY_{uuid}__"),
+            &uuid
+        ));
+        // Wrong UUID.
+        let other = uuid::Uuid::from_u128(1);
+        assert!(!parse_ready(&format!("__WD_READY_{other}__"), &uuid));
+        // Empty / garbage.
+        assert!(!parse_ready("", &uuid));
+        assert!(!parse_ready("hello", &uuid));
     }
 
     #[test]
@@ -1371,25 +1416,33 @@ mod tests {
     fn run_oneshot_happy_path_ssh() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            host.emit_chunk("PS C:\\>\r\n");
-            // Client should now send `ssh -tt prod\r`.
+            // Linear protocol now — client immediately sends ssh -tt
+            // followed by the formatted command. No prompt-detection
+            // wait in between.
             let ssh_cmd = host
                 .recv_shell_input(Duration::from_secs(2))
                 .expect("client should send ssh -tt");
             assert!(ssh_cmd.starts_with("ssh -tt prod"), "got: {ssh_cmd:?}");
-            // Emit MOTD + remote prompt.
-            host.emit_chunk("Welcome to Ubuntu\r\nMOTD line\r\n➜ \r\n");
-            // Client should send the formatted bash command.
             let cmd = host
                 .recv_shell_input(Duration::from_secs(2))
                 .expect("client should send formatted bash command");
+            assert!(
+                cmd.starts_with("echo __WD_READY_"),
+                "cmd payload must lead with READY: {cmd:?}"
+            );
             assert!(cmd.contains("docker ps"), "cmd payload: {cmd:?}");
             assert!(cmd.contains("$?"), "bash sentinel uses $?: {cmd:?}");
-            // Mimic remote bash echoing the command line + emitting
-            // output + expanded sentinel.
+            // Mimic remote bash: MOTD floods first, then echoes our
+            // line (because `ssh -tt` echoes stdin), then expands the
+            // READY marker, then runs the cmd, then emits the
+            // expanded sentinel.
             let uuid = extract_uuid_from_payload(&cmd);
+            host.emit_chunk("Welcome to Ubuntu\r\nMOTD line 1\r\nMOTD line 2\r\n");
             host.emit_chunk(&format!(
-                "docker ps; echo \"__WD_DONE_{uuid}__$?\"\r\nrow1\r\nrow2\r\n__WD_DONE_{uuid}__0\r\n"
+                "echo __WD_READY_{uuid}__; docker ps; echo \"__WD_DONE_{uuid}__$?\"\r\n"
+            ));
+            host.emit_chunk(&format!(
+                "__WD_READY_{uuid}__\r\nrow1\r\nrow2\r\n__WD_DONE_{uuid}__0\r\n"
             ));
         });
 
@@ -1454,13 +1507,23 @@ mod tests {
     }
 
     #[test]
-    fn clean_stdout_ssh_mode_strips_echo() {
+    fn clean_stdout_ssh_mode_strips_motd_and_echo() {
+        // Realistic --ssh wire stream: MOTD flood, `ssh -tt`-echoed
+        // payload (single line containing READY-emitter + cmd + DONE-
+        // formatter), expanded READY (lower bound), command output,
+        // expanded DONE sentinel (upper bound).
         let uuid = uuid::Uuid::nil();
         let buf = format!(
-            "MOTD line\n➜ \ndocker ps; echo \"__WD_DONE_{uuid}__$?\"\nrow1\nrow2\n__WD_DONE_{uuid}__0\n"
+            "Welcome to Ubuntu\nMOTD line 1\nMOTD line 2\n\
+             echo __WD_READY_{uuid}__; docker ps; echo \"__WD_DONE_{uuid}__$?\"\n\
+             __WD_READY_{uuid}__\n\
+             row1\nrow2\n\
+             __WD_DONE_{uuid}__0\n"
         );
         let out = clean_stdout(&buf, &uuid);
-        assert!(!out.contains("__WD_DONE"), "echoed sentinel must be stripped: {out:?}");
+        assert!(!out.contains("Welcome"), "MOTD must be stripped: {out:?}");
+        assert!(!out.contains("__WD_READY"), "READY echo must be stripped: {out:?}");
+        assert!(!out.contains("__WD_DONE"), "echoed/expanded sentinel must be stripped: {out:?}");
         assert!(!out.contains("docker ps;"), "echoed cmd line should be gone: {out:?}");
         assert_eq!(out, "row1\nrow2");
     }
