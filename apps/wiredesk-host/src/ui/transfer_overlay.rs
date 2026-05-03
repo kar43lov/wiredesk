@@ -10,7 +10,10 @@
 //! Pure helper [`render_overlay_text`] is unit-tested cross-platform; the
 //! nwg wiring (window build + timer wiring) is `#[cfg(windows)]`.
 
-#![cfg_attr(not(windows), allow(dead_code))]
+// Module currently disabled in `main.rs` (overlay window interfered with
+// z-order / focus on the user's setup). Code retained as a starting point
+// for the follow-up that uses a less-intrusive surfacing mechanism.
+#![allow(dead_code)]
 
 // `ProgressCounters` is consumed by the `windows_impl` submodule (the
 // nwg-driven overlay) and by the cross-platform unit tests below. On
