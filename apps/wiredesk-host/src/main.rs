@@ -255,9 +255,18 @@ fn run_windows(
     // fires SetEvent on the named event; this thread blocks on
     // WaitForSingleObject and bumps a separate Notice that the UI
     // thread picks up to surface the Settings window.
+    //
+    // CRITICAL: parent must NOT be the same `MessageWindow` that
+    // already holds the status-bridge Notice — nwg 1.0.13 panics
+    // "Cannot bind control with an handle of type" when a second
+    // Notice tries to attach to a MessageWindow that already has
+    // one. We piggyback on the Settings window instead (a regular
+    // nwg::Window), which accepts an arbitrary number of child
+    // controls.
+    log::info!("run_windows: building show-settings Notice");
     let mut show_notice = nwg::Notice::default();
     if let Err(e) = nwg::Notice::builder()
-        .parent(&tray.borrow().window)
+        .parent(&settings.borrow().window)
         .build(&mut show_notice)
     {
         fatal("show Notice::build", e);
