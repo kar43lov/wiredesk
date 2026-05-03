@@ -71,15 +71,23 @@ fn run(args: &Args) -> Result<()> {
         args.port, args.baud
     );
 
-    let transport = SerialTransport::open(&args.port, args.baud)?;
-    let transport: Arc<Mutex<Box<dyn Transport>>> = Arc::new(Mutex::new(Box::new(transport)));
+    let writer = SerialTransport::open(&args.port, args.baud)?;
+    // Split the port into independent reader/writer handles so a
+    // blocking `recv()` on the reader thread doesn't gate every
+    // keystroke on the writer side. Without this split, raw-mode
+    // typing is gated by the serial recv timeout and feels frozen.
+    let reader = writer
+        .try_clone()
+        .map_err(|e| WireDeskError::Transport(format!("port split: {e}")))?;
+    let writer: Arc<Mutex<Box<dyn Transport>>> = Arc::new(Mutex::new(Box::new(writer)));
+    let mut reader: Box<dyn Transport> = reader;
 
-    // Send Hello and wait for HelloAck. Limit how long we'll wait.
-    handshake(&transport, &args.name)?;
+    // Send Hello on the writer, drain HelloAck on the reader.
+    handshake(&writer, &mut reader, &args.name)?;
 
     // Open shell on Host
     {
-        let mut t = transport.lock().map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
+        let mut t = writer.lock().map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
         t.send(&Packet::new(
             Message::ShellOpen { shell: args.shell.clone() },
             0,
@@ -89,14 +97,14 @@ fn run(args: &Args) -> Result<()> {
     // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
     terminal::enable_raw_mode().map_err(|e| WireDeskError::Input(format!("raw mode: {e}")))?;
 
-    let result = bridge_loop(transport.clone());
+    let result = bridge_loop(writer.clone(), reader);
 
     // Restore terminal regardless of how the loop exited.
     let _ = terminal::disable_raw_mode();
     eprintln!("\nwiredesk-term: disconnected");
 
     // Best-effort: tell the host to close the shell.
-    if let Ok(mut t) = transport.lock() {
+    if let Ok(mut t) = writer.lock() {
         let _ = t.send(&Packet::new(Message::ShellClose, 0));
     }
 
@@ -112,10 +120,40 @@ fn format_connected_banner(host_name: &str, screen_w: u16, screen_h: u16) -> Str
     )
 }
 
-/// Send Hello, wait up to ~5 seconds for HelloAck. Drains other packets meanwhile.
-fn handshake(transport: &Arc<Mutex<Box<dyn Transport>>>, client_name: &str) -> Result<()> {
+/// Translate the byte stream we just read from stdin into what the host
+/// shell expects on its stdin pipe. The only translation is `\r → \n`:
+/// macOS raw mode delivers Enter as a bare CR (0x0D), but PowerShell /
+/// cmd / bash on the host treat the line as terminated only when they
+/// see an LF (0x0A). Without this fix you can type `dir<Enter>` and the
+/// command just sits in the host's read buffer forever.
+///
+/// Bytes other than `\r` pass through unchanged — including 0x7F which
+/// the host shell handles as its own backspace.
+fn translate_input_for_host(chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    for &b in chunk {
+        if b == b'\r' {
+            out.push(b'\n');
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Send Hello on the writer, drain HelloAck on the reader. Reader is
+/// taken `&mut` because `recv()` needs `&mut self` to update its frame
+/// buffer; the caller keeps ownership and hands the reader off to
+/// `bridge_loop` afterward.
+fn handshake(
+    writer: &Arc<Mutex<Box<dyn Transport>>>,
+    reader: &mut Box<dyn Transport>,
+    client_name: &str,
+) -> Result<()> {
     {
-        let mut t = transport.lock().map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
+        let mut t = writer
+            .lock()
+            .map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
         t.send(&Packet::new(
             Message::Hello {
                 version: VERSION,
@@ -132,11 +170,7 @@ fn handshake(transport: &Arc<Mutex<Box<dyn Transport>>>, client_name: &str) -> R
                 "handshake: no HelloAck within 5 seconds".into(),
             ));
         }
-        let pkt = {
-            let mut t = transport.lock().map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
-            t.recv()
-        };
-        match pkt {
+        match reader.recv() {
             Ok(p) => match p.message {
                 Message::HelloAck { host_name, screen_w, screen_h, .. } => {
                     eprintln!("{}", format_connected_banner(&host_name, screen_w, screen_h));
@@ -147,7 +181,6 @@ fn handshake(transport: &Arc<Mutex<Box<dyn Transport>>>, client_name: &str) -> R
                         "host returned error {code}: {msg}"
                     )));
                 }
-                // Other packets pre-handshake are ignored
                 _ => continue,
             },
             Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => continue,
@@ -156,16 +189,22 @@ fn handshake(transport: &Arc<Mutex<Box<dyn Transport>>>, client_name: &str) -> R
     }
 }
 
-/// Three threads — reader (serial → stdout), heartbeat (timer → serial),
-/// and main (stdin → serial).
-fn bridge_loop(transport: Arc<Mutex<Box<dyn Transport>>>) -> Result<()> {
+/// Three threads — reader (serial → stdout) on its own port handle,
+/// heartbeat (timer → serial) and main (stdin → serial) sharing the
+/// writer handle behind a mutex. Splitting the port avoids gating
+/// every keystroke on the reader's blocking recv timeout.
+fn bridge_loop(
+    writer: Arc<Mutex<Box<dyn Transport>>>,
+    reader: Box<dyn Transport>,
+) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Reader thread: pull packets, write ShellOutput to stdout.
+    // Reader thread: pull packets on its own port handle, write
+    // ShellOutput to stdout. Independent from writer-side mutex so
+    // its blocking recv can't stall typing.
     let reader_stop = stop.clone();
-    let reader_transport = transport.clone();
-    let reader = thread::spawn(move || {
-        reader_thread(reader_transport, reader_stop);
+    let reader_handle = thread::spawn(move || {
+        reader_thread(reader, reader_stop);
     });
 
     // Heartbeat thread: keep the host's session alive while the user
@@ -173,9 +212,9 @@ fn bridge_loop(transport: Arc<Mutex<Box<dyn Transport>>>) -> Result<()> {
     // 6 s idle timeout (or 30 s busy timeout during a transfer) ends
     // the session the moment the user steps away.
     let hb_stop = stop.clone();
-    let hb_transport = transport.clone();
+    let hb_writer = writer.clone();
     let heartbeat = thread::spawn(move || {
-        heartbeat_thread(hb_transport, hb_stop);
+        heartbeat_thread(hb_writer, hb_stop);
     });
 
     // Main thread: read stdin and forward bytes as ShellInput.
@@ -193,9 +232,17 @@ fn bridge_loop(transport: Arc<Mutex<Box<dyn Transport>>>) -> Result<()> {
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                if let Ok(mut t) = transport.lock() {
+                // No local echo: every shell we currently support
+                // (PowerShell -NoExit, cmd /Q, bash -i, zsh -i) is
+                // launched in interactive mode and echoes stdin back
+                // through stdout. Local echo on top of that produces
+                // doubled characters ("ddiirr"). If a future shell
+                // option turns out to need it, gate it on a per-shell
+                // setting instead of doing it unconditionally.
+                let host_payload = translate_input_for_host(chunk);
+                if let Ok(mut t) = writer.lock() {
                     if let Err(e) = t.send(&Packet::new(
-                        Message::ShellInput { data: chunk.to_vec() },
+                        Message::ShellInput { data: host_payload },
                         0,
                     )) {
                         eprintln!("\r\nwiredesk-term: send error: {e}");
@@ -217,7 +264,7 @@ fn bridge_loop(transport: Arc<Mutex<Box<dyn Transport>>>) -> Result<()> {
 
     // Signal reader and heartbeat threads to stop, then join.
     stop.store(true, Ordering::Relaxed);
-    let _ = reader.join();
+    let _ = reader_handle.join();
     let _ = heartbeat.join();
     Ok(())
 }
@@ -310,6 +357,26 @@ mod tests {
     }
 
     #[test]
+    fn translate_for_host_replaces_cr_with_lf() {
+        // Raw-mode Enter is bare CR; host shells (PowerShell, cmd, bash)
+        // need LF to terminate a line. Without this PowerShell
+        // buffers `dir<Enter>` forever and never executes.
+        let s = translate_input_for_host(b"dir\r");
+        assert_eq!(s, b"dir\n");
+    }
+
+    #[test]
+    fn translate_for_host_passes_through_non_cr_bytes() {
+        // Backspace, printable ASCII, UTF-8 — all unchanged.
+        let s = translate_input_for_host(b"a\x7Fb");
+        assert_eq!(s, b"a\x7Fb");
+        let s = translate_input_for_host("дир\r".as_bytes());
+        let mut expected = "дир".as_bytes().to_vec();
+        expected.push(b'\n');
+        assert_eq!(s, expected);
+    }
+
+    #[test]
     fn format_banner_unicode_host_name() {
         // Host names round-trip as UTF-8; a non-ASCII name shouldn't
         // break formatting (Russian-locale Windows hostname is realistic).
@@ -337,13 +404,10 @@ mod tests {
     }
 }
 
-fn reader_thread(transport: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<AtomicBool>) {
+fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
     let stdout = io::stdout();
     while !stop.load(Ordering::Relaxed) {
-        let pkt = {
-            let Ok(mut t) = transport.lock() else { break };
-            t.recv()
-        };
+        let pkt = transport.recv();
         match pkt {
             Ok(p) => match p.message {
                 Message::ShellOutput { data } => {
