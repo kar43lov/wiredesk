@@ -80,12 +80,13 @@ fn main() {
             ui::single_instance::SingleInstanceResult::Acquired(g) => g,
             ui::single_instance::SingleInstanceResult::AlreadyRunning => {
                 log::warn!("another wiredesk-host instance is already running");
+                // Instead of nagging with a message box, ask the running
+                // process to surface its Settings window so a double-click
+                // on the .exe behaves like "open the app I already have".
                 #[cfg(windows)]
                 {
-                    let _ = native_windows_gui::init();
-                    native_windows_gui::simple_message(
-                        "WireDesk",
-                        "WireDesk Host is already running — check the tray icon.",
+                    let _ = ui::single_instance::signal_show_settings(
+                        ui::single_instance::SHOW_SETTINGS_EVENT_NAME,
                     );
                 }
                 #[cfg(not(windows))]
@@ -250,10 +251,56 @@ fn run_windows(
 
     let _bridge = ui::status_bridge::spawn(status_rx, last.clone(), notice.sender());
 
+    // Cross-process "show settings" pipe: a second-instance launch
+    // fires SetEvent on the named event; this thread blocks on
+    // WaitForSingleObject and bumps a separate Notice that the UI
+    // thread picks up to surface the Settings window.
+    let mut show_notice = nwg::Notice::default();
+    if let Err(e) = nwg::Notice::builder()
+        .parent(&tray.borrow().window)
+        .build(&mut show_notice)
+    {
+        fatal("show Notice::build", e);
+        return;
+    }
+    #[cfg(windows)]
+    let _show_event_thread = {
+        match ui::single_instance::create_show_settings_event(
+            ui::single_instance::SHOW_SETTINGS_EVENT_NAME,
+        ) {
+            Some(handle) => {
+                let sender = show_notice.sender();
+                Some(std::thread::spawn(move || loop {
+                    if !handle.wait() {
+                        break;
+                    }
+                    sender.notice();
+                }))
+            }
+            None => {
+                log::warn!("create_show_settings_event failed — second-instance launch will be silent");
+                None
+            }
+        }
+    };
+
     // Wire events. nwg's full_bind_event_handler pushes events to a closure
     // that gets RawEvent + control handle; we dispatch manually.
     let tray_handle = tray.borrow().window.handle;
     let settings_handle = settings.borrow().window.handle;
+    let show_notice_handle = show_notice.handle;
+
+    // Cross-process show-settings notice: bumped from the wait thread
+    // when a second instance fires SetEvent on the named event.
+    let show_settings_clone = settings.clone();
+    let _show_event_handler = nwg::full_bind_event_handler(
+        &show_notice_handle,
+        move |evt, _evt_data, _handle| {
+            if matches!(evt, nwg::Event::OnNotice) {
+                show_settings_clone.borrow().show();
+            }
+        },
+    );
 
     let tray_clone = tray.clone();
     let settings_clone = settings.clone();
@@ -407,6 +454,7 @@ fn run_windows(
                     handle == s.copy_mac_btn.handle,
                     handle == s.restart_btn.handle,
                     handle == s.detect_btn.handle,
+                    handle == s.quit_btn.handle,
                 ),
                 Err(_) => {
                     log::debug!(
@@ -415,7 +463,7 @@ fn run_windows(
                     return;
                 }
             };
-            let (is_save, is_copy_mac, is_restart, is_detect) = probe;
+            let (is_save, is_copy_mac, is_restart, is_detect, is_quit) = probe;
             match evt {
                 E::OnButtonClick => {
                     if is_save {
@@ -426,6 +474,11 @@ fn run_windows(
                         handle_restart(&settings_clone2, &cfg_holder);
                     } else if is_detect {
                         handle_detect(&settings_clone2);
+                    } else if is_quit {
+                        // Same effect as the tray's Quit menu — drop out
+                        // of the nwg event loop. Drop'ed guards (mutex,
+                        // session thread join handle, etc.) clean up.
+                        nwg::stop_thread_dispatch();
                     }
                 }
                 E::OnWindowClose => {

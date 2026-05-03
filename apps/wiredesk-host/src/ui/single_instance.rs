@@ -109,6 +109,108 @@ pub fn try_acquire_with_retry(
     SingleInstanceResult::AlreadyRunning
 }
 
+/// Cross-process "show settings" signal between the running host and a
+/// freshly-launched second instance. Implementation: a Win32 named
+/// auto-reset event. The owning process keeps a handle and a wait
+/// thread; a second instance opens the same event by name, calls
+/// SetEvent, and exits.
+///
+/// Auto-reset (manual_reset = FALSE) so a single SetEvent wakes one
+/// waiter and resets — perfect for "click the icon again to bring
+/// up Settings" semantics.
+#[cfg(windows)]
+pub const SHOW_SETTINGS_EVENT_NAME: &str = "WireDeskHostShowSettings";
+
+/// Open and signal the show-settings event. Used by a second-instance
+/// launch when the named-mutex check returns AlreadyRunning. Returns
+/// true if the existing process was successfully signalled.
+#[cfg(windows)]
+pub fn signal_show_settings(name: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+
+    let wide: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        match OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(wide.as_ptr())) {
+            Ok(h) => {
+                let ok = SetEvent(h).is_ok();
+                let _ = CloseHandle(h);
+                ok
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Owning-side: create the named auto-reset event. Returns the raw
+/// handle as a `usize` so it can cross thread boundaries (the
+/// `windows::HANDLE` is `!Send`/`!Sync`). Caller is responsible for
+/// closing it on shutdown — typically by holding the returned guard.
+#[cfg(windows)]
+pub fn create_show_settings_event(name: &str) -> Option<ShowSettingsEventHandle> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Threading::CreateEventW;
+
+    let wide: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        match CreateEventW(None, false, false, PCWSTR(wide.as_ptr())) {
+            Ok(h) => Some(ShowSettingsEventHandle { raw: h.0 as usize }),
+            Err(_) => None,
+        }
+    }
+}
+
+/// Wait on the event handle until SetEvent fires, or `stop()` is invoked
+/// from another thread. The returned closure stops the wait by
+/// signalling the event itself — auto-reset means the one waiter wakes
+/// and the loop checks `should_stop` before continuing.
+#[cfg(windows)]
+pub struct ShowSettingsEventHandle {
+    raw: usize,
+}
+
+#[cfg(windows)]
+impl ShowSettingsEventHandle {
+    /// Block until SetEvent fires. Returns true on a real signal,
+    /// false on error.
+    pub fn wait(&self) -> bool {
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+        unsafe {
+            let h = HANDLE(self.raw as *mut _);
+            WaitForSingleObject(h, INFINITE) == WAIT_OBJECT_0
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShowSettingsEventHandle {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        unsafe {
+            let _ = CloseHandle(HANDLE(self.raw as *mut _));
+        }
+    }
+}
+
+// Send/Sync: HANDLE is just a kernel object; sharing the raw usize
+// across threads is fine — the OS handles synchronisation.
+#[cfg(windows)]
+unsafe impl Send for ShowSettingsEventHandle {}
+#[cfg(windows)]
+unsafe impl Sync for ShowSettingsEventHandle {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
