@@ -26,7 +26,7 @@ Host (Windows 11)                       Client (macOS)
 - Captures keyboard and mouse input on Mac, sends to Windows via serial
 - Injects input on Windows via SendInput API (scancodes, works with any keyboard layout, Cyrillic included)
 - **OS-level keyboard capture on macOS** via CGEventTap — system shortcuts like Cmd+Space (input-method switch) and Cmd+C/Cmd+V are intercepted before macOS gets them and forwarded to Host as Win+Space / Ctrl+C / Ctrl+V
-- Syncs clipboard **text and PNG images** in both directions automatically (polled every 500ms; UTF-8 text up to 256 KB, images up to 1 MB encoded)
+- Syncs clipboard **text and PNG images** in both directions automatically (polled every 500ms; UTF-8 text up to 256 KB, images up to 1 MB encoded). Settings → Clipboard offers four independent toggles (send/receive × text/image) — handy when an app like Whispr Flow keeps writing transcribed text into the clipboard. Mac shows a visual progress bar in the window and inside the capture banner; menu bar shows "↑43%" / "↓67%". Windows surfaces oversize warnings as a tray balloon notification.
 - Toggle capture with `Cmd+Esc` — input goes to Host when active, back to Mac when released
 - Toggle fullscreen with `Cmd+Enter` — for "third monitor" workflow when WireDesk is dragged onto a display fed by the HDMI-capture. **Per-monitor selection** on macOS — pick a target display in Settings and `Cmd+Enter` lands fullscreen on that exact screen. Entering fullscreen auto-engages capture, leaving it auto-releases — no second shortcut needed.
 - Auto-pauses capture when the WireDesk window loses focus — click any other Mac app and Cmd-shortcuts work locally again
@@ -176,7 +176,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded; OS-level keyboard hijack on macOS), fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, shell-over-serial, tray agent on Windows with auto-detect CH340 + Save & Restart, `.app` bundle on macOS, TOML-backed settings UI on both sides, file logging on Windows, autostart toggle, single-instance lock. 211 tests passing.
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, shell-over-serial. Mac UI: visual progress bars in the chrome panel and inside the capture banner (visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → Clipboard with four send/receive × text/image toggles. Win host: tray agent (nwg) with auto-detect CH340, Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. ~280 tests passing.
 
 ## License
 
