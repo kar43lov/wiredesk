@@ -34,9 +34,17 @@ pub(crate) const MAX_IMAGE_BYTES: usize = 1024 * 1024; // 1 MB encoded
 /// while a screenshot stays on the OS clipboard) would loop: each text
 /// write erases the image hash → next poll sees image as "new" → resends.
 /// Bug captured in `2026-05-03 09:24` log session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Text slot holds a small ring buffer (`TEXT_HISTORY`) of recent hashes,
+/// not just the latest. Whispr Flow / TextExpander-style apps "save→
+/// write→paste→restore" the clipboard around their inject — that
+/// produces the alternating sequence `prev→new→prev→new` and a
+/// single-hash slot would re-send `prev` on every restore. The history
+/// ring lets us skip both `new` AND `prev` since both were just seen.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LastSeen {
-    pub text: Option<u64>,
+    /// Last N text hashes (most recent first). N = `TEXT_HISTORY`.
+    pub text_history: std::collections::VecDeque<u64>,
     /// Successfully sent/received image hash (over RGBA bytes).
     pub image: Option<u64>,
     /// RGBA hash of the most recent image rejected by the size cap. Lets the
@@ -45,6 +53,10 @@ pub(crate) struct LastSeen {
     /// AC4 expects one toast per oversize event, not one per poll.
     pub oversize_image: Option<u64>,
 }
+
+/// How many recent text hashes the dedup history retains. 4 covers a
+/// Whispr-Flow inject cycle (prev → transcript → prev) plus a buffer.
+const TEXT_HISTORY: usize = 4;
 
 impl LastSeen {
     /// True when the given RGBA hash matches either the last sent/received
@@ -55,7 +67,7 @@ impl LastSeen {
     }
 
     pub(crate) fn matches_text_hash(&self, hash: u64) -> bool {
-        self.text == Some(hash)
+        self.text_history.contains(&hash)
     }
 }
 
@@ -83,12 +95,23 @@ impl ClipboardState {
     }
 
     pub(crate) fn get(&self) -> LastSeen {
-        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub(crate) fn set_text(&self, hash: u64) {
         let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        g.text = Some(hash);
+        // Skip duplicate (already at front of history).
+        if g.text_history.front() == Some(&hash) {
+            return;
+        }
+        // Move to front if already present elsewhere — keeps the LRU order.
+        if let Some(pos) = g.text_history.iter().position(|h| *h == hash) {
+            g.text_history.remove(pos);
+        }
+        g.text_history.push_front(hash);
+        while g.text_history.len() > TEXT_HISTORY {
+            g.text_history.pop_back();
+        }
     }
 
     pub(crate) fn set_image(&self, hash: u64) {
@@ -871,7 +894,7 @@ mod tests {
     fn last_kind_default_is_none() {
         let state = ClipboardState::new();
         let s = state.get();
-        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
+        assert!(s.text_history.is_empty() && s.image.is_none() && s.oversize_image.is_none());
     }
 
     #[test]
@@ -883,9 +906,9 @@ mod tests {
         let state = ClipboardState::new();
 
         state.set_text(0xAABB_CCDD);
-        assert_eq!(state.get().text, Some(0xAABB_CCDD));
+        assert!(state.get().matches_text_hash(0xAABB_CCDD));
         state.reset();
-        assert!(state.get().text.is_none());
+        assert!(state.get().text_history.is_empty());
 
         state.set_image(0x1122_3344);
         assert_eq!(state.get().image, Some(0x1122_3344));
@@ -907,13 +930,33 @@ mod tests {
         state.set_text(0x1111);
         state.set_image(0x2222);
         let s = state.get();
-        assert_eq!(s.text, Some(0x1111));
+        assert!(s.matches_text_hash(0x1111));
         assert_eq!(s.image, Some(0x2222));
 
         state.set_text(0x3333); // text update
         let s = state.get();
-        assert_eq!(s.text, Some(0x3333));
+        assert!(s.matches_text_hash(0x3333));
+        assert!(
+            s.matches_text_hash(0x1111),
+            "older text hash should remain in history (LRU)"
+        );
         assert_eq!(s.image, Some(0x2222), "image hash must survive text update");
+    }
+
+    #[test]
+    fn text_history_dedups_whispr_inject_pattern() {
+        // Whispr Flow saves clipboard, writes transcript, paste's, restores.
+        // The poll thread sees: prev → new → prev → newer → prev → ...
+        // With a single-hash slot the resends loop forever; with the LRU
+        // history both `prev` and `new` stay in window so neither resends
+        // until something genuinely fresh arrives.
+        let state = ClipboardState::new();
+        state.set_text(0xAAAA); // prev (e.g. host-pushed text)
+        state.set_text(0xBBBB); // Whispr writes transcript
+        // Whispr restores prev — must NOT mark as new.
+        assert!(state.get().matches_text_hash(0xAAAA));
+        // New transcript still detected as new.
+        assert!(!state.get().matches_text_hash(0xCCCC));
     }
 
     #[test]
@@ -1203,7 +1246,7 @@ mod tests {
             CommittedPayload::Text(s) => assert_eq!(s, text),
             other => panic!("expected text, got {other:?}"),
         }
-        assert!(state.get().text.is_some());
+        assert!(!state.get().text_history.is_empty());
     }
 
     #[test]
@@ -1219,7 +1262,7 @@ mod tests {
 
         assert!(incoming.last_committed.is_none(), "no payload should commit");
         let s = state.get();
-        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
+        assert!(s.text_history.is_empty() && s.image.is_none() && s.oversize_image.is_none());
         // After failed commit the receiver must be ready for a new offer.
         assert_eq!(incoming.expected_len, 0);
         assert_eq!(incoming.expected_format, 0);
@@ -1238,7 +1281,7 @@ mod tests {
 
         assert!(incoming.last_committed.is_none(), "no payload should commit");
         let s = state.get();
-        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
+        assert!(s.text_history.is_empty() && s.image.is_none() && s.oversize_image.is_none());
         assert_eq!(incoming.expected_len, 0);
         assert_eq!(incoming.expected_format, 0);
     }
@@ -1254,7 +1297,7 @@ mod tests {
 
         assert!(incoming.last_committed.is_none());
         let s = state.get();
-        assert!(s.text.is_none() && s.image.is_none() && s.oversize_image.is_none());
+        assert!(s.text_history.is_empty() && s.image.is_none() && s.oversize_image.is_none());
     }
 
     /// Codex C3 deferred: marker test documenting the rich-selection gap.
