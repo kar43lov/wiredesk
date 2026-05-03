@@ -4,10 +4,11 @@ mod config;
 mod input;
 mod keyboard_tap;
 mod monitor;
+mod restart;
 mod status_bar;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,6 +99,11 @@ fn main() {
     let receive_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_images));
     let send_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_text));
     let receive_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_text));
+    // Karabiner-Elements `left_command ↔ left_option` compensation (see
+    // ClientConfig::swap_option_command). Read once on startup and surfaced
+    // through Settings; flipping the checkbox at runtime takes effect on the
+    // next FlagsChanged / KeyDown the tap sees.
+    let swap_option_command = Arc::new(std::sync::atomic::AtomicBool::new(cfg.swap_option_command));
 
     // Writer thread — owns one half of the port. Drains outgoing channel,
     // sends heartbeats, sends Hello on startup. UI never blocks because this
@@ -106,10 +112,18 @@ fn main() {
     // Owns outgoing_progress/total updates (M3 fix): increments AFTER each
     // successful transport.send so the UI reflects real wire-state progress
     // (≥2 visible increments during typical 500 KB transfers, AC5).
+    // Cancel atomics need to be in scope before writer/reader spawn — both
+    // threads observe them to drop in-flight clipboard packets when the UI
+    // hits the Cancel button. (See `outgoing_text_in_flight` block below
+    // for the full set of clipboard-orchestration atomics.)
+    let outgoing_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let incoming_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let writer_events_tx = events_tx.clone();
     let client_name = cfg.client_name.clone();
     let writer_outgoing_progress = outgoing_progress.clone();
     let writer_outgoing_total = outgoing_total.clone();
+    let writer_outgoing_cancel = outgoing_cancel.clone();
     thread::spawn(move || {
         writer_thread(
             writer_transport,
@@ -118,6 +132,7 @@ fn main() {
             client_name,
             writer_outgoing_progress,
             writer_outgoing_total,
+            writer_outgoing_cancel,
         );
     });
 
@@ -141,6 +156,7 @@ fn main() {
     let reader_outgoing_total = outgoing_total.clone();
     let reader_receive_images = receive_images.clone();
     let reader_receive_text = receive_text.clone();
+    let reader_incoming_cancel = incoming_cancel.clone();
     thread::spawn(move || {
         reader_thread(
             reader_transport,
@@ -152,8 +168,20 @@ fn main() {
             reader_outgoing_total,
             reader_receive_images,
             reader_receive_text,
+            reader_incoming_cancel,
         );
     });
+
+    // Synthetic-combo dispatcher pieces. Whispr Flow / TextExpander send
+    // Cmd+V via CGEventPost, which races against Mac→Host clipboard sync —
+    // without deferral the synthesized paste lands on the previous
+    // clipboard. The poll thread flips `outgoing_text_in_flight` true at
+    // the start of every text-send and clears it on the next tick;
+    // meanwhile the tap shoves all synthetic combos through `synth_tx`,
+    // and the dispatcher below drains the channel, waiting on the flag.
+    let outgoing_text_in_flight =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (synth_tx, synth_rx) = std::sync::mpsc::channel::<keyboard_tap::SyntheticCombo>();
 
     // Clipboard poll thread — pushes Mac clipboard changes to host.
     // Outgoing progress counters are updated by writer_thread now (M3 fix),
@@ -165,11 +193,41 @@ fn main() {
         poll_events_tx,
         send_images.clone(),
         send_text.clone(),
+        outgoing_text_in_flight.clone(),
     );
+
+    // Synthetic dispatcher thread — see comment above. Holds each combo
+    // while a clipboard sync is in flight (max 2 s), then waits a short
+    // grace for Host to commit before emitting on the wire.
+    {
+        let outgoing_tx = outgoing_tx.clone();
+        let in_flight = outgoing_text_in_flight.clone();
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+            const GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+            const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+            while let Ok(combo) = synth_rx.recv() {
+                let start = std::time::Instant::now();
+                while in_flight.load(Ordering::Acquire) && start.elapsed() < MAX_WAIT {
+                    std::thread::sleep(POLL);
+                }
+                std::thread::sleep(GRACE);
+                for packet in combo {
+                    let _ = outgoing_tx.send(packet);
+                }
+            }
+        });
+    }
 
     // Keyboard tap (macOS only — no-op elsewhere). Initially disabled;
     // enable() is called when the user enters capture-mode.
-    let tap_handle = keyboard_tap::start(outgoing_tx.clone(), tap_events_tx);
+    let tap_handle = keyboard_tap::start(
+        outgoing_tx.clone(),
+        tap_events_tx,
+        swap_option_command.clone(),
+        synth_tx,
+    );
 
     // Status bar item — same Arcs the egui status row reads from. Idle
     // shows "W"; in-flight transfer shows "↑ N%" / "↓ N%". Initialised
@@ -196,11 +254,14 @@ fn main() {
         receive_images,
         send_text,
         receive_text,
+        swap_option_command,
+        outgoing_cancel,
+        incoming_cancel,
     );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 600.0])
+            .with_inner_size([520.0, 760.0])
             .with_title("WireDesk"),
         ..Default::default()
     };
@@ -289,6 +350,7 @@ fn writer_thread(
     client_name: String,
     outgoing_progress: Arc<AtomicU64>,
     outgoing_total: Arc<AtomicU64>,
+    outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -310,6 +372,26 @@ fn writer_thread(
 
         match outgoing_rx.recv_timeout(timeout) {
             Ok(packet) => {
+                let is_clip = matches!(
+                    packet.message,
+                    Message::ClipOffer { .. } | Message::ClipChunk { .. }
+                );
+                let cancelling = outgoing_cancel.load(Ordering::Acquire);
+                if is_clip && cancelling {
+                    // User pressed Cancel mid-transfer. Drop the queued
+                    // clip packet without writing it to the wire so Host
+                    // never sees the rest of the offer. Counters are
+                    // cleared by the UI thread; here we just keep eating
+                    // packets until the next non-clip packet (or queue
+                    // drains naturally) — at which point we clear the
+                    // flag so the next ClipOffer flows normally.
+                    log::info!("clipboard.send CANCELLED — dropping queued clip packet");
+                    continue;
+                }
+                if cancelling && !is_clip {
+                    // Drained the cancelled batch. Re-arm for next transfer.
+                    outgoing_cancel.store(false, Ordering::Release);
+                }
                 if let Err(e) = transport.send(&packet) {
                     log::error!("send error: {e}");
                     let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
@@ -323,7 +405,14 @@ fn writer_thread(
                     &outgoing_total,
                 );
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Queue empty. If a cancel was pending, the only way to
+                // be here is that we've dropped every queued clip packet —
+                // safe to clear the flag.
+                if outgoing_cancel.load(Ordering::Acquire) {
+                    outgoing_cancel.store(false, Ordering::Release);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
@@ -354,6 +443,7 @@ fn reader_thread(
     outgoing_total: Arc<AtomicU64>,
     receive_images: Arc<std::sync::atomic::AtomicBool>,
     receive_text: Arc<std::sync::atomic::AtomicBool>,
+    incoming_cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -405,9 +495,21 @@ fn reader_thread(
                     let _ = events_tx.send(TransportEvent::Heartbeat);
                 }
                 Message::ClipOffer { format, total_len } => {
+                    if incoming_cancel.swap(false, Ordering::AcqRel) {
+                        // Stale cancel from before this offer — clear and
+                        // accept the new offer normally.
+                    }
                     incoming_clip.on_offer(format, total_len);
                 }
                 Message::ClipChunk { index, data } => {
+                    if incoming_cancel.load(Ordering::Acquire) {
+                        log::info!("clipboard.recv CANCELLED — dropping chunk {index}");
+                        incoming_clip.reset();
+                        // Keep the flag set: more chunks from the same offer
+                        // are still on the wire, drop them too. Cleared on
+                        // next ClipOffer (above).
+                        continue;
+                    }
                     incoming_clip.on_chunk(index, data);
                 }
                 Message::ShellOutput { data } => {

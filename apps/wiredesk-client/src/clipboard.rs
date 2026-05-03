@@ -353,12 +353,17 @@ pub(crate) fn apply_outgoing_progress(
 /// `events_tx` is used to surface transient warnings to the UI — currently
 /// just the "image too large" toast. Reusing the existing UI event channel
 /// avoids adding a separate signalling path for one warning kind.
+/// Shared `outgoing_text_in_flight` is set true while a Mac→Host text-clipboard
+/// sync is in flight on the wire; the synthetic-combo dispatcher holds
+/// Whispr-Flow-style synthetic Cmd+V until this clears (plus a small grace)
+/// so the paste lands on the *new* clipboard, not the previous one.
 pub fn spawn_poll_thread(
     state: ClipboardState,
     outgoing_tx: mpsc::Sender<Packet>,
     events_tx: mpsc::Sender<TransportEvent>,
     send_images: Arc<AtomicBool>,
     send_text: Arc<AtomicBool>,
+    outgoing_text_in_flight: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let mut clip = match arboard::Clipboard::new() {
@@ -400,6 +405,15 @@ pub fn spawn_poll_thread(
         loop {
             thread::sleep(CLIP_POLL_INTERVAL);
 
+            // Clear the in-flight flag at the start of each tick. By now
+            // the previous text-send (if any) has been drained from
+            // outgoing_tx by writer_thread, written on the wire, and Host
+            // has committed — 500 ms is plenty for typical 50–500 byte
+            // dictation strings (~5 ms wire time at 11 KB/s). The
+            // synthetic-combo dispatcher uses this flag to defer
+            // Whispr-Flow's Cmd+V until the new clipboard reaches Host.
+            outgoing_text_in_flight.store(false, Ordering::Release);
+
             // 1) Probe text. Independent dedup slot (`LastSeen.text`) so
             // an alternating text/image clipboard (Whispr Flow + a
             // standing screenshot) doesn't loop. Runtime toggle gates
@@ -421,6 +435,8 @@ pub fn spawn_poll_thread(
                                     "clipboard: pushing {} bytes to host",
                                     bytes.len()
                                 );
+                                outgoing_text_in_flight
+                                    .store(true, Ordering::Release);
                                 emit_offer_and_chunks(
                                     &outgoing_tx,
                                     FORMAT_TEXT_UTF8,

@@ -63,6 +63,15 @@ pub struct ClientConfig {
     /// Accept incoming text from Host → Mac.
     #[serde(default = "default_true")]
     pub receive_text: bool,
+    /// Compensate Karabiner-Elements `left_command ↔ left_option` swap when
+    /// forwarding modifiers and detecting local hotkeys. With Karabiner
+    /// remapping the two keys at the HID level (so the same physical
+    /// keyboard works identically on macOS and Windows), our CGEventTap
+    /// sees Cmd where the user pressed Option and vice versa — Cmd+V then
+    /// arrives on Host as Alt+V instead of the paste combo. Enabling this
+    /// re-swaps modifiers locally so Host gets the user-intended scancodes.
+    #[serde(default)]
+    pub swap_option_command: bool,
 }
 
 fn default_true() -> bool {
@@ -113,6 +122,7 @@ impl Default for ClientConfig {
             receive_images: true,
             send_text: true,
             receive_text: true,
+            swap_option_command: false,
         }
     }
 }
@@ -223,6 +233,7 @@ mod tests {
             receive_images: true,
             send_text: true,
             receive_text: true,
+            swap_option_command: false,
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -347,6 +358,7 @@ mod tests {
             receive_images: true,
             send_text: true,
             receive_text: true,
+            swap_option_command: false,
         }
     }
 

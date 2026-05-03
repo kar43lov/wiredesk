@@ -133,6 +133,17 @@ pub struct WireDeskApp {
     receive_images: Arc<AtomicBool>,
     send_text: Arc<AtomicBool>,
     receive_text: Arc<AtomicBool>,
+    /// Karabiner-Elements `left_command ↔ left_option` compensation. Shared
+    /// with the keyboard tap thread; flipping the Settings checkbox takes
+    /// effect on the next FlagsChanged / KeyDown the tap sees.
+    swap_option_command: Arc<AtomicBool>,
+    /// User-pressed Cancel for the outgoing transfer. Shared with the
+    /// writer thread, which drops queued ClipOffer/ClipChunk packets while
+    /// the flag is set and re-arms it once the stale batch drains.
+    outgoing_cancel: Arc<AtomicBool>,
+    /// Same shape, for the incoming transfer. The reader thread drops
+    /// further chunks of the current offer and resets reassembly state.
+    incoming_cancel: Arc<AtomicBool>,
     /// Generic 3-second toast surfaced by `TransportEvent::Toast`. Currently
     /// used by the clipboard poll thread to warn the user when a copied image
     /// exceeds `MAX_IMAGE_BYTES` (Task 7b). Distinct from `save_toast`, which
@@ -209,6 +220,38 @@ pub fn format_progress(action: &str, current: u64, total: u64) -> Option<String>
 ///
 /// Returns `Some(ratio)` in 0.0..=1.0 when a transfer is active (`total > 0`),
 /// or `None` when idle. Overshoot is clamped to 1.0.
+/// Render a progress bar with an inline Cancel button on its right.
+/// Clicking the button flips `cancel_flag` to true; the writer/reader
+/// thread observes the flag and drops the in-flight clipboard packets,
+/// then re-arms the flag itself once the stale batch is drained. The
+/// caller decides whether the bar should appear at all (None ratio →
+/// no row); we only render once we know there's something to show.
+fn render_progress_row(
+    ui: &mut egui::Ui,
+    ratio: f32,
+    text: &str,
+    cancel_flag: &Arc<AtomicBool>,
+    progress_atomic: &Arc<AtomicU64>,
+    total_atomic: &Arc<AtomicU64>,
+) {
+    ui.horizontal(|ui| {
+        let bar_width = ui.available_width() - 70.0;
+        ui.add_sized(
+            [bar_width.max(120.0), 18.0],
+            egui::ProgressBar::new(ratio).text(text),
+        );
+        if ui
+            .small_button("✕ Cancel")
+            .on_hover_text("Abort this transfer")
+            .clicked()
+        {
+            cancel_flag.store(true, Ordering::Release);
+            progress_atomic.store(0, Ordering::Relaxed);
+            total_atomic.store(0, Ordering::Relaxed);
+        }
+    });
+}
+
 pub fn progress_ratio(current: u64, total: u64) -> Option<f32> {
     if total == 0 {
         return None;
@@ -247,6 +290,9 @@ impl WireDeskApp {
         receive_images: Arc<AtomicBool>,
         send_text: Arc<AtomicBool>,
         receive_text: Arc<AtomicBool>,
+        swap_option_command: Arc<AtomicBool>,
+        outgoing_cancel: Arc<AtomicBool>,
+        incoming_cancel: Arc<AtomicBool>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -294,6 +340,9 @@ impl WireDeskApp {
             receive_images,
             send_text,
             receive_text,
+            swap_option_command,
+            outgoing_cancel,
+            incoming_cancel,
             transient_toast: None,
         }
     }
@@ -332,6 +381,7 @@ impl WireDeskApp {
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
         let mut dirty = false;
         let mut want_save = false;
+        let mut want_save_and_restart = false;
         let mut want_reset = false;
         let mut want_refresh_ports = false;
         let available_ports = self.available_ports.clone();
@@ -563,10 +613,36 @@ impl WireDeskApp {
                         dirty = true;
                     }
                 });
+                let mut swap_oc = cfg.swap_option_command;
+                if ui
+                    .checkbox(&mut swap_oc, "Swap ⌥/⌘ on Host (Karabiner-Elements compensation)")
+                    .changed()
+                {
+                    cfg.swap_option_command = swap_oc;
+                    self.swap_option_command.store(swap_oc, Ordering::Relaxed);
+                    dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Enable if you remap left_command ↔ left_option in \
+                         Karabiner-Elements so the same physical keyboard \
+                         works on macOS and Windows. Without this WireDesk \
+                         forwards Cmd+V as Alt+V to Host. Cmd+Esc / Cmd+Enter \
+                         keep firing on the same physical key you press today.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
             });
 
             ui.horizontal(|ui| {
                 let save_enabled = self.config_dirty || dirty;
+                if ui
+                    .add_enabled(save_enabled, egui::Button::new("Save && Restart"))
+                    .clicked()
+                {
+                    want_save_and_restart = true;
+                }
                 if ui
                     .add_enabled(save_enabled, egui::Button::new("Save"))
                     .clicked()
@@ -603,6 +679,18 @@ impl WireDeskApp {
                         "Saved. Restart WireDesk to apply.".to_string(),
                         Instant::now(),
                     ));
+                }
+                Err(e) => {
+                    self.save_toast =
+                        Some((format!("Save failed: {e}"), Instant::now()));
+                }
+            }
+        }
+        if want_save_and_restart {
+            match self.pending_config.save() {
+                Ok(()) => {
+                    self.config_dirty = false;
+                    crate::restart::restart_app();
                 }
                 Err(e) => {
                     self.save_toast =
@@ -951,13 +1039,27 @@ impl WireDeskApp {
                 progress_ratio(out_cur, out_tot),
                 format_progress("Sending clipboard", out_cur, out_tot),
             ) {
-                ui.add(egui::ProgressBar::new(ratio).text(text));
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.outgoing_cancel,
+                    &self.outgoing_progress,
+                    &self.outgoing_total,
+                );
             }
             if let (Some(ratio), Some(text)) = (
                 progress_ratio(inc_cur, inc_tot),
                 format_progress("Receiving clipboard", inc_cur, inc_tot),
             ) {
-                ui.add(egui::ProgressBar::new(ratio).text(text));
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.incoming_cancel,
+                    &self.incoming_progress,
+                    &self.incoming_total,
+                );
             }
         }
 
@@ -1165,6 +1267,13 @@ impl eframe::App for WireDeskApp {
                 return;
             }
 
+            // Wrap chrome content in a ScrollArea so the Settings panel
+            // can grow past the window's initial height — the user can
+            // either resize the window or scroll without losing buttons
+            // (Save / Save & Restart / Reset) below the fold.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // 28px icon next to the heading — branding consistency with
                 // the Win host title-bar icon. egui downscales the 1024×1024
@@ -1224,14 +1333,28 @@ impl eframe::App for WireDeskApp {
                 progress_ratio(out_cur, out_tot),
                 format_progress("Sending clipboard", out_cur, out_tot),
             ) {
-                ui.add(egui::ProgressBar::new(ratio).text(text));
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.outgoing_cancel,
+                    &self.outgoing_progress,
+                    &self.outgoing_total,
+                );
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
             if let (Some(ratio), Some(text)) = (
                 progress_ratio(inc_cur, inc_tot),
                 format_progress("Receiving clipboard", inc_cur, inc_tot),
             ) {
-                ui.add(egui::ProgressBar::new(ratio).text(text));
+                render_progress_row(
+                    ui,
+                    ratio,
+                    &text,
+                    &self.incoming_cancel,
+                    &self.incoming_progress,
+                    &self.incoming_total,
+                );
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
 
@@ -1438,6 +1561,7 @@ impl eframe::App for WireDeskApp {
             if let Some((msg, _)) = &self.transient_toast {
                 ui.colored_label(COLOR_WARNING, msg);
             }
+                }); // ScrollArea
         });
 
         // Handle captured input — push to outgoing channel (non-blocking).
@@ -1519,7 +1643,16 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::channel();
         let (_ev_tx, ev_rx) = mpsc::channel();
         let (tap_tx, tap_rx) = mpsc::channel();
-        let tap_handle = keyboard_tap::start(out_tx.clone(), tap_tx);
+        let swap_flag = Arc::new(AtomicBool::new(false));
+        let (synth_tx, _synth_rx) = mpsc::channel();
+        let tap_handle = keyboard_tap::start(
+            out_tx.clone(),
+            tap_tx,
+            swap_flag.clone(),
+            synth_tx,
+        );
+        let outgoing_cancel = Arc::new(AtomicBool::new(false));
+        let incoming_cancel = Arc::new(AtomicBool::new(false));
         let cfg = ClientConfig {
             port: "/dev/null".into(),
             ..ClientConfig::default()
@@ -1538,6 +1671,9 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
+            swap_flag,
+            outgoing_cancel,
+            incoming_cancel,
         )
     }
 

@@ -243,6 +243,32 @@ pub fn cg_flag_change_to_scancodes(flags: u64, prev: u64) -> Vec<(u16, bool)> {
     out
 }
 
+/// Swap CG_FLAG_COMMAND ↔ CG_FLAG_ALT bits in a flags bitmap.
+/// Used when Karabiner-Elements remaps `left_command ↔ left_option`
+/// at the HID level — our tap then has to undo that swap before
+/// translating to Windows scancodes so Host receives the user-intended
+/// modifiers (physical Cmd → Ctrl, physical Option → Alt).
+fn swap_cmd_alt_bits(f: u64) -> u64 {
+    let cmd = (f & CG_FLAG_COMMAND) != 0;
+    let alt = (f & CG_FLAG_ALT) != 0;
+    let mut out = f & !(CG_FLAG_COMMAND | CG_FLAG_ALT);
+    if cmd {
+        out |= CG_FLAG_ALT;
+    }
+    if alt {
+        out |= CG_FLAG_COMMAND;
+    }
+    out
+}
+
+/// Variant of [`cg_flag_change_to_scancodes`] that pre-swaps Cmd ↔ Option
+/// in both inputs. Use when the user has Karabiner-Elements (or similar
+/// HID remapper) swapping the keys on their keyboard — without this the
+/// tap forwards e.g. Cmd+V as Alt+V to Host.
+pub fn cg_flag_change_to_scancodes_swapped(flags: u64, prev: u64) -> Vec<(u16, bool)> {
+    cg_flag_change_to_scancodes(swap_cmd_alt_bits(flags), swap_cmd_alt_bits(prev))
+}
+
 /// Convert egui Modifiers to our modifier bitmap.
 /// On macOS, Cmd is remapped to Ctrl for Windows.
 pub fn egui_modifiers_to_u8(modifiers: &egui::Modifiers) -> u8 {
@@ -426,5 +452,71 @@ mod tests {
     fn flag_change_alt_only() {
         let out = cg_flag_change_to_scancodes(CG_FLAG_ALT, 0);
         assert_eq!(out, vec![(WIN_SCAN_LALT, true)]);
+    }
+
+    // Swap-mode tests — Karabiner-Elements left_command ↔ left_option compensation.
+    // Physical Cmd → Karabiner remaps to Option → CGEventTap sees Option;
+    // user expects Host to receive Ctrl. Swap-aware helper achieves that.
+
+    #[test]
+    fn swap_cmd_press_emits_alt() {
+        // User pressed physical Option → Mac sees Cmd flag; we want Host to
+        // get Alt.
+        let out = cg_flag_change_to_scancodes_swapped(CG_FLAG_COMMAND, 0);
+        assert_eq!(out, vec![(WIN_SCAN_LALT, true)]);
+    }
+
+    #[test]
+    fn swap_alt_press_emits_ctrl() {
+        // User pressed physical Cmd → Mac sees Option flag; we want Host to
+        // get Ctrl.
+        let out = cg_flag_change_to_scancodes_swapped(CG_FLAG_ALT, 0);
+        assert_eq!(out, vec![(WIN_SCAN_LCTRL, true)]);
+    }
+
+    #[test]
+    fn swap_cmd_release_emits_alt_release() {
+        let out = cg_flag_change_to_scancodes_swapped(0, CG_FLAG_COMMAND);
+        assert_eq!(out, vec![(WIN_SCAN_LALT, false)]);
+    }
+
+    #[test]
+    fn swap_alt_release_emits_ctrl_release() {
+        let out = cg_flag_change_to_scancodes_swapped(0, CG_FLAG_ALT);
+        assert_eq!(out, vec![(WIN_SCAN_LCTRL, false)]);
+    }
+
+    #[test]
+    fn swap_shift_unaffected() {
+        // Only Cmd↔Option are swapped; Shift flows through as-is.
+        let out = cg_flag_change_to_scancodes_swapped(CG_FLAG_SHIFT, 0);
+        assert_eq!(out, vec![(WIN_SCAN_LSHIFT, true)]);
+    }
+
+    #[test]
+    fn swap_ctrl_unaffected() {
+        // Real Mac Ctrl flag still maps to Win Ctrl (it's already there
+        // physically — Karabiner only swaps Cmd↔Option).
+        let out = cg_flag_change_to_scancodes_swapped(CG_FLAG_CONTROL, 0);
+        assert_eq!(out, vec![(WIN_SCAN_LCTRL, true)]);
+    }
+
+    #[test]
+    fn swap_idempotent() {
+        let f = CG_FLAG_COMMAND | CG_FLAG_SHIFT;
+        let out = cg_flag_change_to_scancodes_swapped(f, f);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn swap_full_combo_press() {
+        // User physically presses Cmd+Shift+Option → Karabiner swaps Cmd↔Opt
+        // → Mac sees Opt+Shift+Cmd; we want Host to see Ctrl+Shift+Alt.
+        let target = CG_FLAG_COMMAND | CG_FLAG_SHIFT | CG_FLAG_ALT;
+        let out = cg_flag_change_to_scancodes_swapped(target, 0);
+        assert_eq!(out.len(), 3);
+        assert!(out.contains(&(WIN_SCAN_LCTRL, true)));
+        assert!(out.contains(&(WIN_SCAN_LSHIFT, true)));
+        assert!(out.contains(&(WIN_SCAN_LALT, true)));
     }
 }
