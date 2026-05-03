@@ -95,6 +95,13 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         &self.clipboard
     }
 
+    /// Drain any transient warning the clipboard layer queued up since the
+    /// last call (e.g., "image too large"). The session thread forwards
+    /// this to the tray UI as a balloon notification.
+    pub fn take_clipboard_warning(&mut self) -> Option<String> {
+        self.clipboard.take_warning()
+    }
+
     /// Test-only: rewind `last_heartbeat_recv` so the next tick() sees the
     /// heartbeat-timeout branch and drives the disconnect cleanup path.
     #[cfg(test)]

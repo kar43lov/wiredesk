@@ -98,6 +98,18 @@ impl TrayUi {
     }
 
     pub fn update_status(&mut self, status: &SessionStatus) -> Result<(), nwg::NwgError> {
+        // `Notification` is transient — surface as a balloon and don't touch
+        // the persistent icon/tooltip. Today only fires on "image too large".
+        if let SessionStatus::Notification(msg) = status {
+            self.tray.show(
+                msg,
+                Some("WireDesk"),
+                Some(nwg::TrayNotificationFlags::WARNING_ICON
+                    | nwg::TrayNotificationFlags::LARGE_ICON),
+                None,
+            );
+            return Ok(());
+        }
         let icon = icons::build_status_icon(status)?;
         self.tray.set_icon(&icon);
         self.tray.set_tip(&format!("WireDesk Host — {}", status.label()));

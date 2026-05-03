@@ -192,6 +192,12 @@ pub struct ClipboardSync {
     /// recv() so heartbeats and input keep flowing during image transfers.
     pending_outbox: VecDeque<Message>,
 
+    /// Transient warning the UI should surface (e.g., "image too large to
+    /// send"). Set inside `poll()`; consumed by the session thread once per
+    /// tick via [`take_warning`]. Single-slot — repeated warnings within a
+    /// tick overwrite the previous (rare; oversize-skip is the only writer).
+    pending_warning: Option<String>,
+
     /// Test-only sink — captures the last successfully committed payload so
     /// unit tests can assert on outcomes without depending on a live arboard
     /// clipboard backend.
@@ -232,6 +238,7 @@ impl ClipboardSync {
             outgoing_progress: counters.outgoing_progress,
             outgoing_total: counters.outgoing_total,
             pending_outbox: VecDeque::new(),
+            pending_warning: None,
             #[cfg(test)]
             last_committed: None,
         }
@@ -254,8 +261,16 @@ impl ClipboardSync {
             outgoing_progress: Arc::new(AtomicU64::new(0)),
             outgoing_total: Arc::new(AtomicU64::new(0)),
             pending_outbox: VecDeque::new(),
+            pending_warning: None,
             last_committed: None,
         }
+    }
+
+    /// Drain the most recent warning, if any. Called by the session thread
+    /// after every tick — a `Some(msg)` is forwarded to the tray UI as a
+    /// balloon notification ("image too large", etc.).
+    pub fn take_warning(&mut self) -> Option<String> {
+        self.pending_warning.take()
     }
 
     /// Drain up to `MAX_MESSAGES_PER_POLL` messages from `pending_outbox`
@@ -371,6 +386,18 @@ impl ClipboardSync {
                 e.png_len,
                 MAX_IMAGE_BYTES
             );
+            // Surface a transient UI notification — the host has no chrome
+            // panel of its own, so without this the user only sees a log
+            // entry and an unexplained "no transfer started" silence. The
+            // session thread takes the warning out via `take_warning` and
+            // forwards it as a balloon notification.
+            let kb = e.png_len / 1024;
+            let limit_kb = MAX_IMAGE_BYTES / 1024;
+            self.pending_warning = Some(format!(
+                "Clipboard image too large to send: {} KB > {} KB limit. \
+                 Copy a smaller selection.",
+                kb, limit_kb
+            ));
             // Stamp the RGBA hash so the next poll tick short-circuits for
             // the same buffer. A new RGBA (user re-copied) gives a new hash
             // and re-tries the encode path.

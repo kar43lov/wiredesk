@@ -130,7 +130,7 @@ fn main() {
     let counters = ProgressCounters::default();
     let _session = session_thread::spawn(cfg.clone(), status_tx, counters.clone());
 
-    let last_status = Arc::new(Mutex::new(SessionStatus::Waiting));
+    let last_status = Arc::new(Mutex::new(ui::status_bridge::StatusState::default()));
 
     #[cfg(windows)]
     run_windows(cfg, status_rx, last_status, counters);
@@ -145,14 +145,17 @@ fn main() {
 #[cfg(not(windows))]
 fn run_dev_loop(
     status_rx: mpsc::Receiver<SessionStatus>,
-    last: Arc<Mutex<SessionStatus>>,
+    last: Arc<Mutex<ui::status_bridge::StatusState>>,
 ) {
     let _bridge = ui::status_bridge::spawn_no_notice(status_rx, last.clone());
     log::info!("session thread spawned; running dev-mode foreground loop (no tray)");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
         if let Ok(g) = last.lock() {
-            log::info!("session status: {}", g.label());
+            log::info!(
+                "session status: {}",
+                g.persistent.to_session_status().label()
+            );
         }
     }
 }
@@ -161,7 +164,7 @@ fn run_dev_loop(
 fn run_windows(
     cfg: HostConfig,
     status_rx: mpsc::Receiver<SessionStatus>,
-    last: Arc<Mutex<SessionStatus>>,
+    last: Arc<Mutex<ui::status_bridge::StatusState>>,
     counters: ProgressCounters,
 ) {
     use native_windows_gui as nwg;
@@ -277,12 +280,34 @@ fn run_windows(
         use nwg::MousePressEvent as MP;
         match evt {
             E::OnNotice => {
-                // Status bridge fired — update tray icon + settings status.
-                if let Ok(g) = last_clone.lock() {
-                    if let Err(e) = tray_clone.borrow_mut().update_status(&g) {
+                // Status bridge fired. Two independent updates:
+                //   1) pending notification (transient balloon, doesn't
+                //      change persistent UI state),
+                //   2) persistent status (tray icon color + settings row).
+                // Take the notification first under a brief lock, drop it,
+                // then read persistent under a fresh lock for the icon.
+                let notification = if let Ok(mut g) = last_clone.lock() {
+                    g.pending_notification.take()
+                } else {
+                    None
+                };
+                if let Some(msg) = notification {
+                    if let Err(e) = tray_clone
+                        .borrow_mut()
+                        .update_status(&SessionStatus::Notification(msg))
+                    {
+                        log::warn!("tray balloon failed: {e}");
+                    }
+                }
+                let persistent = last_clone
+                    .lock()
+                    .ok()
+                    .map(|g| g.persistent.to_session_status());
+                if let Some(s) = persistent {
+                    if let Err(e) = tray_clone.borrow_mut().update_status(&s) {
                         log::warn!("tray icon update failed: {e}");
                     }
-                    settings_clone.borrow_mut().set_status(&g);
+                    settings_clone.borrow_mut().set_status(&s);
                 }
             }
             E::OnContextMenu => {

@@ -14,6 +14,11 @@ pub fn status_color(status: &SessionStatus) -> StatusColor {
         SessionStatus::Connected { .. } => StatusColor::Green,
         SessionStatus::Waiting => StatusColor::Yellow,
         SessionStatus::Disconnected(_) => StatusColor::Gray,
+        // Notifications are transient (balloon-only) and never reach
+        // the icon-color path. Default to Gray as a sensible no-op so a
+        // future caller that forgets to special-case Notification doesn't
+        // panic on a missing match arm.
+        SessionStatus::Notification(_) => StatusColor::Gray,
     }
 }
 

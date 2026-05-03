@@ -11,11 +11,16 @@ use crate::session::{Session, SessionState};
 /// Status reported up to the UI thread (tray icon color, settings window
 /// status row). `Connected` carries the latest `client_name` reported via
 /// the Hello handshake.
+///
+/// `Notification` is a transient event — not a state — that the tray UI
+/// surfaces as a balloon and then drops. It does NOT change tray-icon color
+/// or settings-row status. Used today only for "image too large to send".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     Disconnected(String),
     Waiting,
     Connected { client_name: String },
+    Notification(String),
 }
 
 impl SessionStatus {
@@ -25,11 +30,14 @@ impl SessionStatus {
     }
 
     /// Human-readable label for the tray tooltip / settings status row.
+    /// `Notification` is transient — it's surfaced as a balloon, not as
+    /// the persistent status row, so this label is never user-visible.
     pub fn label(&self) -> String {
         match self {
             Self::Disconnected(reason) => format!("Disconnected: {reason}"),
             Self::Waiting => "Waiting for client…".to_string(),
             Self::Connected { client_name } => format!("Connected to {client_name}"),
+            Self::Notification(msg) => msg.clone(),
         }
     }
 }
@@ -124,6 +132,14 @@ where
                     log::error!("session error: {e}");
                     thread::sleep(Duration::from_secs(1));
                 }
+            }
+
+            // Drain any transient clipboard warning (e.g., "image too
+            // large") into a one-shot Notification status. The UI shows a
+            // balloon and then the status flow returns to the persistent
+            // (Connected/Waiting/Disconnected) state below.
+            if let Some(warning) = sess.take_clipboard_warning() {
+                let _ = status_tx.send(SessionStatus::Notification(warning));
             }
 
             let next = derive_status(sess.current_state(), sess.client_name());
