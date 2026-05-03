@@ -254,13 +254,11 @@ fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)] // names mirror state semantics intentionally
 enum OneShotState {
-    /// Waiting for the host PowerShell prompt to appear in the buffer.
-    AwaitingHostPrompt,
-    /// `--ssh` is set, host prompt already seen, sent `ssh -tt ALIAS`,
-    /// now waiting for the remote shell prompt.
+    /// `--ssh` is set, sent `ssh -tt ALIAS`, now waiting for the
+    /// remote shell prompt before pushing the formatted command.
     AwaitingRemotePrompt,
-    /// Target prompt seen, formatted command sent, looking for the
-    /// expanded sentinel line.
+    /// Formatted command already sent, looking for the expanded
+    /// sentinel line.
     AwaitingSentinel,
 }
 
@@ -295,7 +293,25 @@ fn run_oneshot(
     };
     let payload = format_command(&uuid, target_kind, cmd);
 
-    let mut state = OneShotState::AwaitingHostPrompt;
+    // PowerShell with stdout piped (`-NoLogo -NoExit`, our spawn flags)
+    // does NOT emit a prompt initially in non-interactive mode — the
+    // host stays silent until we push something on stdin. Waiting for
+    // a prompt that never arrives just times out at `--timeout`.
+    //
+    // So in PS-only mode we send the formatted command immediately
+    // after ShellOpen and rely on the sentinel to know when we're done.
+    // In `--ssh` mode we still need to wait for the *remote* prompt
+    // (that one DOES come over the wire because ssh -tt forces a TTY
+    // on the remote side), so first we push `ssh -tt ALIAS\r` and
+    // then watch for the remote prompt before sending the command.
+    let mut state = if let Some(alias) = ssh {
+        send_text(&writer, &format!("ssh -tt {alias}\r"))?;
+        OneShotState::AwaitingRemotePrompt
+    } else {
+        send_text(&writer, &payload)?;
+        OneShotState::AwaitingSentinel
+    };
+
     // `pending` is the line-walker scratch — only completed lines get
     // popped out of it. `full_log` accumulates EVERYTHING received so
     // `clean_stdout` at the end has the whole conversation to slice
@@ -336,17 +352,6 @@ fn run_oneshot(
             pending.drain(..=nl_idx);
 
             match state {
-                OneShotState::AwaitingHostPrompt => {
-                    if is_powershell_prompt(&line) {
-                        if let Some(alias) = ssh {
-                            send_text(&writer, &format!("ssh -tt {alias}\r"))?;
-                            state = OneShotState::AwaitingRemotePrompt;
-                        } else {
-                            send_text(&writer, &payload)?;
-                            state = OneShotState::AwaitingSentinel;
-                        }
-                    }
-                }
                 OneShotState::AwaitingRemotePrompt => {
                     if is_remote_prompt(&line) {
                         send_text(&writer, &payload)?;
@@ -362,35 +367,16 @@ fn run_oneshot(
             }
         }
 
-        // CRITICAL: prompts arrive WITHOUT a trailing newline — the
-        // shell positions the cursor right after `> ` / `$ ` / `➜ `
-        // and waits for input. The line-walker above only sees
-        // `\n`-terminated lines, so it would never trigger on a
-        // prompt by itself. Inspect the partial leftover in
-        // `pending` and treat it as a prompt match if it looks
-        // like one. On match we transition state and clear the
-        // partial — its bytes have served their purpose.
-        match state {
-            OneShotState::AwaitingHostPrompt
-                if is_powershell_prompt(pending.trim_end()) =>
-            {
-                if let Some(alias) = ssh {
-                    send_text(&writer, &format!("ssh -tt {alias}\r"))?;
-                    state = OneShotState::AwaitingRemotePrompt;
-                } else {
-                    send_text(&writer, &payload)?;
-                    state = OneShotState::AwaitingSentinel;
-                }
-                pending.clear();
-            }
-            OneShotState::AwaitingRemotePrompt
-                if is_remote_prompt(pending.trim_end()) =>
-            {
-                send_text(&writer, &payload)?;
-                state = OneShotState::AwaitingSentinel;
-                pending.clear();
-            }
-            _ => {}
+        // Remote prompts arrive WITHOUT a trailing newline — bash/zsh
+        // park the cursor right after `$ ` / `# ` / `➜ ` waiting for
+        // input. The line-walker only handles `\n`-terminated lines,
+        // so we also peek at the partial leftover.
+        if state == OneShotState::AwaitingRemotePrompt
+            && is_remote_prompt(pending.trim_end())
+        {
+            send_text(&writer, &payload)?;
+            state = OneShotState::AwaitingSentinel;
+            pending.clear();
         }
 
         if exit_code.is_some() {
@@ -778,6 +764,53 @@ fn heartbeat_thread(transport: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<AtomicB
         }
         if let Ok(mut t) = transport.lock() {
             let _ = t.send(&Packet::new(Message::Heartbeat, 0));
+        }
+    }
+}
+
+fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
+    let stdout = io::stdout();
+    // Cross-chunk state for LF→CRLF translation. The local terminal
+    // is in raw mode, so a bare \n only moves the cursor down — it
+    // doesn't return to column 0. Linux / SSH output uses bare \n,
+    // which produced staircase output ("Welcome..." sliding right
+    // line by line). We insert \r before any \n that wasn't already
+    // preceded by \r, even across chunk boundaries.
+    let mut last_was_cr = false;
+    while !stop.load(Ordering::Relaxed) {
+        let pkt = transport.recv();
+        match pkt {
+            Ok(p) => match p.message {
+                Message::ShellOutput { data } => {
+                    let translated = translate_output_for_terminal(&data, &mut last_was_cr);
+                    let mut out = stdout.lock();
+                    let _ = out.write_all(&translated);
+                    let _ = out.flush();
+                }
+                Message::ShellExit { code } => {
+                    let mut out = stdout.lock();
+                    let _ = writeln!(out, "\r\n[shell exited with code {code}]\r");
+                    let _ = out.flush();
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Message::Error { code, msg } => {
+                    let mut out = stdout.lock();
+                    let _ = writeln!(out, "\r\n[host error {code}: {msg}]\r");
+                    let _ = out.flush();
+                }
+                Message::Heartbeat => {}
+                Message::Disconnect => {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                _ => {}
+            },
+            Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => continue,
+            Err(_) => {
+                // Brief backoff to avoid tight loop on persistent failure.
+                thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -1188,6 +1221,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)] // test helper; descriptive tuple beats type alias here
     fn make_split_pair() -> (
         Arc<Mutex<Box<dyn Transport>>>,
         Box<dyn Transport>,
@@ -1213,20 +1247,16 @@ mod tests {
     fn run_oneshot_happy_path_powershell() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            host.emit_chunk("PS C:\\Users\\User>\r\n");
-            // Wait for the formatted command from the client.
+            // PS-only mode now sends the formatted command immediately
+            // — no prompt detection on this path because PS in pipe
+            // mode doesn't emit one.
             let cmd = host
                 .recv_shell_input(Duration::from_secs(2))
                 .expect("client should send formatted command");
             assert!(cmd.contains("Get-ChildItem"), "cmd payload: {cmd:?}");
             assert!(cmd.contains("__WD_DONE_"));
             assert!(cmd.contains("$LASTEXITCODE"));
-            // Echo the command back (PS pipe-mode actually doesn't,
-            // but echoing here is a no-op: clean_stdout will simply
-            // not find the literal echo line and skip the echo strip).
             host.emit_chunk("file1\r\nfile2\r\n");
-            // Pull the UUID from the cmd payload to build the expanded
-            // sentinel.
             let uuid = extract_uuid_from_payload(&cmd);
             host.emit_chunk(&format!("__WD_DONE_{uuid}__0\r\n"));
         });
@@ -1273,7 +1303,6 @@ mod tests {
     fn run_oneshot_timeout_returns_124() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            host.emit_chunk("PS C:\\>\r\n");
             // Consume the cmd but never emit a sentinel.
             let _cmd = host.recv_shell_input(Duration::from_secs(2));
             thread::sleep(Duration::from_millis(2_000));
@@ -1289,7 +1318,6 @@ mod tests {
     fn run_oneshot_propagates_nonzero_exit() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            host.emit_chunk("PS C:\\>\r\n");
             let cmd = host
                 .recv_shell_input(Duration::from_secs(2))
                 .expect("cmd");
@@ -1430,52 +1458,5 @@ mod tests {
         assert!(!is_remote_prompt("Welcome to Ubuntu 20.04.6 LTS"));
         assert!(!is_remote_prompt("karlovpg in 🌐 knd02 in ~"));
         assert!(!is_remote_prompt("PS C:\\>"));
-    }
-}
-
-fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
-    let stdout = io::stdout();
-    // Cross-chunk state for LF→CRLF translation. The local terminal
-    // is in raw mode, so a bare \n only moves the cursor down — it
-    // doesn't return to column 0. Linux / SSH output uses bare \n,
-    // which produced staircase output ("Welcome..." sliding right
-    // line by line). We insert \r before any \n that wasn't already
-    // preceded by \r, even across chunk boundaries.
-    let mut last_was_cr = false;
-    while !stop.load(Ordering::Relaxed) {
-        let pkt = transport.recv();
-        match pkt {
-            Ok(p) => match p.message {
-                Message::ShellOutput { data } => {
-                    let translated = translate_output_for_terminal(&data, &mut last_was_cr);
-                    let mut out = stdout.lock();
-                    let _ = out.write_all(&translated);
-                    let _ = out.flush();
-                }
-                Message::ShellExit { code } => {
-                    let mut out = stdout.lock();
-                    let _ = writeln!(out, "\r\n[shell exited with code {code}]\r");
-                    let _ = out.flush();
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                Message::Error { code, msg } => {
-                    let mut out = stdout.lock();
-                    let _ = writeln!(out, "\r\n[host error {code}: {msg}]\r");
-                    let _ = out.flush();
-                }
-                Message::Heartbeat => {}
-                Message::Disconnect => {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                _ => {}
-            },
-            Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => continue,
-            Err(_) => {
-                // Brief backoff to avoid tight loop on persistent failure.
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
     }
 }
