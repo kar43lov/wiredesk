@@ -241,12 +241,17 @@ enum ShellKind {
 ///
 /// Bash continues past non-zero `exit` of any single command in a
 /// `;`-list, so a plain `cmd; echo "<sentinel>"` is enough.
+///
+/// Line terminator is bare `\n` — PowerShell stdin in pipe mode does
+/// NOT treat a lone `\r` as end-of-line and parks the line in its
+/// read buffer waiting for `\n`. The interactive bridge sends `\n`
+/// for the same reason (see `bridge_loop`'s line-flush).
 fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
     match kind {
         ShellKind::PowerShell => format!(
-            "try {{ {cmd} }} catch {{ $LASTEXITCODE = 1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\r"
+            "try {{ {cmd} }} catch {{ $LASTEXITCODE = 1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
         ),
-        ShellKind::Bash => format!("{cmd}; echo \"__WD_DONE_{uuid}__$?\"\r"),
+        ShellKind::Bash => format!("{cmd}; echo \"__WD_DONE_{uuid}__$?\"\n"),
     }
 }
 
@@ -305,7 +310,7 @@ fn run_oneshot(
     // on the remote side), so first we push `ssh -tt ALIAS\r` and
     // then watch for the remote prompt before sending the command.
     let mut state = if let Some(alias) = ssh {
-        send_text(&writer, &format!("ssh -tt {alias}\r"))?;
+        send_text(&writer, &format!("ssh -tt {alias}\n"))?;
         OneShotState::AwaitingRemotePrompt
     } else {
         send_text(&writer, &payload)?;
@@ -1076,7 +1081,7 @@ mod tests {
             s.contains("$LASTEXITCODE"),
             "PS sentinel must use $LASTEXITCODE: {s}"
         );
-        assert!(s.ends_with('\r'), "payload must end with CR for host stdin: {s}");
+        assert!(s.ends_with('\n'), "payload must end with LF for host stdin: {s}");
     }
 
     #[test]
@@ -1092,7 +1097,7 @@ mod tests {
             !s.contains("$LASTEXITCODE"),
             "bash payload must NOT use $LASTEXITCODE: {s}"
         );
-        assert!(s.ends_with('\r'));
+        assert!(s.ends_with('\n'));
     }
 
     #[test]
