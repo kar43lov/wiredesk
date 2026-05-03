@@ -304,6 +304,21 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.clipboard.on_chunk(*index, data.clone());
             }
 
+            (SessionState::Connected, Message::ClipDecline { format }) => {
+                // Peer doesn't want this transfer (its receive_* toggle is
+                // off). Drop the pending outbox so we stop saturating the
+                // wire with chunks the peer is going to discard. Without
+                // this the link's RX direction stays full of data the peer
+                // ignores, starving its TX (mouse, heartbeats, decline
+                // ack itself) and triggering a heartbeat timeout.
+                let dropped = self.clipboard.cancel_outgoing();
+                if dropped > 0 {
+                    log::info!(
+                        "clipboard: peer declined offer (format={format}); dropped {dropped} queued packets"
+                    );
+                }
+            }
+
             (SessionState::Connected, Message::ShellOpen { shell }) => {
                 if self.shell.is_some() {
                     log::warn!("ShellOpen received but a shell is already running");

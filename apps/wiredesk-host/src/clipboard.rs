@@ -318,6 +318,20 @@ impl ClipboardSync {
         self.expected_len > 0 || !self.pending_outbox.is_empty()
     }
 
+    /// Drop everything currently queued in `pending_outbox`. Called when
+    /// the peer signals `ClipDecline` — they don't want this transfer,
+    /// no point spending wire bandwidth on chunks they'll discard.
+    /// Also resets the outgoing-progress counters so the UI doesn't
+    /// stick at a stale percentage. Returns the number of packets
+    /// dropped for logging purposes.
+    pub fn cancel_outgoing(&mut self) -> usize {
+        let n = self.pending_outbox.len();
+        self.pending_outbox.clear();
+        self.outgoing_progress.store(0, Ordering::Relaxed);
+        self.outgoing_total.store(0, Ordering::Relaxed);
+        n
+    }
+
     /// Drain up to `MAX_MESSAGES_PER_POLL` messages from `pending_outbox`
     /// into a fresh Vec. Returned to the caller in arrival order. Any
     /// `ClipChunk` removed from the queue bumps `outgoing_progress` so the
