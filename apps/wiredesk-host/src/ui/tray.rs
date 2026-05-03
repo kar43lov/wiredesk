@@ -21,6 +21,7 @@ pub struct TrayUi {
     pub menu: nwg::Menu,
     pub menu_show_settings: nwg::MenuItem,
     pub menu_open_logs: nwg::MenuItem,
+    pub menu_restart: nwg::MenuItem,
     pub menu_separator: nwg::MenuSeparator,
     pub menu_quit: nwg::MenuItem,
 
@@ -86,6 +87,10 @@ impl TrayUi {
                 .text("Open Logs")
                 .parent(&s.menu)
                 .build(&mut s.menu_open_logs)?;
+            nwg::MenuItem::builder()
+                .text("Restart")
+                .parent(&s.menu)
+                .build(&mut s.menu_restart)?;
             nwg::MenuSeparator::builder()
                 .parent(&s.menu)
                 .build(&mut s.menu_separator)?;

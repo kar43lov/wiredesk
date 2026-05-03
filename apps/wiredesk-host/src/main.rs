@@ -344,6 +344,27 @@ fn run_windows(
                     settings_clone.borrow().show();
                 } else if handle == t.menu_open_logs.handle {
                     t.open_logs();
+                } else if handle == t.menu_restart.handle {
+                    drop(t);
+                    // Spawn a fresh host process, then ask the current
+                    // event loop to exit. Same pattern as Save & Restart
+                    // in the Settings window — single-instance retry-loop
+                    // covers the brief window where both processes hold
+                    // the named mutex.
+                    match std::env::current_exe() {
+                        Ok(exe) => match std::process::Command::new(exe).spawn() {
+                            Ok(_) => {
+                                log::info!("restart: spawned new host process from tray");
+                                nwg::stop_thread_dispatch();
+                            }
+                            Err(e) => {
+                                log::warn!("restart from tray: spawn failed: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("restart from tray: current_exe failed: {e}");
+                        }
+                    }
                 } else if handle == t.menu_quit.handle {
                     nwg::stop_thread_dispatch();
                 }

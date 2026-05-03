@@ -10,7 +10,18 @@ use crate::injector::InputInjector;
 use crate::shell::{ShellEvent, ShellProcess};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(6); // 3 missed heartbeats
+/// Heartbeat timeout while the link is idle. 3 missed heartbeats — fast
+/// enough for the user to notice an unplugged cable but loose enough to
+/// tolerate a single dropped CRC.
+const HEARTBEAT_TIMEOUT_IDLE: Duration = Duration::from_secs(6);
+/// Heartbeat timeout while a clipboard transfer is in flight (incoming
+/// reassembly armed or outgoing chunks queued). At 11 KB/s an 80–500 KB
+/// image takes 7–45 s on the wire, during which the strict 6 s timeout
+/// would falsely fire — the peer is busy receiving chunks and its
+/// heartbeats can be queued behind ours. ×5 the idle timeout: enough
+/// slack for ~3 MB of in-flight payload before we treat silence as a
+/// real disconnect.
+const HEARTBEAT_TIMEOUT_BUSY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -106,7 +117,21 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// heartbeat-timeout branch and drives the disconnect cleanup path.
     #[cfg(test)]
     pub fn force_heartbeat_timeout(&mut self) {
-        self.last_heartbeat_recv = Instant::now() - HEARTBEAT_TIMEOUT - Duration::from_secs(1);
+        // Use the busy timeout so the rewind triggers regardless of which
+        // branch the runtime check picks.
+        self.last_heartbeat_recv =
+            Instant::now() - HEARTBEAT_TIMEOUT_BUSY - Duration::from_secs(1);
+    }
+
+    /// Effective heartbeat timeout — extended while a clipboard transfer
+    /// is in flight to avoid false-positive disconnects when the wire is
+    /// saturated by chunk traffic.
+    fn heartbeat_timeout(&self) -> Duration {
+        if self.clipboard.transfer_in_flight() {
+            HEARTBEAT_TIMEOUT_BUSY
+        } else {
+            HEARTBEAT_TIMEOUT_IDLE
+        }
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -134,7 +159,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
         // Check heartbeat timeout
         if self.state == SessionState::Connected
-            && self.last_heartbeat_recv.elapsed() >= HEARTBEAT_TIMEOUT
+            && self.last_heartbeat_recv.elapsed() >= self.heartbeat_timeout()
         {
             log::warn!("heartbeat timeout — disconnecting");
             self.injector.release_all()?;

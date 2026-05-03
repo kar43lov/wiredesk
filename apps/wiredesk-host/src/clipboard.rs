@@ -307,6 +307,17 @@ impl ClipboardSync {
         self.pending_warning.take()
     }
 
+    /// `true` while either side of clipboard sync is mid-transfer:
+    /// outgoing chunks queued in `pending_outbox`, or incoming reassembly
+    /// armed by a `ClipOffer` and not yet committed/aborted. Used by
+    /// `Session::tick` to extend the heartbeat timeout while the wire is
+    /// saturated by a large image — at 11 KB/s an 80 KB image takes ~7 s,
+    /// during which the peer's heartbeats can be drowned out by chunk
+    /// traffic and the strict 6 s timeout would falsely disconnect.
+    pub fn transfer_in_flight(&self) -> bool {
+        self.expected_len > 0 || !self.pending_outbox.is_empty()
+    }
+
     /// Drain up to `MAX_MESSAGES_PER_POLL` messages from `pending_outbox`
     /// into a fresh Vec. Returned to the caller in arrival order. Any
     /// `ClipChunk` removed from the queue bumps `outgoing_progress` so the
