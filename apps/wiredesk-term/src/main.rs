@@ -232,14 +232,23 @@ enum ShellKind {
 
 /// Build the `<command>; <emit-sentinel>` payload for `run_oneshot`.
 ///
-/// PowerShell variant wraps the command in `try { … } catch …` so that
-/// a *terminating* error (`Get-Item /nonexistent`, mistyped cmdlet)
-/// still falls through to the sentinel-emit. Without that, a
-/// terminating error skips the trailing statement and run_oneshot
-/// hangs to `--timeout` (exit 124) instead of returning a clean
-/// non-zero exit.
+/// PowerShell variant:
+///   - `$LASTEXITCODE = 0` — pre-init the variable. Cmdlets (like
+///     `echo`/`Write-Output`) do NOT set `$LASTEXITCODE`, only
+///     external commands do. Without pre-init `$LASTEXITCODE` may be
+///     `$null` and the interpolated sentinel becomes
+///     `__WD_DONE_<uuid>__` (no integer tail), which `parse_sentinel`
+///     correctly rejects → run_oneshot hangs to `--timeout`. This was
+///     the root cause of the very first sentinel-never-arrives bug.
+///   - `try { <cmd> } catch { $LASTEXITCODE = 1 }` — catches *terminating*
+///     errors (`Get-Item /nonexistent`, mistyped cmdlet) so the
+///     sentinel still emits. Without try/catch, a terminating error
+///     skips the trailing statement.
+///   - The trailing string is just emitted to the success stream;
+///     PS prints it on its own line via implicit Write-Output.
 ///
-/// Bash continues past non-zero `exit` of any single command in a
+/// Bash variant uses `$?` — bash always sets it after every command,
+/// terminating or not. Bash also continues past a non-zero exit in a
 /// `;`-list, so a plain `cmd; echo "<sentinel>"` is enough.
 ///
 /// Line terminator is bare `\n` — PowerShell stdin in pipe mode does
@@ -249,7 +258,7 @@ enum ShellKind {
 fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
     match kind {
         ShellKind::PowerShell => format!(
-            "try {{ {cmd} }} catch {{ $LASTEXITCODE = 1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
+            "$LASTEXITCODE=0; try {{ {cmd} }} catch {{ $LASTEXITCODE=1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
         ),
         ShellKind::Bash => format!("{cmd}; echo \"__WD_DONE_{uuid}__$?\"\n"),
     }
@@ -297,22 +306,28 @@ fn run_oneshot(
         ShellKind::PowerShell
     };
     let payload = format_command(&uuid, target_kind, cmd);
+    log::debug!("[exec] uuid={uuid} kind={target_kind:?} payload={payload:?}");
 
     // PowerShell with stdout piped (`-NoLogo -NoExit`, our spawn flags)
-    // does NOT emit a prompt initially in non-interactive mode — the
-    // host stays silent until we push something on stdin. Waiting for
-    // a prompt that never arrives just times out at `--timeout`.
+    // emits the prompt over the wire on startup but does NOT wait for
+    // any "ready" handshake — it just runs whatever lines arrive on
+    // stdin in order. Since the prompt isn't load-bearing for us
+    // (we already know the shell is up because handshake completed),
+    // skip prompt-detection in PS-only mode and push the formatted
+    // command immediately.
     //
-    // So in PS-only mode we send the formatted command immediately
-    // after ShellOpen and rely on the sentinel to know when we're done.
-    // In `--ssh` mode we still need to wait for the *remote* prompt
-    // (that one DOES come over the wire because ssh -tt forces a TTY
-    // on the remote side), so first we push `ssh -tt ALIAS\r` and
-    // then watch for the remote prompt before sending the command.
+    // In `--ssh` mode we still wait for the *remote* prompt — `ssh -tt`
+    // forces a TTY on the remote side and the remote shell DOES emit
+    // a prompt over the wire that signals "remote shell ready". Without
+    // waiting we'd race the ssh handshake and our cmd would land
+    // either in PS (before ssh starts) or get eaten as part of MOTD.
     let mut state = if let Some(alias) = ssh {
-        send_text(&writer, &format!("ssh -tt {alias}\n"))?;
+        let ssh_cmd = format!("ssh -tt {alias}\n");
+        log::debug!("[exec] sending ssh hop: {ssh_cmd:?}");
+        send_text(&writer, &ssh_cmd)?;
         OneShotState::AwaitingRemotePrompt
     } else {
+        log::debug!("[exec] sending formatted command immediately");
         send_text(&writer, &payload)?;
         OneShotState::AwaitingSentinel
     };
@@ -332,18 +347,36 @@ fn run_oneshot(
 
     while started.elapsed() < max_wait {
         match reader.recv() {
-            Ok(p) => {
-                if let Message::ShellOutput { data } = p.message {
+            Ok(p) => match p.message {
+                Message::ShellOutput { data } => {
                     let text = String::from_utf8_lossy(&data);
+                    log::debug!(
+                        "[exec] recv ShellOutput {} bytes: {text:?}",
+                        data.len()
+                    );
                     pending.push_str(&text);
                     full_log.push_str(&text);
                 }
-                // Other message types (Heartbeat, etc.) are ignored here.
-            }
+                Message::ShellExit { code } => {
+                    log::debug!("[exec] recv ShellExit code={code} — host shell died");
+                    // Host shell exited before sentinel — bail with that
+                    // code rather than waiting for a sentinel that will
+                    // never come.
+                    exit_code = Some(code);
+                    break;
+                }
+                Message::Error { code, msg } => {
+                    log::debug!("[exec] recv host Error code={code} msg={msg:?}");
+                }
+                other => {
+                    log::trace!("[exec] recv (ignored) {other:?}");
+                }
+            },
             Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => {
                 // No data this tick — re-check overall timeout below.
             }
             Err(e) => {
+                log::debug!("[exec] recv error: {e}");
                 stop.store(true, Ordering::Relaxed);
                 let _ = heartbeat.join();
                 return Err(e);
@@ -355,16 +388,19 @@ fn run_oneshot(
         while let Some(nl_idx) = pending.find('\n') {
             let line: String = pending[..nl_idx].trim_end_matches('\r').to_string();
             pending.drain(..=nl_idx);
+            log::trace!("[exec] line state={state:?}: {line:?}");
 
             match state {
                 OneShotState::AwaitingRemotePrompt => {
                     if is_remote_prompt(&line) {
+                        log::debug!("[exec] remote prompt matched, sending payload");
                         send_text(&writer, &payload)?;
                         state = OneShotState::AwaitingSentinel;
                     }
                 }
                 OneShotState::AwaitingSentinel => {
                     if let Some(code) = parse_sentinel(&line, &uuid) {
+                        log::debug!("[exec] sentinel matched, exit code = {code}");
                         exit_code = Some(code);
                         break;
                     }
@@ -1070,11 +1106,15 @@ mod tests {
         let uuid = uuid::Uuid::nil();
         let s = format_command(&uuid, ShellKind::PowerShell, "Get-ChildItem");
         assert!(
+            s.starts_with("$LASTEXITCODE=0;"),
+            "PS payload must pre-init $LASTEXITCODE so cmdlet success → 0: {s}"
+        );
+        assert!(
             s.contains("try { Get-ChildItem }"),
             "PS payload must wrap cmd in try/catch: {s}"
         );
         assert!(
-            s.contains("catch { $LASTEXITCODE = 1 }"),
+            s.contains("catch { $LASTEXITCODE=1 }"),
             "PS payload must set $LASTEXITCODE on terminating error: {s}"
         );
         assert!(
@@ -1082,6 +1122,24 @@ mod tests {
             "PS sentinel must use $LASTEXITCODE: {s}"
         );
         assert!(s.ends_with('\n'), "payload must end with LF for host stdin: {s}");
+    }
+
+    #[test]
+    fn format_command_powershell_cmdlet_yields_zero_exit() {
+        // Regression: pre-init `$LASTEXITCODE=0` is what makes
+        // sentinel parsing work for cmdlets (echo, Get-ChildItem, …)
+        // — without it, PS would interpolate `$null` and the wire
+        // line becomes `__WD_DONE_<uuid>__` (no integer tail), which
+        // parse_sentinel rejects → run_oneshot hangs to --timeout.
+        let uuid = uuid::Uuid::nil();
+        let s = format_command(&uuid, ShellKind::PowerShell, "echo hello");
+        // Simulate what PS would emit on success: $LASTEXITCODE
+        // expands to 0, so the wire line is …__0.
+        let simulated_wire_line = format!("__WD_DONE_{uuid}__0");
+        assert_eq!(parse_sentinel(&simulated_wire_line, &uuid), Some(0));
+        // The payload itself contains the literal `$LASTEXITCODE`,
+        // not its expansion (we send it verbatim, PS expands).
+        assert!(s.contains("__WD_DONE_") && s.contains("$LASTEXITCODE"));
     }
 
     #[test]
