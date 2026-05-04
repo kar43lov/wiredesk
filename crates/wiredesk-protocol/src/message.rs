@@ -40,6 +40,14 @@ pub enum MessageType {
     ShellOutput = 0x42,
     ShellClose = 0x43,
     ShellExit = 0x44,
+    /// Open a shell with a real PTY backend (ConPTY on Windows,
+    /// forkpty on Unix). Carries initial size — host opens the
+    /// pty with these dimensions before spawning the child.
+    ShellOpenPty = 0x45,
+    /// Resize the active PTY (no-op when the live shell is in
+    /// pipe-mode). Sent by the client whenever its terminal
+    /// dimensions change.
+    PtyResize = 0x46,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -66,6 +74,8 @@ impl TryFrom<u8> for MessageType {
             0x42 => Ok(Self::ShellOutput),
             0x43 => Ok(Self::ShellClose),
             0x44 => Ok(Self::ShellExit),
+            0x45 => Ok(Self::ShellOpenPty),
+            0x46 => Ok(Self::PtyResize),
             _ => Err(WireDeskError::Protocol(format!("unknown message type: 0x{v:02X}"))),
         }
     }
@@ -97,6 +107,12 @@ pub enum Message {
     ShellOutput { data: Vec<u8> },         // bytes from shell stdout/stderr
     ShellClose,
     ShellExit { code: i32 },
+    /// Open a shell wrapped in a real PTY. `cols`/`rows` are the
+    /// initial terminal dimensions. Wire layout:
+    /// `[cols u16 LE][rows u16 LE][shell-string with length prefix]`.
+    ShellOpenPty { shell: String, cols: u16, rows: u16 },
+    /// Resize the active PTY. Wire layout: `[cols u16 LE][rows u16 LE]`.
+    PtyResize { cols: u16, rows: u16 },
 }
 
 impl Message {
@@ -121,6 +137,8 @@ impl Message {
             Self::ShellOutput { .. } => MessageType::ShellOutput,
             Self::ShellClose => MessageType::ShellClose,
             Self::ShellExit { .. } => MessageType::ShellExit,
+            Self::ShellOpenPty { .. } => MessageType::ShellOpenPty,
+            Self::PtyResize { .. } => MessageType::PtyResize,
         }
     }
 
@@ -184,6 +202,15 @@ impl Message {
             }
             Self::ShellExit { code } => {
                 buf.extend_from_slice(&code.to_le_bytes());
+            }
+            Self::ShellOpenPty { shell, cols, rows } => {
+                buf.extend_from_slice(&cols.to_le_bytes());
+                buf.extend_from_slice(&rows.to_le_bytes());
+                write_string(&mut buf, shell, 32);
+            }
+            Self::PtyResize { cols, rows } => {
+                buf.extend_from_slice(&cols.to_le_bytes());
+                buf.extend_from_slice(&rows.to_le_bytes());
             }
         }
         buf
@@ -285,6 +312,24 @@ impl Message {
                 ensure_min_len(payload, 4)?;
                 let code = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Self::ShellExit { code })
+            }
+            MessageType::ShellOpenPty => {
+                ensure_min_len(payload, 4)?;
+                let cols = u16::from_le_bytes([payload[0], payload[1]]);
+                let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                let shell = read_string(&payload[4..])?;
+                Ok(Self::ShellOpenPty { shell, cols, rows })
+            }
+            MessageType::PtyResize => {
+                if payload.len() != 4 {
+                    return Err(WireDeskError::Protocol(format!(
+                        "PtyResize payload must be exactly 4 bytes, got {}",
+                        payload.len()
+                    )));
+                }
+                let cols = u16::from_le_bytes([payload[0], payload[1]]);
+                let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                Ok(Self::PtyResize { cols, rows })
             }
         }
     }
@@ -476,5 +521,73 @@ mod tests {
     #[test]
     fn truncated_payload() {
         assert!(Message::deserialize(MessageType::MouseMove, &[0x01]).is_err());
+    }
+
+    #[test]
+    fn message_type_pty_opcodes_roundtrip() {
+        assert_eq!(MessageType::try_from(0x45).unwrap(), MessageType::ShellOpenPty);
+        assert_eq!(MessageType::try_from(0x46).unwrap(), MessageType::PtyResize);
+    }
+
+    #[test]
+    fn roundtrip_shell_open_pty_powershell() {
+        roundtrip(&Message::ShellOpenPty {
+            shell: "powershell".into(),
+            cols: 100,
+            rows: 40,
+        });
+    }
+
+    #[test]
+    fn roundtrip_shell_open_pty_empty_shell() {
+        roundtrip(&Message::ShellOpenPty {
+            shell: String::new(),
+            cols: 1,
+            rows: 1,
+        });
+    }
+
+    #[test]
+    fn roundtrip_pty_resize_basic() {
+        roundtrip(&Message::PtyResize { cols: 80, rows: 24 });
+    }
+
+    #[test]
+    fn roundtrip_pty_resize_max() {
+        roundtrip(&Message::PtyResize { cols: 0xFFFF, rows: 0xFFFF });
+    }
+
+    #[test]
+    fn shell_open_pty_payload_too_short() {
+        // 3 bytes — no room for cols/rows (need 4) + length prefix.
+        let r = Message::deserialize(MessageType::ShellOpenPty, &[0x00, 0x00, 0x18]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn shell_open_pty_payload_missing_string_len() {
+        // Exactly 4 bytes — cols/rows present but no length prefix for shell.
+        let r = Message::deserialize(MessageType::ShellOpenPty, &[0x40, 0x00, 0x18, 0x00]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn shell_open_pty_invalid_utf8() {
+        // cols=64, rows=24, len=2, then 0xff,0xfe — invalid UTF-8 lead bytes.
+        let r = Message::deserialize(
+            MessageType::ShellOpenPty,
+            &[0x40, 0x00, 0x18, 0x00, 0x02, 0xff, 0xfe],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn pty_resize_wrong_length_rejected() {
+        // 5 bytes (one byte too many) — strict length check.
+        let r = Message::deserialize(MessageType::PtyResize, &[0x50, 0x00, 0x18, 0x00, 0x00]);
+        assert!(r.is_err());
+        // 3 bytes (one byte too few).
+        let r = Message::deserialize(MessageType::PtyResize, &[0x50, 0x00, 0x18]);
+        assert!(r.is_err());
     }
 }
