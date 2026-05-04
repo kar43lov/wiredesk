@@ -806,6 +806,7 @@ impl WireDeskApp {
                         m.frame.min,
                     ));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    crate::presentation::enter_kiosk();
                 }
                 None => {
                     // runtime_preferred_monitor was Some(name) but no live
@@ -824,6 +825,7 @@ impl WireDeskApp {
                         ));
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    crate::presentation::enter_kiosk();
                 }
             }
             // Going fullscreen implies "I want to drive the Host" — auto-engage
@@ -841,6 +843,7 @@ impl WireDeskApp {
             if self.capturing {
                 self.toggle_capture();
             }
+            crate::presentation::exit_kiosk();
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             if let Some(pos) = self.original_position.take() {
                 // Defer OuterPosition until macOS finishes the Spaces

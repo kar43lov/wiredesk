@@ -4,6 +4,7 @@ mod config;
 mod input;
 mod keyboard_tap;
 mod monitor;
+mod presentation;
 mod restart;
 mod status_bar;
 
