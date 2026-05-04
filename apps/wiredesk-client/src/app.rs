@@ -1017,45 +1017,36 @@ impl WireDeskApp {
     /// participate in CentralPanel layout, so coordinate mapping stays
     /// 1:1 across the full window.
     ///
-    /// Banner is non-interactable (just a label, no clicks). In
-    /// fullscreen the banner is *not* rendered at all — the user is
-    /// looking at the Host display through HDMI capture and the Mac
-    /// banner is invisible to them anyway, while still visually
-    /// occluding the top row when the user does glance back at Mac.
-    /// Windowed capture keeps the banner since the user is actively
-    /// looking at Mac in that case.
-    ///
-    /// Progress bars must stay interactable (cancel button), so they
-    /// live in a separate Area pinned to the BOTTOM of the screen —
-    /// Host's bottom row is less click-critical than the top.
+    /// Banner is non-interactable (just a label, no clicks). Progress
+    /// bars must stay interactable (cancel button), so they live in a
+    /// separate Area pinned to the BOTTOM of the screen — Host's bottom
+    /// row is less click-critical than the top.
     fn render_capture_overlays(&self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
         let banner_fill = COLOR_CAPTURE_RED.linear_multiply(0.3);
 
-        if !self.fullscreen {
-            egui::Area::new(egui::Id::new("capture_banner_overlay"))
-                .order(egui::Order::Foreground)
-                .interactable(false)
-                .fixed_pos(screen_rect.min)
-                .show(ctx, |ui| {
-                    ui.set_width(screen_rect.width());
-                    egui::Frame::group(ui.style())
-                        .fill(banner_fill)
-                        .show(ui, |ui| {
-                            ui.with_layout(
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new("CAPTURING — Cmd+Esc to release")
-                                            .size(BANNER_FONT_SIZE)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    );
-                                },
-                            );
-                        });
-                });
-        }
+        egui::Area::new(egui::Id::new("capture_banner_overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                ui.set_width(screen_rect.width());
+                egui::Frame::group(ui.style())
+                    .fill(banner_fill)
+                    .show(ui, |ui| {
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new("CAPTURING — Cmd+Esc to release")
+                                        .size(BANNER_FONT_SIZE)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                            },
+                        );
+                    });
+            });
 
         // Clipboard transfer progress — visible inside capture / fullscreen
         // because the macOS menu bar is hidden in fullscreen and chrome panel
@@ -1112,47 +1103,62 @@ impl WireDeskApp {
     /// the user is looking at the Host monitor and this Mac-side info
     /// is invisible anyway, while keeping it in CentralPanel would
     /// reintroduce the layout-squash problem for Host top row.
-    fn render_capture_info_text(&self, ui: &mut egui::Ui) {
-        ui.add_space(BANNER_FONT_SIZE * 2.5); // clearance under the banner overlay
-        ui.vertical_centered(|ui| {
-            ui.heading("WireDesk — input forwarded to Host");
-            ui.add_space(8.0);
-            if self.state == ConnectionState::Connected {
-                ui.label(format!(
-                    "Connected to {} ({}×{})",
-                    self.host_name, self.screen_w, self.screen_h
-                ));
-            } else {
-                ui.label("Not connected");
-            }
-        });
-        ui.add_space(20.0);
+    /// Info-text rendered as a non-interactable overlay so it stays
+    /// visible in BOTH windowed and fullscreen capture without eating
+    /// CentralPanel layout (which would reintroduce the top-row
+    /// squash). Anchored center-vertical so it doesn't compete with
+    /// banner (top) or progress overlay (bottom).
+    ///
+    /// `interactable(false)` is the key: cursor passes straight
+    /// through, so mouse_pos.y in this region maps to Host as if the
+    /// text wasn't there. Visually present, mechanically transparent.
+    fn render_capture_info_text(&self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("capture_info_overlay"))
+            .order(egui::Order::Background)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("WireDesk — input forwarded to Host");
+                    ui.add_space(8.0);
+                    if self.state == ConnectionState::Connected {
+                        ui.label(format!(
+                            "Connected to {} ({}×{})",
+                            self.host_name, self.screen_w, self.screen_h
+                        ));
+                    } else {
+                        ui.label("Not connected");
+                    }
+                });
+                ui.add_space(20.0);
 
-        ui.label("Active hotkeys (intercepted locally — not sent to Host):");
-        ui.indent("local_hotkeys", |ui| {
-            ui.label("• Cmd+Esc — release capture");
-            ui.label("• Cmd+Enter — toggle fullscreen");
-        });
-        ui.add_space(8.0);
+                ui.label("Active hotkeys (intercepted locally — not sent to Host):");
+                ui.indent("local_hotkeys", |ui| {
+                    ui.label("• Cmd+Esc — release capture");
+                    ui.label("• Cmd+Enter — toggle fullscreen");
+                });
+                ui.add_space(8.0);
 
-        ui.label("Forwarded to Host (Cmd → Ctrl mapping):");
-        ui.indent("forwarded", |ui| {
-            ui.label("• Cmd+Space → Win+Space (input language toggle)");
-            ui.label("• Cmd+C / Cmd+V → Ctrl+C / Ctrl+V");
-            ui.label("• Cmd+Tab, Cmd+Q, etc. — all Cmd-combos go to Host");
-            ui.label("• Letters, digits, function keys, arrows — direct");
-        });
-        ui.add_space(12.0);
+                ui.label("Forwarded to Host (Cmd → Ctrl mapping):");
+                ui.indent("forwarded", |ui| {
+                    ui.label("• Cmd+Space → Win+Space (input language toggle)");
+                    ui.label("• Cmd+C / Cmd+V → Ctrl+C / Ctrl+V");
+                    ui.label("• Cmd+Tab, Cmd+Q, etc. — all Cmd-combos go to Host");
+                    ui.label("• Letters, digits, function keys, arrows — direct");
+                });
+                ui.add_space(12.0);
 
-        ui.label(
-            "Clipboard auto-syncs both ways every ~500 ms — copy on either \
-             side appears on the other.",
-        );
-        ui.add_space(8.0);
-        ui.weak(
-            "Tap pauses automatically when this window loses focus — switch \
-             to another Mac app and Cmd-shortcuts work locally again.",
-        );
+                ui.label(
+                    "Clipboard auto-syncs both ways every ~500 ms — copy on either \
+                     side appears on the other.",
+                );
+                ui.add_space(8.0);
+                ui.weak(
+                    "Tap pauses automatically when this window loses focus — switch \
+                     to another Mac app and Cmd-shortcuts work locally again.",
+                );
+            });
     }
 
     /// Human-readable status string for the chrome status row. Pure helper
@@ -1300,21 +1306,18 @@ impl eframe::App for WireDeskApp {
         let show_chrome = self.should_show_chrome();
         let permission_granted = self.permission_granted;
 
-        // In capture mode the banner + progress live in overlays so they
-        // don't occlude Host's top row coordinate-mapping. Render those
-        // BEFORE CentralPanel so they sit on top.
+        // In capture mode banner / progress / info-text all live in
+        // overlays so they don't occlude Host's top row coordinate-
+        // mapping. Render BEFORE CentralPanel so they sit on top.
+        // CentralPanel itself stays empty — Mac coords map 1:1 onto
+        // full Host display in both windowed and fullscreen capture.
         if !show_chrome {
             self.render_capture_overlays(ctx);
+            self.render_capture_info_text(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if !show_chrome {
-                // Info-text only in windowed capture. In fullscreen,
-                // CentralPanel stays empty so Mac mouse coords map 1:1
-                // onto the full Host display (no layout-occupying widgets).
-                if !self.fullscreen {
-                    self.render_capture_info_text(ui);
-                }
                 return;
             }
 
