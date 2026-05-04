@@ -2,6 +2,8 @@ mod app;
 mod clipboard;
 mod config;
 mod exec_bridge;
+#[cfg(target_os = "macos")]
+mod ipc;
 mod input;
 mod keyboard_tap;
 mod monitor;
@@ -168,9 +170,25 @@ fn main() {
     let exec_slot: exec_bridge::ExecEventSlot =
         Arc::new(std::sync::Mutex::new(None));
     let reader_exec_slot = exec_slot.clone();
-    // Hold the second clone here for Task 6 (`spawn_ipc_acceptor` below).
-    // For now, suppress unused-var until the IPC server lands.
-    let _ipc_exec_slot = exec_slot;
+
+    // Spawn the IPC acceptor so `wd --exec` can run in parallel with
+    // an active GUI (Mac-only — non-Mac builds are unsupported by
+    // design, but the cfg keeps cross-compilation working). Bind
+    // failure is non-fatal: GUI continues, term falls back to direct
+    // serial.
+    #[cfg(target_os = "macos")]
+    {
+        let ipc_outgoing_tx = outgoing_tx.clone();
+        let ipc_slot = exec_slot.clone();
+        let single_inflight: Arc<std::sync::Mutex<()>> =
+            Arc::new(std::sync::Mutex::new(()));
+        let socket_path = wiredesk_exec_core::default_socket_path();
+        ipc::spawn_ipc_acceptor(socket_path, ipc_outgoing_tx, ipc_slot, single_inflight);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &exec_slot; // suppress unused on non-Mac
+    }
     thread::spawn(move || {
         reader_thread(
             reader_transport,
