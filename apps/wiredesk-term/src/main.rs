@@ -16,10 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 use crossterm::terminal;
 use wiredesk_core::error::{Result, WireDeskError};
-use wiredesk_exec_core::{
-    clean_stdout, format_command, format_timeout_diagnostic, is_remote_prompt, parse_sentinel,
-    strip_ansi, OneShotState, ShellKind,
-};
+use wiredesk_exec_core::format_timeout_diagnostic;
 use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::serial::SerialTransport;
@@ -169,7 +166,7 @@ fn run(args: &Args) -> Result<i32> {
     let result_code = if args.exec {
         // Validation above guarantees command is Some().
         let cmd = args.command.as_deref().expect("validated above");
-        run_oneshot(writer.clone(), reader, cmd, args.ssh.as_deref(), args.timeout)
+        run_exec_oneshot(writer.clone(), reader, cmd, args.ssh.as_deref(), args.timeout)
     } else {
         // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
         terminal::enable_raw_mode()
@@ -242,20 +239,69 @@ fn format_hotkey_cheatsheet() -> String {
     s
 }
 
-/// Drive a single `--exec` run end to end. Owns the writer (for sending
-/// `ssh`-hop and the formatted command), takes the reader by value
-/// (synchronous polling — no separate reader thread, since we don't
-/// also pump stdin like `bridge_loop` does). Heartbeat thread shares
-/// the writer mutex so the host's idle timeout doesn't kick us off
-/// during a slow command.
+/// `ExecTransport` impl that bridges the shared crate's runner to the
+/// term's split serial-port halves. The writer side is locked behind
+/// `Arc<Mutex>` because the heartbeat thread shares it; the reader
+/// side is owned exclusively here (no concurrent recv).
+struct SerialExecTransport {
+    writer: Arc<Mutex<Box<dyn Transport>>>,
+    reader: Box<dyn Transport>,
+}
+
+impl wiredesk_exec_core::ExecTransport for SerialExecTransport {
+    fn send_input(&mut self, data: &[u8]) -> std::result::Result<(), wiredesk_exec_core::ExecError> {
+        let mut t = self
+            .writer
+            .lock()
+            .map_err(|_| wiredesk_exec_core::ExecError::Transport("mutex poisoned".into()))?;
+        t.send(&Packet::new(
+            Message::ShellInput { data: data.to_vec() },
+            0,
+        ))
+        .map_err(|e| wiredesk_exec_core::ExecError::Transport(e.to_string()))
+    }
+
+    fn recv_event(
+        &mut self,
+        _timeout: Duration,
+    ) -> std::result::Result<wiredesk_exec_core::ExecEvent, wiredesk_exec_core::ExecError> {
+        // Underlying SerialTransport already implements its own per-recv
+        // timeout window — caller's `_timeout` parameter is informational.
+        // We honour it implicitly: the runner re-checks its overall
+        // budget on every Idle, and Idle is what we return when the
+        // serial layer reports a timeout error.
+        match self.reader.recv() {
+            Ok(p) => match p.message {
+                Message::ShellOutput { data } => Ok(wiredesk_exec_core::ExecEvent::ShellOutput(data)),
+                Message::ShellExit { code } => Ok(wiredesk_exec_core::ExecEvent::ShellExit(code)),
+                Message::Error { code, msg } => {
+                    Ok(wiredesk_exec_core::ExecEvent::HostError(format!("{code}: {msg}")))
+                }
+                _ => Ok(wiredesk_exec_core::ExecEvent::Idle),
+            },
+            Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => {
+                Ok(wiredesk_exec_core::ExecEvent::Idle)
+            }
+            Err(e) => Err(wiredesk_exec_core::ExecError::Transport(e.to_string())),
+        }
+    }
+}
+
+/// Drive a single `--exec` run end to end through the shared runner.
+/// Owns the writer (for sending the payload), takes the reader by
+/// value (synchronous polling — no separate reader thread, since we
+/// don't also pump stdin like `bridge_loop` does). Heartbeat thread
+/// shares the writer mutex so the host's idle timeout doesn't kick
+/// us off during a slow command.
 ///
 /// Returns the exit code that should propagate to `process::exit`:
 /// - `Ok(N)` where N is the command's exit code (0–255 typical).
-/// - `Ok(124)` on timeout (matches `timeout(1)` convention).
+/// - `Ok(124)` on timeout (matches `timeout(1)` convention) — also
+///   prints `format_timeout_diagnostic(...)` to stderr.
 /// - `Err(...)` on a transport / handshake error (caller turns into exit 1).
-fn run_oneshot(
+fn run_exec_oneshot(
     writer: Arc<Mutex<Box<dyn Transport>>>,
-    mut reader: Box<dyn Transport>,
+    reader: Box<dyn Transport>,
     cmd: &str,
     ssh: Option<&str>,
     timeout_secs: u64,
@@ -265,166 +311,44 @@ fn run_oneshot(
     let hb_writer = writer.clone();
     let heartbeat = thread::spawn(move || heartbeat_thread(hb_writer, hb_stop));
 
-    let uuid = uuid::Uuid::new_v4();
-    let target_kind = if ssh.is_some() {
-        ShellKind::Bash
-    } else {
-        ShellKind::PowerShell
-    };
-    let payload = format_command(&uuid, target_kind, cmd);
-    log::debug!("[exec] uuid={uuid} kind={target_kind:?} payload={payload:?}");
+    let mut transport = SerialExecTransport { writer, reader };
 
-    // PS-only path: PowerShell with piped stdout reads stdin
-    // line-by-line and executes. Send the formatted command
-    // immediately — no prompt-detection needed (PS doesn't reliably
-    // emit a prompt in pipe-mode anyway).
-    //
-    // SSH path: we MUST wait for the *remote* shell prompt before
-    // sending the payload. Reason: PS's .NET StreamReader does
-    // read-ahead. If we push `ssh -tt ALIAS\n` + payload back-to-back
-    // (one batch into PS's stdin pipe), PS slurps both lines into its
-    // internal buffer, executes line 1 (spawns ssh), but line 2 stays
-    // trapped in PS-memory and never reaches the ssh subprocess
-    // (confirmed in trace logs — Starship prompt arrived on the wire,
-    // payload silently went nowhere). Waiting for the remote prompt
-    // before sending payload guarantees ssh is the active reader on
-    // PS's stdin pipe by the time we push bytes.
-    let mut state = if let Some(alias) = ssh {
-        let ssh_cmd = format!("ssh -tt {alias}\n");
-        log::debug!("[exec] ssh hop: {ssh_cmd:?}");
-        send_text(&writer, &ssh_cmd)?;
-        OneShotState::AwaitingRemotePrompt
-    } else {
-        log::debug!("[exec] sending payload");
-        send_text(&writer, &payload)?;
-        OneShotState::AwaitingSentinel
-    };
-
-    // `pending` is the line-walker scratch — only completed lines get
-    // popped out of it. `full_log` accumulates EVERYTHING received so
-    // `clean_stdout` at the end has the whole conversation to slice.
-    let mut pending = String::new();
-    let mut full_log = String::new();
-    let started = std::time::Instant::now();
-    let max_wait = Duration::from_secs(timeout_secs);
-
-    let mut exit_code: Option<i32> = None;
-
-    while started.elapsed() < max_wait {
-        match reader.recv() {
-            Ok(p) => match p.message {
-                Message::ShellOutput { data } => {
-                    let text = String::from_utf8_lossy(&data);
-                    log::debug!(
-                        "[exec] recv ShellOutput {} bytes: {text:?}",
-                        data.len()
-                    );
-                    pending.push_str(&text);
-                    full_log.push_str(&text);
-                }
-                Message::ShellExit { code } => {
-                    log::debug!("[exec] recv ShellExit code={code} — host shell died");
-                    exit_code = Some(code);
-                    break;
-                }
-                Message::Error { code, msg } => {
-                    log::debug!("[exec] recv host Error code={code} msg={msg:?}");
-                }
-                other => {
-                    log::trace!("[exec] recv (ignored) {other:?}");
-                }
-            },
-            Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => {
-                // No data this tick — re-check overall timeout below.
-            }
-            Err(e) => {
-                log::debug!("[exec] recv error: {e}");
-                stop.store(true, Ordering::Relaxed);
-                let _ = heartbeat.join();
-                return Err(e);
-            }
-        }
-
-        // Walk completed lines.
-        while let Some(nl_idx) = pending.find('\n') {
-            let line: String = pending[..nl_idx].trim_end_matches('\r').to_string();
-            pending.drain(..=nl_idx);
-            log::trace!("[exec] line state={state:?}: {line:?}");
-
-            match state {
-                OneShotState::AwaitingRemotePrompt => {
-                    // Strip ANSI before prompt detection — Starship et al
-                    // wrap prompts in color/cursor escapes plus a
-                    // trailing `\x1b[K` (clear-to-EOL).
-                    let stripped = strip_ansi(&line);
-                    if is_remote_prompt(stripped.trim_end()) {
-                        log::debug!("[exec] remote prompt matched (line), sending payload");
-                        send_text(&writer, &payload)?;
-                        state = OneShotState::AwaitingSentinel;
-                    }
-                }
-                OneShotState::AwaitingSentinel => {
-                    if let Some(code) = parse_sentinel(&line, &uuid) {
-                        log::debug!("[exec] sentinel matched, exit code = {code}");
-                        exit_code = Some(code);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Remote prompts arrive WITHOUT a trailing newline — bash/zsh
-        // park the cursor right after `$ ` / `# ` / `➜ `. Peek the
-        // partial leftover after stripping ANSI escapes.
-        if state == OneShotState::AwaitingRemotePrompt {
-            let stripped = strip_ansi(&pending);
-            if is_remote_prompt(stripped.trim_end()) {
-                log::debug!("[exec] remote prompt matched (partial), sending payload");
-                send_text(&writer, &payload)?;
-                state = OneShotState::AwaitingSentinel;
-                pending.clear();
-            }
-        }
-
-        if exit_code.is_some() {
-            break;
-        }
-    }
+    // Streaming callback: write each emitted chunk straight to stdout.
+    // The runner already attaches a trailing `\n` to every line it
+    // emits, so the caller can be a dumb pipe — no extra newline
+    // bookkeeping needed. AC3 byte-equality preserved: the bundled
+    // path used to write `clean_stdout(...)` + a single `\n`; the
+    // streaming path emits the same content split across line-aligned
+    // chunks, total bytes identical.
+    let result = wiredesk_exec_core::run_oneshot(
+        &mut transport,
+        cmd,
+        ssh,
+        timeout_secs,
+        |chunk| {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let _ = out.write_all(chunk);
+        },
+    );
 
     stop.store(true, Ordering::Relaxed);
     let _ = heartbeat.join();
 
-    match exit_code {
-        Some(code) => {
-            let cleaned = clean_stdout(&full_log, &uuid);
-            if !cleaned.is_empty() {
-                use std::io::Write;
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                let _ = out.write_all(cleaned.as_bytes());
-                // Add trailing newline so caller shells see a clean line.
-                let _ = out.write_all(b"\n");
-            }
-            Ok(code)
-        }
-        None => {
-            eprintln!("{}", format_timeout_diagnostic(&full_log, timeout_secs));
+    match result {
+        Ok(code) => Ok(code),
+        Err(wiredesk_exec_core::ExecError::Timeout(buf)) => {
+            eprintln!("{}", format_timeout_diagnostic(&buf, timeout_secs));
             Ok(124)
         }
+        Err(wiredesk_exec_core::ExecError::Transport(m)) => {
+            Err(WireDeskError::Transport(m))
+        }
+        Err(wiredesk_exec_core::ExecError::Closed) => {
+            Err(WireDeskError::Transport("transport closed".into()))
+        }
     }
-}
-
-/// Send a text payload as a `ShellInput` packet through the shared
-/// writer mutex. Centralises the lock/encode boilerplate so the
-/// state-machine code in `run_oneshot` reads cleaner.
-fn send_text(writer: &Arc<Mutex<Box<dyn Transport>>>, s: &str) -> Result<()> {
-    let mut t = writer
-        .lock()
-        .map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
-    t.send(&Packet::new(
-        Message::ShellInput { data: s.as_bytes().to_vec() },
-        0,
-    ))
 }
 
 /// Send Hello on the writer, drain HelloAck on the reader. Reader is
@@ -985,8 +909,8 @@ mod tests {
             host.emit_chunk(&format!("__WD_DONE_{uuid}__0\r\n"));
         });
 
-        let code = run_oneshot(writer, reader, "Get-ChildItem", None, 5)
-            .expect("run_oneshot ok");
+        let code = run_exec_oneshot(writer, reader, "Get-ChildItem", None, 5)
+            .expect("run_exec_oneshot ok");
         assert_eq!(code, 0);
         host_thread.join().expect("host thread");
     }
@@ -1030,8 +954,8 @@ mod tests {
             ));
         });
 
-        let code = run_oneshot(writer, reader, "docker ps", Some("prod"), 5)
-            .expect("run_oneshot ok");
+        let code = run_exec_oneshot(writer, reader, "docker ps", Some("prod"), 5)
+            .expect("run_exec_oneshot ok");
         assert_eq!(code, 0);
         host_thread.join().expect("host thread");
     }
@@ -1045,8 +969,8 @@ mod tests {
             thread::sleep(Duration::from_millis(2_000));
         });
 
-        let code = run_oneshot(writer, reader, "Start-Sleep 60", None, 1)
-            .expect("run_oneshot ok");
+        let code = run_exec_oneshot(writer, reader, "Start-Sleep 60", None, 1)
+            .expect("run_exec_oneshot ok");
         assert_eq!(code, 124, "expected timeout exit code");
         host_thread.join().expect("host thread");
     }
@@ -1062,7 +986,7 @@ mod tests {
             host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
         });
 
-        let code = run_oneshot(writer, reader, "exit 7", None, 5).expect("ok");
+        let code = run_exec_oneshot(writer, reader, "exit 7", None, 5).expect("ok");
         assert_eq!(code, 7);
         host_thread.join().expect("host thread");
     }
@@ -1111,8 +1035,8 @@ mod tests {
             );
         });
 
-        let code = run_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5)
-            .expect("run_oneshot ok");
+        let code = run_exec_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5)
+            .expect("run_exec_oneshot ok");
         assert_eq!(code, 0, "should complete with exit 0, not timeout");
         host_thread.join().expect("host thread");
     }

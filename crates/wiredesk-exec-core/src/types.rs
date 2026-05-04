@@ -32,17 +32,26 @@ pub enum ExecEvent {
     Idle,
 }
 
-/// Failure modes for `ExecTransport`. `Transport(...)` covers serial
-/// IO errors and mpsc Sender disconnects mid-send. `Closed` is the
-/// permanent-shutdown signal — for `IpcExecTransport` it means the
-/// reader thread's mpsc receiver was dropped (GUI tearing down); for
-/// `SerialExecTransport` it's EOF / disconnected line.
+/// Failure modes for `ExecTransport` and the runner.
+///
+/// `Transport(...)` covers serial IO errors and mpsc Sender disconnects
+/// mid-send. `Closed` is the permanent-shutdown signal — for
+/// `IpcExecTransport` it means the reader thread's mpsc receiver was
+/// dropped (GUI tearing down); for `SerialExecTransport` it's EOF /
+/// disconnected line.
+///
+/// `Timeout(buf)` is runner-specific: the wall-clock budget elapsed
+/// without a sentinel arriving. Carries the raw wire-log buffer so the
+/// caller can pass it through `format_timeout_diagnostic` and print
+/// a meaningful "stuck where" tail before exiting 124.
 #[derive(Debug, Error)]
 pub enum ExecError {
     #[error("transport: {0}")]
     Transport(String),
     #[error("transport closed")]
     Closed,
+    #[error("timeout (no sentinel arrived in budget)")]
+    Timeout(String),
 }
 
 /// State machine for the runner. PS-only mode skips straight to
