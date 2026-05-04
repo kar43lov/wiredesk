@@ -15,6 +15,12 @@ pub struct SerialTransport {
 
 const MAX_PARTIAL_TIMEOUTS: u32 = 500; // ~5 sec at 10ms timeout
 
+/// Hard frame-size limit before the reader discards and resyncs.
+/// Must accommodate `MAX_PAYLOAD` (4096) + header (8) + CRC (2) + COBS
+/// overhead (~16) with margin. Bumped from hardcoded 1024 along with
+/// MAX_PAYLOAD 512→4096 in feat/wd-exec-fixes.
+const MAX_FRAME_SIZE: usize = 8192;
+
 impl SerialTransport {
     pub fn open(port_name: &str, baud_rate: u32) -> Result<Self> {
         let mut port = serialport::new(port_name, baud_rate)
@@ -40,7 +46,7 @@ impl SerialTransport {
 
         Ok(Self {
             port,
-            read_buf: Vec::with_capacity(1024),
+            read_buf: Vec::with_capacity(MAX_FRAME_SIZE),
             partial_timeouts: 0,
         })
     }
@@ -85,7 +91,7 @@ impl Transport for SerialTransport {
                     }
                     self.read_buf.push(byte_buf[0]);
 
-                    if self.read_buf.len() > 1024 {
+                    if self.read_buf.len() > MAX_FRAME_SIZE {
                         // Discard and skip to next delimiter
                         self.read_buf.clear();
                         loop {
@@ -141,7 +147,7 @@ impl Transport for SerialTransport {
             .map_err(|e| WireDeskError::Transport(format!("serial try_clone: {e}")))?;
         Ok(Box::new(SerialTransport {
             port: cloned,
-            read_buf: Vec::with_capacity(1024),
+            read_buf: Vec::with_capacity(MAX_FRAME_SIZE),
             partial_timeouts: 0,
         }))
     }

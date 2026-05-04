@@ -198,7 +198,7 @@ cd ~/Data/prjcts/wiredesk
 
 Появится приглашение PowerShell. **Ctrl+]** — выход с восстановлением локального терминала.
 
-Ограничение: PTY нет, поэтому `vim`, `sudo` с паролем и подобные интерактивные программы работать не будут. SSH с ключами по сети из-под Хоста — работает.
+Interactive `wd` теперь использует настоящий PTY на host'е (ConPTY) — vim/htop/nano, ssh без `-tt`, PSReadLine с history через стрелки и Tab autocomplete работают как в нативном терминале. Окно Ghostty можно ресайзить — vim/htop reflow'ят корректно. Ограничение: для `wd --exec` (non-interactive single-shot mode) специально используется pipe-канал — sudo с паролем и интерактивные prompt'ы там работать не будут (по дизайну, для clean stdout sentinel detection).
 
 ---
 

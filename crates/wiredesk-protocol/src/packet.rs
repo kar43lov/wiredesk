@@ -12,8 +12,13 @@ const HEADER_SIZE: usize = 8;
 /// CRC size
 const CRC_SIZE: usize = 2;
 
-/// Max payload
-pub const MAX_PAYLOAD: usize = 512;
+/// Max payload (bumped 512→4096 in feat/wd-exec-fixes — typical ES
+/// `_search` queries via wd --exec are 600+ bytes; 4 KB gives 4× headroom.
+/// `len: u16` in the header caps at 65535 so we are far from the wire
+/// hard-limit. Reader-side `MAX_FRAME_SIZE` in
+/// `crates/wiredesk-transport/src/serial.rs` must stay ≥ this value
+/// plus header (8) + CRC (2) + COBS overhead (~16).
+pub const MAX_PAYLOAD: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketFlags(u8);
@@ -229,5 +234,23 @@ mod tests {
         let msg = Message::ClipChunk { index: 0, data };
         let packet = Packet::new(msg, 0);
         assert!(packet.to_bytes().is_err());
+    }
+
+    #[test]
+    fn roundtrip_4kb_shell_input() {
+        // 4 KB ShellInput packet — the typical large case unlocked by
+        // MAX_PAYLOAD 512→4096 bump (real ES `_search` queries via
+        // wd --exec land here). Roundtrips through to_bytes →
+        // from_bytes byte-for-byte.
+        let data = vec![0xAB; 4000];
+        let msg = Message::ShellInput { data: data.clone() };
+        let packet = Packet::new(msg, 42);
+        let raw = packet.to_bytes().expect("4 KB packet must serialize");
+        let decoded = Packet::from_bytes(&raw).expect("4 KB packet must deserialize");
+        assert_eq!(decoded.seq, 42);
+        match decoded.message {
+            Message::ShellInput { data: out } => assert_eq!(out, data),
+            other => panic!("expected ShellInput, got {other:?}"),
+        }
     }
 }
