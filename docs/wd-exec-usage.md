@@ -14,7 +14,7 @@ wd --exec --timeout <secs> "<command>"            # default 90s, exit 124 on tim
 
 ## Что нужно знать ДО запуска
 
-1. **`wd` и `WireDesk.app` взаимоисключающие** — один процесс держит serial-порт. Если открыт GUI — `wd --exec` упадёт с busy. Закрой App или используй один из двух за раз.
+1. **`wd --exec` и `WireDesk.app` теперь работают параллельно** (Mac, начиная с feat/wd-exec-ipc). GUI на старте поднимает Unix-socket в `~/Library/Application Support/WireDesk/wd-exec.sock`, `wd --exec` коннектится к нему и ходит через тот же serial, который GUI использует для clipboard sync. Если GUI закрыт — `wd --exec` falls back на direct-open serial (поведение idential pre-implementation). **Interactive `wd`** (без `--exec`, PTY-mode bridge для Ghostty/iTerm) **остаётся single-port-owner** — если GUI запущен, interactive `wd` упадёт с busy; закрой GUI на время interactive-сессии.
 2. **Macros в alias не работают с env-prefix.** Для трейса:
    ```bash
    export RUST_LOG=debug
@@ -65,6 +65,7 @@ wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrad
 | 1 | PS terminating error (catch'нулось через `try { } catch { }`) — например `Get-Item /nonexistent` |
 | 124 | Sentinel не пришёл за `--timeout` секунд (default 90). Convention `timeout(1)`. На stderr печатается `last bytes received: "..."` — last 256 байт wire-buffer'а для диагностики где залип (mid-MOTD vs после READY-marker vs mid-command output). |
 | 125 | Transport error (serial drop'нулся, host исчез) |
+| любой | **Ctrl+C на `wd --exec` через IPC mode**: term-процесс умирает мгновенно, но host-side команда продолжает выполняться до собственного завершения (не interrupt'им host shell mid-run — destructive operations safety). GUI handler ждёт sentinel/timeout, потом освобождает single-inflight queue. Следующий `wd --exec` будет ждать пока предыдущая команда не закончится на host'е. Acceptable trade-off для clean-state semantics. |
 | любой | Обычный shell exit propagation |
 
 ## Гочи
