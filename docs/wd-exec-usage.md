@@ -7,7 +7,7 @@ Drop-in replacement for `Bash(...)` when the target machine is the Win11 host on
 ```bash
 wd --exec "<powershell command>"                  # run on host PS
 wd --exec --ssh <alias> "<bash command>"          # run on remote box via host PS → ssh
-wd --exec --timeout <secs> "<command>"            # default 30s, exit 124 on timeout
+wd --exec --timeout <secs> "<command>"            # default 90s, exit 124 on timeout
 ```
 
 `wd` is a zsh alias for `./target/release/wiredesk-term`. The binary itself is at `target/release/wiredesk-term`.
@@ -63,7 +63,7 @@ wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrad
 |---|---|
 | 0–253 | Реальный exit code команды (PS `$LASTEXITCODE` или bash `$?`) |
 | 1 | PS terminating error (catch'нулось через `try { } catch { }`) — например `Get-Item /nonexistent` |
-| 124 | Sentinel не пришёл за `--timeout` секунд (default 30). Convention `timeout(1)`. На stderr печатается `last bytes received: "..."` — last 256 байт wire-buffer'а для диагностики где залип (mid-MOTD vs после READY-marker vs mid-command output). |
+| 124 | Sentinel не пришёл за `--timeout` секунд (default 90). Convention `timeout(1)`. На stderr печатается `last bytes received: "..."` — last 256 байт wire-buffer'а для диагностики где залип (mid-MOTD vs после READY-marker vs mid-command output). |
 | 125 | Transport error (serial drop'нулся, host исчез) |
 | любой | Обычный shell exit propagation |
 
@@ -98,7 +98,25 @@ wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrad
   - Для git editor'а — `EDITOR=true git ...` или `--no-edit` где есть.
 - **Multi-line input** — wd шлёт команду одной строкой. Multiline scripts либо собирай через `;`, либо пиши скрипт в файл и зови `bash script.sh`.
 - **stdin** — нет. `wd --exec "cat | grep foo"` без stdin провиснет до timeout.
-- **Очень большой output** (>100 KB) — медленно (ограничен 11 KB/s). Лучше grep'ни на remote.
+- **Очень большой output** (>100 KB) — медленно (ограничен 11 KB/s). Лучше grep'ни на remote. Future: `--compress` flag (см. `docs/briefs/wd-exec-compression.md`).
+
+## Encoding (кириллица в SQL-запросах)
+
+`wd --exec` передаёт команду как байты на host'е. PowerShell на Win по умолчанию в **cp1251/cp866** (зависит от региональных настроек), при отправке в `psql` (который ждёт **UTF-8**) кириллица в `WHERE`-clause ломается:
+```
+ERROR:  invalid byte sequence for encoding "UTF8": 0xa6
+```
+
+`chcp 65001` + `[Console]::OutputEncoding = [Text.Encoding]::UTF8` помогает не всегда (зависит от того, как PowerShell конвертирует argv → child process). Workaround на стороне SQL — **Unicode escape** `U&'\NNNN'`:
+
+```bash
+# Найти "Стародумов" / "Виктор":
+wd --exec --ssh prod-mup "psql ... -c \"select * from official where last_name = U&'\\0421\\0442\\0430\\0440\\043E\\0434\\0443\\043C\\043E\\0432' and first_name = U&'\\0412\\0438\\043A\\0442\\043E\\0440'\""
+```
+
+Codepoint каждой буквы: А=0410, Б=0411, ..., Я=042F, а=0430, ..., я=044F, Ё=0401, ё=0451.
+
+**Read из БД работает корректно** — кириллица в результатах приходит в UTF-8 без проблем. Issue только при отправке в `WHERE`/`VALUES`. Альтернатива — поиск по ASCII-полям (UUID, mail, login если в латинице).
 
 ## Под капотом (если нужно дебажить)
 

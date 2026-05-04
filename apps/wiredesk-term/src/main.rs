@@ -72,7 +72,10 @@ struct Args {
 
     /// Seconds to wait for the sentinel before giving up and
     /// returning exit code 124 (the same convention as `timeout(1)`).
-    #[arg(long, default_value = "30")]
+    /// Default 90 s covers worst-case 1 MB clipboard image transfer
+    /// (~80 s on 11 KB/s wire) when running in IPC mode through a
+    /// busy GUI client.
+    #[arg(long, default_value = "90")]
     timeout: u64,
 
     /// Command to run when --exec is set. Ignored otherwise.
@@ -1861,5 +1864,13 @@ mod tests {
         assert!(!is_remote_prompt("Welcome to Ubuntu 20.04.6 LTS"));
         assert!(!is_remote_prompt("karlovpg in 🌐 knd02 in ~"));
         assert!(!is_remote_prompt("PS C:\\>"));
+    }
+
+    #[test]
+    fn args_default_timeout_is_90_seconds() {
+        // Worst-case 1 MB clipboard image transfer over 11 KB/s wire is ~80 s,
+        // so the IPC mode default needs ≥ 90 s to avoid false 124 timeouts.
+        let args = Args::try_parse_from(["wd"]).expect("parse");
+        assert_eq!(args.timeout, 90);
     }
 }
