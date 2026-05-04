@@ -46,13 +46,23 @@ impl InputInjector for WindowsInjector {
     fn mouse_button(&mut self, button: u8, pressed: bool) -> Result<()> {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
-        let flags = match (button, pressed) {
-            (0, true) => MOUSEEVENTF_LEFTDOWN,
-            (0, false) => MOUSEEVENTF_LEFTUP,
-            (1, true) => MOUSEEVENTF_RIGHTDOWN,
-            (1, false) => MOUSEEVENTF_RIGHTUP,
-            (2, true) => MOUSEEVENTF_MIDDLEDOWN,
-            (2, false) => MOUSEEVENTF_MIDDLEUP,
+        // For X1/X2 (button 3/4 = Back/Forward), Win32 wants
+        // MOUSEEVENTF_XDOWN/XUP plus the XBUTTON discriminator in
+        // `mouseData` — literally 1 for X1 (Back), 2 for X2 (Forward),
+        // see winuser.h. For LMB/RMB/MMB mouseData stays 0.
+        const XBUTTON1_DATA: u32 = 1;
+        const XBUTTON2_DATA: u32 = 2;
+        let (flags, mouse_data) = match (button, pressed) {
+            (0, true) => (MOUSEEVENTF_LEFTDOWN, 0u32),
+            (0, false) => (MOUSEEVENTF_LEFTUP, 0u32),
+            (1, true) => (MOUSEEVENTF_RIGHTDOWN, 0u32),
+            (1, false) => (MOUSEEVENTF_RIGHTUP, 0u32),
+            (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0u32),
+            (2, false) => (MOUSEEVENTF_MIDDLEUP, 0u32),
+            (3, true) => (MOUSEEVENTF_XDOWN, XBUTTON1_DATA),
+            (3, false) => (MOUSEEVENTF_XUP, XBUTTON1_DATA),
+            (4, true) => (MOUSEEVENTF_XDOWN, XBUTTON2_DATA),
+            (4, false) => (MOUSEEVENTF_XUP, XBUTTON2_DATA),
             _ => return Ok(()),
         };
 
@@ -62,7 +72,7 @@ impl InputInjector for WindowsInjector {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: 0,
+                    mouseData: mouse_data,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,

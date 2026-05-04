@@ -6,6 +6,23 @@ use wiredesk_protocol::packet::Packet;
 
 use super::keymap;
 
+/// Map `egui::PointerButton` to the protocol byte the host expects.
+///
+/// 0 = LMB, 1 = RMB, 2 = MMB. 3 = X1 (Back), 4 = X2 (Forward) — host
+/// translates these to Win32 `MOUSEEVENTF_XDOWN/XUP` with
+/// `mouseData = XBUTTON1/2`. Pure helper so the match is exhaustive
+/// over `PointerButton` and unit-testable without spinning an
+/// `InputMapper` + channel.
+pub fn pointer_button_to_proto(button: egui::PointerButton) -> u8 {
+    match button {
+        egui::PointerButton::Primary => 0,
+        egui::PointerButton::Secondary => 1,
+        egui::PointerButton::Middle => 2,
+        egui::PointerButton::Extra1 => 3,
+        egui::PointerButton::Extra2 => 4,
+    }
+}
+
 /// Converts egui input events into WireDesk protocol messages and sends them.
 pub struct InputMapper {
     host_screen_w: u16,
@@ -174,6 +191,17 @@ mod tests {
             }
             other => panic!("expected KeyDown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pointer_button_proto_mapping() {
+        assert_eq!(pointer_button_to_proto(egui::PointerButton::Primary), 0);
+        assert_eq!(pointer_button_to_proto(egui::PointerButton::Secondary), 1);
+        assert_eq!(pointer_button_to_proto(egui::PointerButton::Middle), 2);
+        // Side buttons — Back / Forward — were silently dropped before
+        // fix/capture-mouse-side-and-top.
+        assert_eq!(pointer_button_to_proto(egui::PointerButton::Extra1), 3);
+        assert_eq!(pointer_button_to_proto(egui::PointerButton::Extra2), 4);
     }
 
     #[test]

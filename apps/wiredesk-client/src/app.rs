@@ -1007,118 +1007,158 @@ impl WireDeskApp {
     /// Info-only screen shown when capture or fullscreen is active. No
     /// clickable elements — just a description of what the app is doing
     /// and the relevant hotkeys.
-    fn render_capture_info(&self, ui: &mut egui::Ui) {
-        // Full-width red-tinted banner — instantly communicates that the
-        // window is intercepting input. Sized large (20pt strong, white) so
-        // it's readable from across the room when the user is interacting
-        // with the Host monitor and not looking at the Mac display.
+    /// Render banner + progress bars as **overlays** (egui::Area), not
+    /// inside the CentralPanel. Without this the banner Frame eats the
+    /// top ~50px of CentralPanel layout — and since `mouse_pos` is
+    /// normalised against the full `screen_rect`, the top of the Host
+    /// display gets squashed into those pixels (Host top 3-5% mapped
+    /// into Mac top 50px). Net effect: tab close-buttons / menu items
+    /// in the very first row become almost unreachable. Overlays don't
+    /// participate in CentralPanel layout, so coordinate mapping stays
+    /// 1:1 across the full window.
+    ///
+    /// Banner is non-interactable (just a label, no clicks). Progress
+    /// bars must stay interactable (cancel button), so they live in a
+    /// separate Area pinned to the BOTTOM of the screen — Host's bottom
+    /// row is less click-critical than the top.
+    fn render_capture_overlays(&self, ctx: &egui::Context) {
+        let screen_rect = ctx.screen_rect();
         let banner_fill = COLOR_CAPTURE_RED.linear_multiply(0.3);
-        egui::Frame::group(ui.style())
-            .fill(banner_fill)
-            .show(ui, |ui| {
-                ui.with_layout(
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        // No Unicode bullet — egui default font lacks
-                        // U+25CF on some macOS setups; "CAPTURING" + the
-                        // red banner background already convey the state
-                        // unambiguously.
-                        ui.label(
-                            egui::RichText::new("CAPTURING — Cmd+Esc to release")
-                                .size(BANNER_FONT_SIZE)
-                                .strong()
-                                .color(egui::Color32::WHITE),
+
+        egui::Area::new(egui::Id::new("capture_banner_overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                ui.set_width(screen_rect.width());
+                egui::Frame::group(ui.style())
+                    .fill(banner_fill)
+                    .show(ui, |ui| {
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new("CAPTURING — Cmd+Esc to release")
+                                        .size(BANNER_FONT_SIZE)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                            },
                         );
-                    },
-                );
+                    });
             });
 
-        // Clipboard transfer progress bars — visible inside capture / fullscreen
+        // Clipboard transfer progress — visible inside capture / fullscreen
         // because the macOS menu bar is hidden in fullscreen and chrome panel
-        // is collapsed. Without these, an active transfer is invisible to the
-        // user once they engage capture. Render only when a transfer is in
-        // flight (format_progress returns None when total == 0).
+        // is collapsed. Render only when a transfer is in flight.
         let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
         let out_tot = self.outgoing_total.load(Ordering::Relaxed);
         let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
         let inc_tot = self.incoming_total.load(Ordering::Relaxed);
         let any_active = out_tot > 0 || inc_tot > 0;
-        if any_active {
-            ui.add_space(8.0);
-            if let (Some(ratio), Some(text)) = (
-                progress_ratio(out_cur, out_tot),
-                format_progress("Sending clipboard", out_cur, out_tot),
-            ) {
-                render_progress_row(
-                    ui,
-                    ratio,
-                    &text,
-                    &self.outgoing_cancel,
-                    &self.outgoing_progress,
-                    &self.outgoing_total,
-                );
-            }
-            if let (Some(ratio), Some(text)) = (
-                progress_ratio(inc_cur, inc_tot),
-                format_progress("Receiving clipboard", inc_cur, inc_tot),
-            ) {
-                render_progress_row(
-                    ui,
-                    ratio,
-                    &text,
-                    &self.incoming_cancel,
-                    &self.incoming_progress,
-                    &self.incoming_total,
-                );
-            }
+        if !any_active {
+            return;
         }
 
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.heading("WireDesk — input forwarded to Host");
-            ui.add_space(8.0);
-            // Plain text — no Unicode bullet (see status row note above).
-            if self.state == ConnectionState::Connected {
-                ui.label(format!(
-                    "Connected to {} ({}×{})",
-                    self.host_name, self.screen_w, self.screen_h
-                ));
-            } else {
-                ui.label("Not connected");
-            }
-        });
-        ui.add_space(20.0);
+        // Anchor at bottom-center so progress rows don't occlude Host
+        // top row (the area users click most). LeftBottom anchor +
+        // full width via set_width works around `Area::default_width`
+        // not respecting `set_width` after layout starts.
+        egui::Area::new(egui::Id::new("capture_progress_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
+            .show(ctx, |ui| {
+                ui.set_max_width((screen_rect.width() - 32.0).max(200.0));
+                if let (Some(ratio), Some(text)) = (
+                    progress_ratio(out_cur, out_tot),
+                    format_progress("Sending clipboard", out_cur, out_tot),
+                ) {
+                    render_progress_row(
+                        ui,
+                        ratio,
+                        &text,
+                        &self.outgoing_cancel,
+                        &self.outgoing_progress,
+                        &self.outgoing_total,
+                    );
+                }
+                if let (Some(ratio), Some(text)) = (
+                    progress_ratio(inc_cur, inc_tot),
+                    format_progress("Receiving clipboard", inc_cur, inc_tot),
+                ) {
+                    render_progress_row(
+                        ui,
+                        ratio,
+                        &text,
+                        &self.incoming_cancel,
+                        &self.incoming_progress,
+                        &self.incoming_total,
+                    );
+                }
+            });
+    }
 
-        ui.label("Active hotkeys (intercepted locally — not sent to Host):");
-        ui.indent("local_hotkeys", |ui| {
-            ui.label("• Cmd+Esc — release capture");
-            ui.label("• Cmd+Enter — toggle fullscreen");
-        });
-        ui.add_space(8.0);
+    /// Info-text inside CentralPanel: connection status + hotkey
+    /// cheatsheet. Only shown when **not** in fullscreen — in fullscreen
+    /// the user is looking at the Host monitor and this Mac-side info
+    /// is invisible anyway, while keeping it in CentralPanel would
+    /// reintroduce the layout-squash problem for Host top row.
+    /// Info-text rendered as a non-interactable overlay so it stays
+    /// visible in BOTH windowed and fullscreen capture without eating
+    /// CentralPanel layout (which would reintroduce the top-row
+    /// squash). Anchored center-vertical so it doesn't compete with
+    /// banner (top) or progress overlay (bottom).
+    ///
+    /// `interactable(false)` is the key: cursor passes straight
+    /// through, so mouse_pos.y in this region maps to Host as if the
+    /// text wasn't there. Visually present, mechanically transparent.
+    fn render_capture_info_text(&self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("capture_info_overlay"))
+            .order(egui::Order::Background)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("WireDesk — input forwarded to Host");
+                    ui.add_space(8.0);
+                    if self.state == ConnectionState::Connected {
+                        ui.label(format!(
+                            "Connected to {} ({}×{})",
+                            self.host_name, self.screen_w, self.screen_h
+                        ));
+                    } else {
+                        ui.label("Not connected");
+                    }
+                });
+                ui.add_space(20.0);
 
-        ui.label("Forwarded to Host (Cmd → Ctrl mapping):");
-        ui.indent("forwarded", |ui| {
-            ui.label("• Cmd+Space → Win+Space (input language toggle)");
-            ui.label("• Cmd+C / Cmd+V → Ctrl+C / Ctrl+V");
-            ui.label("• Cmd+Tab, Cmd+Q, etc. — all Cmd-combos go to Host");
-            ui.label("• Letters, digits, function keys, arrows — direct");
-        });
-        ui.add_space(12.0);
+                ui.label("Active hotkeys (intercepted locally — not sent to Host):");
+                ui.indent("local_hotkeys", |ui| {
+                    ui.label("• Cmd+Esc — release capture");
+                    ui.label("• Cmd+Enter — toggle fullscreen");
+                });
+                ui.add_space(8.0);
 
-        ui.label(
-            "Clipboard auto-syncs both ways every ~500 ms — copy on either \
-             side appears on the other.",
-        );
-        ui.add_space(8.0);
-        ui.weak(
-            "Tap pauses automatically when this window loses focus — switch \
-             to another Mac app and Cmd-shortcuts work locally again.",
-        );
+                ui.label("Forwarded to Host (Cmd → Ctrl mapping):");
+                ui.indent("forwarded", |ui| {
+                    ui.label("• Cmd+Space → Win+Space (input language toggle)");
+                    ui.label("• Cmd+C / Cmd+V → Ctrl+C / Ctrl+V");
+                    ui.label("• Cmd+Tab, Cmd+Q, etc. — all Cmd-combos go to Host");
+                    ui.label("• Letters, digits, function keys, arrows — direct");
+                });
+                ui.add_space(12.0);
 
-        if self.fullscreen {
-            ui.add_space(12.0);
-            ui.weak("(Cmd+Enter again to exit fullscreen)");
-        }
+                ui.label(
+                    "Clipboard auto-syncs both ways every ~500 ms — copy on either \
+                     side appears on the other.",
+                );
+                ui.add_space(8.0);
+                ui.weak(
+                    "Tap pauses automatically when this window loses focus — switch \
+                     to another Mac app and Cmd-shortcuts work locally again.",
+                );
+            });
     }
 
     /// Human-readable status string for the chrome status row. Pure helper
@@ -1266,9 +1306,18 @@ impl eframe::App for WireDeskApp {
         let show_chrome = self.should_show_chrome();
         let permission_granted = self.permission_granted;
 
+        // In capture mode banner / progress / info-text all live in
+        // overlays so they don't occlude Host's top row coordinate-
+        // mapping. Render BEFORE CentralPanel so they sit on top.
+        // CentralPanel itself stays empty — Mac coords map 1:1 onto
+        // full Host display in both windowed and fullscreen capture.
+        if !show_chrome {
+            self.render_capture_overlays(ctx);
+            self.render_capture_info_text(ctx);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if !show_chrome {
-                self.render_capture_info(ui);
                 return;
             }
 
@@ -1619,12 +1668,7 @@ impl eframe::App for WireDeskApp {
                         self.mapper.send_key(&self.outgoing_tx, key, modifiers, *pressed);
                     }
                     egui::Event::PointerButton { button, pressed, .. } => {
-                        let btn = match button {
-                            egui::PointerButton::Primary => 0,
-                            egui::PointerButton::Secondary => 1,
-                            egui::PointerButton::Middle => 2,
-                            _ => continue,
-                        };
+                        let btn = crate::input::mapper::pointer_button_to_proto(*button);
                         self.mapper.send_mouse_button(&self.outgoing_tx, btn, *pressed);
                     }
                     egui::Event::MouseWheel { delta, .. } => {
