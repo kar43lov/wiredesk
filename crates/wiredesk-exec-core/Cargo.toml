@@ -8,3 +8,5 @@ license.workspace = true
 thiserror.workspace = true
 log.workspace = true
 uuid.workspace = true
+serde.workspace = true
+bincode = "1"
