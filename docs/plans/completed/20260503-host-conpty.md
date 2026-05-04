@@ -219,7 +219,7 @@ Message::PtyResize { cols, rows } => {
 
 ### Task 6: Acceptance criteria verification
 
-- [ ] AC8: `cargo test --workspace` — green
+- [ ] AC8: `cargo test --workspace -- --test-threads=1` — green. ⚠️ Default parallel runner на macOS flakes (~50%) с SIGABRT в host'овом test-binary'е — это **pre-existing** baseline issue (не вызвано моими изменениями), proverено через `git stash` + master-side test runs. Решение: `--test-threads=1` для host; alternativ — пометить host'-тесты `serial_test::serial`. Для CI (если будет) — фиксированно `--test-threads=1`.
 - [ ] record exact test counts after changes: `wiredesk-protocol N`, `wiredesk-host N`, `wiredesk-term N`. Comparison vs pre-change CLAUDE.md baseline (`148 client + 93 host + 48 term`). Записать здесь для Task 8 doc-update.
 - [ ] AC8: `cargo clippy --workspace -- -D warnings` — green
 - [ ] AC8: `cargo build --release --workspace` — green на Mac
