@@ -7,9 +7,10 @@ edition.workspace = true
 wiredesk-core.workspace = true
 wiredesk-protocol.workspace = true
 wiredesk-transport.workspace = true
+wiredesk-exec-core.workspace = true
 thiserror.workspace = true
 log.workspace = true
 env_logger.workspace = true
 clap.workspace = true
 crossterm = "0.28"
-uuid = { version = "1", features = ["v4"] }
+uuid.workspace = true

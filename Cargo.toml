@@ -4,6 +4,7 @@ members = [
     "crates/wiredesk-core",
     "crates/wiredesk-protocol",
     "crates/wiredesk-transport",
+    "crates/wiredesk-exec-core",
     "apps/wiredesk-host",
     "apps/wiredesk-client",
     "apps/wiredesk-term",
@@ -18,6 +19,7 @@ license = "MIT"
 wiredesk-core = { path = "crates/wiredesk-core" }
 wiredesk-protocol = { path = "crates/wiredesk-protocol" }
 wiredesk-transport = { path = "crates/wiredesk-transport" }
+wiredesk-exec-core = { path = "crates/wiredesk-exec-core" }
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
@@ -26,3 +28,4 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 serialport = "4"
 crc = "3"
+uuid = { version = "1", features = ["v4"] }

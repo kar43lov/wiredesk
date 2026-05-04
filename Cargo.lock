@@ -5025,6 +5025,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiredesk-exec-core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "wiredesk-host"
 version = "0.1.0"
 dependencies = [
@@ -5074,6 +5083,7 @@ dependencies = [
  "thiserror 2.0.18",
  "uuid",
  "wiredesk-core",
+ "wiredesk-exec-core",
  "wiredesk-protocol",
  "wiredesk-transport",
 ]
