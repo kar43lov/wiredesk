@@ -138,13 +138,22 @@ fn run(args: &Args) -> Result<i32> {
     // stderr.
     handshake(&writer, &mut reader, &args.name, args.exec)?;
 
-    // Open shell on Host
+    // Open shell on Host. Pipe-mode for `--exec` (PR #9 sentinel
+    // detection requires clean stdout, no PSReadLine/ANSI). PTY-mode
+    // for the interactive bridge so vim/htop/ssh-without-`-tt`/
+    // PSReadLine all work as in a native shell.
+    let (cols, rows) = if !args.exec {
+        // Initial PTY size from the local terminal. Default 100×40
+        // matches the legacy hardcoded value if size() fails (no tty
+        // / pre-raw-mode quirk).
+        terminal::size().unwrap_or((100, 40))
+    } else {
+        (0, 0) // ignored in pipe-mode
+    };
+    let open_msg = build_shell_open_message(&args.shell, args.exec, cols, rows);
     {
         let mut t = writer.lock().map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
-        t.send(&Packet::new(
-            Message::ShellOpen { shell: args.shell.clone() },
-            0,
-        ))?;
+        t.send(&Packet::new(open_msg, 0))?;
     }
 
     // Branch: --exec runs the non-interactive sentinel-driven path
@@ -179,6 +188,26 @@ fn run(args: &Args) -> Result<i32> {
     result_code
 }
 
+/// Pick the right shell-open packet for the chosen mode. Pipe-mode
+/// (`exec=true`) keeps the legacy `ShellOpen` message — `wd --exec`
+/// relies on stdin/stdout being plain pipes for sentinel detection
+/// (no PSReadLine echoes, no ANSI in output). PTY-mode (`exec=false`)
+/// asks the host to allocate a real PTY at `cols × rows` so the
+/// interactive bridge gets vim/htop/ssh-without-`-tt`/PSReadLine.
+///
+/// Pure helper so the choice is unit-tested without spinning serial.
+fn build_shell_open_message(shell: &str, exec: bool, cols: u16, rows: u16) -> Message {
+    if exec {
+        Message::ShellOpen { shell: shell.to_owned() }
+    } else {
+        Message::ShellOpenPty {
+            shell: shell.to_owned(),
+            cols,
+            rows,
+        }
+    }
+}
+
 /// Format the post-handshake banner. Pure helper so the format is unit-tested
 /// independently of any live transport — typo regressions in the user-visible
 /// "connected" line otherwise only surface during a hardware run.
@@ -204,47 +233,6 @@ fn format_hotkey_cheatsheet() -> String {
     s.push_str("    Ctrl+D   send EOF to host stdin (closes the shell)\r\n");
     s.push_str("    others   pass through to host as typed\r\n");
     s
-}
-
-/// Convert bare LFs (Unix-style line endings) into CRLF for a raw-mode
-/// terminal. The local terminal is in raw mode (no line discipline),
-/// so a bare `\n` only moves the cursor down — column stays where it
-/// was. SSH'd Linux output, `cat foo.txt` on bash, anything Unix uses
-/// bare `\n`, producing the staircase effect. We track `last_was_cr`
-/// across chunks so a CRLF that happens to span a chunk boundary
-/// isn't expanded to CRCRLF.
-///
-/// Returns the translated bytes; updates `last_was_cr` to the value
-/// after processing the last byte.
-fn translate_output_for_terminal(input: &[u8], last_was_cr: &mut bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    for &b in input {
-        if b == b'\n' && !*last_was_cr {
-            out.extend_from_slice(b"\r\n");
-        } else {
-            out.push(b);
-        }
-        *last_was_cr = b == b'\r';
-    }
-    out
-}
-
-/// Pop the last whole UTF-8 char from `buf`. Returns `true` if anything
-/// was popped, `false` if the buffer was already empty. Required because
-/// our cooked-mode line buffer holds raw bytes — popping just one byte
-/// would split a Russian "д" (0xD0 0xB4) and corrupt the line. We walk
-/// backward over continuation bytes (0b10xxxxxx) until we hit the lead.
-fn pop_utf8_char(buf: &mut Vec<u8>) -> bool {
-    if buf.is_empty() {
-        return false;
-    }
-    while let Some(&last) = buf.last() {
-        buf.pop();
-        if (last & 0xC0) != 0x80 {
-            return true;
-        }
-    }
-    true
 }
 
 /// Which host shell flavour we're targeting when formatting the
@@ -762,7 +750,16 @@ fn handshake(
 /// Three threads — reader (serial → stdout) on its own port handle,
 /// heartbeat (timer → serial) and main (stdin → serial) sharing the
 /// writer handle behind a mutex. Splitting the port avoids gating
-/// every keystroke on the reader's blocking recv timeout.
+/// every keystroke on the reader's blocking recv timeout. Plus a
+/// fourth thread for resize-polling so a window resize mid-`vim`
+/// reflows promptly without piggy-backing on the 2 s heartbeat tick.
+///
+/// Pass-through raw: the host shell now lives in a real PTY (ConPTY
+/// on Win11) and echoes/edits keystrokes itself. We forward stdin
+/// byte-for-byte without local echo, line buffering, or
+/// backspace-erase — anything else would double-echo. The only
+/// keystroke we still intercept is Ctrl+] (0x1D), the telnet/nc-
+/// style local quit hotkey.
 fn bridge_loop(
     writer: Arc<Mutex<Box<dyn Transport>>>,
     reader: Box<dyn Transport>,
@@ -787,29 +784,22 @@ fn bridge_loop(
         heartbeat_thread(hb_writer, hb_stop);
     });
 
-    // Main thread: read stdin and forward bytes as ShellInput.
-    //
-    // We run a small "cooked mode" line discipline locally — the host
-    // shell (PowerShell pipe-mode without PSReadLine) only echoes the
-    // *space* portion of an erase sequence, leaving a trailing
-    // visible space and de-syncing the cursor. So instead of
-    // forwarding bytes one-by-one we accumulate a line in `line_buf`,
-    // local-echo printable bytes ourselves, and only flush the line
-    // to host on Enter. Just before the flush we erase the local-
-    // echoed characters with `\b \b` × N so the host's own echo paints
-    // the line exactly once. Backspace pops a UTF-8 char from the
-    // buffer (so Russian д = 2 bytes erases as one keystroke), Ctrl+C
-    // / Ctrl+D bypass the buffer and hit the host immediately as
-    // signals/EOF.
+    // Resize-poll thread: watch local terminal dimensions and forward
+    // PtyResize whenever they change. 500 ms cadence — fast enough that
+    // a window drag during `vim` reflows naturally, slow enough not to
+    // saturate the 11 KB/s wire with redundant resize packets when the
+    // terminal hasn't actually changed.
+    let resize_stop = stop.clone();
+    let resize_writer = writer.clone();
+    let resize_handle = thread::spawn(move || {
+        resize_poll_thread(resize_writer, resize_stop);
+    });
+
+    // Main thread: read stdin and forward bytes as ShellInput, byte-
+    // for-byte. ConPTY echoes/edits/colors output; we are a dumb pipe.
     let stdin = io::stdin();
     let mut stdin_lock = stdin.lock();
     let mut buf = [0u8; 256];
-    let mut line_buf: Vec<u8> = Vec::new();
-    // Number of *display cells* currently on screen for line_buf —
-    // not byte count. ASCII byte = 1 cell, UTF-8 multi-byte char
-    // also typically = 1 cell. We track this so erase-on-flush emits
-    // the right number of `\b \b` triples.
-    let mut line_cells: usize = 0;
 
     while !stop.load(Ordering::Relaxed) {
         match stdin_lock.read(&mut buf) {
@@ -820,93 +810,19 @@ fn bridge_loop(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-
-                // Per-byte processing. We handle Backspace and Enter
-                // here without going to the host; printable bytes are
-                // both echoed locally and held in line_buf.
-                let mut send_now: Option<Vec<u8>> = None;
-                let mut local_echo: Vec<u8> = Vec::new();
-                let mut byte_idx = 0;
-                while byte_idx < chunk.len() {
-                    let b = chunk[byte_idx];
-                    match b {
-                        0x7F => {
-                            // Backspace: pop one UTF-8 char from line_buf,
-                            // erase locally if anything was popped.
-                            if pop_utf8_char(&mut line_buf) {
-                                line_cells = line_cells.saturating_sub(1);
-                                local_echo.extend_from_slice(b"\x08 \x08");
-                            }
-                            byte_idx += 1;
-                        }
-                        b'\r' | b'\n' => {
-                            // Enter: erase what we locally echoed so the
-                            // host's own echo doesn't double the line,
-                            // then flush the line + LF to host.
-                            for _ in 0..line_cells {
-                                local_echo.extend_from_slice(b"\x08 \x08");
-                            }
-                            let mut payload = std::mem::take(&mut line_buf);
-                            payload.push(b'\n');
-                            send_now = Some(payload);
-                            line_cells = 0;
-                            byte_idx += 1;
-                            break;
-                        }
-                        0x03 | 0x04 => {
-                            // Ctrl+C / Ctrl+D — forward immediately,
-                            // bypass the line buffer. Buffer keeps its
-                            // half-typed state; user can still finish
-                            // the line if Ctrl+C was a no-op on host.
-                            send_now = Some(vec![b]);
-                            byte_idx += 1;
-                            break;
-                        }
-                        _ => {
-                            // Append to buffer, echo locally. We assume
-                            // ASCII / UTF-8 input — multi-byte starts
-                            // here, continuation bytes will fall through
-                            // and be appended too on the next iteration.
-                            // Cell count is bumped only on a *new char*
-                            // (lead byte), not on continuation bytes.
-                            let is_continuation = (b & 0xC0) == 0x80;
-                            line_buf.push(b);
-                            local_echo.push(b);
-                            if !is_continuation {
-                                line_cells += 1;
-                            }
-                            byte_idx += 1;
-                        }
-                    }
-                }
-
-                if !local_echo.is_empty() {
-                    let mut out = io::stdout().lock();
-                    let _ = out.write_all(&local_echo);
-                    let _ = out.flush();
-                }
-
-                if let Some(payload) = send_now {
-                    if let Ok(mut t) = writer.lock() {
-                        if let Err(e) = t.send(&Packet::new(
-                            Message::ShellInput { data: payload },
-                            0,
-                        )) {
-                            eprintln!("\r\nwiredesk-term: send error: {e}");
-                            stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    } else {
+                if let Ok(mut t) = writer.lock() {
+                    if let Err(e) = t.send(&Packet::new(
+                        Message::ShellInput { data: chunk.to_vec() },
+                        0,
+                    )) {
+                        eprintln!("\r\nwiredesk-term: send error: {e}");
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
+                } else {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
                 }
-
-                // Anything past the byte that triggered send_now (e.g.
-                // text typed after Ctrl+C in the same chunk) has not
-                // been processed. Realistically stdin reads are aligned
-                // to keystrokes, so this is not a hot edge case.
-                let _ = byte_idx;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
@@ -916,11 +832,47 @@ fn bridge_loop(
         }
     }
 
-    // Signal reader and heartbeat threads to stop, then join.
+    // Signal reader, heartbeat and resize threads to stop, then join.
     stop.store(true, Ordering::Relaxed);
     let _ = reader_handle.join();
     let _ = heartbeat.join();
+    let _ = resize_handle.join();
     Ok(())
+}
+
+/// Poll the local terminal size every 500 ms; forward `PtyResize`
+/// whenever it changes. Pure helper that tests can drive against a
+/// canned size-source — see `compute_resize_packet` below.
+fn resize_poll_thread(transport: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<AtomicBool>) {
+    let mut last: Option<(u16, u16)> = None;
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(500));
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let cur = match terminal::size() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Some(msg) = compute_resize_packet(last, cur) {
+            last = Some(cur);
+            if let Ok(mut t) = transport.lock() {
+                let _ = t.send(&Packet::new(msg, 0));
+            }
+        }
+    }
+}
+
+/// Pure helper for the resize-poll decision. `prev=None` always emits
+/// (initial baseline tick); identical sizes emit nothing; different
+/// sizes emit a `PtyResize` packet body. Extracted so the thread's
+/// "should I send" decision is unit-testable without spinning real
+/// hardware.
+fn compute_resize_packet(prev: Option<(u16, u16)>, cur: (u16, u16)) -> Option<Message> {
+    match prev {
+        Some(p) if p == cur => None,
+        _ => Some(Message::PtyResize { cols: cur.0, rows: cur.1 }),
+    }
 }
 
 /// Periodic Heartbeat sender — runs in its own thread. Wakes every
@@ -948,21 +900,18 @@ fn heartbeat_thread(transport: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<AtomicB
 
 fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
     let stdout = io::stdout();
-    // Cross-chunk state for LF→CRLF translation. The local terminal
-    // is in raw mode, so a bare \n only moves the cursor down — it
-    // doesn't return to column 0. Linux / SSH output uses bare \n,
-    // which produced staircase output ("Welcome..." sliding right
-    // line by line). We insert \r before any \n that wasn't already
-    // preceded by \r, even across chunk boundaries.
-    let mut last_was_cr = false;
+    // Host shell now lives in a real PTY (ConPTY on Win11), which
+    // emits CRLF natively the same way a local terminal would. No
+    // LF→CRLF translation needed — shell output goes straight to
+    // stdout byte-for-byte, including any colors / cursor moves /
+    // bracketed-paste sequences emitted by PSReadLine.
     while !stop.load(Ordering::Relaxed) {
         let pkt = transport.recv();
         match pkt {
             Ok(p) => match p.message {
                 Message::ShellOutput { data } => {
-                    let translated = translate_output_for_terminal(&data, &mut last_was_cr);
                     let mut out = stdout.lock();
-                    let _ = out.write_all(&translated);
+                    let _ = out.write_all(&data);
                     let _ = out.flush();
                 }
                 Message::ShellExit { code } => {
@@ -1058,89 +1007,58 @@ mod tests {
     }
 
     #[test]
-    fn translate_output_bare_lf_becomes_crlf() {
-        let mut last_cr = false;
-        let s = translate_output_for_terminal(b"line1\nline2\n", &mut last_cr);
-        assert_eq!(s, b"line1\r\nline2\r\n");
-        assert!(!last_cr);
+    fn shell_open_for_exec_uses_pipe_mode() {
+        let m = build_shell_open_message("powershell", true, 80, 24);
+        match m {
+            Message::ShellOpen { shell } => assert_eq!(shell, "powershell"),
+            other => panic!("expected ShellOpen for --exec, got {other:?}"),
+        }
     }
 
     #[test]
-    fn translate_output_existing_crlf_unchanged() {
-        let mut last_cr = false;
-        let s = translate_output_for_terminal(b"line1\r\nline2\r\n", &mut last_cr);
-        assert_eq!(s, b"line1\r\nline2\r\n");
+    fn shell_open_for_interactive_uses_pty_mode() {
+        let m = build_shell_open_message("powershell", false, 100, 40);
+        match m {
+            Message::ShellOpenPty { shell, cols, rows } => {
+                assert_eq!(shell, "powershell");
+                assert_eq!(cols, 100);
+                assert_eq!(rows, 40);
+            }
+            other => panic!("expected ShellOpenPty for interactive, got {other:?}"),
+        }
     }
 
     #[test]
-    fn translate_output_crlf_across_chunk_boundary_no_double_cr() {
-        // Chunk 1 ends with \r, chunk 2 starts with \n — must NOT
-        // emit \r\r\n.
-        let mut last_cr = false;
-        let s1 = translate_output_for_terminal(b"line1\r", &mut last_cr);
-        assert_eq!(s1, b"line1\r");
-        assert!(last_cr);
-        let s2 = translate_output_for_terminal(b"\nline2", &mut last_cr);
-        assert_eq!(s2, b"\nline2");
-        assert!(!last_cr);
+    fn shell_open_default_shell_name_carried_through() {
+        // Empty shell string ("") is the host's "default" sentinel —
+        // host's resolve_shell() turns it into PowerShell on Windows.
+        // Helper must preserve it verbatim, no trimming or fallback.
+        let m = build_shell_open_message("", false, 80, 24);
+        match m {
+            Message::ShellOpenPty { shell, .. } => assert!(shell.is_empty()),
+            other => panic!("expected ShellOpenPty, got {other:?}"),
+        }
     }
 
     #[test]
-    fn translate_output_lone_cr_passes_through() {
-        // Some progress-bar UIs use \r alone for "rewrite this line".
-        let mut last_cr = false;
-        let s = translate_output_for_terminal(b"50%\r100%", &mut last_cr);
-        assert_eq!(s, b"50%\r100%");
+    fn compute_resize_packet_first_tick_emits() {
+        // First tick (prev=None) always emits — establishes a baseline
+        // size for the host PTY before the user starts typing.
+        let p = compute_resize_packet(None, (80, 24));
+        assert!(matches!(p, Some(Message::PtyResize { cols: 80, rows: 24 })));
     }
 
     #[test]
-    fn translate_output_empty_input() {
-        let mut last_cr = false;
-        let s = translate_output_for_terminal(b"", &mut last_cr);
-        assert!(s.is_empty());
-        assert!(!last_cr);
+    fn compute_resize_packet_unchanged_skips() {
+        // Identical size — no resend, saves wire on a 11 KB/s link.
+        let p = compute_resize_packet(Some((80, 24)), (80, 24));
+        assert!(p.is_none());
     }
 
     #[test]
-    fn pop_utf8_char_on_empty_buffer() {
-        let mut buf: Vec<u8> = Vec::new();
-        assert!(!pop_utf8_char(&mut buf));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn pop_utf8_char_pops_single_ascii() {
-        let mut buf = b"abc".to_vec();
-        assert!(pop_utf8_char(&mut buf));
-        assert_eq!(buf, b"ab");
-    }
-
-    #[test]
-    fn pop_utf8_char_pops_two_byte_cyrillic() {
-        // Russian "д" is 0xD0 0xB4 — 2 bytes, 1 char. Popping must
-        // remove BOTH bytes, otherwise next typed char + leftover
-        // continuation byte produces invalid UTF-8 in the line buffer.
-        let mut buf = "abд".as_bytes().to_vec();
-        assert_eq!(buf.len(), 4);
-        assert!(pop_utf8_char(&mut buf));
-        assert_eq!(buf, b"ab");
-    }
-
-    #[test]
-    fn pop_utf8_char_pops_three_byte_emoji_lead() {
-        // "€" is 0xE2 0x82 0xAC — 3 bytes. Pop removes all three.
-        let mut buf = "a€".as_bytes().to_vec();
-        assert_eq!(buf.len(), 4);
-        assert!(pop_utf8_char(&mut buf));
-        assert_eq!(buf, b"a");
-    }
-
-    #[test]
-    fn pop_utf8_char_pops_to_empty() {
-        let mut buf = "д".as_bytes().to_vec();
-        assert_eq!(buf.len(), 2);
-        assert!(pop_utf8_char(&mut buf));
-        assert!(buf.is_empty());
+    fn compute_resize_packet_changed_emits() {
+        let p = compute_resize_packet(Some((80, 24)), (120, 40));
+        assert!(matches!(p, Some(Message::PtyResize { cols: 120, rows: 40 })));
     }
 
     #[test]
