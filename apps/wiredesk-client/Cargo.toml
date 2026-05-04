@@ -28,5 +28,5 @@ core-graphics = "0.25"
 core-foundation = "0.10"
 accessibility-sys = "0.1"
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSScreen", "NSStatusBar", "NSStatusItem", "NSApplication", "NSResponder"] }
+objc2-app-kit = { version = "0.2", features = ["NSScreen", "NSStatusBar", "NSStatusItem"] }
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSGeometry", "NSThread"] }
