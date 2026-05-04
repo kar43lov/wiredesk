@@ -533,10 +533,7 @@ fn run_oneshot(
             Ok(code)
         }
         None => {
-            eprintln!(
-                "wiredesk-term: --exec timeout after {}s (no sentinel from host)",
-                timeout_secs
-            );
+            eprintln!("{}", format_timeout_diagnostic(&full_log, timeout_secs));
             Ok(124)
         }
     }
@@ -593,6 +590,23 @@ fn parse_ready(line: &str, uuid: &uuid::Uuid) -> bool {
 /// `ssh -tt`) and `__WD_READY_<uuid>__` (the unexpanded READY echo,
 /// same reason) are filtered out.
 ///
+/// Format a diagnostic message for `--exec` timeout. Includes the
+/// last 256 bytes of the wire log so the user can see where things
+/// stalled (mid-MOTD vs after READY-marker vs mid-command output).
+///
+/// Slicing on byte boundaries can land in the middle of a multi-byte
+/// UTF-8 char; `String::from_utf8_lossy` handles that safely with a
+/// `?` replacement. Debug-format on the tail escapes ANSI/CRLF so a
+/// piped stderr stays parseable for downstream tooling.
+fn format_timeout_diagnostic(buf: &str, timeout_secs: u64) -> String {
+    let bytes = buf.as_bytes();
+    let start = bytes.len().saturating_sub(256);
+    let tail = String::from_utf8_lossy(&bytes[start..]);
+    format!(
+        "wiredesk-term: --exec timeout after {timeout_secs}s (no sentinel from host)\nlast bytes received: {tail:?}"
+    )
+}
+
 /// Pure helper, returns owned `String`.
 fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
     let lines: Vec<&str> = buf.split('\n').collect();
@@ -1231,6 +1245,41 @@ mod tests {
         let ready_pos = s.find(&ready_marker).unwrap();
         let cmd_pos = s.find("ls;").unwrap();
         assert!(ready_pos < cmd_pos, "READY must come before cmd: {s}");
+    }
+
+    #[test]
+    fn format_timeout_diagnostic_truncates_and_handles_utf8() {
+        // Long ASCII buffer → only last 256 bytes appear in output.
+        let long = "X".repeat(1024);
+        let out = format_timeout_diagnostic(&long, 30);
+        assert!(out.contains("--exec timeout after 30s"));
+        // First 256 bytes must NOT appear (we truncated to the tail).
+        // Quick check: count Xs in the formatted tail — should be 256
+        // exactly (Debug-format wraps in quotes, no escaping for ASCII).
+        let x_count = out.matches('X').count();
+        assert_eq!(x_count, 256, "expected last 256 X's, got {x_count}");
+
+        // Empty buffer → no panic, output still includes the timeout
+        // sentence and an empty tail (`""` after Debug-format).
+        let out = format_timeout_diagnostic("", 5);
+        assert!(out.contains("--exec timeout after 5s"));
+        assert!(out.contains("last bytes received: \"\""));
+
+        // Buffer ending mid-cyrillic multi-byte char → no panic.
+        // Cyrillic "к" is 2 bytes (0xD0 0xBA). Build a 257-byte buf
+        // where the last 2 bytes are a complete "к" so when we slice
+        // `[len-256..]` the start lands inside the previous "к" → lossy
+        // decode replaces with `?`. Test only verifies no-panic and
+        // that the output is well-formed UTF-8.
+        let mut buf = String::from("a");
+        for _ in 0..128 {
+            buf.push('к'); // 256 bytes of cyrillic
+        }
+        // buf is now 1 + 256 = 257 bytes; slice [1..257] starts inside
+        // first "к" (at the 2nd byte 0xBA). lossy decoder must handle.
+        let out = format_timeout_diagnostic(&buf, 1);
+        assert!(out.contains("--exec timeout after 1s"));
+        assert!(out.is_ascii() || out.chars().all(|c| !c.is_control() || c == '\n'));
     }
 
     #[test]

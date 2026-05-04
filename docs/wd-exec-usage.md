@@ -24,6 +24,7 @@ wd --exec --timeout <secs> "<command>"            # default 30s, exit 124 on tim
    Или вызывай бинарь напрямую: `RUST_LOG=debug ./target/release/wiredesk-term --exec "..."`.
 3. **Латенси handshake'а** ≈ 1.5–2 сек на каждый `wd --exec` (Hello → ShellOpen → spawn PS). Для batch'а — собирай команды в одну (`cmd1; cmd2; cmd3` через `--exec`).
 4. **Wire-channel — 115200 baud (~11 KB/s)** — мелкий output ок, гигабайты не качай.
+5. **Лимит команды — 4 KB.** Один `wd --exec "..."` packet'ом — payload до 4096 bytes (bump'нут с 512 в feat/wd-exec-fixes). Типичный ES `_search` с агрегациями (~600 байт) и средние shell-конвейеры умещаются. Длиннее — разбивай на несколько `wd --exec` или пиши скрипт в файл и зови `bash script.sh`.
 
 ## Примеры
 
@@ -62,7 +63,7 @@ wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrad
 |---|---|
 | 0–253 | Реальный exit code команды (PS `$LASTEXITCODE` или bash `$?`) |
 | 1 | PS terminating error (catch'нулось через `try { } catch { }`) — например `Get-Item /nonexistent` |
-| 124 | Sentinel не пришёл за `--timeout` секунд (default 30). Convention `timeout(1)`. |
+| 124 | Sentinel не пришёл за `--timeout` секунд (default 30). Convention `timeout(1)`. На stderr печатается `last bytes received: "..."` — last 256 байт wire-buffer'а для диагностики где залип (mid-MOTD vs после READY-marker vs mid-command output). |
 | 125 | Transport error (serial drop'нулся, host исчез) |
 | любой | Обычный shell exit propagation |
 

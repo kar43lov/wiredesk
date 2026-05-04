@@ -117,45 +117,43 @@ None => {
 - Modify: `crates/wiredesk-protocol/src/packet.rs`
 - Modify: `crates/wiredesk-transport/src/serial.rs`
 
-- [ ] grep `crates/ apps/` на hardcoded `512` — игнорировать `cobs.rs:155` (data sample, не лимит)
-- [ ] изменить `pub const MAX_PAYLOAD: usize = 512;` → `4096` в `crates/wiredesk-protocol/src/packet.rs:16`
-- [ ] обновить existing `payload_too_large_fails` тест в `packet.rs` (строка ~228) — payload size adapt под новое значение (`vec![0xAA; MAX_PAYLOAD + 1]` уже параметризован через константу, но проверить что assertion message не hardcoded'ен)
-- [ ] добавить новую константу `MAX_FRAME_SIZE: usize = 8192` в `crates/wiredesk-transport/src/serial.rs` (запас сверх MAX_PAYLOAD + header + CRC + COBS overhead)
-- [ ] заменить hardcoded'ный `1024` в `serial.rs:88` (frame discard threshold) на `MAX_FRAME_SIZE`
-- [ ] заменить hardcoded'ный `1024` в `serial.rs:144` (`Vec::with_capacity` hint) на `MAX_FRAME_SIZE`
-- [ ] добавить тест `roundtrip_4kb_shell_input` в `packet.rs::tests` — `Packet::new(Message::ShellInput { data: vec![0xAA; 4000] }, 0)` → `to_bytes` → `from_bytes` → `assert_eq!`. Использовать `4000`, не `MAX_PAYLOAD - N`, чтобы тест не требовал верификации точного overhead'а ShellInput-сериализатора (Message::ShellInput payload = data байты напрямую без overhead'а, но тест robust'нее на конкретном значении)
-- [ ] run `cargo test --workspace -- --test-threads=1` — все 348+ зелёные, 1 новый
-- [ ] run `cargo clippy --workspace -- -D warnings` — чисто
+- [x] grep `crates/ apps/` на hardcoded `512` — найдено только `cobs.rs:155` (data sample) и тест-fixtures в clipboard.rs (test data sizes); все игнорируем
+- [x] изменить `pub const MAX_PAYLOAD: usize = 512;` → `4096` в `crates/wiredesk-protocol/src/packet.rs:16`
+- [x] existing `over_max_payload` test использует `vec![0xAA; MAX_PAYLOAD]` через константу — auto-adapts, изменения не нужны
+- [x] добавить новую константу `MAX_FRAME_SIZE: usize = 8192` в `crates/wiredesk-transport/src/serial.rs`
+- [x] заменить hardcoded'ный `1024` в `serial.rs:88` (frame discard threshold) на `MAX_FRAME_SIZE`
+- [x] заменить hardcoded'ный `1024` в `serial.rs:144` (`Vec::with_capacity` hint в `try_clone`) на `MAX_FRAME_SIZE`
+- [x] ➕ дополнительно: `serial.rs:43` (`Vec::with_capacity(1024)` в `open`) тоже заменено на `MAX_FRAME_SIZE` — пропущено в plan'е, но обнаружено grep'ом
+- [x] добавить тест `roundtrip_4kb_shell_input` в `packet.rs::tests` — `vec![0xAB; 4000]` через ShellInput
+- [x] run `cargo test --workspace -- --test-threads=1` — 353 passed (было 352 + 1 new), все зелёные
+- [x] run `cargo clippy --workspace -- -D warnings` — чисто
 
 ### Task 2: format_timeout_diagnostic helper + dump on timeout
 
 **Files:**
 - Modify: `apps/wiredesk-term/src/main.rs`
 
-- [ ] добавить pure-helper `fn format_timeout_diagnostic(buf: &str, timeout_secs: u64) -> String` рядом с другими helper'ами (около `clean_stdout`, ~строка 600)
-- [ ] в `run_oneshot::None` arm (строка ~535) заменить inline-eprintln на `eprintln!("{}", format_timeout_diagnostic(&full_log, timeout_secs));` перед `Ok(124)`
-- [ ] добавить unit-test `format_timeout_diagnostic_truncates_and_handles_utf8` в `tests` module — три assertions в одном тесте:
-  - long ASCII buffer (1024 bytes) → output содержит только last 256 bytes (proof: первые 256 bytes input'а не в output'е)
-  - empty buffer → no panic, output содержит "no sentinel" сообщение и пустой tail
-  - buffer ending mid-cyrillic (e.g. `"русск"` где последний byte — continuation) на boundary 256 → no panic, lossy decode handles (output содержит replacement char или truncated string)
-- [ ] обновить existing `run_oneshot_timeout_returns_124` (строка 1513) — добавить assertion что `Ok(124)` всё ещё возвращается без regression на mock-host'е, который шлёт ShellOutput-chunk перед тишиной (verify dump'а через stderr напрямую не testable, но pure-helper покрывает the логика)
-- [ ] run `cargo test --workspace -- --test-threads=1` — зелёное, 1 новый тест
-- [ ] run `cargo clippy --workspace -- -D warnings` — чисто
+- [x] добавлен pure-helper `fn format_timeout_diagnostic(buf: &str, timeout_secs: u64) -> String` перед `clean_stdout`
+- [x] в `run_oneshot::None` arm заменено на `eprintln!("{}", format_timeout_diagnostic(&full_log, timeout_secs));`
+- [x] добавлен unit-test `format_timeout_diagnostic_truncates_and_handles_utf8` — три assertions: 1024-byte ASCII → last 256, empty buffer → no panic, mid-cyrillic boundary → lossy handles
+- [x] existing `run_oneshot_timeout_returns_124` не нужно обновлять — он verify'ит exit code 124 (regression-trap), форматирование stderr не testable из cargo test без `assert_cmd`
+- [x] run `cargo test --workspace -- --test-threads=1` — 354 passed (+1 new)
+- [x] run `cargo clippy --workspace -- -D warnings` — чисто
 
 ### Task 3: Verify acceptance criteria
 
-- [ ] AC1 (P1 unit): `roundtrip_4kb_shell_input` проходит
-- [ ] AC3 (P2 unit): `format_timeout_diagnostic_truncates_and_handles_utf8` проходит
-- [ ] AC6 (regression): `cargo test --workspace -- --test-threads=1` все 348 + 2 новых = 350 зелёные
-- [ ] AC7 (lint): `cargo clippy --workspace -- -D warnings` чисто
+- [x] AC1 (P1 unit): `roundtrip_4kb_shell_input` проходит
+- [x] AC3 (P2 unit): `format_timeout_diagnostic_truncates_and_handles_utf8` проходит
+- [x] AC6 (regression): 354 passed (148 client + 97 host + 60 protocol + 45 term + 4 transport), 0 failed
+- [x] AC7 (lint): `cargo clippy --workspace -- -D warnings` чисто
 - [ ] AC2 (P1 live, после merge на master): отмечается в Post-Completion — требует Win11 host
 - [ ] AC4 (P2 live): отмечается в Post-Completion — требует ssh chain
 
 ### Task 4: [Final] Update documentation
 
-- [ ] update `docs/wd-exec-usage.md` — секция «Гочи»: упомянуть что `MAX_PAYLOAD` теперь 4096 (раньше упоминания не было), и про last-bytes dump в stderr на timeout (для debugging hint'а)
-- [ ] update `CLAUDE.md` — статус-параграф: «MAX_PAYLOAD = 4096», тестовые counts (350), плюс одна строчка про last-bytes dump в Section про `wd --exec`
-- [ ] move plan to `docs/plans/completed/`: `mkdir -p docs/plans/completed && mv docs/plans/20260504-wd-exec-fixes.md docs/plans/completed/`
+- [x] update `docs/wd-exec-usage.md` — добавлена строка про 4 KB лимит в «Что нужно знать ДО запуска» + примечание про last-bytes dump в Exit codes table
+- [x] update `CLAUDE.md` — статус-параграф: «MAX_PAYLOAD = 4096» + matched `MAX_FRAME_SIZE = 8192` упомянут, test counts обновлены 348→354, добавлена строка про `format_timeout_diagnostic` рядом с `wd --exec` описанием
+- [x] move plan to `docs/plans/completed/` через `git mv`
 
 ## Post-Completion
 
