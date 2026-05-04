@@ -610,6 +610,7 @@ fn format_timeout_diagnostic(buf: &str, timeout_secs: u64) -> String {
 /// Pure helper, returns owned `String`.
 fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
     let lines: Vec<&str> = buf.split('\n').collect();
+    let prefix = format!("__WD_DONE_{uuid}__");
 
     // Find sentinel line index (first match).
     let sentinel_idx = lines
@@ -634,24 +635,32 @@ fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
     // shell echoes stdin. Filter both DONE and READY echoes.
     let done_echo = format!("__WD_DONE_{uuid}__$");
     let ready_echo = format!("__WD_READY_{uuid}__");
-    let kept: Vec<&str> = lines[lower..upper]
+    let echo_check = |s: &str| {
+        !(s.contains(&done_echo) || s.contains("echo ") && s.contains(&ready_echo))
+    };
+
+    let mut kept: Vec<String> = lines[lower..upper]
         .iter()
         .copied()
-        .filter(|l| {
-            // Drop the unexpanded echoed sentinel formatter.
-            if l.contains(&done_echo) {
-                return false;
-            }
-            // Drop the unexpanded echoed READY emitter (the line
-            // contains literal `echo __WD_READY_<uuid>__` — the
-            // *expanded* one already served as our lower bound and
-            // is not in this slice).
-            if l.contains("echo ") && l.contains(&ready_echo) {
-                return false;
-            }
-            true
-        })
+        .filter(|l| echo_check(l))
+        .map(|l| l.to_string())
         .collect();
+
+    // Sentinel-line may carry pre-prefix output when the command's
+    // stdout had no trailing newline (e.g. `head -c 800` on a JSON
+    // payload). The Bash sandwich glues the sentinel onto it. Recover
+    // that prefix portion as the last output line.
+    if let Some(idx) = sentinel_idx {
+        let line = lines[idx];
+        if let Some(pos) = line.rfind(&prefix) {
+            if pos > 0 {
+                let pre = line[..pos].trim_end_matches('\r');
+                if !pre.is_empty() && echo_check(pre) {
+                    kept.push(pre.to_string());
+                }
+            }
+        }
+    }
 
     let mut out = kept.join("\n");
     while out.ends_with('\n') || out.ends_with('\r') {
@@ -660,19 +669,35 @@ fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
     out
 }
 
-/// Parse a single line for our sentinel marker. Returns `Some(exit_code)`
-/// only when the line is **exactly** `__WD_DONE_<our-uuid>__<digits>`,
-/// modulo trailing whitespace. Crucially the digit-class match is what
-/// disambiguates the *expanded* sentinel (e.g. `__WD_DONE_xxx__0`) from
-/// the *stdin echo* of the format-string (e.g. `…__WD_DONE_xxx__$LASTEXITCODE`)
-/// — the literal `$LASTEXITCODE` / `$?` won't parse as `i32`.
+/// Parse a line for our sentinel marker. Returns `Some(exit_code)` when
+/// `__WD_DONE_<our-uuid>__<digits>` appears anywhere in the line.
 ///
-/// UUID is included in the match so a third party emitting a sentinel
-/// with a *different* UUID can't fool us.
+/// We anchor with `rfind` (not `strip_prefix`) because Bash sandwich
+/// `<cmd>; echo "__WD_DONE_<uuid>__$?"` glues the sentinel directly
+/// onto unterminated `<cmd>` output (e.g. `head -c 800` on a JSON
+/// payload without trailing newline). Wire stream then arrives as
+/// `<800-byte JSON>__WD_DONE_<uuid>__0\n` — one line, sentinel mid-string.
+/// `strip_prefix` would miss it; `rfind` finds the last (so always the
+/// expanded one — earlier echoes carry literal `$LASTEXITCODE`/`$?`
+/// which the digit parse rejects).
+///
+/// The digit-class match disambiguates the *expanded* sentinel from
+/// the *stdin echo* of the format-string (literal `$LASTEXITCODE` /
+/// `$?` won't parse as `i32`). UUID is included in the match so a
+/// third party emitting a sentinel with a *different* UUID can't fool us.
 fn parse_sentinel(line: &str, uuid: &uuid::Uuid) -> Option<i32> {
     let prefix = format!("__WD_DONE_{uuid}__");
-    let rest = line.trim().strip_prefix(&prefix)?;
-    rest.parse::<i32>().ok()
+    let trimmed = line.trim();
+    let pos = trimmed.rfind(&prefix)?;
+    let rest = &trimmed[pos + prefix.len()..];
+    // Take only the leading digit run (with optional minus). Anything
+    // after — trailing garbage, ANSI escapes, prompt fragments — is
+    // ignored. parse on empty string fails, which correctly rejects
+    // `…__$LASTEXITCODE` and `…__$?` echoes.
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i32>().ok()
 }
 
 /// `true` when `line` looks like a Windows PowerShell prompt:
@@ -1589,6 +1614,56 @@ mod tests {
         host_thread.join().expect("host thread");
     }
 
+    /// AC4 of `docs/briefs/sentinel-detection-ansi-tail.md`: command
+    /// emits stdout WITHOUT trailing newline, sentinel arrives glued to
+    /// it in the same wire chunk, plus Starship-style ANSI tail in the
+    /// following chunk. Pre-fix run_oneshot timed out on this; now must
+    /// match sentinel and clean stdout to just the JSON.
+    #[test]
+    fn run_oneshot_handles_unterminated_output_with_ansi_tail() {
+        let (writer, reader, host) = make_split_pair();
+        let host_thread = thread::spawn(move || {
+            // Step 1: ssh hop sent first.
+            let ssh_cmd = host
+                .recv_shell_input(Duration::from_secs(2))
+                .expect("client should send ssh -tt");
+            assert!(ssh_cmd.starts_with("ssh -tt prod"), "got: {ssh_cmd:?}");
+
+            // Step 2: emit a remote prompt so client sends the bash payload.
+            host.emit_chunk("Welcome\r\nuser@host:~$ ");
+
+            // Step 3: client sends the bash payload (echo READY; cmd; echo DONE).
+            let cmd = host
+                .recv_shell_input(Duration::from_secs(2))
+                .expect("client should send bash payload");
+            let uuid = extract_uuid_from_payload(&cmd);
+
+            // Step 4: simulate the bug scenario — bash echoes the
+            // payload, emits READY, runs cmd whose stdout has no
+            // trailing newline, then expanded sentinel glued onto it.
+            // Starship-style ANSI prompt arrives in a separate chunk.
+            host.emit_chunk(&format!(
+                "echo __WD_READY_{uuid}__; head -c 800 ...; echo \"__WD_DONE_{uuid}__$?\"\r\n"
+            ));
+            host.emit_chunk(&format!("__WD_READY_{uuid}__\r\n"));
+            // The unterminated output + sentinel in one chunk:
+            host.emit_chunk(&format!(
+                "{{\"hits\":{{\"total\":42}},\"aggs\":\"x\"}}__WD_DONE_{uuid}__0\r\n"
+            ));
+            // ANSI Starship tail in following chunk — must NOT confuse
+            // the parser, sentinel was already detected above.
+            host.emit_chunk(
+                "\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m \r\n\x1b[1;33muser\x1b[0m \r\n\
+                 ➜ \x1b[K\x1b[?2004h",
+            );
+        });
+
+        let code = run_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5)
+            .expect("run_oneshot ok");
+        assert_eq!(code, 0, "should complete with exit 0, not timeout");
+        host_thread.join().expect("host thread");
+    }
+
     /// Extract the UUID embedded in the `format_command` payload so
     /// the host-side test thread can build the matching expanded
     /// sentinel.
@@ -1719,6 +1794,65 @@ mod tests {
         assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__"), &uuid), None);
         // Non-numeric tail.
         assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__abc"), &uuid), None);
+    }
+
+    /// Regression for the unterminated-output bug: command that emits
+    /// stdout WITHOUT trailing newline (e.g. `head -c 800` on a JSON
+    /// payload) glues the bash sandwich's expanded sentinel directly
+    /// after it. parse_sentinel must still match.
+    #[test]
+    fn parse_sentinel_after_unterminated_output() {
+        let uuid = uuid::Uuid::nil();
+        let glued = format!("<long unterminated json>__WD_DONE_{uuid}__0");
+        assert_eq!(parse_sentinel(&glued, &uuid), Some(0));
+
+        let glued_nonzero = format!("xxxxx__WD_DONE_{uuid}__7");
+        assert_eq!(parse_sentinel(&glued_nonzero, &uuid), Some(7));
+    }
+
+    /// Trailing garbage after the digit run (ANSI escapes, prompt
+    /// fragments) must not break the parse — only the leading digits
+    /// are consumed.
+    #[test]
+    fn parse_sentinel_with_trailing_garbage() {
+        let uuid = uuid::Uuid::nil();
+        let with_ansi = format!("__WD_DONE_{uuid}__42\x1b[K\x1b[?2004h");
+        assert_eq!(parse_sentinel(&with_ansi, &uuid), Some(42));
+    }
+
+    /// A line that contains both an *echoed* sentinel formatter (carrying
+    /// literal `$?` or `$LASTEXITCODE`) AND an *expanded* one — pick the
+    /// expanded by `rfind` (last occurrence), since echo always precedes
+    /// expansion in the wire stream.
+    #[test]
+    fn parse_sentinel_prefers_expanded_over_echo_in_same_line() {
+        let uuid = uuid::Uuid::nil();
+        let mixed = format!(
+            "echo \"__WD_DONE_{uuid}__$?\" some-output __WD_DONE_{uuid}__7"
+        );
+        assert_eq!(parse_sentinel(&mixed, &uuid), Some(7));
+    }
+
+    /// `clean_stdout` must recover the pre-sentinel output when the
+    /// command's stdout had no trailing newline (the unterminated-output
+    /// scenario from `parse_sentinel_after_unterminated_output`). The
+    /// sentinel itself must NOT leak into user-visible stdout.
+    #[test]
+    fn clean_stdout_recovers_prefix_from_mixed_sentinel_line() {
+        let uuid = uuid::Uuid::nil();
+        let buf = format!(
+            "__WD_READY_{uuid}__\n\
+             {{\"hits\":{{\"total\":42}}}}__WD_DONE_{uuid}__0\n"
+        );
+        let out = clean_stdout(&buf, &uuid);
+        assert!(
+            out.contains("{\"hits\":{\"total\":42}}"),
+            "expected JSON output preserved: {out:?}"
+        );
+        assert!(
+            !out.contains("__WD_DONE_"),
+            "sentinel must not leak into stdout: {out:?}"
+        );
     }
 
     #[test]
