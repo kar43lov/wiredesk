@@ -162,7 +162,7 @@ wiredesk-term: connected to 'wiredesk-host' (2560×1440). Press Ctrl+] to quit.
     others   pass through to host as typed
 ```
 
-The CLI runs a small **cooked-mode line discipline** so backspace, UTF-8 input (Russian / non-ASCII) and Enter all behave as you'd expect even though the host shell isn't a real TTY. A 2-second heartbeat keeps idle interactive sessions alive — you can step away from the keyboard and come back to a still-live shell. Linux output (bare `\n`) is translated to CRLF locally, so `ssh` to a remote box doesn't render in a staircase.
+The CLI runs as a **pass-through raw bridge** — the host shell now lives in a real PTY (ConPTY) so PSReadLine, vim, htop, less, ssh-without-`-tt`, `git commit`-editor and similar interactive tools all just work. A 2-second heartbeat keeps idle sessions alive; resizing the local terminal window reflows `htop` / `vim` on the host within ~500 ms.
 
 For a shorter command alias, drop this in `~/.zshrc` / `~/.bashrc`:
 
@@ -170,14 +170,7 @@ For a shorter command alias, drop this in `~/.zshrc` / `~/.bashrc`:
 alias wd='wiredesk-term'
 ```
 
-**SSH to remote Linux through `wd`:** by default the host shell is a pipe, not a TTY, so plain `ssh dev` makes the remote bash run non-interactive (no `.bashrc`, no prompt, no aliases). Use `ssh -tt dev` to force PTY allocation on the remote, or add this to `~/.ssh/config`:
-
-```
-Host dev
-    RequestTTY force
-```
-
-Full TTY support on the host side itself (so `vim`, `htop`, `git commit`-editor, `psql` password prompts work locally on the host's shell) is a planned ConPTY refactor — out of MVP scope.
+**SSH to remote Linux through `wd`:** plain `ssh dev` works directly — the host shell is a real PTY, so the remote bash gets allocated its own PTY automatically. `.bashrc` loads, prompt and aliases work, `vim`/`htop` over ssh render correctly. The `ssh -tt` workaround is only relevant for `wd --exec --ssh ALIAS …` (the non-interactive path is intentionally pipe-based for sentinel detection — see below).
 
 ### Run a single command (`--exec` mode)
 
@@ -217,7 +210,7 @@ The first `wd --exec --ssh prod-mup ...` call creates the multiplexed connection
 Custom binary protocol over COBS-framed serial:
 
 - Packet: `[magic "WD"][type][flags][seq][len][payload][crc16]`
-- 18 message types: handshake, 5 input types, 3 clipboard types, heartbeat/error/disconnect, 5 shell types
+- 20 message types: handshake, 5 input types, 4 clipboard types, heartbeat/error/disconnect, 7 shell types (incl. ShellOpenPty + PtyResize)
 - Input events: fire-and-forget (low latency)
 - Clipboard: chunked, fire-and-forget (CRC at packet level handles drops; next poll cycle resends)
 - Heartbeat: every 2 sec, timeout after 6 sec
@@ -239,7 +232,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode bridge in Ghostty/iTerm with cooked-mode line discipline, UTF-8 backspace, hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → System (Karabiner swap, Save & Restart) and Clipboard (4 send/receive × text/image toggles). Win host: tray agent (nwg) with auto-detect CH340, **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. 148 client + 93 host + 17 term + 50 protocol tests passing.
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode pass-through bridge in Ghostty/iTerm against a real PTY on the host — vim/htop/ssh without `-tt`/PSReadLine arrow-up + Tab autocomplete work natively; window resize reflows the host's `htop`/`vim` within 500 ms; hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately; `wd --exec` non-interactive mode and the GUI shell-panel keep using the legacy pipe path with zero regressions). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → System (Karabiner swap, Save & Restart) and Clipboard (4 send/receive × text/image toggles). Win host: tray agent (nwg) with auto-detect CH340, **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. 148 client + 97 host + 44 term + 59 protocol = 348 tests passing (use `cargo test --workspace -- --test-threads=1` on macOS — host-side parallel runner has a pre-existing flake).
 
 ## License
 

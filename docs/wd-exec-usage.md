@@ -91,7 +91,7 @@ wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrad
 
 ## Чего НЕЛЬЗЯ делать
 
-- **Interactive prompts** (`sudo` без `-S`, `git push` с пасс-фразой ключа, `ssh` с password auth, `vim`, `htop`, `git interactive rebase`) — сломаются. Никакого ConPTY. Используй non-interactive формы:
+- **Interactive prompts** (`sudo` без `-S`, `git push` с пасс-фразой ключа, `ssh` с password auth, `vim`, `htop`, `git interactive rebase`) — сломаются. `wd --exec` намеренно pipe-mode (нужно для sentinel detection в clean stdout); для интерактивщины используй просто `wd` без `--exec` — там ConPTY и всё работает. Для скриптов внутри `--exec` используй non-interactive формы:
   - `sudo -n` или `sudo` через настроенный sudoers без password
   - Ssh keys без passphrase либо через ssh-agent
   - `git --no-pager` для команд которые иначе зовут `less`
