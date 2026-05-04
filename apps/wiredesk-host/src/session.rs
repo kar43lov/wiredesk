@@ -113,6 +113,11 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         self.clipboard.take_warning()
     }
 
+    #[cfg(test)]
+    pub fn has_shell(&self) -> bool {
+        self.shell.is_some()
+    }
+
     /// Test-only: rewind `last_heartbeat_recv` so the next tick() sees the
     /// heartbeat-timeout branch and drives the disconnect cleanup path.
     #[cfg(test)]
@@ -328,7 +333,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                     })?;
                 } else {
                     log::info!("opening shell '{shell}'");
-                    match ShellProcess::spawn(shell) {
+                    match ShellProcess::spawn(shell, None) {
                         Ok(proc) => self.shell = Some(proc),
                         Err(e) => {
                             log::error!("failed to spawn shell: {e}");
@@ -339,6 +344,37 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                         }
                     }
                 }
+            }
+
+            (SessionState::Connected, Message::ShellOpenPty { shell, cols, rows }) => {
+                if self.shell.is_some() {
+                    log::warn!("ShellOpenPty received but a shell is already running");
+                    self.send(Message::Error {
+                        code: 2,
+                        msg: "shell already open".into(),
+                    })?;
+                } else {
+                    log::info!("opening pty shell '{shell}' ({cols}x{rows})");
+                    match ShellProcess::spawn(shell, Some((*cols, *rows))) {
+                        Ok(proc) => self.shell = Some(proc),
+                        Err(e) => {
+                            log::error!("failed to spawn pty shell: {e}");
+                            self.send(Message::Error {
+                                code: 3,
+                                msg: format!("pty shell spawn: {e}"),
+                            })?;
+                        }
+                    }
+                }
+            }
+
+            (SessionState::Connected, Message::PtyResize { cols, rows }) => {
+                if let Some(sh) = self.shell.as_ref() {
+                    sh.resize(*cols, *rows);
+                }
+                // No shell open → silently ignore. Pre-spawn resize is
+                // a benign race when client computes initial size in
+                // parallel with ShellOpenPty.
             }
 
             (SessionState::Connected, Message::ShellInput { data }) => {
@@ -565,5 +601,69 @@ mod tests {
 
         assert_eq!(session.clipboard_state().expected_len(), 0,
             "re-handshake must reset clipboard reassembly");
+    }
+
+    #[test]
+    fn pty_resize_without_shell_is_silent_noop() {
+        // Pre-spawn PtyResize is benign (client computes size in parallel
+        // with ShellOpenPty). Session must accept it, ignore it, and
+        // not respond with Error.
+        let (mut session, mut client) = setup();
+        client.send(&Packet::new(
+            Message::Hello { version: 1, client_name: "test".into() },
+            0,
+        )).unwrap();
+        session.tick().unwrap();
+        let _ack = client.recv().unwrap();
+
+        client.send(&Packet::new(Message::PtyResize { cols: 80, rows: 24 }, 1)).unwrap();
+        session.tick().unwrap();
+
+        // Sending another packet should still work (no protocol breakage).
+        client.send(&Packet::new(Message::Heartbeat, 2)).unwrap();
+        session.tick().unwrap();
+        assert_eq!(session.state(), SessionState::Connected);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn shell_open_pty_on_non_windows_returns_error_to_client() {
+        // PTY-backed shell is Windows-only. A Mac/Linux host must
+        // surface the spawn error back to the client through the
+        // existing Message::Error path — silent fallback to pipe-mode
+        // would mask a misconfigured deployment.
+        let (mut session, mut client) = setup();
+        client.send(&Packet::new(
+            Message::Hello { version: 1, client_name: "test".into() },
+            0,
+        )).unwrap();
+        session.tick().unwrap();
+        let _ack = client.recv().unwrap();
+
+        assert!(!session.has_shell());
+
+        client.send(&Packet::new(
+            Message::ShellOpenPty { shell: "/bin/sh".into(), cols: 80, rows: 24 },
+            1,
+        )).unwrap();
+        session.tick().unwrap();
+
+        assert!(!session.has_shell(), "non-Windows host must refuse PTY shell");
+
+        // Host should have sent an Error packet — drain heartbeats /
+        // other messages, but expect at least one Error.
+        let mut saw_error = false;
+        for _ in 0..8 {
+            match client.recv() {
+                Ok(p) => {
+                    if matches!(p.message, Message::Error { .. }) {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(saw_error, "expected Message::Error from non-Windows pty-spawn");
     }
 }

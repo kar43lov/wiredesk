@@ -39,3 +39,4 @@ windows = { version = "0.58", features = [
 ] }
 native-windows-gui = "1"
 native-windows-derive = "1"
+portable-pty = "0.9"
