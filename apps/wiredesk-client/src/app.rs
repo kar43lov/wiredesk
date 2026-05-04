@@ -1017,36 +1017,45 @@ impl WireDeskApp {
     /// participate in CentralPanel layout, so coordinate mapping stays
     /// 1:1 across the full window.
     ///
-    /// Banner is non-interactable (just a label, no clicks). Progress
-    /// bars must stay interactable (cancel button), so they live in a
-    /// separate Area pinned to the BOTTOM of the screen — Host's bottom
-    /// row is less click-critical than the top.
+    /// Banner is non-interactable (just a label, no clicks). In
+    /// fullscreen the banner is *not* rendered at all — the user is
+    /// looking at the Host display through HDMI capture and the Mac
+    /// banner is invisible to them anyway, while still visually
+    /// occluding the top row when the user does glance back at Mac.
+    /// Windowed capture keeps the banner since the user is actively
+    /// looking at Mac in that case.
+    ///
+    /// Progress bars must stay interactable (cancel button), so they
+    /// live in a separate Area pinned to the BOTTOM of the screen —
+    /// Host's bottom row is less click-critical than the top.
     fn render_capture_overlays(&self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
         let banner_fill = COLOR_CAPTURE_RED.linear_multiply(0.3);
 
-        egui::Area::new(egui::Id::new("capture_banner_overlay"))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .fixed_pos(screen_rect.min)
-            .show(ctx, |ui| {
-                ui.set_width(screen_rect.width());
-                egui::Frame::group(ui.style())
-                    .fill(banner_fill)
-                    .show(ui, |ui| {
-                        ui.with_layout(
-                            egui::Layout::top_down(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new("CAPTURING — Cmd+Esc to release")
-                                        .size(BANNER_FONT_SIZE)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                            },
-                        );
-                    });
-            });
+        if !self.fullscreen {
+            egui::Area::new(egui::Id::new("capture_banner_overlay"))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .fixed_pos(screen_rect.min)
+                .show(ctx, |ui| {
+                    ui.set_width(screen_rect.width());
+                    egui::Frame::group(ui.style())
+                        .fill(banner_fill)
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("CAPTURING — Cmd+Esc to release")
+                                            .size(BANNER_FONT_SIZE)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                },
+                            );
+                        });
+                });
+        }
 
         // Clipboard transfer progress — visible inside capture / fullscreen
         // because the macOS menu bar is hidden in fullscreen and chrome panel
