@@ -186,8 +186,40 @@ fn handle_connection(
     let (event_tx, event_rx) = mpsc::channel::<ExecEvent>();
     let _slot_guard = ExecSlotGuard::install(&exec_slot, event_tx);
 
+    // Open a fresh pipe-mode shell on the host. Standalone term does
+    // this in `run()` before calling run_oneshot; in IPC mode the
+    // handler owns the lifecycle so we send ShellOpen here and a
+    // matching ShellClose after the run. Without this, host shell
+    // slot is empty and our `ShellInput` packets get ignored — what
+    // the user saw as "GUI IPC unresponsive (no first frame in 2s)".
+    if let Err(e) = outgoing_tx.send(Packet::new(
+        Message::ShellOpen { shell: String::new() },
+        0,
+    )) {
+        log::warn!("IPC: failed to send ShellOpen: {e}; aborting handler");
+        let _ = write_response(
+            &mut stream,
+            &IpcResponse::Error(format!("ShellOpen send: {e}")),
+        );
+        return;
+    }
+
+    // Drain the PS startup banner so it doesn't pollute the runner's
+    // stdout. Win11 host emits the banner + initial prompt within
+    // ~100–300 ms of ShellOpen; we drain for 500 ms to be safe. Each
+    // drained event is silently discarded — the runner's phase tracker
+    // would have to filter them anyway, and the PS-only path now
+    // streams from the first event so any leftover noise would leak.
+    let drain_until = std::time::Instant::now() + Duration::from_millis(500);
+    while let Some(remaining) = drain_until.checked_duration_since(std::time::Instant::now()) {
+        match event_rx.recv_timeout(remaining) {
+            Ok(_ev) => continue,
+            Err(_) => break,
+        }
+    }
+
     let mut transport = IpcExecTransport {
-        outgoing_tx,
+        outgoing_tx: outgoing_tx.clone(),
         rx: event_rx,
     };
 
@@ -256,6 +288,14 @@ fn handle_connection(
     };
 
     let _ = write_response(&mut stream, &final_frame);
+
+    // Close the shell on the host so the next IPC handler can ShellOpen
+    // again. Without this, the second `wd --exec` lands in a host with
+    // a shell slot still occupied by the previous run — host returns
+    // "shell already open" Error and the run hangs to timeout.
+    if let Err(e) = outgoing_tx.send(Packet::new(Message::ShellClose, 0)) {
+        log::warn!("IPC: failed to send ShellClose: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -332,16 +372,20 @@ mod tests {
         // channel for the ShellInput packet, then push events).
         let stage_slot = exec_slot.clone();
         let stage_thread = thread::spawn(move || {
-            // Wait for the runner's payload (PS-only path: single
-            // ShellInput followed by host responses). Pull at most 2
-            // packets (the test command + maybe an unintended retry).
-            let pkt = outgoing_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("runner should send ShellInput");
-            // Extract UUID from payload to craft a matching sentinel.
-            let payload = match pkt.message {
-                Message::ShellInput { data } => String::from_utf8_lossy(&data).to_string(),
-                other => panic!("expected ShellInput, got {other:?}"),
+            // Handler now sends ShellOpen first, then payload (a
+            // ShellInput) — drain ShellOpen and keep reading until
+            // we land on the ShellInput carrying the sentinel marker.
+            let payload = loop {
+                let pkt = outgoing_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("runner should send packets");
+                if let Message::ShellInput { data } = pkt.message {
+                    let s = String::from_utf8_lossy(&data).to_string();
+                    if s.contains("__WD_DONE_") {
+                        break s;
+                    }
+                }
+                // ShellOpen / heartbeats / others — keep draining.
             };
             let marker = "__WD_DONE_";
             let start = payload.find(marker).expect("uuid") + marker.len();
