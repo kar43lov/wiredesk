@@ -197,6 +197,16 @@ where
                     // unterminated output line (the bash sandwich
                     // `cmd; echo "__WD_DONE_..."` does that whenever
                     // <cmd>'s last byte isn't a newline).
+                    //
+                    // BUT: skip parse_sentinel on the echo'd cmd line
+                    // itself. In compress mode the wrapper carries a
+                    // hardcoded `__WD_DONE_<uuid>__0` literal in its
+                    // source — when ssh -tt echoes our input back,
+                    // parse_sentinel would match the literal and we'd
+                    // return Ok(0) before the real cmd has even run.
+                    // is_echo_line catches both bash and PS compress
+                    // cmd echoes via anchor-pair signatures.
+                    if !is_echo_line(line) {
                     if let Some(code) = parse_sentinel(line, &uuid) {
                         if let Some(pos) = line.rfind(&prefix) {
                             if pos > 0 {
@@ -228,6 +238,7 @@ where
                         }
                         return Ok(code);
                     }
+                    } // close the !is_echo_line guard around parse_sentinel
 
                     // Compress mode: PS path emits the READY line as
                     // regular output (we go straight to Streaming on
@@ -722,6 +733,68 @@ mod tests {
         // output and the in-band marker, so the final byte of the
         // delivered payload is `g`, not `\n`.
         assert_eq!(emitted, b"the quick brown fox\nover the lazy dog");
+    }
+
+    #[test]
+    fn runner_compress_skips_sentinel_match_on_echo_line() {
+        // Regression for live-test 2026-05-05: ssh -tt PTY echoes our
+        // wrapper input back as-is, and the new compress wrapper has
+        // a literal `__WD_DONE_<uuid>__0` in its source (sentinel rc
+        // is hardcoded 0). Without the is_echo_line guard around
+        // parse_sentinel, the runner sees the echoed line, matches
+        // the sentinel pattern, returns Ok(0) before the cmd runs —
+        // empty buffer, 0 bytes output.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    let echoed_cmd = s.trim_end_matches('\n');
+                    let b64 = make_compressed_b64_with_rc(b"real output\n", 0);
+                    // 1) PTY echoes our compress cmd back literally
+                    //    (contains "__WD_DONE_<uuid>__0" in the source!)
+                    self.queue.push_back(out(&format!("{echoed_cmd}\r\n")));
+                    // 2) READY from `echo __WD_READY_...`
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    // 3) Real base64 payload
+                    self.queue.push_back(out(&format!("{b64}\n")));
+                    // 4) Real sentinel
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "ls -la", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok");
+        assert_eq!(code, 0);
+        // Without the guard, this assertion would fail with empty
+        // emitted (runner returned on the echo'd line's literal
+        // `__WD_DONE_<uuid>__0` BEFORE the real cmd ran).
+        assert_eq!(emitted, b"real output");
     }
 
     #[test]
