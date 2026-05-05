@@ -83,6 +83,13 @@ struct Args {
     #[arg(long, default_value = "90")]
     timeout: u64,
 
+    /// Compress stdout via gzip+base64 (5-10x speedup for large text
+    /// output). Opt-in: skip for binary output (no ratio gain) or
+    /// short outputs (~0.5 s overhead). Both --ssh bash and host
+    /// PowerShell paths are supported.
+    #[arg(long)]
+    compress: bool,
+
     /// Command to run when --exec is set. Ignored otherwise.
     #[arg(value_name = "COMMAND")]
     command: Option<String>,
@@ -130,7 +137,9 @@ fn run(args: &Args) -> Result<i32> {
     #[cfg(target_os = "macos")]
     if args.exec {
         let cmd = args.command.as_deref().expect("validated above");
-        if let Some(code) = try_socket_first(cmd, args.ssh.as_deref(), args.timeout)? {
+        if let Some(code) =
+            try_socket_first(cmd, args.ssh.as_deref(), args.timeout, args.compress)?
+        {
             return Ok(code);
         }
         // Else: fall through to direct serial.
@@ -184,7 +193,14 @@ fn run(args: &Args) -> Result<i32> {
     let result_code = if args.exec {
         // Validation above guarantees command is Some().
         let cmd = args.command.as_deref().expect("validated above");
-        run_exec_oneshot(writer.clone(), reader, cmd, args.ssh.as_deref(), args.timeout)
+        run_exec_oneshot(
+            writer.clone(),
+            reader,
+            cmd,
+            args.ssh.as_deref(),
+            args.timeout,
+            args.compress,
+        )
     } else {
         // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
         terminal::enable_raw_mode()
@@ -262,7 +278,12 @@ fn format_hotkey_cheatsheet() -> String {
 /// there or the handler is unresponsive (caller falls back to direct
 /// serial — backward-compatible). Mac-only.
 #[cfg(target_os = "macos")]
-fn try_socket_first(cmd: &str, ssh: Option<&str>, timeout_secs: u64) -> Result<Option<i32>> {
+fn try_socket_first(
+    cmd: &str,
+    ssh: Option<&str>,
+    timeout_secs: u64,
+    compress: bool,
+) -> Result<Option<i32>> {
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
 
@@ -291,6 +312,7 @@ fn try_socket_first(cmd: &str, ssh: Option<&str>, timeout_secs: u64) -> Result<O
         cmd: cmd.into(),
         ssh: ssh.map(|s| s.into()),
         timeout_secs,
+        compress,
     };
     if write_request(&mut stream, &req).is_err() {
         return Ok(None);
@@ -404,6 +426,7 @@ fn run_exec_oneshot(
     cmd: &str,
     ssh: Option<&str>,
     timeout_secs: u64,
+    compress: bool,
 ) -> Result<i32> {
     let stop = Arc::new(AtomicBool::new(false));
     let hb_stop = stop.clone();
@@ -424,6 +447,7 @@ fn run_exec_oneshot(
         cmd,
         ssh,
         timeout_secs,
+        compress,
         |chunk| {
             use std::io::Write;
             let stdout = std::io::stdout();
@@ -446,6 +470,13 @@ fn run_exec_oneshot(
         }
         Err(wiredesk_exec_core::ExecError::Closed) => {
             Err(WireDeskError::Transport("transport closed".into()))
+        }
+        Err(wiredesk_exec_core::ExecError::CompressionFailed(m)) => {
+            // Decode failure post-sentinel — host's gzip+base64 wrapper
+            // produced a payload we couldn't unpack. Surface as exit
+            // 125 (transport-class error) with a diagnostic on stderr.
+            eprintln!("wiredesk-term: --compress decode failed: {m}");
+            Ok(125)
         }
     }
 }
@@ -1008,7 +1039,7 @@ mod tests {
             host.emit_chunk(&format!("__WD_DONE_{uuid}__0\r\n"));
         });
 
-        let code = run_exec_oneshot(writer, reader, "Get-ChildItem", None, 5)
+        let code = run_exec_oneshot(writer, reader, "Get-ChildItem", None, 5, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 0);
         host_thread.join().expect("host thread");
@@ -1053,7 +1084,7 @@ mod tests {
             ));
         });
 
-        let code = run_exec_oneshot(writer, reader, "docker ps", Some("prod"), 5)
+        let code = run_exec_oneshot(writer, reader, "docker ps", Some("prod"), 5, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 0);
         host_thread.join().expect("host thread");
@@ -1068,7 +1099,7 @@ mod tests {
             thread::sleep(Duration::from_millis(2_000));
         });
 
-        let code = run_exec_oneshot(writer, reader, "Start-Sleep 60", None, 1)
+        let code = run_exec_oneshot(writer, reader, "Start-Sleep 60", None, 1, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 124, "expected timeout exit code");
         host_thread.join().expect("host thread");
@@ -1085,7 +1116,7 @@ mod tests {
             host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
         });
 
-        let code = run_exec_oneshot(writer, reader, "exit 7", None, 5).expect("ok");
+        let code = run_exec_oneshot(writer, reader, "exit 7", None, 5, false).expect("ok");
         assert_eq!(code, 7);
         host_thread.join().expect("host thread");
     }
@@ -1134,7 +1165,7 @@ mod tests {
             );
         });
 
-        let code = run_exec_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5)
+        let code = run_exec_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 0, "should complete with exit 0, not timeout");
         host_thread.join().expect("host thread");
@@ -1224,6 +1255,7 @@ mod tests {
                 cmd: "echo hi".into(),
                 ssh: None,
                 timeout_secs: 5,
+                compress: false,
             },
         )
         .unwrap();
@@ -1246,6 +1278,28 @@ mod tests {
         // the optimiser strips other paths.
         let _: fn(&mut std::os::unix::net::UnixStream, &mut [u8]) -> std::io::Result<usize> =
             std::os::unix::net::UnixStream::read;
+    }
+
+    #[test]
+    fn args_compress_propagates_to_ipc_request() {
+        // Smoke: an IpcRequest built from --compress true carries the
+        // flag through bincode unchanged. This is the only thin glue
+        // path between clap args and the wire protocol; clap itself
+        // is well-tested.
+        let req = wiredesk_exec_core::ipc::IpcRequest {
+            cmd: "echo hi".into(),
+            ssh: None,
+            timeout_secs: 90,
+            compress: true,
+        };
+        let mut buf = Vec::new();
+        wiredesk_exec_core::ipc::write_request(&mut buf, &req).unwrap();
+        let mut r = std::io::Cursor::new(buf);
+        let decoded = wiredesk_exec_core::ipc::read_request(&mut r).unwrap();
+        assert!(
+            decoded.compress,
+            "compress flag must round-trip through bincode wire format"
+        );
     }
 
     #[cfg(target_os = "macos")]

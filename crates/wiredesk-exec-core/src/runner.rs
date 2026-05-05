@@ -14,7 +14,8 @@
 use std::time::{Duration, Instant};
 
 use crate::helpers::{
-    format_command, is_powershell_prompt, is_remote_prompt, parse_ready, parse_sentinel, strip_ansi,
+    decode_compressed_stream, extract_compressed_rc, format_command, format_compressed_command,
+    is_powershell_prompt, is_remote_prompt, parse_ready, parse_sentinel, strip_ansi,
 };
 use crate::transport::ExecTransport;
 use crate::types::{ExecError, ExecEvent, OneShotState, ShellKind};
@@ -39,21 +40,33 @@ enum Phase {
 
 /// Drive a single sentinel-bracketed command to completion.
 ///
-/// `on_chunk` is called once per emitted line, with the trailing `\n`
-/// already attached. Pre-sentinel output that lacks a newline (the
-/// "unterminated output" case from `parse_sentinel_after_unterminated_output`)
-/// is recovered as one final chunk before the runner returns.
+/// `on_chunk` is called once per emitted line in non-compress mode,
+/// with the trailing `\n` already attached. Pre-sentinel output that
+/// lacks a newline (the "unterminated output" case from
+/// `parse_sentinel_after_unterminated_output`) is recovered as one
+/// final chunk before the runner returns.
+///
+/// In `compress=true` mode the streaming property is intentionally
+/// dropped: post-READY lines (and any pre-sentinel unterminated tail)
+/// are accumulated into a single base64 buffer and decoded on
+/// sentinel-detect. The caller's callback is then invoked **once**
+/// with the decompressed bytes. Trade-off: latency vs throughput;
+/// opt-in via the flag.
 ///
 /// Returns `Ok(exit_code)` on success, `Err(ExecError::Timeout(buf))`
 /// if the wall-clock budget elapses without the sentinel — `buf`
 /// carries the raw wire log so the caller can pass it through
-/// `format_timeout_diagnostic`. Other `ExecError` variants surface
-/// transport-layer failures verbatim.
+/// `format_timeout_diagnostic`. In compress mode a partial buffer
+/// at timeout is **not** decoded (it would be a fragment, not data).
+/// Other `ExecError` variants surface transport-layer failures
+/// verbatim; `ExecError::CompressionFailed` covers decode errors
+/// once the sentinel arrives.
 pub fn run_oneshot<T, F>(
     transport: &mut T,
     cmd: &str,
     ssh: Option<&str>,
     timeout_secs: u64,
+    compress: bool,
     mut on_chunk: F,
 ) -> Result<i32, ExecError>
 where
@@ -66,8 +79,12 @@ where
     } else {
         ShellKind::PowerShell
     };
-    let payload = format_command(&uuid, target_kind, cmd);
-    log::debug!("[exec] uuid={uuid} kind={target_kind:?} payload={payload:?}");
+    let payload = if compress {
+        format_compressed_command(&uuid, target_kind, cmd)
+    } else {
+        format_command(&uuid, target_kind, cmd)
+    };
+    log::debug!("[exec] uuid={uuid} kind={target_kind:?} compress={compress} payload={payload:?}");
 
     // SSH path: hop first, wait for *remote* prompt before sending payload.
     // PS path: pipe-mode reads stdin line-by-line, no need to sync.
@@ -96,16 +113,41 @@ where
 
     let prefix = format!("__WD_DONE_{uuid}__");
     let done_echo = format!("__WD_DONE_{uuid}__$");
+    let done_zero_echo = format!("__WD_DONE_{uuid}__0");
     let ready_echo = format!("__WD_READY_{uuid}__");
     // Stdin-echo filter: drop the literal echoes that the remote shell
     // emits in `ssh -tt` mode (echoing our READY emitter and DONE
-    // formatter back at us).
+    // formatter back at us). Compress wrappers use a hardcoded `__0`
+    // sentinel rather than `$rc`/`$LASTEXITCODE`, so we look for the
+    // unique compress-only fragments (`gzip -c | base64` for bash,
+    // `[Console]::OutputEncoding` for PS) anchored by the READY uuid
+    // marker — the b64 payload itself can never plausibly match those.
     let is_echo_line = |s: &str| {
-        s.contains(&done_echo) || (s.contains("echo ") && s.contains(&ready_echo))
+        s.contains(&done_echo)
+            || (s.contains("echo ") && s.contains(&ready_echo))
+            || (s.contains(&ready_echo) && s.contains(&done_zero_echo))
+            || (s.contains(&ready_echo) && s.contains("gzip -c | base64"))
+            || (s.contains(&ready_echo) && s.contains("[Console]::OutputEncoding"))
     };
+
+    /// In compress mode, the wire stream between READY and DONE must
+    /// be pure base64 (with whitespace tolerated). Anything else is
+    /// noise — stray PS error formatting, ssh-tt echo fragments,
+    /// banners — that would corrupt the decode. This predicate is
+    /// the second line of defence after `is_echo_line`.
+    fn looks_like_base64(s: &str) -> bool {
+        let t = s.trim();
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    }
 
     let mut pending = String::new();
     let mut full_log = String::new();
+    // In compress mode, post-READY lines accumulate into a single base64
+    // buffer that's decoded once the sentinel arrives. In non-compress
+    // mode this stays empty and the streaming callback is used directly.
+    let mut compress_buf = String::new();
     let started = Instant::now();
     let max_wait = Duration::from_secs(timeout_secs);
 
@@ -155,21 +197,61 @@ where
                     // unterminated output line (the bash sandwich
                     // `cmd; echo "__WD_DONE_..."` does that whenever
                     // <cmd>'s last byte isn't a newline).
+                    //
+                    // BUT: skip parse_sentinel on the echo'd cmd line
+                    // itself. In compress mode the wrapper carries a
+                    // hardcoded `__WD_DONE_<uuid>__0` literal in its
+                    // source — when ssh -tt echoes our input back,
+                    // parse_sentinel would match the literal and we'd
+                    // return Ok(0) before the real cmd has even run.
+                    // is_echo_line catches both bash and PS compress
+                    // cmd echoes via anchor-pair signatures.
+                    if !is_echo_line(line) {
                     if let Some(code) = parse_sentinel(line, &uuid) {
                         if let Some(pos) = line.rfind(&prefix) {
                             if pos > 0 {
                                 let pre = line[..pos].trim_end_matches('\r');
                                 if !pre.is_empty() && !is_echo_line(pre) {
-                                    let mut chunk = pre.to_string();
-                                    chunk.push('\n');
-                                    on_chunk(chunk.as_bytes());
+                                    if compress {
+                                        if looks_like_base64(pre) {
+                                            compress_buf.push_str(pre.trim());
+                                            compress_buf.push('\n');
+                                        }
+                                    } else {
+                                        let mut chunk = pre.to_string();
+                                        chunk.push('\n');
+                                        on_chunk(chunk.as_bytes());
+                                    }
                                 }
                             }
                         }
+                        if compress && !compress_buf.is_empty() {
+                            let decoded = decode_compressed_stream(&compress_buf)?;
+                            let (clean, in_band_rc) = extract_compressed_rc(decoded);
+                            if !clean.is_empty() {
+                                on_chunk(&clean);
+                            }
+                            // In compress mode the sentinel rc is always 0
+                            // (set by the wrapper); the real rc is the
+                            // in-band marker we just extracted.
+                            return Ok(in_band_rc);
+                        }
                         return Ok(code);
                     }
+                    } // close the !is_echo_line guard around parse_sentinel
 
-                    if phase == Phase::Mute {
+                    // Compress mode: PS path emits the READY line as
+                    // regular output (we go straight to Streaming on
+                    // PS, no Mute phase). Drop it explicitly so it
+                    // doesn't poison the base64 buffer. Bash path
+                    // already drops READY via the Mute→Streaming
+                    // transition below — no double-handling.
+                    if compress && parse_ready(line, &uuid) {
+                        if phase == Phase::Mute {
+                            phase = Phase::Streaming;
+                        }
+                        // Drop the READY line itself in either phase.
+                    } else if phase == Phase::Mute {
                         // Mute → Streaming on READY (Bash/--ssh path).
                         // We don't trigger on prompt here because the
                         // SSH path's READY is the canonical lower bound;
@@ -191,10 +273,18 @@ where
                         // until READY; any prompt arriving in Streaming
                         // would be unusual but harmless to drop.
                     } else if !is_echo_line(line) {
-                        let mut chunk = String::with_capacity(line.len() + 1);
-                        chunk.push_str(line);
-                        chunk.push('\n');
-                        on_chunk(chunk.as_bytes());
+                        if compress {
+                            if looks_like_base64(line) {
+                                compress_buf.push_str(line.trim());
+                                compress_buf.push('\n');
+                            }
+                            // else: drop noise (stray PS error, banner, ...)
+                        } else {
+                            let mut chunk = String::with_capacity(line.len() + 1);
+                            chunk.push_str(line);
+                            chunk.push('\n');
+                            on_chunk(chunk.as_bytes());
+                        }
                     }
                 }
             }
@@ -250,6 +340,12 @@ mod tests {
     /// extract the UUID from a real `Packet`).
     fn expected_payload_uuid(outbox: &[Vec<u8>]) -> uuid::Uuid {
         let payload = std::str::from_utf8(&outbox[0]).expect("utf8 payload");
+        extract_uuid_from(payload)
+    }
+
+    /// Extract the UUID from a `format_command` / `format_compressed_command`
+    /// payload by locating the `__WD_DONE_<uuid>__` marker within it.
+    fn extract_uuid_from(payload: &str) -> uuid::Uuid {
         let marker = "__WD_DONE_";
         let start = payload.find(marker).expect("uuid marker") + marker.len();
         let after = &payload[start..];
@@ -343,7 +439,7 @@ mod tests {
         };
 
         let mut emitted: Vec<u8> = Vec::new();
-        let code = run_oneshot(&mut t, "echo hi", None, 5, |chunk| {
+        let code = run_oneshot(&mut t, "echo hi", None, 5, false, |chunk| {
             emitted.extend_from_slice(chunk);
         })
         .expect("run_oneshot ok");
@@ -420,7 +516,7 @@ mod tests {
         };
 
         let mut emitted = Vec::new();
-        let code = run_oneshot(&mut t, "docker ps", Some("prod"), 5, |chunk| {
+        let code = run_oneshot(&mut t, "docker ps", Some("prod"), 5, false, |chunk| {
             emitted.extend_from_slice(chunk);
         })
         .expect("run_oneshot ok");
@@ -443,7 +539,7 @@ mod tests {
         // Loop seeds idles after queue drains, which keeps the runner
         // ticking until budget elapses.
 
-        let result = run_oneshot(&mut t, "stuck", None, 1, |_| {});
+        let result = run_oneshot(&mut t, "stuck", None, 1, false, |_| {});
 
         match result {
             Err(ExecError::Timeout(buf)) => {
@@ -489,7 +585,7 @@ mod tests {
             queue: std::collections::VecDeque::new(),
         };
         let mut emitted = Vec::new();
-        let code = run_oneshot(&mut t, "false_cmd", None, 5, |c| {
+        let code = run_oneshot(&mut t, "false_cmd", None, 5, false, |c| {
             emitted.extend_from_slice(c);
         })
         .unwrap();
@@ -546,7 +642,7 @@ mod tests {
             queue: std::collections::VecDeque::new(),
         };
         let mut emitted = Vec::new();
-        let code = run_oneshot(&mut t, "head -c 800 …", Some("prod"), 5, |c| {
+        let code = run_oneshot(&mut t, "head -c 800 …", Some("prod"), 5, false, |c| {
             emitted.extend_from_slice(c);
         })
         .unwrap();
@@ -557,6 +653,402 @@ mod tests {
             "{\"hits\":{\"total\":42}}\n",
             "unterminated prefix recovered, sentinel stripped"
         );
+    }
+
+    /// Build a base64-of-gzip fixture with a trailing `__WD_RC__<rc>__`
+    /// marker — mimicking what the new compress wrapper actually emits
+    /// (rc is in-band, sentinel rc is hardcoded 0).
+    fn make_compressed_b64_with_rc(payload: &[u8], rc: i32) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut full = Vec::from(payload);
+        full.extend_from_slice(format!("__WD_RC__{rc}__\n").as_bytes());
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&full).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        let raw = STANDARD.encode(&gzipped);
+        let mut out = String::with_capacity(raw.len() + raw.len() / 76);
+        for (i, ch) in raw.chars().enumerate() {
+            if i > 0 && i % 76 == 0 {
+                out.push('\n');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    #[test]
+    fn runner_compress_happy_path_ssh_decodes_buffer_once() {
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    // Wrapper emits cmd output + __WD_RC__<rc>__ marker
+                    // before sentinel; happy path uses rc=0.
+                    let b64 = make_compressed_b64_with_rc(
+                        b"the quick brown fox\nover the lazy dog\n",
+                        0,
+                    );
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out(&format!("{b64}\n")));
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let mut callback_calls = 0;
+        let code = run_oneshot(&mut t, "head /var/log", Some("prod"), 5, true, |c| {
+            callback_calls += 1;
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok");
+        assert_eq!(code, 0);
+        assert_eq!(callback_calls, 1, "compress mode emits exactly one chunk");
+        // Cmd output's trailing \n is preserved byte-for-byte
+        // (AC2 byte-identical with non-compress baseline).
+        assert_eq!(emitted, b"the quick brown fox\nover the lazy dog\n");
+    }
+
+    #[test]
+    fn runner_compress_skips_sentinel_match_on_echo_line() {
+        // Regression for live-test 2026-05-05: ssh -tt PTY echoes our
+        // wrapper input back as-is, and the new compress wrapper has
+        // a literal `__WD_DONE_<uuid>__0` in its source (sentinel rc
+        // is hardcoded 0). Without the is_echo_line guard around
+        // parse_sentinel, the runner sees the echoed line, matches
+        // the sentinel pattern, returns Ok(0) before the cmd runs —
+        // empty buffer, 0 bytes output.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    let echoed_cmd = s.trim_end_matches('\n');
+                    let b64 = make_compressed_b64_with_rc(b"real output\n", 0);
+                    // 1) PTY echoes our compress cmd back literally
+                    //    (contains "__WD_DONE_<uuid>__0" in the source!)
+                    self.queue.push_back(out(&format!("{echoed_cmd}\r\n")));
+                    // 2) READY from `echo __WD_READY_...`
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    // 3) Real base64 payload
+                    self.queue.push_back(out(&format!("{b64}\n")));
+                    // 4) Real sentinel
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "ls -la", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok");
+        assert_eq!(code, 0);
+        // Without the guard, this assertion would fail with empty
+        // emitted (runner returned on the echo'd line's literal
+        // `__WD_DONE_<uuid>__0` BEFORE the real cmd ran). Trailing
+        // \n preserved byte-for-byte.
+        assert_eq!(emitted, b"real output\n");
+    }
+
+    #[test]
+    fn runner_compress_in_band_rc_propagates_over_sentinel_zero() {
+        // The new wrapper hardcodes sentinel rc=0; the real exit code
+        // is in the in-band __WD_RC__ marker. Verify the runner picks
+        // up the in-band rc, not the sentinel one.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    let b64 = make_compressed_b64_with_rc(b"err: nope\n", 42);
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out(&format!("{b64}\n")));
+                    // Sentinel rc is 0 — runner must use in-band 42 instead.
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "false", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok");
+        assert_eq!(code, 42, "in-band rc must override sentinel rc=0");
+        assert_eq!(emitted, b"err: nope\n");
+    }
+
+    #[test]
+    fn runner_compress_non_base64_noise_is_dropped_silently() {
+        // Noise lines (PS error formatting with quotes, ssh banners,
+        // anything that isn't pure base64) get filtered out by the
+        // looks_like_base64 predicate. Buffer ends up empty → runner
+        // returns Ok(0) without invoking the callback. This is the
+        // robust-to-host-noise behaviour: better to silently produce
+        // no output than to hard-fail with CompressionFailed on
+        // legitimate stray host text.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    // Three noise variants the filter must drop.
+                    self.queue.push_back(out("!!!not base64!!!\n"));
+                    self.queue.push_back(out(
+                        "Get-Item : Cannot find path \"C:\\nope\" because it does not exist.\n",
+                    ));
+                    self.queue.push_back(out("    + CategoryInfo : ObjectNotFound\n"));
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "noisy", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok — noise dropped, sentinel rc=0");
+        assert_eq!(code, 0);
+        assert!(emitted.is_empty(), "no callback invoked for empty buffer");
+    }
+
+    #[test]
+    fn runner_compress_valid_b64_invalid_gzip_returns_compression_failed() {
+        // Filter passes (chars are base64-shaped) but the decoded
+        // bytes aren't a valid gzip stream. Distinct from the noise
+        // case above — here we made it past base64 decode and
+        // failed at gunzip.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    // Valid base64 of "hello" — but "hello" isn't gzip.
+                    self.queue.push_back(out("aGVsbG8=\n"));
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let result = run_oneshot(&mut t, "x", Some("prod"), 5, true, |_| {});
+        assert!(
+            matches!(result, Err(ExecError::CompressionFailed(_))),
+            "valid-b64-invalid-gzip must surface as CompressionFailed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn runner_compress_timeout_returns_timeout_not_compression_failed() {
+        // Host streams READY + partial base64 then goes idle. Runner
+        // must hit wall-clock timeout and return Err(Timeout(_)) — NOT
+        // attempt to decode the partial buffer (which would yield a
+        // misleading CompressionFailed).
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let _uuid = extract_uuid_from(s);
+                    self.queue.push_back(out(&format!("__WD_READY_{_uuid}__\n")));
+                    self.queue.push_back(out("H4sIAAAAAAAAAytJLS4BAAhJ\n"));
+                    // No DONE sentinel — runner times out.
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let result = run_oneshot(&mut t, "stuck", Some("prod"), 1, true, |_| {});
+        assert!(
+            matches!(result, Err(ExecError::Timeout(_))),
+            "expected Timeout (not CompressionFailed) on partial buffer + budget exhaust: {result:?}"
+        );
+    }
+
+    #[test]
+    fn runner_compress_pre_prefix_unterminated_recovery_buffered() {
+        // If the host glues sentinel directly onto the last base64 line
+        // (no trailing newline before the marker), the runner's pre-
+        // prefix recovery path kicks in. In compress mode that prefix
+        // must go into the base64 buffer, not the callback — otherwise
+        // the buffer is missing its tail and decode fails.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    let b64 =
+                        make_compressed_b64_with_rc(b"hello compressed world", 0);
+                    let single = b64.replace('\n', "");
+                    // Glue: last base64 line with sentinel directly
+                    // appended (no \n between them).
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue
+                        .push_back(out(&format!("{single}__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "x", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok");
+        assert_eq!(code, 0);
+        assert_eq!(emitted, b"hello compressed world");
     }
 
     #[test]
@@ -607,7 +1099,7 @@ mod tests {
             queue: std::collections::VecDeque::new(),
         };
         let mut emitted = Vec::new();
-        let code = run_oneshot(&mut t, "x", Some("prod"), 5, |c| {
+        let code = run_oneshot(&mut t, "x", Some("prod"), 5, false, |c| {
             emitted.extend_from_slice(c);
         })
         .unwrap();

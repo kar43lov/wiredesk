@@ -29,3 +29,5 @@ clap = { version = "4", features = ["derive"] }
 serialport = "4"
 crc = "3"
 uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+base64 = "0.22"

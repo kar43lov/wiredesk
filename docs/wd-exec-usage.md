@@ -8,6 +8,7 @@ Drop-in replacement for `Bash(...)` when the target machine is the Win11 host on
 wd --exec "<powershell command>"                  # run on host PS
 wd --exec --ssh <alias> "<bash command>"          # run on remote box via host PS → ssh
 wd --exec --timeout <secs> "<command>"            # default 90s, exit 124 on timeout
+wd --exec --compress "<command>"                  # gzip+base64 stdout (5-10x for text)
 ```
 
 `wd` is a zsh alias for `./target/release/wiredesk-term`. The binary itself is at `target/release/wiredesk-term`.
@@ -57,6 +58,37 @@ wd --exec --ssh prod-mup "ps aux" | head -20
 wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrade"
 ```
 
+### Compression для больших текстовых выводов
+
+```bash
+# До: ~18 сек на 200 KB логов
+wd --exec --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"
+
+# После: ~3 сек (×6 быстрее)
+wd --exec --compress --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"
+```
+
+Сжимает stdout на host'е (gzip+base64), разворачивает на Mac. Stdout байт-в-байт идентичен non-compress версии — pipe-friendly работает: `wd --exec --compress --ssh prod 'docker logs ...' | grep ERROR | head -20`.
+
+Когда **включать**:
+- `docker logs --tail N` на болтливом контейнере (ratio 5–10×)
+- `kubectl logs / describe pod` с YAML/text-выводом
+- `cat /var/log/<file>.log` на linux'е через `--ssh`
+- `Get-EventLog -Newest N`, `Get-Content C:\big.log` на host PS
+
+Когда **НЕ включать**:
+- Уже сжатый бинарь (`cat /usr/bin/...`) — ratio ~1×, оверхед впустую
+- Малые выводы (<1 KB): overhead +0.5 сек, нет выгоды
+- `docker exec ... cat /some/binary.tar.gz` — двойной gzip ничего не даёт
+
+Поддерживается **обе path'и**:
+- `wd --exec --compress --ssh <alias>` — bash через `gzip -c | base64`
+- `wd --exec --compress` без --ssh — PowerShell через `[System.IO.Compression.GZipStream]`
+
+Кириллица в PS-выводе работает: обёртка явно ставит `[Console]::OutputEncoding = UTF8` перед запуском команды.
+
+Decode error → exit 125 (transport-class) с диагностикой в stderr `--compress decode failed: <msg>`.
+
 ## Exit codes
 
 | Code | Значение |
@@ -64,7 +96,7 @@ wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrad
 | 0–253 | Реальный exit code команды (PS `$LASTEXITCODE` или bash `$?`) |
 | 1 | PS terminating error (catch'нулось через `try { } catch { }`) — например `Get-Item /nonexistent` |
 | 124 | Sentinel не пришёл за `--timeout` секунд (default 90). Convention `timeout(1)`. На stderr печатается `last bytes received: "..."` — last 256 байт wire-buffer'а для диагностики где залип (mid-MOTD vs после READY-marker vs mid-command output). |
-| 125 | Transport error (serial drop'нулся, host исчез) |
+| 125 | Transport error (serial drop'нулся, host исчез) **или** `--compress` decode failure (host выдал невалидный gzip+base64 payload — на stderr печатается `--compress decode failed: <msg>`) |
 | любой | **Ctrl+C на `wd --exec` через IPC mode**: term-процесс умирает мгновенно, но host-side команда продолжает выполняться до собственного завершения (не interrupt'им host shell mid-run — destructive operations safety). GUI handler ждёт sentinel/timeout, потом освобождает single-inflight queue. Следующий `wd --exec` будет ждать пока предыдущая команда не закончится на host'е. Acceptable trade-off для clean-state semantics. |
 | любой | Обычный shell exit propagation |
 
@@ -134,6 +166,43 @@ echo __WD_READY_<uuid>__; <cmd>; echo "__WD_DONE_<uuid>__$?"
 `__WD_READY_<uuid>__` — нижняя граница для clean_stdout (срезает MOTD/banner). `__WD_DONE_<uuid>__N` — верхняя + exit code.
 
 Trace через `RUST_LOG=debug` показывает каждый recv'ed packet, parse-state, prompt detection.
+
+### `--compress` wire-format
+
+**Exit code в обоих путях передаётся in-band через `__WD_RC__<rc>__` маркер внутри gzipped payload'а** — это POSIX-portable (работает в bash/sh/dash на удалённой стороне) и обходит проблему `${PIPESTATUS[0]}` теряющегося в pipe-subshell'е. Sentinel rc хардкоженый 0 — runner после decode извлекает реальный rc из marker'а через `extract_compressed_rc`.
+
+Bash (через `--ssh`):
+```bash
+echo __WD_READY_<uuid>__
+{ <cmd> 2>&1; printf "__WD_RC__%s__\n" "$?"; } | gzip -c | base64
+echo
+echo "__WD_DONE_<uuid>__0"
+```
+
+PowerShell (host-direct):
+```powershell
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Write-Output "__WD_READY_<uuid>__"
+$LASTEXITCODE=0; $ErrorActionPreference='Stop'
+try { $out = & { <cmd> } 2>&1 | Out-String } catch { $out = $_.ToString(); $LASTEXITCODE=1 }
+$rc = $LASTEXITCODE
+$ms = New-Object System.IO.MemoryStream
+$gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+$bytes = [Text.Encoding]::UTF8.GetBytes($out + "__WD_RC__" + $rc + "__")
+$gz.Write($bytes, 0, $bytes.Length); $gz.Close()
+Write-Output ([Convert]::ToBase64String($ms.ToArray()))
+Write-Output "__WD_DONE_<uuid>__0"
+```
+
+Между `__WD_READY_` и `__WD_DONE_` — base64-encoded gzip-payload (multi-line, 76 chars per line для bash; single-line для PS). Runner буферит весь блок до sentinel'а, потом decode + extract_compressed_rc → один callback. Streaming в этом режиме не работает — trade-off opt-in флага.
+
+### Известная limitation: cyrillic в PS source-литералах
+
+`wd --exec --compress 'Write-Output "Привет"'` — кириллица **в тексте PS-скрипта** придёт как mojibake (`╨Я╤А╨╕╨▓╨╡╤В`). Корень проблемы: PowerShell в pipe-mode читает stdin через `[Console]::InputEncoding` = OEM codepage (cp866 на RU Win11). UTF-8 байты от Mac'а интерпретируются как cp866 → строка содержит mojibake-кодпойнты ещё до того как наш wrapper успеет что-то сделать. Без compress'а это работает только потому что output идёт через ту же кривую cp866 в обратную сторону — два errors compensate roundtrip.
+
+**Реальные кейсы (cyrillic в FILE CONTENT, в API responses, в БД-запросах) — работают**, потому что .NET StreamReader / API парсеры читают свои источники с правильным encoding и кладут в `$variable` корректную строку. Через `Out-String` → UTF8.GetBytes → wire — всё ок.
+
+**Workaround если нужен cyrillic literal:** не использовать compress для такой команды (`wd --exec` без `--compress` работает через accidental roundtrip). Или вынести payload в файл и читать через `Get-Content`.
 
 ## Memory
 
