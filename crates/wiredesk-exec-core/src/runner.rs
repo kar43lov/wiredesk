@@ -113,13 +113,34 @@ where
 
     let prefix = format!("__WD_DONE_{uuid}__");
     let done_echo = format!("__WD_DONE_{uuid}__$");
+    let done_zero_echo = format!("__WD_DONE_{uuid}__0");
     let ready_echo = format!("__WD_READY_{uuid}__");
     // Stdin-echo filter: drop the literal echoes that the remote shell
     // emits in `ssh -tt` mode (echoing our READY emitter and DONE
-    // formatter back at us).
+    // formatter back at us). Compress wrappers use a hardcoded `__0`
+    // sentinel rather than `$rc`/`$LASTEXITCODE`, so we look for the
+    // unique compress-only fragments (`gzip -c | base64` for bash,
+    // `[Console]::OutputEncoding` for PS) anchored by the READY uuid
+    // marker — the b64 payload itself can never plausibly match those.
     let is_echo_line = |s: &str| {
-        s.contains(&done_echo) || (s.contains("echo ") && s.contains(&ready_echo))
+        s.contains(&done_echo)
+            || (s.contains("echo ") && s.contains(&ready_echo))
+            || (s.contains(&ready_echo) && s.contains(&done_zero_echo))
+            || (s.contains(&ready_echo) && s.contains("gzip -c | base64"))
+            || (s.contains(&ready_echo) && s.contains("[Console]::OutputEncoding"))
     };
+
+    /// In compress mode, the wire stream between READY and DONE must
+    /// be pure base64 (with whitespace tolerated). Anything else is
+    /// noise — stray PS error formatting, ssh-tt echo fragments,
+    /// banners — that would corrupt the decode. This predicate is
+    /// the second line of defence after `is_echo_line`.
+    fn looks_like_base64(s: &str) -> bool {
+        let t = s.trim();
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    }
 
     let mut pending = String::new();
     let mut full_log = String::new();
@@ -182,8 +203,10 @@ where
                                 let pre = line[..pos].trim_end_matches('\r');
                                 if !pre.is_empty() && !is_echo_line(pre) {
                                     if compress {
-                                        compress_buf.push_str(pre);
-                                        compress_buf.push('\n');
+                                        if looks_like_base64(pre) {
+                                            compress_buf.push_str(pre.trim());
+                                            compress_buf.push('\n');
+                                        }
                                     } else {
                                         let mut chunk = pre.to_string();
                                         chunk.push('\n');
@@ -240,8 +263,11 @@ where
                         // would be unusual but harmless to drop.
                     } else if !is_echo_line(line) {
                         if compress {
-                            compress_buf.push_str(line);
-                            compress_buf.push('\n');
+                            if looks_like_base64(line) {
+                                compress_buf.push_str(line.trim());
+                                compress_buf.push('\n');
+                            }
+                            // else: drop noise (stray PS error, banner, ...)
                         } else {
                             let mut chunk = String::with_capacity(line.len() + 1);
                             chunk.push_str(line);
@@ -748,7 +774,14 @@ mod tests {
     }
 
     #[test]
-    fn runner_compress_invalid_b64_returns_compression_failed() {
+    fn runner_compress_non_base64_noise_is_dropped_silently() {
+        // Noise lines (PS error formatting with quotes, ssh banners,
+        // anything that isn't pure base64) get filtered out by the
+        // looks_like_base64 predicate. Buffer ends up empty → runner
+        // returns Ok(0) without invoking the callback. This is the
+        // robust-to-host-noise behaviour: better to silently produce
+        // no output than to hard-fail with CompressionFailed on
+        // legitimate stray host text.
         struct UuidEcho {
             outbox: Vec<Vec<u8>>,
             sent_ssh: bool,
@@ -766,7 +799,12 @@ mod tests {
                     self.sent_payload = true;
                     let uuid = extract_uuid_from(s);
                     self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    // Three noise variants the filter must drop.
                     self.queue.push_back(out("!!!not base64!!!\n"));
+                    self.queue.push_back(out(
+                        "Get-Item : Cannot find path \"C:\\nope\" because it does not exist.\n",
+                    ));
+                    self.queue.push_back(out("    + CategoryInfo : ObjectNotFound\n"));
                     self.queue
                         .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
                 }
@@ -783,8 +821,61 @@ mod tests {
             sent_payload: false,
             queue: std::collections::VecDeque::new(),
         };
-        let result = run_oneshot(&mut t, "garbage", Some("prod"), 5, true, |_| {});
-        assert!(matches!(result, Err(ExecError::CompressionFailed(_))));
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "noisy", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok — noise dropped, sentinel rc=0");
+        assert_eq!(code, 0);
+        assert!(emitted.is_empty(), "no callback invoked for empty buffer");
+    }
+
+    #[test]
+    fn runner_compress_valid_b64_invalid_gzip_returns_compression_failed() {
+        // Filter passes (chars are base64-shaped) but the decoded
+        // bytes aren't a valid gzip stream. Distinct from the noise
+        // case above — here we made it past base64 decode and
+        // failed at gunzip.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    // Valid base64 of "hello" — but "hello" isn't gzip.
+                    self.queue.push_back(out("aGVsbG8=\n"));
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let result = run_oneshot(&mut t, "x", Some("prod"), 5, true, |_| {});
+        assert!(
+            matches!(result, Err(ExecError::CompressionFailed(_))),
+            "valid-b64-invalid-gzip must surface as CompressionFailed: {result:?}"
+        );
     }
 
     #[test]
