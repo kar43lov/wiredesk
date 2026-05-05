@@ -153,19 +153,6 @@ fn handle_connection(
     exec_slot: ExecEventSlot,
     single_inflight: Arc<Mutex<()>>,
 ) {
-    // Serialise concurrent `wd --exec` calls. The single serial writer
-    // already serialises packets, but if two callers raced into the
-    // runner with overlapping ShellOpen+ShellInput sequences they'd
-    // step on each other's sentinels. RAII guard keeps lock held until
-    // function return / panic — `_inflight_guard` is intentional.
-    let _inflight_guard = match single_inflight.lock() {
-        Ok(g) => g,
-        Err(p) => {
-            log::warn!("IPC single_inflight mutex poisoned; recovering: {p:?}");
-            p.into_inner()
-        }
-    };
-
     let req = match read_request(&mut stream) {
         Ok(r) => r,
         Err(e) => {
@@ -180,15 +167,40 @@ fn handle_connection(
         req.timeout_secs
     );
 
-    // Keepalive: emit an empty Stdout frame immediately so the term's
-    // 2 s read-timeout-on-first-frame doesn't false-fire on long Mute
-    // phases (notably the SSH path's wait-for-remote-prompt, which
-    // routinely sits silent for 5+ s during ssh handshake). Term sees
-    // any first frame, drops the timeout, then waits for real output
-    // as long as the runner needs.
+    // Keepalive BEFORE acquiring single_inflight. If a prior handler
+    // is stuck in run_oneshot (e.g. `--ssh dev "exit 42"` exits the
+    // remote bash, ssh tunnel closes, host PS stays alive, sentinel
+    // never arrives → runner waits to its full timeout), acquiring
+    // the mutex would block here for up to 90 s. Without this early
+    // keepalive, term's 2 s read-timeout-on-first-frame fires, term
+    // falls back to direct serial, which then errors with "port busy"
+    // because the GUI is still holding it. With keepalive emitted
+    // first, term knows the handler is alive and queued, and just
+    // waits — user can Ctrl+C if it's too long.
     if let Err(e) = write_response(&mut stream, &IpcResponse::Stdout(Vec::new())) {
         log::warn!("IPC: keepalive write failed: {e}; aborting handler");
         return;
+    }
+
+    // Serialise concurrent `wd --exec` calls. The single serial writer
+    // already serialises packets, but if two callers raced into the
+    // runner with overlapping ShellOpen+ShellInput sequences they'd
+    // step on each other's sentinels. RAII guard keeps lock held until
+    // function return / panic — `_inflight_guard` is intentional.
+    let lock_started = std::time::Instant::now();
+    let _inflight_guard = match single_inflight.lock() {
+        Ok(g) => g,
+        Err(p) => {
+            log::warn!("IPC single_inflight mutex poisoned; recovering: {p:?}");
+            p.into_inner()
+        }
+    };
+    let waited = lock_started.elapsed();
+    if waited > Duration::from_secs(1) {
+        log::warn!(
+            "IPC handler: waited {:?} for single_inflight (prior wd --exec held it long — likely an --ssh path that exited the remote shell without a matching sentinel; that handler will release on its own timeout)",
+            waited
+        );
     }
 
     // Private mpsc for the duration of this run. Reader thread fans
