@@ -169,12 +169,14 @@ Trace через `RUST_LOG=debug` показывает каждый recv'ed pack
 
 ### `--compress` wire-format
 
+**Exit code в обоих путях передаётся in-band через `__WD_RC__<rc>__` маркер внутри gzipped payload'а** — это POSIX-portable (работает в bash/sh/dash на удалённой стороне) и обходит проблему `${PIPESTATUS[0]}` теряющегося в pipe-subshell'е. Sentinel rc хардкоженый 0 — runner после decode извлекает реальный rc из marker'а через `extract_compressed_rc`.
+
 Bash (через `--ssh`):
 ```bash
 echo __WD_READY_<uuid>__
-{ <cmd>; } 2>&1 | gzip -c | base64; rc=${PIPESTATUS[0]}
+{ <cmd> 2>&1; printf "__WD_RC__%s__\n" "$?"; } | gzip -c | base64
 echo
-echo "__WD_DONE_<uuid>__$rc"
+echo "__WD_DONE_<uuid>__0"
 ```
 
 PowerShell (host-direct):
@@ -186,13 +188,21 @@ try { $out = & { <cmd> } 2>&1 | Out-String } catch { $out = $_.ToString(); $LAST
 $rc = $LASTEXITCODE
 $ms = New-Object System.IO.MemoryStream
 $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
-$bytes = [Text.Encoding]::UTF8.GetBytes($out)
+$bytes = [Text.Encoding]::UTF8.GetBytes($out + "__WD_RC__" + $rc + "__")
 $gz.Write($bytes, 0, $bytes.Length); $gz.Close()
 Write-Output ([Convert]::ToBase64String($ms.ToArray()))
-Write-Output "__WD_DONE_<uuid>__$rc"
+Write-Output "__WD_DONE_<uuid>__0"
 ```
 
-Между `__WD_READY_` и `__WD_DONE_` — base64-encoded gzip-payload (multi-line, 76 chars per line для bash; single-line для PS). Runner буферит весь блок до sentinel'а, потом decode и emit single-chunk callback'ом — streaming в этом режиме не работает (trade-off opt-in флага). `${PIPESTATUS[0]}` (bash-only) корректно пробрасывает exit команды, не gzip/base64.
+Между `__WD_READY_` и `__WD_DONE_` — base64-encoded gzip-payload (multi-line, 76 chars per line для bash; single-line для PS). Runner буферит весь блок до sentinel'а, потом decode + extract_compressed_rc → один callback. Streaming в этом режиме не работает — trade-off opt-in флага.
+
+### Известная limitation: cyrillic в PS source-литералах
+
+`wd --exec --compress 'Write-Output "Привет"'` — кириллица **в тексте PS-скрипта** придёт как mojibake (`╨Я╤А╨╕╨▓╨╡╤В`). Корень проблемы: PowerShell в pipe-mode читает stdin через `[Console]::InputEncoding` = OEM codepage (cp866 на RU Win11). UTF-8 байты от Mac'а интерпретируются как cp866 → строка содержит mojibake-кодпойнты ещё до того как наш wrapper успеет что-то сделать. Без compress'а это работает только потому что output идёт через ту же кривую cp866 в обратную сторону — два errors compensate roundtrip.
+
+**Реальные кейсы (cyrillic в FILE CONTENT, в API responses, в БД-запросах) — работают**, потому что .NET StreamReader / API парсеры читают свои источники с правильным encoding и кладут в `$variable` корректную строку. Через `Out-String` → UTF8.GetBytes → wire — всё ок.
+
+**Workaround если нужен cyrillic literal:** не использовать compress для такой команды (`wd --exec` без `--compress` работает через accidental roundtrip). Или вынести payload в файл и читать через `Get-Content`.
 
 ## Memory
 

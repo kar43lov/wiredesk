@@ -14,8 +14,8 @@
 use std::time::{Duration, Instant};
 
 use crate::helpers::{
-    decode_compressed_stream, format_command, format_compressed_command, is_powershell_prompt,
-    is_remote_prompt, parse_ready, parse_sentinel, strip_ansi,
+    decode_compressed_stream, extract_compressed_rc, format_command, format_compressed_command,
+    is_powershell_prompt, is_remote_prompt, parse_ready, parse_sentinel, strip_ansi,
 };
 use crate::transport::ExecTransport;
 use crate::types::{ExecError, ExecEvent, OneShotState, ShellKind};
@@ -194,7 +194,14 @@ where
                         }
                         if compress && !compress_buf.is_empty() {
                             let decoded = decode_compressed_stream(&compress_buf)?;
-                            on_chunk(&decoded);
+                            let (clean, in_band_rc) = extract_compressed_rc(decoded);
+                            if !clean.is_empty() {
+                                on_chunk(&clean);
+                            }
+                            // In compress mode the sentinel rc is always 0
+                            // (set by the wrapper); the real rc is the
+                            // in-band marker we just extracted.
+                            return Ok(in_band_rc);
                         }
                         return Ok(code);
                     }
@@ -611,12 +618,17 @@ mod tests {
         );
     }
 
-    fn make_compressed_b64(payload: &[u8]) -> String {
+    /// Build a base64-of-gzip fixture with a trailing `__WD_RC__<rc>__`
+    /// marker — mimicking what the new compress wrapper actually emits
+    /// (rc is in-band, sentinel rc is hardcoded 0).
+    fn make_compressed_b64_with_rc(payload: &[u8], rc: i32) -> String {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use flate2::write::GzEncoder;
         use std::io::Write;
+        let mut full = Vec::from(payload);
+        full.extend_from_slice(format!("__WD_RC__{rc}__\n").as_bytes());
         let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(payload).unwrap();
+        encoder.write_all(&full).unwrap();
         let gzipped = encoder.finish().unwrap();
         let raw = STANDARD.encode(&gzipped);
         let mut out = String::with_capacity(raw.len() + raw.len() / 76);
@@ -647,7 +659,12 @@ mod tests {
                 } else if !self.sent_payload && s.contains("__WD_DONE_") {
                     self.sent_payload = true;
                     let uuid = extract_uuid_from(s);
-                    let b64 = make_compressed_b64(b"the quick brown fox\nover the lazy dog\n");
+                    // Wrapper emits cmd output + __WD_RC__<rc>__ marker
+                    // before sentinel; happy path uses rc=0.
+                    let b64 = make_compressed_b64_with_rc(
+                        b"the quick brown fox\nover the lazy dog\n",
+                        0,
+                    );
                     self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
                     self.queue.push_back(out(&format!("{b64}\n")));
                     self.queue
@@ -675,7 +692,59 @@ mod tests {
         .expect("ok");
         assert_eq!(code, 0);
         assert_eq!(callback_calls, 1, "compress mode emits exactly one chunk");
-        assert_eq!(emitted, b"the quick brown fox\nover the lazy dog\n");
+        // extract_compressed_rc strips the trailing `\n` between cmd
+        // output and the in-band marker, so the final byte of the
+        // delivered payload is `g`, not `\n`.
+        assert_eq!(emitted, b"the quick brown fox\nover the lazy dog");
+    }
+
+    #[test]
+    fn runner_compress_in_band_rc_propagates_over_sentinel_zero() {
+        // The new wrapper hardcodes sentinel rc=0; the real exit code
+        // is in the in-band __WD_RC__ marker. Verify the runner picks
+        // up the in-band rc, not the sentinel one.
+        struct UuidEcho {
+            outbox: Vec<Vec<u8>>,
+            sent_ssh: bool,
+            sent_payload: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for UuidEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                let s = std::str::from_utf8(data).unwrap_or("");
+                if !self.sent_ssh && s.starts_with("ssh -tt ") {
+                    self.sent_ssh = true;
+                    self.queue.push_back(out("user@host:~$ "));
+                } else if !self.sent_payload && s.contains("__WD_DONE_") {
+                    self.sent_payload = true;
+                    let uuid = extract_uuid_from(s);
+                    let b64 = make_compressed_b64_with_rc(b"err: nope\n", 42);
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out(&format!("{b64}\n")));
+                    // Sentinel rc is 0 — runner must use in-band 42 instead.
+                    self.queue
+                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = UuidEcho {
+            outbox: Vec::new(),
+            sent_ssh: false,
+            sent_payload: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "false", Some("prod"), 5, true, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .expect("ok");
+        assert_eq!(code, 42, "in-band rc must override sentinel rc=0");
+        assert_eq!(emitted, b"err: nope");
     }
 
     #[test]
@@ -787,7 +856,8 @@ mod tests {
                 } else if !self.sent_payload && s.contains("__WD_DONE_") {
                     self.sent_payload = true;
                     let uuid = extract_uuid_from(s);
-                    let b64 = make_compressed_b64(b"hello compressed world");
+                    let b64 =
+                        make_compressed_b64_with_rc(b"hello compressed world", 0);
                     let single = b64.replace('\n', "");
                     // Glue: last base64 line with sentinel directly
                     // appended (no \n between them).

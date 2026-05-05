@@ -236,34 +236,34 @@ pub fn is_remote_prompt(line: &str) -> bool {
 
 /// Build the `--compress` variant of the sentinel-bearing payload.
 ///
-/// Bash variant pipes stdout (with stderr merged via `2>&1`) through
-/// `gzip -c | base64`, captures `${PIPESTATUS[0]}` (the command's own
-/// exit, not gzip's or base64's), and emits a trailing `echo` so the
-/// sentinel line starts on its own boundary — otherwise the last
-/// base64 line could glue to the sentinel and `parse_sentinel`'s
-/// `rfind` would still locate the marker but the runner's pre-decode
-/// buffer would carry sentinel bytes (decode would then fail).
+/// Both shell variants emit the user command's exit code as an
+/// **in-band marker** `__WD_RC__<rc>__` at the very end of the
+/// compressed stream, NOT in the post-pipe sentinel. Reasoning:
+/// `${PIPESTATUS[0]}` is bash-only (breaks on `sh`/`dash` remote
+/// login shells), and `{ cmd; rc=$?; } | gzip` loses rc to the
+/// pipe-subshell anyway. Putting rc inside the gzipped payload
+/// makes the wrapper POSIX-portable on the bash side and uniform
+/// across both paths. The `__WD_DONE_<uuid>__0` sentinel becomes
+/// a fixed marker — runner extracts the real rc from the in-band
+/// marker after decode (see `extract_compressed_rc`).
 ///
-/// `${PIPESTATUS[0]}` is bash-only — we already require `bash -c` for
-/// the `--ssh` path. Do NOT use `{ <cmd>; rc=$?; } | gzip` — `rc=$?`
-/// inside the left subshell of the pipe is not visible in the parent.
+/// Bash variant pipes stdout (with stderr merged via `2>&1`) plus
+/// the rc-marker through `gzip -c | base64`. Trailing `echo` before
+/// the sentinel guarantees `\n` boundary so the last base64 line
+/// can't glue onto `__WD_DONE_`.
 ///
-/// PowerShell variant uses `[System.IO.Compression.GZipStream]` plus
-/// `[Convert]::ToBase64String`. `[Console]::OutputEncoding =
-/// [Text.Encoding]::UTF8` is **mandatory** before invoking the user's
-/// command — without it, Cyrillic and other non-ASCII output goes
-/// through cp1251/cp866 (Windows console default) and `Out-String`
-/// produces mojibake. `Out-String -Stream` would defeat the purpose
-/// (we need a single string to compress); `Out-String` (default)
-/// joins lines with the system separator, which is fine post-encode.
-///
-/// `$LASTEXITCODE = 0` pre-init mirrors `format_command`. The
-/// try/catch sets it to 1 on terminating errors; cmdlets don't touch
-/// it, so non-error cmdlet runs return 0.
+/// PowerShell variant appends the rc-marker to `$out` before
+/// `[Text.Encoding]::UTF8.GetBytes`, then gzips and emits as one
+/// base64 string. `[Console]::OutputEncoding = UTF8` is harmless
+/// here (sentinel is ASCII), kept for symmetry. Non-ASCII source
+/// literals (e.g. Cyrillic in script text) parse via PS console
+/// input encoding before this line runs and arrive as mojibake —
+/// known limitation, not fixable in pipe-mode without multi-line
+/// codepage handshake.
 pub fn format_compressed_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
     match kind {
         ShellKind::Bash => format!(
-            "echo __WD_READY_{uuid}__; {{ {cmd}; }} 2>&1 | gzip -c | base64; rc=${{PIPESTATUS[0]}}; echo; echo \"__WD_DONE_{uuid}__$rc\"\n"
+            "echo __WD_READY_{uuid}__; {{ {cmd} 2>&1; printf \"__WD_RC__%s__\\n\" \"$?\"; }} | gzip -c | base64; echo; echo \"__WD_DONE_{uuid}__0\"\n"
         ),
         ShellKind::PowerShell => format!(
             "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
@@ -273,12 +273,61 @@ pub fn format_compressed_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) 
              $rc = $LASTEXITCODE; \
              $ms = New-Object System.IO.MemoryStream; \
              $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress); \
-             $bytes = [Text.Encoding]::UTF8.GetBytes($out); \
+             $bytes = [Text.Encoding]::UTF8.GetBytes($out + \"__WD_RC__\" + $rc + \"__\"); \
              $gz.Write($bytes, 0, $bytes.Length); $gz.Close(); \
              Write-Output ([Convert]::ToBase64String($ms.ToArray())); \
-             Write-Output \"__WD_DONE_{uuid}__$rc\"\n"
+             Write-Output \"__WD_DONE_{uuid}__0\"\n"
         ),
     }
+}
+
+/// Strip the trailing `__WD_RC__<rc>__` marker from decoded compress
+/// output and return `(payload_without_marker, rc)`. If no valid
+/// marker is found, returns `(bytes, 0)` — runner treats it as
+/// success but leaves payload untouched.
+///
+/// Byte-oriented (not str-oriented) so binary cmd output (e.g.
+/// `cat /usr/bin/ls`) doesn't corrupt the search. We only look at
+/// the trailing 64 bytes since the marker is ~16 bytes and always
+/// at end. If user's binary somehow contains the marker pattern in
+/// the middle, `rposition` finds the LAST occurrence — which is
+/// our marker, near end. Trailing `\n` after marker (printf adds
+/// one) is also stripped.
+pub fn extract_compressed_rc(bytes: Vec<u8>) -> (Vec<u8>, i32) {
+    let needle = b"__WD_RC__";
+    let len = bytes.len();
+    let search_start = len.saturating_sub(64);
+    let tail = &bytes[search_start..];
+
+    let pos_in_tail = match tail.windows(needle.len()).rposition(|w| w == needle) {
+        Some(p) => p,
+        None => return (bytes, 0),
+    };
+    let abs_pos = search_start + pos_in_tail;
+    let after = &bytes[abs_pos + needle.len()..];
+
+    let end_pos = match after.windows(2).position(|w| w == b"__") {
+        Some(p) => p,
+        None => return (bytes, 0),
+    };
+
+    let rc_str = match std::str::from_utf8(&after[..end_pos]) {
+        Ok(s) => s,
+        Err(_) => return (bytes, 0),
+    };
+    let rc = match rc_str.parse::<i32>() {
+        Ok(r) => r,
+        Err(_) => return (bytes, 0),
+    };
+
+    // Strip marker. Also trim a leading `\n` between cmd output and
+    // marker (the `printf "...\n"` in bash wrapper adds one). PS
+    // wrapper appends marker without leading newline.
+    let mut clean_end = abs_pos;
+    if clean_end > 0 && bytes[clean_end - 1] == b'\n' {
+        clean_end -= 1;
+    }
+    (bytes[..clean_end].to_vec(), rc)
 }
 
 /// Decode a base64-of-gzip payload back into raw bytes.
@@ -680,12 +729,14 @@ mod tests {
         let uuid = uuid::Uuid::nil();
         let out = format_compressed_command(&uuid, ShellKind::Bash, "ls -la");
         assert!(out.contains(&format!("__WD_READY_{uuid}__")));
-        assert!(out.contains("{ ls -la; } 2>&1 | gzip -c | base64"));
-        assert!(out.contains("rc=${PIPESTATUS[0]}"));
-        assert!(out.contains(&format!("__WD_DONE_{uuid}__$rc")));
+        assert!(out.contains("{ ls -la 2>&1; printf \"__WD_RC__%s__\\n\" \"$?\"; } | gzip -c | base64"));
+        // sentinel rc is hardcoded 0 — real rc is in-band via __WD_RC__
+        assert!(out.contains(&format!("__WD_DONE_{uuid}__0")));
         // explicit echo before the DONE sentinel so a trailing
         // base64 line cannot glue onto the marker.
-        assert!(out.contains("base64; rc=${PIPESTATUS[0]}; echo;"));
+        assert!(out.contains("| base64; echo; echo"));
+        // No bashism left over.
+        assert!(!out.contains("PIPESTATUS"));
         assert!(out.ends_with('\n'));
     }
 
@@ -701,7 +752,9 @@ mod tests {
         assert!(out.contains("catch { $out = $_.ToString(); $LASTEXITCODE=1 }"));
         assert!(out.contains("System.IO.Compression.GZipStream"));
         assert!(out.contains("[Convert]::ToBase64String"));
-        assert!(out.contains(&format!("__WD_DONE_{uuid}__$rc")));
+        // PS wrapper appends __WD_RC__$rc__ to $out before encoding.
+        assert!(out.contains("$out + \"__WD_RC__\" + $rc + \"__\""));
+        assert!(out.contains(&format!("__WD_DONE_{uuid}__0")));
         assert!(out.ends_with('\n'));
     }
 
@@ -713,9 +766,7 @@ mod tests {
             ShellKind::Bash,
             "echo 'single' && echo \"double\"",
         );
-        // The wrapper itself doesn't escape — caller is responsible.
-        // We just verify the cmd is embedded verbatim inside { ... }.
-        assert!(out.contains("{ echo 'single' && echo \"double\"; }"));
+        assert!(out.contains("{ echo 'single' && echo \"double\" 2>&1;"));
     }
 
     #[test]
@@ -737,6 +788,60 @@ mod tests {
             // Both markers must use the same uuid.
             assert!(out.matches(&uuid.to_string()).count() >= 2, "kind={kind:?}");
         }
+    }
+
+    // --- extract_compressed_rc ---
+
+    #[test]
+    fn extract_rc_strips_trailing_marker_text() {
+        let bytes = b"hello world\n__WD_RC__0__\n".to_vec();
+        let (clean, rc) = extract_compressed_rc(bytes);
+        assert_eq!(clean, b"hello world");
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn extract_rc_propagates_nonzero() {
+        let bytes = b"some output\n__WD_RC__42__\n".to_vec();
+        let (clean, rc) = extract_compressed_rc(bytes);
+        assert_eq!(clean, b"some output");
+        assert_eq!(rc, 42);
+    }
+
+    #[test]
+    fn extract_rc_handles_glued_marker_no_leading_newline() {
+        // PS wrapper appends marker without a newline between $out and marker.
+        let bytes = b"some output__WD_RC__1__".to_vec();
+        let (clean, rc) = extract_compressed_rc(bytes);
+        assert_eq!(clean, b"some output");
+        assert_eq!(rc, 1);
+    }
+
+    #[test]
+    fn extract_rc_no_marker_returns_zero_and_keeps_bytes() {
+        let bytes = b"plain output, no marker".to_vec();
+        let (clean, rc) = extract_compressed_rc(bytes.clone());
+        assert_eq!(clean, bytes);
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn extract_rc_byte_safe_for_binary_payload() {
+        // Binary cmd output (non-UTF-8 bytes) followed by marker.
+        let mut bytes = vec![0xFFu8, 0xFE, 0x00, 0x80, 0x42];
+        bytes.extend_from_slice(b"\n__WD_RC__7__\n");
+        let (clean, rc) = extract_compressed_rc(bytes);
+        assert_eq!(clean, &[0xFFu8, 0xFE, 0x00, 0x80, 0x42]);
+        assert_eq!(rc, 7);
+    }
+
+    #[test]
+    fn extract_rc_finds_last_marker_if_multiple() {
+        // If user output happens to contain "__WD_RC__N__", we still
+        // pick the LAST one (our wrapper marker is always last).
+        let bytes = b"fake __WD_RC__99__ in middle\nreal output\n__WD_RC__3__\n".to_vec();
+        let (_clean, rc) = extract_compressed_rc(bytes);
+        assert_eq!(rc, 3);
     }
 
     // --- decode_compressed_stream ---
