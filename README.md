@@ -195,6 +195,8 @@ This skips raw mode and the interactive bridge entirely. The CLI sends the comma
 
 PS-only wrapper sets `$LASTEXITCODE=0; $ErrorActionPreference='Stop'` and wraps the user command in `try { … } catch { $LASTEXITCODE=1 }` so cmdlet successes return 0, terminating errors return 1, and external commands propagate their actual exit codes. SSH path sandwiches the user command between an explicit `__WD_READY_<uuid>__` marker (lower bound for output-slicing) and the `__WD_DONE_<uuid>__$?` sentinel (upper bound + exit code). Default timeout 90 s, override with `--timeout SECONDS`. Timeout returns exit 124 (`timeout(1)` convention). On macOS, `wd --exec` runs in parallel with an active `WireDesk.app` via a Unix-socket IPC bridge — GUI keeps the serial port open and routes the exec through it; if the GUI isn't running, term falls back to direct serial. See `docs/wd-exec-usage.md` for the full reference (exit codes, gotchas, examples for AI agents through Bash-tool).
 
+**For agent / automation authors:** writing helpers on top of `wd --exec` (binary push, `.ps1` generation, multi-call orchestration)? Read [Host environment quirks](docs/wd-exec-usage.md#host-environment-quirks) — three Win-host gotchas (`AppendAllBytes` missing in .NET 4.x, ru-RU PS parser without UTF-8 BOM, bash `$()` subshell killing serial channel) that look like `wd` bugs but aren't. Each costs hours if you don't know.
+
 For sub-second persistent SSH (so consecutive `--ssh prod-mup` calls don't re-handshake every time), set up OpenSSH ControlMaster on the host's `~/.ssh/config`:
 
 ```
