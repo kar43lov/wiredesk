@@ -7,6 +7,7 @@ edition.workspace = true
 wiredesk-core.workspace = true
 wiredesk-protocol.workspace = true
 wiredesk-transport.workspace = true
+wiredesk-exec-core.workspace = true
 thiserror.workspace = true
 log.workspace = true
 env_logger.workspace = true

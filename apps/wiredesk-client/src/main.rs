@@ -1,6 +1,9 @@
 mod app;
 mod clipboard;
 mod config;
+mod exec_bridge;
+#[cfg(target_os = "macos")]
+mod ipc;
 mod input;
 mod keyboard_tap;
 mod monitor;
@@ -159,6 +162,33 @@ fn main() {
     let reader_incoming_cancel = incoming_cancel.clone();
     let reader_outgoing_cancel = outgoing_cancel.clone();
     let reader_outgoing_tx = outgoing_tx.clone();
+    // Shell-event broadcast slot for the IPC handler (Task 6).
+    // None until a `wd --exec` connection arrives; reader_thread
+    // checks it on every shell event and fans out a parallel copy
+    // when set. Lifecycle managed by ExecSlotGuard RAII so a panicking
+    // handler doesn't strand the slot.
+    let exec_slot: exec_bridge::ExecEventSlot =
+        Arc::new(std::sync::Mutex::new(None));
+    let reader_exec_slot = exec_slot.clone();
+
+    // Spawn the IPC acceptor so `wd --exec` can run in parallel with
+    // an active GUI (Mac-only — non-Mac builds are unsupported by
+    // design, but the cfg keeps cross-compilation working). Bind
+    // failure is non-fatal: GUI continues, term falls back to direct
+    // serial.
+    #[cfg(target_os = "macos")]
+    {
+        let ipc_outgoing_tx = outgoing_tx.clone();
+        let ipc_slot = exec_slot.clone();
+        let single_inflight: Arc<std::sync::Mutex<()>> =
+            Arc::new(std::sync::Mutex::new(()));
+        let socket_path = wiredesk_exec_core::default_socket_path();
+        ipc::spawn_ipc_acceptor(socket_path, ipc_outgoing_tx, ipc_slot, single_inflight);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &exec_slot; // suppress unused on non-Mac
+    }
     thread::spawn(move || {
         reader_thread(
             reader_transport,
@@ -173,6 +203,7 @@ fn main() {
             reader_receive_text,
             reader_incoming_cancel,
             reader_outgoing_cancel,
+            reader_exec_slot,
         );
     });
 
@@ -482,6 +513,7 @@ fn reader_thread(
     receive_text: Arc<std::sync::atomic::AtomicBool>,
     incoming_cancel: Arc<std::sync::atomic::AtomicBool>,
     outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
+    exec_slot: exec_bridge::ExecEventSlot,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -589,14 +621,30 @@ fn reader_thread(
                     incoming_clip.on_chunk(index, data);
                 }
                 Message::ShellOutput { data } => {
+                    exec_bridge::broadcast_exec_event(
+                        &exec_slot,
+                        wiredesk_exec_core::ExecEvent::ShellOutput(data.clone()),
+                    );
                     let _ = events_tx.send(TransportEvent::ShellOutput(data));
                 }
                 Message::ShellExit { code } => {
+                    exec_bridge::broadcast_exec_event(
+                        &exec_slot,
+                        wiredesk_exec_core::ExecEvent::ShellExit(code),
+                    );
                     let _ = events_tx.send(TransportEvent::ShellExit(code));
                 }
                 Message::Error { code, msg } => {
                     log::warn!("error from host: code={code} msg={msg}");
                     if msg.contains("shell") {
+                        // Fan-out to IPC slot first — it doesn't subscribe
+                        // to the GUI's `events_tx` ShellError filter, but
+                        // a host-error during a `wd --exec` run is exactly
+                        // what the runner wants to surface as HostError.
+                        exec_bridge::broadcast_exec_event(
+                            &exec_slot,
+                            wiredesk_exec_core::ExecEvent::HostError(msg.clone()),
+                        );
                         let _ = events_tx.send(TransportEvent::ShellError(msg));
                     }
                 }

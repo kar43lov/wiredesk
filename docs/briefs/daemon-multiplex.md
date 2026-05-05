@@ -1,6 +1,12 @@
 # Бриф: Daemon mode — одновременная работа GUI + `wd --exec`
 
-**Status:** не начат, в roadmap. Активируется когда живой workflow реально требует обеих сторон одновременно.
+**Status:** ⚠️ **SUPERSEDED** by [`wd-exec-via-gui-ipc.md`](./wd-exec-via-gui-ipc.md) (брейншторм 2026-05-04).
+
+Брейншторм зафиксировал, что full-daemon extraction (~2–3 нед) — overkill: interactive `wd` параллельно не требуется (только `wd --exec` от Claude в чате параллельно с GUI clipboard sync). Меньший shape — embedded IPC поверх GUI (~5–7 дней) — покрывает реальный workflow. Текущий бриф оставлен для контекста; новый бриф — primary spec.
+
+---
+
+## Исходный бриф (для контекста / возможной миграции)
 
 ## Проблема
 
