@@ -151,6 +151,102 @@ Codepoint каждой буквы: А=0410, Б=0411, ..., Я=042F, а=0430, ...,
 
 **Read из БД работает корректно** — кириллица в результатах приходит в UTF-8 без проблем. Issue только при отправке в `WHERE`/`VALUES`. Альтернатива — поиск по ASCII-полям (UUID, mail, login если в латинице).
 
+## Host environment quirks
+
+Раздел для тех, кто пишет orchestration-helpers поверх `wd --exec` (типичный use-case Claude / agents). Это **не баги `wd`** — это особенности Win-host окружения, которые проявляются именно через automation-канал. Без знания каждый эпизод выглядит как «`wd` сломался» и съедает часы.
+
+Все три подтверждены на Win11 ru-RU + PowerShell 5.1 + .NET Framework 4.x — стандартный baseline RU-сборки Win11.
+
+### Q1: `[System.IO.File]::AppendAllBytes` падает rc=1 с пустым stderr
+
+**Симптом:** при chunked-base64 binary push (`wd --exec` зовёт PS-скрипт, который накапливает chunks через append'ы и финально дозаписывает) — первый `WriteAllBytes` ок, последующие `AppendAllBytes` выдают `wd --exec` exit 1 без stderr.
+
+**Причина:** `[System.IO.File]::AppendAllBytes` появился в .NET Core / .NET 5+. Win11 PowerShell 5.1 работает на **.NET Framework 4.x** — там этого метода нет, вызов кидает `MethodNotFound` который PS обёртка ловит как terminating error → exit 1.
+
+**Workaround:** копи chunks как text-base64 через `Add-Content -Encoding ASCII -NoNewline`, в финале — один `[System.IO.File]::WriteAllBytes` с decoded bytes:
+
+```powershell
+# accumulate chunk N (called per chunk from the orchestrator)
+$chunk = "<base64 string>"
+Add-Content -Path "C:\temp\push.b64" -Value $chunk -Encoding ASCII -NoNewline
+
+# finalize (called once after last chunk)
+$b64 = Get-Content -Path "C:\temp\push.b64" -Encoding ASCII -Raw
+$bytes = [Convert]::FromBase64String($b64)
+[System.IO.File]::WriteAllBytes("C:\temp\target.bin", $bytes)
+Remove-Item "C:\temp\push.b64"
+```
+
+`Add-Content` с `-NoNewline` — это plain text append без append-binary-bytes API: работает на любом .NET 4.x, ratio ×4/3 от base64 — приемлемо для files до нескольких MB.
+
+### Q2: PS-скрипт с кириллическими комментариями падает `TerminatorExpectedAtEndOfString` на «безобидной» строке
+
+**Симптом:** через `wd --exec` пушим `.ps1` файл, на host'е `Get-Content script.ps1` показывает корректную кириллицу, но `powershell -File script.ps1` падает на строке N где парсер не должен видеть проблему. Сообщение типа `TerminatorExpectedAtEndOfString` или `MissingEndCurlyBrace`.
+
+**Причина:** PowerShell parser на ru-RU локали без явного UTF-8 BOM считает файл закодированным в **CP1251**. Multi-byte UTF-8 кириллицы (2 байта на символ) парсятся как два cp1251 символа, ломают подсчёт кавычек / скобок / парных терминаторов в комментариях и литералах.
+
+**Workaround:** надёжные пути — два:
+
+1. **ASCII-only `.ps1`** (комментарии на английском, идентификаторы латиницей) — никаких encoding-проблем нет, BOM не нужен.
+
+2. **UTF-8 контент через base64-passthrough** (см. Q1 для chunked-push). Source-литералы остаются ASCII (base64 charset), на host'е decode'им и пишем с BOM через `UTF8Encoding($true)`:
+
+```powershell
+# через wd --exec — body передаётся как base64-encoded UTF-8 bytes,
+# никакого cyrillic source-литерала в самой PS-команде:
+$base64 = "<base64 of UTF-8 script body, prepared agent-side>"
+$body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+$utf8bom = New-Object System.Text.UTF8Encoding $true
+[System.IO.File]::WriteAllText("C:\temp\script.ps1", $body, $utf8bom)
+
+# или Out-File (PS 5.1 -Encoding utf8 пишет BOM автоматически):
+$base64 = "<...>"
+[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64)) `
+    | Out-File -FilePath "C:\temp\script.ps1" -Encoding utf8
+```
+
+> **Почему НЕ inline cyrillic в команде:** `wd --exec --compress 'powershell -Command "$body=\"# Комментарий\"..."'` **не работает** — `wd --exec` обёртка не выставляет `[Console]::InputEncoding`, source-литералы парсятся через OEM cp866 до того как wrapper успевает что-либо сделать (см. известную limitation о cyrillic в PS source ниже). BOM записанный поверх корруптного `$body` сохраняет mojibake. Только base64-passthrough или ASCII-only безопасны через `wd --exec` канал.
+
+### Q3: Bash subshell `$()` ломает второй `wd --exec`
+
+**Симптом:** orchestrator-скрипт на bash:
+
+```bash
+# WORKS: 5+ последовательных wd --exec работают
+wd --exec "echo first"
+wd --exec "echo second"
+
+# BREAKS: probe через $() → следующий wd --exec падает «sending on a closed channel»
+probe=$(wd --exec "test-something")
+if [ -n "$probe" ]; then
+    wd --exec "do-the-thing"   # ← здесь ShellOpen send fail
+fi
+```
+
+**Причина:** **точно не известна.** Симптом воспроизведён живьём в orchestrator-сессии 2026-05-05, но root-cause не разобран. Сообщение `sending on a closed channel` — это Rust `mpsc::Sender` error внутри `wd` процесса, не системная ошибка открытия serial/socket'а; то есть failure happens **inside** второго `wd --exec`'а, не на уровне device-acquisition. Возможные кандидаты (не подтверждены): timing race в GUI IPC inflight-slot cleanup'е (см. `docs/briefs/`), или проявление IPC inter-request bleed (unconfirmed suspicion). FD-inheritance тут ни при чём — bash дожидается завершения child'а, FDs закрываются с процессом.
+
+**Workaround:** orchestrator писать на **Python** (или любом языке с прямым `subprocess` API), вызывать `wd` через argv-list, не через shell. Эмпирически 5+ последовательных вызовов работают стабильно, в отличие от bash `$()`:
+
+```python
+import subprocess
+
+WD_BIN = "/path/to/wiredesk-term"
+
+def wd_exec(cmd: str, ssh: str | None = None, timeout: int = 90) -> tuple[int, str]:
+    args = [WD_BIN, "--exec", "--timeout", str(timeout)]
+    if ssh:
+        args += ["--ssh", ssh]
+    args.append(cmd)
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 10)
+    return r.returncode, r.stdout
+
+rc, probe = wd_exec("test-something", ssh="prod-mup")
+if rc == 0 and probe.strip():
+    wd_exec("do-the-thing", ssh="prod-mup")  # works, никакого closed-channel
+```
+
+Если bash обязателен — workaround не подтверждён. Redirect в файл (`wd --exec "..." > /tmp/probe.out`) **может** обойти проблему, но это не проверено эмпирически. До root-cause investigation'а — рекомендация однозначно Python orchestrator.
+
 ## Под капотом (если нужно дебажить)
 
 Sentinel framing: `__WD_DONE_<uuid>__<exit_code>`. UUID per call. PS-only:
