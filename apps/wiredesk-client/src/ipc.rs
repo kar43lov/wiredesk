@@ -272,6 +272,7 @@ fn handle_connection(
         &req.cmd,
         req.ssh.as_deref(),
         req.timeout_secs,
+        false, // compress field wired in Task 7
         move |chunk| {
             // Once a write fails, future calls return immediately to
             // avoid log spam. The runner has already committed work to
@@ -307,6 +308,10 @@ fn handle_connection(
         Err(ExecError::Closed) => {
             log::warn!("IPC handler: transport closed (reader thread gone?)");
             IpcResponse::Error("transport closed".into())
+        }
+        Err(ExecError::CompressionFailed(m)) => {
+            log::warn!("IPC handler: --compress decode failed: {m}");
+            IpcResponse::Error(format!("compression failed: {m}"))
         }
     };
 

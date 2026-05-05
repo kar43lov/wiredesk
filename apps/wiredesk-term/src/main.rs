@@ -184,7 +184,14 @@ fn run(args: &Args) -> Result<i32> {
     let result_code = if args.exec {
         // Validation above guarantees command is Some().
         let cmd = args.command.as_deref().expect("validated above");
-        run_exec_oneshot(writer.clone(), reader, cmd, args.ssh.as_deref(), args.timeout)
+        run_exec_oneshot(
+            writer.clone(),
+            reader,
+            cmd,
+            args.ssh.as_deref(),
+            args.timeout,
+            false, // compress flag wired in Task 6
+        )
     } else {
         // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
         terminal::enable_raw_mode()
@@ -404,6 +411,7 @@ fn run_exec_oneshot(
     cmd: &str,
     ssh: Option<&str>,
     timeout_secs: u64,
+    compress: bool,
 ) -> Result<i32> {
     let stop = Arc::new(AtomicBool::new(false));
     let hb_stop = stop.clone();
@@ -424,6 +432,7 @@ fn run_exec_oneshot(
         cmd,
         ssh,
         timeout_secs,
+        compress,
         |chunk| {
             use std::io::Write;
             let stdout = std::io::stdout();
@@ -446,6 +455,13 @@ fn run_exec_oneshot(
         }
         Err(wiredesk_exec_core::ExecError::Closed) => {
             Err(WireDeskError::Transport("transport closed".into()))
+        }
+        Err(wiredesk_exec_core::ExecError::CompressionFailed(m)) => {
+            // Decode failure post-sentinel — host's gzip+base64 wrapper
+            // produced a payload we couldn't unpack. Surface as exit
+            // 125 (transport-class error) with a diagnostic on stderr.
+            eprintln!("wiredesk-term: --compress decode failed: {m}");
+            Ok(125)
         }
     }
 }
@@ -1008,7 +1024,7 @@ mod tests {
             host.emit_chunk(&format!("__WD_DONE_{uuid}__0\r\n"));
         });
 
-        let code = run_exec_oneshot(writer, reader, "Get-ChildItem", None, 5)
+        let code = run_exec_oneshot(writer, reader, "Get-ChildItem", None, 5, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 0);
         host_thread.join().expect("host thread");
@@ -1053,7 +1069,7 @@ mod tests {
             ));
         });
 
-        let code = run_exec_oneshot(writer, reader, "docker ps", Some("prod"), 5)
+        let code = run_exec_oneshot(writer, reader, "docker ps", Some("prod"), 5, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 0);
         host_thread.join().expect("host thread");
@@ -1068,7 +1084,7 @@ mod tests {
             thread::sleep(Duration::from_millis(2_000));
         });
 
-        let code = run_exec_oneshot(writer, reader, "Start-Sleep 60", None, 1)
+        let code = run_exec_oneshot(writer, reader, "Start-Sleep 60", None, 1, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 124, "expected timeout exit code");
         host_thread.join().expect("host thread");
@@ -1085,7 +1101,7 @@ mod tests {
             host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
         });
 
-        let code = run_exec_oneshot(writer, reader, "exit 7", None, 5).expect("ok");
+        let code = run_exec_oneshot(writer, reader, "exit 7", None, 5, false).expect("ok");
         assert_eq!(code, 7);
         host_thread.join().expect("host thread");
     }
@@ -1134,7 +1150,7 @@ mod tests {
             );
         });
 
-        let code = run_exec_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5)
+        let code = run_exec_oneshot(writer, reader, "head -c 800 ...", Some("prod"), 5, false)
             .expect("run_exec_oneshot ok");
         assert_eq!(code, 0, "should complete with exit 0, not timeout");
         host_thread.join().expect("host thread");
