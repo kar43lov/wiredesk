@@ -272,7 +272,7 @@ fn handle_connection(
         &req.cmd,
         req.ssh.as_deref(),
         req.timeout_secs,
-        false, // compress field wired in Task 7
+        req.compress,
         move |chunk| {
             // Once a write fails, future calls return immediately to
             // avoid log spam. The runner has already committed work to
@@ -499,5 +499,27 @@ mod tests {
         // Now it should be a real socket — connect should succeed.
         let res = UnixStream::connect(&socket);
         assert!(res.is_ok(), "stale-unlink + bind should leave a working socket: {res:?}");
+    }
+
+    #[test]
+    fn ipc_handler_extracts_compress_field() {
+        // Smoke: an IpcRequest with compress=true round-trips through
+        // bincode and is readable on the handler side. The actual
+        // forwarding to run_oneshot is direct field access (req.compress),
+        // verified by compilation; this guards the wire-level path.
+        use std::io::Cursor;
+
+        let req = IpcRequest {
+            cmd: "echo hi".into(),
+            ssh: None,
+            timeout_secs: 5,
+            compress: true,
+        };
+        let mut buf = Vec::new();
+        write_request(&mut buf, &req).unwrap();
+        let mut r = Cursor::new(buf);
+        let decoded = read_request(&mut r).unwrap();
+        assert!(decoded.compress, "handler-side decode preserves compress flag");
+        assert_eq!(decoded.cmd, "echo hi");
     }
 }

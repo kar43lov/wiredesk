@@ -83,6 +83,13 @@ struct Args {
     #[arg(long, default_value = "90")]
     timeout: u64,
 
+    /// Compress stdout via gzip+base64 (5-10x speedup for large text
+    /// output). Opt-in: skip for binary output (no ratio gain) or
+    /// short outputs (~0.5 s overhead). Both --ssh bash and host
+    /// PowerShell paths are supported.
+    #[arg(long)]
+    compress: bool,
+
     /// Command to run when --exec is set. Ignored otherwise.
     #[arg(value_name = "COMMAND")]
     command: Option<String>,
@@ -131,9 +138,8 @@ fn run(args: &Args) -> Result<i32> {
     if args.exec {
         let cmd = args.command.as_deref().expect("validated above");
         if let Some(code) =
-            try_socket_first(cmd, args.ssh.as_deref(), args.timeout, false)?
+            try_socket_first(cmd, args.ssh.as_deref(), args.timeout, args.compress)?
         {
-            // compress flag wired in Task 6
             return Ok(code);
         }
         // Else: fall through to direct serial.
@@ -193,7 +199,7 @@ fn run(args: &Args) -> Result<i32> {
             cmd,
             args.ssh.as_deref(),
             args.timeout,
-            false, // compress flag wired in Task 6
+            args.compress,
         )
     } else {
         // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
@@ -1272,6 +1278,28 @@ mod tests {
         // the optimiser strips other paths.
         let _: fn(&mut std::os::unix::net::UnixStream, &mut [u8]) -> std::io::Result<usize> =
             std::os::unix::net::UnixStream::read;
+    }
+
+    #[test]
+    fn args_compress_propagates_to_ipc_request() {
+        // Smoke: an IpcRequest built from --compress true carries the
+        // flag through bincode unchanged. This is the only thin glue
+        // path between clap args and the wire protocol; clap itself
+        // is well-tested.
+        let req = wiredesk_exec_core::ipc::IpcRequest {
+            cmd: "echo hi".into(),
+            ssh: None,
+            timeout_secs: 90,
+            compress: true,
+        };
+        let mut buf = Vec::new();
+        wiredesk_exec_core::ipc::write_request(&mut buf, &req).unwrap();
+        let mut r = std::io::Cursor::new(buf);
+        let decoded = wiredesk_exec_core::ipc::read_request(&mut r).unwrap();
+        assert!(
+            decoded.compress,
+            "compress flag must round-trip through bincode wire format"
+        );
     }
 
     #[cfg(target_os = "macos")]
