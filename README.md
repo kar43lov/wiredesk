@@ -138,6 +138,8 @@ wiredesk-client
 wiredesk-client --port /dev/cu.usbserial-XXX
 ```
 
+Logs roll daily into `~/Library/Application Support/WireDesk/client.log.YYYY-MM-DD` and also stream to stderr. Both `WireDesk.app` and the bare binary write to the same file, so post-mortem after a hang or disconnect is now possible without re-running with `RUST_LOG=debug`. The `RUST_LOG` env-filter still works for raising verbosity (defaults to `info`).
+
 **Client (macOS) — terminal only** (run inside Ghostty/iTerm/Terminal.app for a real shell experience with history, scrollback, copy/paste):
 
 ```bash

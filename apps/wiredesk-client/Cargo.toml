@@ -10,7 +10,10 @@ wiredesk-transport.workspace = true
 wiredesk-exec-core.workspace = true
 thiserror.workspace = true
 log.workspace = true
-env_logger.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true
