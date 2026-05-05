@@ -180,6 +180,17 @@ fn handle_connection(
         req.timeout_secs
     );
 
+    // Keepalive: emit an empty Stdout frame immediately so the term's
+    // 2 s read-timeout-on-first-frame doesn't false-fire on long Mute
+    // phases (notably the SSH path's wait-for-remote-prompt, which
+    // routinely sits silent for 5+ s during ssh handshake). Term sees
+    // any first frame, drops the timeout, then waits for real output
+    // as long as the runner needs.
+    if let Err(e) = write_response(&mut stream, &IpcResponse::Stdout(Vec::new())) {
+        log::warn!("IPC: keepalive write failed: {e}; aborting handler");
+        return;
+    }
+
     // Private mpsc for the duration of this run. Reader thread fans
     // ShellOutput / ShellExit / shell-Error into here via the slot
     // guard; runner pulls them as `ExecEvent`s.
