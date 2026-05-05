@@ -488,6 +488,63 @@ mod tests {
     }
 
     #[test]
+    fn format_command_preserves_inline_json_quotes_powershell() {
+        // Probe (2026-05-05, brief wd-exec-payload-quoting):
+        // Real prod-symptom — ES `_search` with nested bool/filter
+        // returns HTTP 400 because the outer `"` around field names get
+        // collapsed somewhere in the macOS-bash → wd → PS → curl chain.
+        //
+        // This test pins down whether `format_command` itself eats
+        // quotes. If it PASSES, the bug is NOT in our wrapper —
+        // it's downstream (PS native command parsing, ssh -tt PTY echo
+        // collapse, cp866 codepage read of stdin, curl arg parsing).
+        // If it FAILS, we've localized the bug to format_command and
+        // the fix is one-line escape adjustment here.
+        let uuid = uuid::Uuid::nil();
+        let cmd = r#"curl.exe -d '{"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"now-1h"}}}]}}}'"#;
+        let out = format_command(&uuid, ShellKind::PowerShell, cmd);
+
+        let cmd_quote_count = cmd.matches('"').count();
+        let out_quote_count = out.matches('"').count();
+        // format_command adds exactly 2 quotes for the sentinel emit
+        // (`"__WD_DONE_<uuid>__$LASTEXITCODE"`); everything else must
+        // be a verbatim copy of the user cmd.
+        assert_eq!(
+            out_quote_count - cmd_quote_count,
+            2,
+            "format_command must preserve every `\"` from the user cmd verbatim, \
+             only adding 2 for the sentinel emit. cmd={cmd:?} out={out:?}"
+        );
+        assert!(
+            out.contains(cmd),
+            "user cmd must appear verbatim inside try {{ ... }}: out={out:?}"
+        );
+    }
+
+    #[test]
+    fn format_command_preserves_inline_json_quotes_bash() {
+        // Same probe for the `--ssh ALIAS` path. Bash-on-remote is
+        // the actual interpreter once the `ssh -tt` hop is in place.
+        let uuid = uuid::Uuid::nil();
+        let cmd = r#"curl -d '{"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"now-1h"}}}]}}}'"#;
+        let out = format_command(&uuid, ShellKind::Bash, cmd);
+
+        let cmd_quote_count = cmd.matches('"').count();
+        let out_quote_count = out.matches('"').count();
+        // bash format adds 2 for the `"__WD_DONE_<uuid>__$?"` emit.
+        assert_eq!(
+            out_quote_count - cmd_quote_count,
+            2,
+            "format_command must preserve every `\"` from the user cmd verbatim. \
+             cmd={cmd:?} out={out:?}"
+        );
+        assert!(
+            out.contains(cmd),
+            "user cmd must appear verbatim between READY and DONE. out={out:?}"
+        );
+    }
+
+    #[test]
     fn format_command_uuid_in_payload() {
         let uuid_a = uuid::Uuid::nil();
         let uuid_b = uuid::Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef);

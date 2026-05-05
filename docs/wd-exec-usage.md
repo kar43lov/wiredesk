@@ -122,6 +122,44 @@ Decode error → exit 125 (transport-class) с диагностикой в stder
 ### Sequential calls
 - Два `wd --exec` подряд работают (host slot free'ится между ними через ShellClose+Disconnect). Но **между ними ~2 сек handshake'а каждый раз**. Для серии команд лучше — одна команда с `;` или `&&`.
 
+### Inline JSON / nested-quoted payloads — base64-passthrough
+
+**Симптом:** сложный inline JSON в `curl -d '{...}'` через `wd --exec` приходит к target-команде с потерянными `"` вокруг field names — ES возвращает HTTP 400 `was expecting double-quote to start field name at column 3`. Простые JSON (`{"query":{"match_all":{}}}`) проходят, nested bool/filter/range — нет. Точное место quote-collapse'а не локализовано (probe-тесты в `crates/wiredesk-exec-core/src/helpers.rs` подтверждают что **обёртка `format_command` кавычки сохраняет** — collapse происходит ниже, в PS native command argument parsing для `{...}` literals или в `ssh -tt` PTY echo + bash re-tokenization).
+
+**Workaround — base64 payload, decode на host'е, передача через temp-файл:**
+
+`--ssh ALIAS` path (bash на remote):
+
+```bash
+# Mac side — encode payload в base64 (charset alphanumeric + +/= — никаких quoting concerns):
+QUERY_B64=$(printf '%s' '{"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"now-1h"}}}]}}}' | base64)
+
+# Single wd --exec call: decode на remote → temp-file → curl --data-binary → cleanup:
+wd --exec --ssh prod-mup "echo '$QUERY_B64' | base64 -d > /tmp/wd-q.json && \
+  curl -s -XPOST 'http://10.24.200.219:9200/_search' \
+    -H 'Content-Type: application/json' \
+    --data-binary @/tmp/wd-q.json && \
+  rm /tmp/wd-q.json"
+```
+
+PS-direct path (host PowerShell):
+
+```bash
+QUERY_B64=$(printf '%s' '{"query":{"bool":...}}' | base64)
+
+wd --exec "[System.IO.File]::WriteAllBytes('C:\\Temp\\wd-q.json', [Convert]::FromBase64String('$QUERY_B64')); \
+  curl.exe -s -XPOST 'http://es:9200/_search' \
+    -H 'Content-Type: application/json' \
+    --data-binary '@C:\\Temp\\wd-q.json'; \
+  Remove-Item C:\\Temp\\wd-q.json"
+```
+
+**Почему работает:** base64 charset (alphanumeric + `+/=`) не содержит `"`/`'`/`{`/`}` — все четыре «опасных» символа quoting-cascade'а отсутствуют. Payload проходит через все слои (bash → wd serial → PS / ssh-tt → curl) литерально, decode восстанавливает исходные байты на remote.
+
+**Когда применять:** сложный JSON (3+ уровня вложенности bool/filter), длинные `_source` arrays, любой payload с nested `\"` где простое одинарное quoting не выживает. Для простых запросов (`docker ps`, `curl ... '/health'`) обычное inline-quoting работает — base64 overhead не нужен.
+
+**Future:** если эпизодов quote-collapse наберётся больше — `wd --exec --stdin` (передача payload'а на stdin command'а) станет первоклассным решением. Бриф `docs/briefs/wd-exec-payload-quoting.md` зафиксирован, но реализация отложена пока workaround покрывает known кейсы.
+
 ## Чего НЕЛЬЗЯ делать
 
 - **Interactive prompts** (`sudo` без `-S`, `git push` с пасс-фразой ключа, `ssh` с password auth, `vim`, `htop`, `git interactive rebase`) — сломаются. `wd --exec` намеренно pipe-mode (нужно для sentinel detection в clean stdout); для интерактивщины используй просто `wd` без `--exec` — там ConPTY и всё работает. Для скриптов внутри `--exec` используй non-interactive формы:
