@@ -291,8 +291,15 @@ pub fn format_compressed_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) 
 /// the trailing 64 bytes since the marker is ~16 bytes and always
 /// at end. If user's binary somehow contains the marker pattern in
 /// the middle, `rposition` finds the LAST occurrence — which is
-/// our marker, near end. Trailing `\n` after marker (printf adds
-/// one) is also stripped.
+/// our marker, near end.
+///
+/// We do NOT strip the byte before the marker — both wrappers
+/// append the marker DIRECTLY to cmd output (bash: `{ cmd; printf
+/// "__WD_RC__%s__\n" "$?"; } | gzip`; PS: `$out + "__WD_RC__" +
+/// $rc + "__"`). Any trailing `\n` (or `\r\n`) seen there is part
+/// of the cmd's own output (`ls` always emits `\n` after each
+/// entry) and should be preserved byte-for-byte to match the
+/// non-compress baseline (AC2: stdout byte-identical).
 pub fn extract_compressed_rc(bytes: Vec<u8>) -> (Vec<u8>, i32) {
     let needle = b"__WD_RC__";
     let len = bytes.len();
@@ -320,14 +327,7 @@ pub fn extract_compressed_rc(bytes: Vec<u8>) -> (Vec<u8>, i32) {
         Err(_) => return (bytes, 0),
     };
 
-    // Strip marker. Also trim a leading `\n` between cmd output and
-    // marker (the `printf "...\n"` in bash wrapper adds one). PS
-    // wrapper appends marker without leading newline.
-    let mut clean_end = abs_pos;
-    if clean_end > 0 && bytes[clean_end - 1] == b'\n' {
-        clean_end -= 1;
-    }
-    (bytes[..clean_end].to_vec(), rc)
+    (bytes[..abs_pos].to_vec(), rc)
 }
 
 /// Decode a base64-of-gzip payload back into raw bytes.
@@ -793,10 +793,13 @@ mod tests {
     // --- extract_compressed_rc ---
 
     #[test]
-    fn extract_rc_strips_trailing_marker_text() {
+    fn extract_rc_preserves_cmd_trailing_newline() {
+        // cmd's trailing \n is part of its output (e.g. `ls` always
+        // emits \n after each entry) — must NOT be stripped, else
+        // AC2 byte-identical fails for typical CLI tools.
         let bytes = b"hello world\n__WD_RC__0__\n".to_vec();
         let (clean, rc) = extract_compressed_rc(bytes);
-        assert_eq!(clean, b"hello world");
+        assert_eq!(clean, b"hello world\n");
         assert_eq!(rc, 0);
     }
 
@@ -804,13 +807,13 @@ mod tests {
     fn extract_rc_propagates_nonzero() {
         let bytes = b"some output\n__WD_RC__42__\n".to_vec();
         let (clean, rc) = extract_compressed_rc(bytes);
-        assert_eq!(clean, b"some output");
+        assert_eq!(clean, b"some output\n");
         assert_eq!(rc, 42);
     }
 
     #[test]
     fn extract_rc_handles_glued_marker_no_leading_newline() {
-        // PS wrapper appends marker without a newline between $out and marker.
+        // PS wrapper appends marker directly to $out (no separator).
         let bytes = b"some output__WD_RC__1__".to_vec();
         let (clean, rc) = extract_compressed_rc(bytes);
         assert_eq!(clean, b"some output");
@@ -828,11 +831,22 @@ mod tests {
     #[test]
     fn extract_rc_byte_safe_for_binary_payload() {
         // Binary cmd output (non-UTF-8 bytes) followed by marker.
+        // The intermediate byte (0x42 here) is preserved as part of
+        // the original payload — wrapper appends marker directly.
         let mut bytes = vec![0xFFu8, 0xFE, 0x00, 0x80, 0x42];
-        bytes.extend_from_slice(b"\n__WD_RC__7__\n");
+        bytes.extend_from_slice(b"__WD_RC__7__\n");
         let (clean, rc) = extract_compressed_rc(bytes);
         assert_eq!(clean, &[0xFFu8, 0xFE, 0x00, 0x80, 0x42]);
         assert_eq!(rc, 7);
+    }
+
+    #[test]
+    fn extract_rc_preserves_binary_with_internal_newlines() {
+        // Binary payload that ends with \n (e.g. `ls` output) — \n
+        // before marker is part of payload, must be preserved.
+        let bytes = b"line1\nline2\n__WD_RC__0__\n".to_vec();
+        let (clean, _rc) = extract_compressed_rc(bytes);
+        assert_eq!(clean, b"line1\nline2\n");
     }
 
     #[test]

@@ -729,10 +729,9 @@ mod tests {
         .expect("ok");
         assert_eq!(code, 0);
         assert_eq!(callback_calls, 1, "compress mode emits exactly one chunk");
-        // extract_compressed_rc strips the trailing `\n` between cmd
-        // output and the in-band marker, so the final byte of the
-        // delivered payload is `g`, not `\n`.
-        assert_eq!(emitted, b"the quick brown fox\nover the lazy dog");
+        // Cmd output's trailing \n is preserved byte-for-byte
+        // (AC2 byte-identical with non-compress baseline).
+        assert_eq!(emitted, b"the quick brown fox\nover the lazy dog\n");
     }
 
     #[test]
@@ -793,8 +792,9 @@ mod tests {
         assert_eq!(code, 0);
         // Without the guard, this assertion would fail with empty
         // emitted (runner returned on the echo'd line's literal
-        // `__WD_DONE_<uuid>__0` BEFORE the real cmd ran).
-        assert_eq!(emitted, b"real output");
+        // `__WD_DONE_<uuid>__0` BEFORE the real cmd ran). Trailing
+        // \n preserved byte-for-byte.
+        assert_eq!(emitted, b"real output\n");
     }
 
     #[test]
@@ -843,7 +843,7 @@ mod tests {
         })
         .expect("ok");
         assert_eq!(code, 42, "in-band rc must override sentinel rc=0");
-        assert_eq!(emitted, b"err: nope");
+        assert_eq!(emitted, b"err: nope\n");
     }
 
     #[test]
