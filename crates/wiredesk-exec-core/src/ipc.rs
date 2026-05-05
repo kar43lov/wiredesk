@@ -22,6 +22,15 @@ pub struct IpcRequest {
     pub cmd: String,
     pub ssh: Option<String>,
     pub timeout_secs: u64,
+    /// Opt-in `--compress` mode (gzip+base64 stdout wrapping). Field
+    /// added at the end of the struct so bincode positional encoding
+    /// stays append-friendly. Single-binary deployment in this project
+    /// (GUI and `wd` ship from the same workspace) means there's no
+    /// version-mismatch window where an old client would send a payload
+    /// without this field — bincode 1.x doesn't honour `serde(default)`
+    /// on missing fields, so we keep the field unconditional and rely
+    /// on lock-step rebuild instead.
+    pub compress: bool,
 }
 
 /// Server → client stream: zero or more `Stdout` frames followed by
@@ -177,12 +186,85 @@ mod tests {
             cmd: "docker ps".into(),
             ssh: Some("prod-mup".into()),
             timeout_secs: 90,
+            compress: false,
         };
         let mut buf = Vec::new();
         write_request(&mut buf, &req).unwrap();
         let mut r = Cursor::new(buf);
         let decoded = read_request(&mut r).unwrap();
         assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn ipc_request_roundtrip_with_compress() {
+        for compress in [false, true] {
+            let req = IpcRequest {
+                cmd: "ls".into(),
+                ssh: None,
+                timeout_secs: 30,
+                compress,
+            };
+            let mut buf = Vec::new();
+            write_request(&mut buf, &req).unwrap();
+            let mut r = Cursor::new(buf);
+            let decoded = read_request(&mut r).unwrap();
+            assert_eq!(decoded.compress, compress);
+            assert_eq!(decoded, req);
+        }
+    }
+
+    #[test]
+    fn ipc_request_old_payload_compatibility() {
+        // bincode 1.x is positional and does NOT honour `serde(default)`
+        // for missing fields — an old payload (without the `compress`
+        // field) deserialised into the new struct triggers an EOF
+        // error. Document the limitation: this project ships GUI and
+        // `wd` from the same workspace via lock-step rebuilds, so
+        // there's no real-world mismatch window. Test asserts the
+        // current strict behaviour so we notice if bincode evolves
+        // (or if we swap encoders later).
+        //
+        // We simulate the "old payload" by serialising a tuple-shape
+        // with only the legacy fields and feeding it to read_request.
+        #[derive(serde::Serialize)]
+        struct LegacyRequest {
+            cmd: String,
+            ssh: Option<String>,
+            timeout_secs: u64,
+        }
+        let legacy = LegacyRequest {
+            cmd: "ls".into(),
+            ssh: None,
+            timeout_secs: 5,
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &bytes).unwrap();
+        let mut r = Cursor::new(buf);
+        let result = read_request(&mut r);
+        assert!(
+            result.is_err(),
+            "old payload without compress field must fail to deserialise (lock-step deployment guarantees no real mismatch)"
+        );
+    }
+
+    #[test]
+    fn ipc_request_payload_size_under_cap() {
+        // Even with the new compress field, the encoded request for a
+        // realistic 4 KB cmd payload stays well under MAX_FRAME_BYTES.
+        let req = IpcRequest {
+            cmd: "x".repeat(4096),
+            ssh: Some("prod".into()),
+            timeout_secs: 90,
+            compress: true,
+        };
+        let mut buf = Vec::new();
+        write_request(&mut buf, &req).unwrap();
+        assert!(
+            (buf.len() as u32) < MAX_FRAME_BYTES,
+            "encoded request must fit under {MAX_FRAME_BYTES}-byte cap, got {}",
+            buf.len()
+        );
     }
 
     #[test]
@@ -226,6 +308,7 @@ mod tests {
                 cmd: "echo hi".into(),
                 ssh: None,
                 timeout_secs: 5,
+                compress: false,
             };
             write_request(&mut a, &req).unwrap();
             write_response(&mut a, &IpcResponse::Stdout(b"hi\n".to_vec())).unwrap();

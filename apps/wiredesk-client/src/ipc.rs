@@ -441,6 +441,7 @@ mod tests {
             cmd: "echo hi".into(),
             ssh: None,
             timeout_secs: 5,
+            compress: false,
         };
         write_request(&mut client, &req).unwrap();
 

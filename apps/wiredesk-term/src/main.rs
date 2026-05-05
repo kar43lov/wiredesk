@@ -130,7 +130,10 @@ fn run(args: &Args) -> Result<i32> {
     #[cfg(target_os = "macos")]
     if args.exec {
         let cmd = args.command.as_deref().expect("validated above");
-        if let Some(code) = try_socket_first(cmd, args.ssh.as_deref(), args.timeout)? {
+        if let Some(code) =
+            try_socket_first(cmd, args.ssh.as_deref(), args.timeout, false)?
+        {
+            // compress flag wired in Task 6
             return Ok(code);
         }
         // Else: fall through to direct serial.
@@ -269,7 +272,12 @@ fn format_hotkey_cheatsheet() -> String {
 /// there or the handler is unresponsive (caller falls back to direct
 /// serial — backward-compatible). Mac-only.
 #[cfg(target_os = "macos")]
-fn try_socket_first(cmd: &str, ssh: Option<&str>, timeout_secs: u64) -> Result<Option<i32>> {
+fn try_socket_first(
+    cmd: &str,
+    ssh: Option<&str>,
+    timeout_secs: u64,
+    compress: bool,
+) -> Result<Option<i32>> {
     use std::io::{self, Write};
     use std::os::unix::net::UnixStream;
 
@@ -298,6 +306,7 @@ fn try_socket_first(cmd: &str, ssh: Option<&str>, timeout_secs: u64) -> Result<O
         cmd: cmd.into(),
         ssh: ssh.map(|s| s.into()),
         timeout_secs,
+        compress,
     };
     if write_request(&mut stream, &req).is_err() {
         return Ok(None);
@@ -1240,6 +1249,7 @@ mod tests {
                 cmd: "echo hi".into(),
                 ssh: None,
                 timeout_secs: 5,
+                compress: false,
             },
         )
         .unwrap();
