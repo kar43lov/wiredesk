@@ -78,6 +78,7 @@ open target/release/WireDesk.app
 - **Иконка**: `assets/icon-source.png` (1024×1024) → `Contents/Resources/AppIcon.icns` через `sips` + `iconutil` в build-mac-app.sh
 - **Info.plist**: `dev.kar43lov.wiredesk`, `LSUIElement=false`, `NSHighResolutionCapable=true`. Gatekeeper при первом запуске — правый-клик → Open
 - Source-иконка можно перерисовать через `swift scripts/generate-icon.swift` (Swift+AppKit, без ImageMagick)
+- **Logs**: `~/Library/Application Support/WireDesk/client.log.YYYY-MM-DD` через `tracing-appender::rolling::daily` (зеркалит host pattern). Dual-sink: file + stderr. `RUST_LOG=debug` фильтр работает (env-filter wired up). Panics + legacy `log::*` macros через `tracing-log::LogTracer`.
 
 ### Прямой запуск бинарей (dev)
 

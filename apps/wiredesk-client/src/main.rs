@@ -6,6 +6,7 @@ mod exec_bridge;
 mod ipc;
 mod input;
 mod keyboard_tap;
+mod logging;
 mod monitor;
 mod restart;
 mod status_bar;
@@ -42,7 +43,27 @@ pub struct Args {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Daily-rolling file logging at ~/Library/Application Support/WireDesk/client.log
+    // plus stderr layer (visible when launched from terminal). Worker guard is
+    // tied to `_log_guard`'s lifetime — drop = flush, so we hold it for all of
+    // `main()`. Falls back to stderr-only if the file can't be opened (read-only
+    // home, permissions error etc) so we never silently lose logs at boot.
+    let _log_guard = match logging::init_logging() {
+        Ok(g) => {
+            logging::install_panic_hook();
+            Some(g)
+        }
+        Err(e) => {
+            // File appender unavailable (read-only home, perms, etc) — fall
+            // back to a stderr-only subscriber so `log::*` calls aren't
+            // silently dropped. Without this fallback we'd be quieter than
+            // the pre-tracing env_logger setup.
+            eprintln!("warning: file logging unavailable ({e}); logs will go to stderr only");
+            logging::init_logging_stderr_only();
+            logging::install_panic_hook();
+            None
+        }
+    };
 
     // Resolve config: defaults → config.toml → CLI args (override).
     let toml_cfg = ClientConfig::load();
@@ -50,6 +71,7 @@ fn main() {
     let cfg = config::merge_args(&matches, toml_cfg);
 
     log::info!("WireDesk Client");
+    log::info!("log dir: {}", logging::log_dir().display());
     log::info!("config: {}", ClientConfig::config_path().display());
     log::info!("serial: {} @ {} baud", cfg.port, cfg.baud);
 
