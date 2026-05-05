@@ -2,7 +2,12 @@
 //! IPC handler — sentinel formatting, line classification, ANSI
 //! stripping, output slicing.
 
-use crate::types::ShellKind;
+use std::io::Read;
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use flate2::read::GzDecoder;
+
+use crate::types::{ExecError, ShellKind};
 
 /// Build the `<command>; <emit-sentinel>` payload for the runner.
 ///
@@ -227,6 +232,80 @@ pub fn is_remote_prompt(line: &str) -> bool {
         return false;
     }
     s.ends_with('$') || s.ends_with('#') || s.ends_with('➜')
+}
+
+/// Build the `--compress` variant of the sentinel-bearing payload.
+///
+/// Bash variant pipes stdout (with stderr merged via `2>&1`) through
+/// `gzip -c | base64`, captures `${PIPESTATUS[0]}` (the command's own
+/// exit, not gzip's or base64's), and emits a trailing `echo` so the
+/// sentinel line starts on its own boundary — otherwise the last
+/// base64 line could glue to the sentinel and `parse_sentinel`'s
+/// `rfind` would still locate the marker but the runner's pre-decode
+/// buffer would carry sentinel bytes (decode would then fail).
+///
+/// `${PIPESTATUS[0]}` is bash-only — we already require `bash -c` for
+/// the `--ssh` path. Do NOT use `{ <cmd>; rc=$?; } | gzip` — `rc=$?`
+/// inside the left subshell of the pipe is not visible in the parent.
+///
+/// PowerShell variant uses `[System.IO.Compression.GZipStream]` plus
+/// `[Convert]::ToBase64String`. `[Console]::OutputEncoding =
+/// [Text.Encoding]::UTF8` is **mandatory** before invoking the user's
+/// command — without it, Cyrillic and other non-ASCII output goes
+/// through cp1251/cp866 (Windows console default) and `Out-String`
+/// produces mojibake. `Out-String -Stream` would defeat the purpose
+/// (we need a single string to compress); `Out-String` (default)
+/// joins lines with the system separator, which is fine post-encode.
+///
+/// `$LASTEXITCODE = 0` pre-init mirrors `format_command`. The
+/// try/catch sets it to 1 on terminating errors; cmdlets don't touch
+/// it, so non-error cmdlet runs return 0.
+pub fn format_compressed_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
+    match kind {
+        ShellKind::Bash => format!(
+            "echo __WD_READY_{uuid}__; {{ {cmd}; }} 2>&1 | gzip -c | base64; rc=${{PIPESTATUS[0]}}; echo; echo \"__WD_DONE_{uuid}__$rc\"\n"
+        ),
+        ShellKind::PowerShell => format!(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+             Write-Output \"__WD_READY_{uuid}__\"; \
+             $LASTEXITCODE=0; $ErrorActionPreference='Stop'; \
+             try {{ $out = & {{ {cmd} }} 2>&1 | Out-String }} catch {{ $out = $_.ToString(); $LASTEXITCODE=1 }}; \
+             $rc = $LASTEXITCODE; \
+             $ms = New-Object System.IO.MemoryStream; \
+             $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress); \
+             $bytes = [Text.Encoding]::UTF8.GetBytes($out); \
+             $gz.Write($bytes, 0, $bytes.Length); $gz.Close(); \
+             Write-Output ([Convert]::ToBase64String($ms.ToArray())); \
+             Write-Output \"__WD_DONE_{uuid}__$rc\"\n"
+        ),
+    }
+}
+
+/// Decode a base64-of-gzip payload back into raw bytes.
+///
+/// The host wrapper for `--compress` mode emits stdout as
+/// `gzip -c | base64` (76-char wrapped) for bash, or
+/// `[Convert]::ToBase64String([System.IO.Compression.GZipStream]...)` for
+/// PowerShell. Both can include `\r\n` between base64 lines, so we strip
+/// all whitespace before decoding.
+///
+/// Errors are wrapped as `ExecError::CompressionFailed` regardless of
+/// stage (bad base64, truncated gzip header, malformed deflate stream)
+/// so the runner can surface a single error type.
+pub fn decode_compressed_stream(input: &str) -> Result<Vec<u8>, ExecError> {
+    let stripped: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.is_empty() {
+        return Err(ExecError::CompressionFailed("empty input".into()));
+    }
+    let raw = STANDARD
+        .decode(stripped.as_bytes())
+        .map_err(|e| ExecError::CompressionFailed(format!("base64: {e}")))?;
+    let mut decoder = GzDecoder::new(&raw[..]);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| ExecError::CompressionFailed(format!("gzip: {e}")))?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -592,5 +671,144 @@ mod tests {
             "echo \"__WD_DONE_{uuid}__$?\" some-output __WD_DONE_{uuid}__7"
         );
         assert_eq!(parse_sentinel(&mixed, &uuid), Some(7));
+    }
+
+    // --- format_compressed_command ---
+
+    #[test]
+    fn format_compressed_bash_shape() {
+        let uuid = uuid::Uuid::nil();
+        let out = format_compressed_command(&uuid, ShellKind::Bash, "ls -la");
+        assert!(out.contains(&format!("__WD_READY_{uuid}__")));
+        assert!(out.contains("{ ls -la; } 2>&1 | gzip -c | base64"));
+        assert!(out.contains("rc=${PIPESTATUS[0]}"));
+        assert!(out.contains(&format!("__WD_DONE_{uuid}__$rc")));
+        // explicit echo before the DONE sentinel so a trailing
+        // base64 line cannot glue onto the marker.
+        assert!(out.contains("base64; rc=${PIPESTATUS[0]}; echo;"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_compressed_powershell_shape() {
+        let uuid = uuid::Uuid::nil();
+        let out = format_compressed_command(&uuid, ShellKind::PowerShell, "Get-ChildItem");
+        assert!(out.contains("[Console]::OutputEncoding = [Text.Encoding]::UTF8"));
+        assert!(out.contains(&format!("__WD_READY_{uuid}__")));
+        assert!(out.contains("$LASTEXITCODE=0"));
+        assert!(out.contains("$ErrorActionPreference='Stop'"));
+        assert!(out.contains("try { $out = & { Get-ChildItem } 2>&1 | Out-String }"));
+        assert!(out.contains("catch { $out = $_.ToString(); $LASTEXITCODE=1 }"));
+        assert!(out.contains("System.IO.Compression.GZipStream"));
+        assert!(out.contains("[Convert]::ToBase64String"));
+        assert!(out.contains(&format!("__WD_DONE_{uuid}__$rc")));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_compressed_bash_preserves_quotes() {
+        let uuid = uuid::Uuid::nil();
+        let out = format_compressed_command(
+            &uuid,
+            ShellKind::Bash,
+            "echo 'single' && echo \"double\"",
+        );
+        // The wrapper itself doesn't escape — caller is responsible.
+        // We just verify the cmd is embedded verbatim inside { ... }.
+        assert!(out.contains("{ echo 'single' && echo \"double\"; }"));
+    }
+
+    #[test]
+    fn format_compressed_powershell_preserves_cmd_verbatim() {
+        let uuid = uuid::Uuid::nil();
+        let out = format_compressed_command(
+            &uuid,
+            ShellKind::PowerShell,
+            "Get-Content C:\\test.txt",
+        );
+        assert!(out.contains("& { Get-Content C:\\test.txt }"));
+    }
+
+    #[test]
+    fn format_compressed_uuid_consistent_in_both_markers() {
+        let uuid = uuid::Uuid::new_v4();
+        for kind in [ShellKind::Bash, ShellKind::PowerShell] {
+            let out = format_compressed_command(&uuid, kind, "echo hi");
+            // Both markers must use the same uuid.
+            assert!(out.matches(&uuid.to_string()).count() >= 2, "kind={kind:?}");
+        }
+    }
+
+    // --- decode_compressed_stream ---
+
+    /// Generate a base64-of-gzipped fixture on the fly so test data
+    /// stays consistent with the real wire format. 76-char wrapping
+    /// matches what `base64` (no `-w0`) emits on the host side.
+    fn make_compressed_b64(payload: &[u8]) -> String {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        let raw = STANDARD.encode(&gzipped);
+        // Wrap at 76 chars to mimic `base64` default output.
+        let mut out = String::with_capacity(raw.len() + raw.len() / 76);
+        for (i, ch) in raw.chars().enumerate() {
+            if i > 0 && i % 76 == 0 {
+                out.push('\n');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    #[test]
+    fn decode_valid_singleline() {
+        let b64 = make_compressed_b64(b"hello world");
+        let single = b64.replace('\n', "");
+        assert_eq!(decode_compressed_stream(&single).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn decode_valid_multiline_crlf() {
+        let payload = b"the quick brown fox jumps over the lazy dog. ".repeat(10);
+        let b64 = make_compressed_b64(&payload);
+        let crlf = b64.replace('\n', "\r\n");
+        assert_eq!(decode_compressed_stream(&crlf).unwrap(), payload);
+    }
+
+    #[test]
+    fn decode_invalid_base64() {
+        let result = decode_compressed_stream("!!!not base64!!!");
+        assert!(matches!(result, Err(ExecError::CompressionFailed(_))));
+    }
+
+    #[test]
+    fn decode_valid_b64_invalid_gzip() {
+        // Valid base64 of plain text "hello" — not gzip framed.
+        let b64 = STANDARD.encode(b"hello");
+        let result = decode_compressed_stream(&b64);
+        assert!(matches!(result, Err(ExecError::CompressionFailed(msg)) if msg.contains("gzip")));
+    }
+
+    #[test]
+    fn decode_empty_string() {
+        let result = decode_compressed_stream("");
+        assert!(matches!(result, Err(ExecError::CompressionFailed(msg)) if msg.contains("empty")));
+
+        let whitespace_only = decode_compressed_stream("\r\n  \t\n");
+        assert!(matches!(whitespace_only, Err(ExecError::CompressionFailed(_))));
+    }
+
+    #[test]
+    fn decode_cyrillic_payload() {
+        let original = "Привет мир\nТестовый файл\n".as_bytes();
+        let b64 = make_compressed_b64(original);
+        let decoded = decode_compressed_stream(&b64).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(
+            std::str::from_utf8(&decoded).unwrap(),
+            "Привет мир\nТестовый файл\n"
+        );
     }
 }

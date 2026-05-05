@@ -52,6 +52,8 @@ pub enum ExecError {
     Closed,
     #[error("timeout (no sentinel arrived in budget)")]
     Timeout(String),
+    #[error("compression failed: {0}")]
+    CompressionFailed(String),
 }
 
 /// State machine for the runner. PS-only mode skips straight to
@@ -68,4 +70,28 @@ pub enum ExecError {
 pub enum OneShotState {
     AwaitingRemotePrompt,
     AwaitingSentinel,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_failed_error_format() {
+        let err = ExecError::CompressionFailed("bad b64".into());
+        assert_eq!(format!("{}", err), "compression failed: bad b64");
+    }
+
+    #[test]
+    fn other_error_variants_format() {
+        assert_eq!(
+            format!("{}", ExecError::Transport("io".into())),
+            "transport: io"
+        );
+        assert_eq!(format!("{}", ExecError::Closed), "transport closed");
+        assert_eq!(
+            format!("{}", ExecError::Timeout("buf".into())),
+            "timeout (no sentinel arrived in budget)"
+        );
+    }
 }
