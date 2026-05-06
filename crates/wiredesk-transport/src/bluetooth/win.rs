@@ -92,8 +92,13 @@ impl BluetoothLeTransport {
         let (tx, rx) = mpsc::unbounded_channel::<Result<Packet>>();
         let is_connected = Arc::new(AtomicBool::new(false));
 
+        // build_service is sync (uses IAsyncOperation::get() for blocking
+        // wait) — windows-rs 0.58 IAsyncOperation doesn't implement
+        // std::future::Future natively. .get() is the canonical sync-wait
+        // pattern; we don't pay an event-loop overhead during init since
+        // we're already on a single thread here.
         let (provider, tx_char, _rx_char) =
-            rt.block_on(async { build_service(service_uuid, tx, Arc::clone(&is_connected)).await })?;
+            build_service(service_uuid, tx, Arc::clone(&is_connected))?;
 
         let inner = Arc::new(Inner {
             rt,
@@ -135,7 +140,7 @@ impl Drop for BluetoothLeTransport {
     }
 }
 
-async fn build_service(
+fn build_service(
     service_uuid: UuidStr,
     tx: mpsc::UnboundedSender<Result<Packet>>,
     is_connected_flag: Arc<AtomicBool>,
@@ -143,8 +148,8 @@ async fn build_service(
     let svc_guid = uuid_to_guid(service_uuid);
     let result = GattServiceProvider::CreateAsync(svc_guid)
         .map_err(|e| WireDeskError::Transport(format!("BLE CreateAsync: {e}")))?
-        .await
-        .map_err(|e| WireDeskError::Transport(format!("BLE CreateAsync await: {e}")))?;
+        .get()
+        .map_err(|e| WireDeskError::Transport(format!("BLE CreateAsync get: {e}")))?;
     let provider = result
         .ServiceProvider()
         .map_err(|e| WireDeskError::Transport(format!("BLE ServiceProvider(): {e}")))?;
@@ -167,8 +172,8 @@ async fn build_service(
     let tx_char_result = service
         .CreateCharacteristicAsync(uuid_to_guid(uuids::TX_CHAR_UUID), &tx_params)
         .map_err(|e| WireDeskError::Transport(format!("BLE TX CreateChar: {e}")))?
-        .await
-        .map_err(|e| WireDeskError::Transport(format!("BLE TX CreateChar await: {e}")))?;
+        .get()
+        .map_err(|e| WireDeskError::Transport(format!("BLE TX CreateChar get: {e}")))?;
     let tx_char = tx_char_result
         .Characteristic()
         .map_err(|e| WireDeskError::Transport(format!("BLE TX Characteristic(): {e}")))?;
@@ -182,18 +187,22 @@ async fn build_service(
     let rx_char_result = service
         .CreateCharacteristicAsync(uuid_to_guid(uuids::RX_CHAR_UUID), &rx_params)
         .map_err(|e| WireDeskError::Transport(format!("BLE RX CreateChar: {e}")))?
-        .await
-        .map_err(|e| WireDeskError::Transport(format!("BLE RX CreateChar await: {e}")))?;
+        .get()
+        .map_err(|e| WireDeskError::Transport(format!("BLE RX CreateChar get: {e}")))?;
     let rx_char = rx_char_result
         .Characteristic()
         .map_err(|e| WireDeskError::Transport(format!("BLE RX Characteristic(): {e}")))?;
 
     // SubscribedClientsChanged on TX → flip is_connected when at least
     // one Mac is subscribed to notifications. Used by Transport::is_connected.
+    //
+    // windows-rs 0.58 TypedEventHandler closures take `&Option<TSender>` /
+    // `&Option<TResult>` parameters (not `Ref<T>` like older versions), so
+    // we destructure via Option::as_ref().
     {
         let flag = Arc::clone(&is_connected_flag);
         let handler = TypedEventHandler::<GattLocalCharacteristic, _>::new(
-            move |sender: windows::core::Ref<GattLocalCharacteristic>, _args| {
+            move |sender: &Option<GattLocalCharacteristic>, _args: &Option<windows::core::IInspectable>| {
                 if let Some(s) = sender.as_ref() {
                     let count = s
                         .SubscribedClients()
@@ -216,9 +225,12 @@ async fn build_service(
     {
         let reassembler = Arc::new(std::sync::Mutex::new(Reassembler::new()));
         let tx = tx.clone();
-        let handler = TypedEventHandler::<_, _>::new(
-            move |_sender: windows::core::Ref<GattLocalCharacteristic>,
-                  args: windows::core::Ref<
+        let handler = TypedEventHandler::<
+            GattLocalCharacteristic,
+            windows::Devices::Bluetooth::GenericAttributeProfile::GattWriteRequestedEventArgs,
+        >::new(
+            move |_sender: &Option<GattLocalCharacteristic>,
+                  args: &Option<
                 windows::Devices::Bluetooth::GenericAttributeProfile::GattWriteRequestedEventArgs,
             >| {
                 let args = match args.as_ref() {
@@ -329,28 +341,26 @@ impl Transport for BluetoothLeTransport {
         let chunks = split_packet(pid, &encoded, payload_cap)
             .map_err(|e| WireDeskError::Transport(format!("BLE split_packet: {e}")))?;
 
-        let inner = Arc::clone(&self.inner);
-        inner.rt.block_on(async {
-            let send_fut = async {
-                for chunk in &chunks {
-                    let buf = write_to_buffer(chunk)?;
-                    inner
-                        .tx_char
-                        .NotifyValueAsync(&buf)
-                        .map_err(|e| {
-                            WireDeskError::Transport(format!("BLE NotifyValueAsync: {e}"))
-                        })?
-                        .await
-                        .map_err(|e| {
-                            WireDeskError::Transport(format!("BLE NotifyValueAsync await: {e}"))
-                        })?;
-                }
-                Ok::<_, WireDeskError>(())
-            };
-            tokio::time::timeout(SEND_TIMEOUT, send_fut)
-                .await
-                .map_err(|_| WireDeskError::Transport("BLE send timeout".into()))?
-        })?;
+        // NotifyValueAsync returns IAsyncOperation which doesn't implement
+        // std::future::Future on windows-rs 0.58 — we use .get() for sync
+        // wait. Up to ~35 chunks for an 8 KB packet, each NotifyValueAsync
+        // typically completes in <10 ms; sequential .get() is acceptable.
+        // Timeout enforced inline via Instant deadline (no need to spawn
+        // a separate timer task — keeps Inner free of Send/Sync concerns).
+        let inner = &self.inner;
+        let start = std::time::Instant::now();
+        for chunk in &chunks {
+            if start.elapsed() > SEND_TIMEOUT {
+                return Err(WireDeskError::Transport("BLE send timeout".into()));
+            }
+            let buf = write_to_buffer(chunk)?;
+            inner
+                .tx_char
+                .NotifyValueAsync(&buf)
+                .map_err(|e| WireDeskError::Transport(format!("BLE NotifyValueAsync: {e}")))?
+                .get()
+                .map_err(|e| WireDeskError::Transport(format!("BLE NotifyValueAsync get: {e}")))?;
+        }
 
         Ok(())
     }
