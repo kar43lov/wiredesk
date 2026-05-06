@@ -79,28 +79,36 @@ fn main() {
     log::info!("WireDesk Client");
     log::info!("log dir: {}", logging::log_dir().display());
     log::info!("config: {}", ClientConfig::config_path().display());
-    log::info!("serial: {} @ {} baud", cfg.port, cfg.baud);
+    log::info!("transport: {} (port={} baud={})", cfg.transport, cfg.port, cfg.baud);
 
-    let transport = match wiredesk_transport::serial::SerialTransport::open(&cfg.port, cfg.baud) {
-        Ok(t) => t,
+    let transport_cfg = config::to_transport_config(&cfg);
+    // The reader thread keeps the original (recv-capable) handle. The
+    // writer thread gets the clone — for BLE that clone is write-only by
+    // design (see plan Decision 4); for serial it's a duplicate fd.
+    // Either way: send-side on the clone, recv-side on the original.
+    let reader_transport = match wiredesk_transport::open_transport(&transport_cfg) {
+        Ok(t) => {
+            log::info!("opened transport: {}", t.name());
+            t
+        }
         Err(e) => {
-            log::error!("failed to open serial port: {e}");
+            log::error!("failed to open transport (mode={}): {e}", cfg.transport);
             eprintln!("Error: {e}");
-            eprintln!("Available ports:");
-            if let Ok(ports) = serialport::available_ports() {
-                for p in ports {
-                    eprintln!("  {}", p.port_name);
+            if cfg.transport == "serial" {
+                eprintln!("Available serial ports:");
+                if let Ok(ports) = serialport::available_ports() {
+                    for p in ports {
+                        eprintln!("  {}", p.port_name);
+                    }
                 }
             }
             std::process::exit(1);
         }
     };
-
-    let writer_transport: Box<dyn Transport> = Box::new(transport);
-    let reader_transport = match writer_transport.try_clone() {
+    let writer_transport = match reader_transport.try_clone() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("Error: cannot clone serial port for reader thread: {e}");
+            eprintln!("Error: cannot clone transport for writer thread: {e}");
             std::process::exit(1);
         }
     };

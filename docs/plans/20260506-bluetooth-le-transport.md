@@ -385,28 +385,20 @@ struct ChunkHeader {
 - Modify: `apps/wiredesk-host/src/config.rs` (если требуется helper для конверсии)
 - Modify: `apps/wiredesk-host/src/session_thread.rs` (если try_clone используется)
 
-- [ ] В `main.rs` заменить прямой `SerialTransport::open(&cfg.port, cfg.baud)` на `transport::open_transport(&to_transport_config(&cfg))`.
-- [ ] Добавить helper `fn to_transport_config(cfg: &HostConfig) -> TransportConfig` в `config.rs`.
-- [ ] Update startup logging — log `transport.name()` после open чтобы было видно какой реально открылся (важно для fallback-сценария).
-- [ ] **try_clone audit**: grep `try_clone()` в `apps/wiredesk-host/`. Verify что cloned handle используется ТОЛЬКО для `send()`-вызовов (writer-thread), не `recv()`. Если найдётся `recv()` на cloned — пометить ⚠️ и переработать call-site (вынести `recv` на original handle).
-- [ ] Update existing test'ы host'а (если они dependent на transport-creation — скорее всего нет, всё в Session/SessionThread слое).
-- [ ] Tests:
-  - [ ] `to_transport_config_serial` — host config с `transport = "serial"` → корректный TransportConfig.
-  - [ ] `to_transport_config_bluetooth` — `transport = "bluetooth"` → корректный TransportConfig с BT-полями.
-- [ ] Запустить `cargo test -p wiredesk-host -- --test-threads=1`.
+- [x] `apps/wiredesk-host/src/session_thread.rs` — заменил прямой `SerialTransport::open(&config.port, config.baud)` на `wiredesk_transport::open_transport(&config::to_transport_config(&config))`. Logging обновлен — log `transport.name()` после open + log mode из config.
+- [x] `apps/wiredesk-host/src/config.rs` — `pub fn to_transport_config(cfg: &HostConfig) -> TransportConfig` builds factory config из host fields.
+- [x] **try_clone audit (host)**: grep показал `try_clone()` в host **не используется** — host работает single-thread session loop без reader/writer split. Никаких изменений не требуется.
+- [x] Tests: `to_transport_config_serial_passes_port_baud`, `to_transport_config_bluetooth_carries_bt_fields`.
+- [x] `cargo test -p wiredesk-host -- --test-threads=1` — 172 passed (2 new + 170 existing).
 
 ### Task 9: Wire factory в client main.rs + verify try_clone call-sites
 
-**Files:**
-- Modify: `apps/wiredesk-client/src/main.rs`
-- Modify: `apps/wiredesk-client/src/config.rs` (helper)
-
-- [ ] Аналогично Task 8 — replace direct `SerialTransport::open` на `transport::open_transport(...)`.
-- [ ] Helper `fn to_transport_config(cfg: &ClientConfig) -> TransportConfig`.
-- [ ] Update startup log.
-- [ ] **try_clone audit**: grep `try_clone()` в `apps/wiredesk-client/`. Verify writer-only usage. Document constraint в comment рядом с try_clone call.
-- [ ] Tests symmetric с Task 8 — `to_transport_config_serial`, `to_transport_config_bluetooth`.
-- [ ] Запустить `cargo test -p wiredesk-client -- --test-threads=1`.
+- [x] `apps/wiredesk-client/src/main.rs` — заменил direct `SerialTransport::open` на `wiredesk_transport::open_transport(&config::to_transport_config(&cfg))`. Updated startup log.
+- [x] `apps/wiredesk-client/src/config.rs` — helper `pub fn to_transport_config(cfg: &ClientConfig) -> TransportConfig`.
+- [x] **try_clone audit (client) — обнаружена baseline regression**: existing client передавал **original** в writer_thread и **clone** в reader_thread. По Decision 4 (write-only clones) reader_thread звал бы `recv()` на cloned handle → Err. **Fix**: swap'нул роли — `let reader_transport = open_transport(...)` (original, recv-capable), `let writer_transport = reader_transport.try_clone()?` (clone, write-only OK). Comment в main.rs объясняет invariant. Для serial это no-op (try_clone duplicates fd, оба handle полностью функциональны); для BLE это критично.
+- [x] Tests symmetric: `to_transport_config_serial_passes_port_baud`, `to_transport_config_bluetooth_carries_bt_fields`.
+- [x] `cargo test -p wiredesk-client -- --test-threads=1` — 104 passed (2 new + 102 existing).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean (после field-reassign-with-default fix'а в новых тестах).
 
 ### Task 10: Auto-reconnect loop в BluetoothLeTransport
 

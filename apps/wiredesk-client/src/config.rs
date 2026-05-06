@@ -6,6 +6,8 @@ use clap::parser::ValueSource;
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
 use wiredesk_core::BluetoothConfig;
+use wiredesk_transport::bluetooth::BluetoothFactoryConfig;
+use wiredesk_transport::{SerialFactoryConfig, TransportConfig};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -227,6 +229,26 @@ fn from_user(src: Option<ValueSource>) -> bool {
         src,
         Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
     )
+}
+
+/// Build the transport-layer's `TransportConfig` from a `ClientConfig`.
+/// Mirrors the host-side helper — see `apps/wiredesk-host/src/config.rs`.
+pub fn to_transport_config(cfg: &ClientConfig) -> TransportConfig {
+    TransportConfig {
+        transport: cfg.transport.clone(),
+        serial: SerialFactoryConfig {
+            port: cfg.port.clone(),
+            baud: cfg.baud,
+        },
+        bluetooth: BluetoothFactoryConfig {
+            service_uuid: cfg.bluetooth.service_uuid.clone(),
+            peer_name: cfg.bluetooth.peer_name.clone(),
+            mtu: cfg.bluetooth.mtu,
+            connect_timeout_secs: cfg.bluetooth.connect_timeout_secs,
+            reconnect_max_attempts: cfg.bluetooth.reconnect_max_attempts,
+        },
+        fallback: cfg.transport_fallback.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -502,5 +524,42 @@ mod tests {
         cfg.transport = "bluetooth".to_string();
         let merged = merge_args(&matches, cfg);
         assert_eq!(merged.transport, "bluetooth");
+    }
+
+    #[test]
+    fn to_transport_config_serial_passes_port_baud() {
+        let cfg = ClientConfig {
+            port: "/dev/cu.test".to_string(),
+            baud: 921_600,
+            transport: "serial".to_string(),
+            ..ClientConfig::default()
+        };
+        let tc = to_transport_config(&cfg);
+        assert_eq!(tc.transport, "serial");
+        assert_eq!(tc.serial.port, "/dev/cu.test");
+        assert_eq!(tc.serial.baud, 921_600);
+        assert!(tc.fallback.is_none());
+    }
+
+    #[test]
+    fn to_transport_config_bluetooth_carries_bt_fields() {
+        let cfg = ClientConfig {
+            transport: "bluetooth".to_string(),
+            transport_fallback: Some("serial".to_string()),
+            bluetooth: BluetoothConfig {
+                service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                peer_name: "TestHost".to_string(),
+                mtu: 244,
+                connect_timeout_secs: 5,
+                reconnect_max_attempts: 3,
+            },
+            ..ClientConfig::default()
+        };
+        let tc = to_transport_config(&cfg);
+        assert_eq!(tc.transport, "bluetooth");
+        assert_eq!(tc.bluetooth.service_uuid, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(tc.bluetooth.peer_name, "TestHost");
+        assert_eq!(tc.bluetooth.mtu, 244);
+        assert_eq!(tc.fallback.as_deref(), Some("serial"));
     }
 }
