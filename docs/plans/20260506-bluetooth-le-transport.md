@@ -289,14 +289,12 @@ struct ChunkHeader {
 - Modify: `crates/wiredesk-transport/src/lib.rs`
 - Create: `crates/wiredesk-transport/tests/factory_test.rs`
 
-- [ ] Создать `factory.rs` с `pub struct TransportConfig { pub transport: String, pub serial: SerialConfig, pub bluetooth: BluetoothFactoryConfig, pub fallback: Option<String> }` — это abstract представление, не зависит от host/client config.
-- [ ] Реализовать `pub fn open_transport(cfg: &TransportConfig) -> Result<Box<dyn Transport>>` со switch'ем `serial` / `bluetooth`. На `bluetooth` failure + `fallback == Some("serial")` — retry serial, log::warn.
-- [ ] В `lib.rs` экспортировать `pub use factory::{open_transport, TransportConfig};`
-- [ ] Создать unit-test'ы в `tests/factory_test.rs`:
-  - [ ] `unknown_transport_errors` — `transport = "ftdi"` возвращает `Err`.
-  - [ ] `serial_transport_resolves` — пытается открыть `serial` (если `port` несуществующий — Err, но видим что попытка сделана через mock или error message check).
-  - [ ] `bluetooth_init_fail_falls_back_to_serial` — invalid BT config + `fallback = "serial"`, fallback path triggered. (Нужен mock.)
-- [ ] Запустить `cargo test -p wiredesk-transport -- --test-threads=1` — все pass.
+- [x] Создан `crates/wiredesk-transport/src/factory.rs` с `SerialFactoryConfig` (port, baud) + `TransportConfig` (transport, serial, bluetooth, fallback). Tests внутри (не отдельным `tests/factory_test.rs` — `#[cfg(test)] mod tests` соответствует существующему pattern'у проекта).
+- [x] `pub fn open_transport(cfg: &TransportConfig) -> Result<Box<dyn Transport>>` со switch `"serial"` / `"bluetooth"`. На BT failure + `fallback == Some("serial")` — log::warn + retry serial. На unknown fallback (например `"ftdi"`) — НЕ recurse'ит, primary error surfaces.
+- [x] В `lib.rs` экспортированы `open_transport`, `SerialFactoryConfig`, `TransportConfig`.
+- [x] 6 unit-тестов: `unknown_transport_errors`, `empty_transport_errors`, `serial_transport_attempts_serial_open` (через invalid port → "serial open" error origin), `bluetooth_transport_without_fallback_returns_ble_error`, `bluetooth_init_fail_falls_back_to_serial` (full path verified через "serial open" error в final result), `unknown_fallback_value_does_not_recurse`.
+- [x] `cargo test -p wiredesk-transport -- --test-threads=1` — 14 passed (6 new factory + 4 bluetooth + 4 mock).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 4: BluetoothLeTransport skeleton — sync facade + tokio runtime + fragmentation
 
