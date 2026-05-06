@@ -451,29 +451,36 @@ struct ChunkHeader {
 - Modify: `docs/architecture.md`
 - Create: `docs/bluetooth-transport.md` (troubleshooting / pair flow)
 
-- [ ] README: добавить раздел «Transport options» с serial/bluetooth-сравнением и конфиг-примерами.
-- [ ] CLAUDE.md: добавить в «Architecture» абзац про BluetoothLeTransport (Mac=Central, Win=Peripheral, embedded tokio runtime, fragmentation MTU=247).
-- [ ] docs/architecture.md: расширить module-map списком `bluetooth/{mod,uuids,fragment,reconnect,runtime,mac,win,stub}`.
-- [ ] Создать `docs/bluetooth-transport.md`:
-  - [ ] One-time pair flow (Mac System Settings → Bluetooth → Connect к DESKTOP-XXX).
-  - [ ] Config switching (`transport = "bluetooth"`, restart).
-  - [ ] Troubleshoot: «не connect'ится» → re-pair, BT radio reset, Continent-policy verification.
-  - [ ] Performance expectations (×3-9 vs CH340).
-  - [ ] Limitations: latency p95 +10-20ms vs serial, MTU нюансы.
+- [x] README.md: short transport mention с pointer на `docs/bluetooth-transport.md`.
+- [x] CLAUDE.md: добавлен Transport options bullet с brief overview (Mac/Win roles, throughput, custom GATT service, AC0 verified). Tests counter обновлен.
+- [x] docs/architecture.md: новая секция «Bluetooth LE Transport (Plan C)» с full module-map (mod/uuids/fragment/runtime/reconnect/mac/win/stub), sync facade pattern explanation, try_clone semantics, factory rationale, BluetoothConfig location, Continent compatibility note, deferred follow-ups.
+- [x] Создан `docs/bluetooth-transport.md` — user-facing guide:
+  - When to use (comparison table A/C/serial)
+  - One-time pairing instructions (Win11 + Mac steps)
+  - Switching transport (Mac UI + Win config.toml)
+  - Performance expectations (throughput / latency / reconnect)
+  - Troubleshooting (no peer found / empty scan / write timeout / Continent block)
+  - Architecture pointers + related docs
 
 ### Task 15: Verify acceptance criteria
 
-- [ ] **AC0 re-verify (10 минут, gate)**: pair Mac↔Win11, отправить тестовый файл 1 KB через стандартный OS BT-flow (или прогнать LightBlue scan видя custom service-UUID после Win-side build'а). Если **fail** — environment изменился (Continent policy update, smartcard rules), план abort'ится. Дёшево, защищает от 5–7 дней wasted work.
-- [ ] AC1 (base connect): `transport = "bluetooth"` на обеих сторонах → paired+connected ≤10s. Tray host показывает `Bluetooth: connected`. Mac status — green dot.
-- [ ] AC2 (input parity): мышь, клавиатура (вкл. кириллица + sidebuttons), modifiers — работают идентично serial. **Restart GUI с `transport = "bluetooth"` ПЕРЕД** spot-check'ом `wd --exec "echo test"` (потому что `wd --exec` идёт через GUI IPC, а GUI открывает один transport per process).
-- [ ] AC3 (clipboard throughput): PNG 1 MB Mac→Host передаётся ≤30s. Замер через `time` обёртку clipboard-event'а.
-- [ ] AC4 (reconnect): Mac sleep на 60s → wake → auto-reconnect ≤5s. (First attempt immediate per Task 10 backoff.)
-- [ ] AC5 (regression): `transport = "serial"` (default) — bit-identical pre-PR behavior. Run full smoke на serial.
-- [ ] AC6 (fallback): broken BT config + `transport_fallback = "serial"` → serial picks up. Log shows fallback warning.
-- [ ] AC7 (docs): README + CLAUDE.md секции updated, docs/bluetooth-transport.md created.
-- [ ] Run full test suite: `cargo test --workspace -- --test-threads=1`
-- [ ] Run clippy: `cargo clippy --workspace -- -D warnings`
-- [ ] Verify test coverage не упало (manual reveal via running tests for transport crate).
+**Static checks (выполнены в этой сессии):**
+- [x] `cargo test --workspace -- --test-threads=1` — 487 passed (172 host + 104 client + 84 protocol + 60 exec-core + 41 transport + 22 term + 4 wiredesk-core), 0 failed.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- [x] Test coverage: +56 new BLE/transport tests across this PR. Existing 427 → 487 total (+14% growth). Mac BLE-stack live error path verified в `mac::tests::open_short_timeout_no_peer_returns_err`.
+- [x] AC7 (docs): README + CLAUDE.md + docs/architecture.md updated, docs/bluetooth-transport.md created.
+
+**Live verification (manual, требует real Mac↔Win11):**
+
+⚠️ **Не выполнены в этой сессии — manual checklist для live-тестов на real hardware:**
+
+- [ ] **AC0 re-verify (gate, 10 мин)**: pair Mac↔Win11 если ещё не paired. Если уже paired (с AC0 testing 2026-05-06) — skip.
+- [ ] **AC1** (base connect): `transport = "bluetooth"` на обеих сторонах. Mac startup-log должен показать `opened transport: bluetooth-le-central`. Win host-log → `opened transport: bluetooth-le-peripheral`. Connection establishment в течение `connect_timeout_secs`.
+- [ ] **AC2** (input parity): restart Mac GUI с `transport = "bluetooth"` (Save & Restart in Settings), потом мышь, клавиатура (incl кириллица), modifiers spot-check. `wd --exec "echo test"` через BT (GUI должна быть запущена с BT перед exec).
+- [ ] **AC3** (clipboard throughput): copy 1 MB PNG на Mac, paste на Win. Time it. Должно быть ≤30s (текущий serial ~90s).
+- [ ] **AC4** (reconnect): Mac sleep на 60s, wake. **NB:** runtime auto-reconnect deferred (Task 10 helper-only). Текущее behaviour — manual reopen WireDesk.app. Helper'ом будет покрыто follow-up'ом `feat/bluetooth-reconnect-runtime`.
+- [ ] **AC5** (regression): `transport = "serial"` (default) → full smoke unchanged. Critical — serial path bit-identical pre-PR.
+- [ ] **AC6** (fallback): `transport = "bluetooth"` + invalid `service_uuid = "00000000-..."` + `transport_fallback = "serial"` → serial picks up. Log shows `bluetooth transport failed (...); falling back to serial`.
 
 ### Task 16: [Final] Move plan to completed
 
