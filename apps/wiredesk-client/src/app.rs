@@ -403,48 +403,122 @@ impl WireDeskApp {
             // ---- Connection group ----
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Connection").strong());
+
+                // Transport selector — picks between USB-Serial null-modem
+                // and the Bluetooth LE Central. Changes take effect after
+                // Save+Restart (no live transport switch — Save+Restart
+                // pattern, matches the rest of the panel).
                 ui.horizontal(|ui| {
-                    ui.label("Port:");
-                    let combo = egui::ComboBox::from_id_salt("settings_port")
-                        .selected_text(cfg.port.clone())
+                    ui.label("Transport:");
+                    egui::ComboBox::from_id_salt("settings_transport")
+                        .selected_text(match cfg.transport.as_str() {
+                            "bluetooth" => "Bluetooth LE",
+                            _ => "USB-Serial",
+                        })
                         .show_ui(ui, |ui| {
-                            for p in &available_ports {
-                                if ui
-                                    .selectable_value(&mut cfg.port, p.clone(), p)
-                                    .changed()
-                                {
-                                    dirty = true;
-                                }
+                            if ui
+                                .selectable_label(cfg.transport == "serial", "USB-Serial")
+                                .clicked()
+                            {
+                                cfg.transport = "serial".to_string();
+                                dirty = true;
+                            }
+                            if ui
+                                .selectable_label(cfg.transport == "bluetooth", "Bluetooth LE")
+                                .clicked()
+                            {
+                                cfg.transport = "bluetooth".to_string();
+                                dirty = true;
                             }
                         });
-                    if combo.response.clicked() {
-                        want_refresh_ports = true;
-                    }
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut cfg.port)
-                                .desired_width(220.0)
-                                .hint_text("/dev/cu.usbserial-XXX"),
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
                 });
 
-                ui.horizontal(|ui| {
-                    ui.label("Baud:");
-                    let mut baud_str = cfg.baud.to_string();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
-                        .changed()
-                    {
-                        if let Ok(v) = baud_str.parse::<u32>() {
-                            cfg.baud = v;
+                if cfg.transport == "bluetooth" {
+                    // Bluetooth LE — minimal UX: show peer name and
+                    // connect timeout. service_uuid stays in config.toml
+                    // for advanced setups (very rarely needs editing).
+                    ui.horizontal(|ui| {
+                        ui.label("Peer name:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut cfg.bluetooth.peer_name)
+                                    .desired_width(220.0)
+                                    .hint_text("WireDeskHost"),
+                            )
+                            .changed()
+                        {
                             dirty = true;
                         }
-                    }
-                });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Connect timeout (s):");
+                        let mut t_str = cfg.bluetooth.connect_timeout_secs.to_string();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut t_str).desired_width(60.0),
+                            )
+                            .changed()
+                        {
+                            if let Ok(v) = t_str.parse::<u32>() {
+                                cfg.bluetooth.connect_timeout_secs = v;
+                                dirty = true;
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Pair Mac↔Win11 once via System Settings → Bluetooth before \
+                             switching transport. Service UUID and MTU are advanced — \
+                             edit in config.toml if needed.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                } else {
+                    // USB-Serial — port + baud as before.
+                    ui.horizontal(|ui| {
+                        ui.label("Port:");
+                        let combo = egui::ComboBox::from_id_salt("settings_port")
+                            .selected_text(cfg.port.clone())
+                            .show_ui(ui, |ui| {
+                                for p in &available_ports {
+                                    if ui
+                                        .selectable_value(&mut cfg.port, p.clone(), p)
+                                        .changed()
+                                    {
+                                        dirty = true;
+                                    }
+                                }
+                            });
+                        if combo.response.clicked() {
+                            want_refresh_ports = true;
+                        }
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut cfg.port)
+                                    .desired_width(220.0)
+                                    .hint_text("/dev/cu.usbserial-XXX"),
+                            )
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Baud:");
+                        let mut baud_str = cfg.baud.to_string();
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut baud_str).desired_width(120.0))
+                            .changed()
+                        {
+                            if let Ok(v) = baud_str.parse::<u32>() {
+                                cfg.baud = v;
+                                dirty = true;
+                            }
+                        }
+                    });
+                }
             });
 
             // ---- Display group ----

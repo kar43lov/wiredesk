@@ -424,38 +424,24 @@ struct ChunkHeader {
 **Files:**
 - Modify: `apps/wiredesk-client/src/app.rs`
 
-- [ ] В Settings panel (group «Connection») добавить:
-  - [ ] Combo «Transport»: «Serial» / «Bluetooth».
-  - [ ] Когда «Bluetooth» selected — показать BT-fields: «Service UUID» (read-only display, editable advanced), «Peer Name», «MTU», «Reconnect attempts».
-  - [ ] Сохранение: при clicking Save — пишем `cfg.transport`, `cfg.bluetooth.*` в TOML.
-  - [ ] Show inline toast: «Transport changed — restart to apply».
-- [ ] **Не делаем live-restart** — в проекте уже Save+Restart pattern, новый transport также требует restart. Documenting.
-- [ ] Tests: existing settings-panel UI-тестов в проекте нет — пропускаем UI-tests, manual checklist в Task N-1.
-- [ ] Запустить `cargo test -p wiredesk-client -- --test-threads=1` (regression check).
+- [x] Connection group в Settings panel: добавлен combo `Transport` с options `USB-Serial` / `Bluetooth LE`. Conditionally show port+baud (serial) или peer_name+connect_timeout (bluetooth) fields. Service UUID и MTU оставлены в config.toml для advanced-users (very rare editing).
+- [x] Save / Save & Restart использует existing pattern — TOML write + process restart применяет transport switch. Inline hint about pairing prerequisite + advanced fields в config.toml.
+- [x] No live-restart — match existing Save+Restart pattern.
+- [x] `cargo test -p wiredesk-client -- --test-threads=1` — 172 passed, no regression.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Live UX verification — Task 15.
 
-### Task 12: Settings UI — Win11 host (nwg)
+### Task 12: Settings UI — Win11 host (nwg) — DEFERRED
 
-**Files:**
-- Modify: `apps/wiredesk-host/src/ui/...` (точный файл — settings panel)
+- [⚠️] **Deferred к follow-up `feat/bluetooth-host-ui`**.
+- [ ] Reasoning: Win nwg Settings требует множество new struct fields (transport_combo, peer_name_input, etc.) + build()/layout/read_form() updates. Без Win-machine для verify — high risk введения compile-errors. Транспорт уже фактически переключается через `transport = "bluetooth"` в `%APPDATA%\WireDesk\config.toml` + Save+Restart restart cycle. UI добавит UX-удобство, но не функциональность.
+- [ ] Когда делать: после Task 15 live verification на Win11 (доступ к Win-machine появится для visual testing UI).
 
-- [ ] Аналогично Task 11 в nwg-Settings:
-  - [ ] Combo «Transport».
-  - [ ] BT-fields visibility toggle.
-  - [ ] Save-handler пишет TOML, prompt для restart.
-- [ ] Manual checklist в Task 15.
-- [ ] Запустить `cargo test -p wiredesk-host -- --test-threads=1`.
+### Task 13: Status indication — DEFERRED
 
-### Task 13: Status indication — connection state (no throughput counter)
-
-**Files:**
-- Modify: `apps/wiredesk-client/src/status_bar.rs`
-- Modify: `apps/wiredesk-host/src/ui/...` (tray tooltip)
-
-- [ ] Mac status-bar: показывать `BT: scanning / paired / connected` когда `transport == "bluetooth"`. Status read'ится через **`Transport::is_connected()`** + cached scan/connect state в `BluetoothLeTransport`-instance (доступен через downcast). Если serial — текущее behaviour, никаких изменений.
-- [ ] Win tray tooltip: при `transport == "bluetooth"` — `WireDesk: BT connected (Mac client)` или `BT waiting for client`. Update on subscribe-event.
-- [ ] **Throughput counter EWMA** — **defer на post-completion follow-up**. Не в AC брифа, не критичен для MVP. Заметка в `Post-Completion` секции.
-- [ ] Tests: existing UI patterns без unit-tests; manual smoke в Task 15.
-- [ ] Запустить `cargo test --workspace -- --test-threads=1` (regression check).
+- [⚠️] **Deferred к follow-up `feat/bluetooth-status-indicator`**.
+- [ ] Reasoning: Mac status-bar / Win tray tooltip changes requires UI verification cycle. Currently startup log (`opened transport: bluetooth-le-central`) даёт baseline visibility — этого достаточно для MVP.
+- [ ] Полная реализация — после AC1-AC3 verified live на Task 15.
 
 ### Task 14: Documentation updates
 
@@ -521,6 +507,8 @@ struct ChunkHeader {
 - **Multi-host BLE discovery** — Mac выбирает между несколькими WireDesk hosts. Single-host scope для MVP.
 - **EWMA throughput counter в status-bar/tray** — отображение текущей скорости BT-канала (KB/s). Стояло в первоначальном Task 14, но не покрывается AC брифа и не критично для MVP. Defer до момента когда понадобится визуальный bench-tool.
 - **Mac/Win BLE auto-reconnect runtime integration** — reconnect.rs helper уже здесь (Task 10), но full runtime hookup в `mac.rs` / `win.rs` deferred. Требует refactor `Inner` (peripheral за Mutex/RwLock для swap при reconnect) + restructured notification_pump. Делать после live verification AC1-AC3 на Task 15 — не speculative. Branch предложен: `feat/bluetooth-reconnect-runtime`.
+- **Win11 nwg Settings UI** — Transport combo + BT fields в host'овском Settings panel (Task 12 deferred). Требует Win-machine для visual testing. Branch: `feat/bluetooth-host-ui`.
+- **BT status indication** — Mac status-bar text + Win tray tooltip update (Task 13 deferred). Branch: `feat/bluetooth-status-indicator`.
 - **Indicate (с ack) вместо Notify для Win→Mac** — если Notify-drop'ы под нагрузкой ломают AC3/AC4 (пока полагаемся на heartbeat-driven recovery). Migration тривиальна — поменять CharacteristicProperties на Indicate, остальное btleplug автоматом подхватит.
 - **Drop `transport_fallback`** — runtime fallback на serial при BT failure добавляет complexity (логирование, два code-path'а в factory, два testing scenarios). Альтернатива: при BT init failure print error, exit, user правит конфиг (соответствует Save+Restart pattern проекта). Если AC6 окажется источником багов — упростить до error-exit. В этом плане оставляем, т.к. в брифе AC6 фиксирован.
 
