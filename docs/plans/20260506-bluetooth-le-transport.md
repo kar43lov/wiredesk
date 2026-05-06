@@ -407,16 +407,17 @@ struct ChunkHeader {
 - Modify: `crates/wiredesk-transport/src/bluetooth/win.rs`
 - Create: `crates/wiredesk-transport/src/bluetooth/reconnect.rs`
 
-- [ ] Создать `reconnect.rs` с pure helper'ом `pub fn next_backoff(attempt: u32) -> Duration` — **первая попытка immediate (0s)**, затем exponential 2s→4s→8s→16s→30s→30s. Это ради AC4 (≤5s после кратковременного disconnect/sleep-wake) — first-attempt без delay, чтобы typical recovery (radio re-acquired в течение секунды после wake) пройти за <5s.
-- [ ] В Mac side: на disconnect-event (peripheral.events stream возвращает `CentralEvent::DeviceDisconnected`) → spawn reconnect-task: loop с `next_backoff()` пытается scan+connect снова. На успешном connect — re-subscribe TX, restore handles. Если configured `reconnect_max_attempts > 0` — break после N attempts, возвращаем persistent disconnected state.
-- [ ] В Win side: на `tx_char.SubscribedClientsChanged` event (subscribers → 0) → spawn task ждёт `SubscribedClientsChanged` → 1 again, no-op (advertising и так running).
-- [ ] **Не интегрируем с existing `mac-auto-reconnect.md` brief** — это per-transport reconnect. Process-level Mac reconnect — отдельный бриф, ortho.
-- [ ] Tests:
-  - [ ] `next_backoff_first_attempt_immediate` — `next_backoff(0) == Duration::ZERO`.
-  - [ ] `next_backoff_exponential` — `next_backoff(1..7)` равны `[2, 4, 8, 16, 30, 30]` секунд.
-  - [ ] `reconnect_loop_respects_max_attempts` — mock-impl с counter, после max returns persistent fail.
-  - [ ] **Live test** Mac sleep-wake → переезжает в Task 15 (verification).
-- [ ] Запустить `cargo test -p wiredesk-transport -- --test-threads=1`.
+- [x] Создан `bluetooth/reconnect.rs` — pure helper:
+  - `pub fn next_backoff(attempt: u32) -> Duration`: 0s (immediate) → 2s → 4s → 8s → 16s → 30s → 30s (capped). AC4 budget tight: total wait через first 2 attempts (0+2=2s) ≤ AC4 deadline ≤5s.
+  - `pub fn should_retry(attempt: u32, max_attempts: u32) -> bool`: max=0 → unlimited, иначе `attempt < max`.
+- [x] Tests: `next_backoff_first_attempt_is_immediate`, `next_backoff_exponential_through_cap`, `ac4_first_three_attempts_under_five_seconds` (regression-guard на AC4 budget), `should_retry_unlimited_when_max_is_zero`, `should_retry_respects_max_attempts`, `reconnect_loop_respects_max_attempts` (simulated loop). 6 unit tests.
+- [⚠️] **Mac/Win runtime integration deferred** к follow-up.
+  - Причина: интеграция требует refactor'а `Inner` (peripheral за `Mutex`/`RwLock` для swap при reconnect) + restructure notification_pump чтобы restart на reconnect, + sync с in-flight send'ами.
+  - Без real Mac↔Win11 hardware verification (Task 15) trying to write speculative reconnect-loop рискует ввести subtle race conditions в working code.
+  - Helper'а `next_backoff` достаточно: при необходимости integration делается в follow-up `feat/bluetooth-reconnect` после AC1-AC3 verified live.
+  - Записано в Post-Completion follow-ups этого плана.
+- [x] `cargo test -p wiredesk-transport -- --test-threads=1` — 41 passed (6 new reconnect + 35 prior).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 11: Settings UI — Mac client
 
@@ -519,6 +520,7 @@ struct ChunkHeader {
 - **In-app pairing UI** — replacement для OS pair-dialog. Ergonomics nice-to-have, не критично.
 - **Multi-host BLE discovery** — Mac выбирает между несколькими WireDesk hosts. Single-host scope для MVP.
 - **EWMA throughput counter в status-bar/tray** — отображение текущей скорости BT-канала (KB/s). Стояло в первоначальном Task 14, но не покрывается AC брифа и не критично для MVP. Defer до момента когда понадобится визуальный bench-tool.
+- **Mac/Win BLE auto-reconnect runtime integration** — reconnect.rs helper уже здесь (Task 10), но full runtime hookup в `mac.rs` / `win.rs` deferred. Требует refactor `Inner` (peripheral за Mutex/RwLock для swap при reconnect) + restructured notification_pump. Делать после live verification AC1-AC3 на Task 15 — не speculative. Branch предложен: `feat/bluetooth-reconnect-runtime`.
 - **Indicate (с ack) вместо Notify для Win→Mac** — если Notify-drop'ы под нагрузкой ломают AC3/AC4 (пока полагаемся на heartbeat-driven recovery). Migration тривиальна — поменять CharacteristicProperties на Indicate, остальное btleplug автоматом подхватит.
 - **Drop `transport_fallback`** — runtime fallback на serial при BT failure добавляет complexity (логирование, два code-path'а в factory, два testing scenarios). Альтернатива: при BT init failure print error, exit, user правит конфиг (соответствует Save+Restart pattern проекта). Если AC6 окажется источником багов — упростить до error-exit. В этом плане оставляем, т.к. в брифе AC6 фиксирован.
 

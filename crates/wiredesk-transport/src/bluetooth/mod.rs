@@ -16,6 +16,7 @@
 //! `docs/plans/20260506-bluetooth-le-transport.md`.
 
 pub mod fragment;
+pub mod reconnect;
 pub mod runtime;
 pub mod uuids;
 
