@@ -15,6 +15,8 @@
 //! Implementation tasks land in this module incrementally — see
 //! `docs/plans/20260506-bluetooth-le-transport.md`.
 
+pub mod fragment;
+pub mod runtime;
 pub mod uuids;
 
 /// Runtime configuration handed to `BluetoothLeTransport::open`.

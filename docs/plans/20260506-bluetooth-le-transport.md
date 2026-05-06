@@ -303,29 +303,17 @@ struct ChunkHeader {
 - Create: `crates/wiredesk-transport/src/bluetooth/runtime.rs`
 - Create: `crates/wiredesk-transport/src/bluetooth/fragment.rs`
 
-- [ ] Создать `runtime.rs` — wrapper `EmbeddedRuntime { rt: tokio::runtime::Runtime }`. `EmbeddedRuntime::new()` builds multi-thread runtime с 2 worker threads. Methods `block_on<F>(&self, fut: F) -> F::Output` и `spawn<F>(&self, fut: F)`.
-- [ ] Создать `fragment.rs` — pure logic для chunking/reassembly:
-  - [ ] `pub struct ChunkHeader { packet_id: u16, chunk_idx: u8, total_chunks: u8 }` с `to_bytes() -> [u8; 4]` / `from_bytes(&[u8]) -> Result<Self>`. Endianness: little-endian для `packet_id`.
-  - [ ] `pub const ATT_HEADER_OVERHEAD: usize = 3;` (BLE ATT header).
-  - [ ] `pub const CHUNK_HEADER_LEN: usize = 4;`
-  - [ ] `pub fn max_chunk_payload(att_mtu: u16) -> usize { (att_mtu as usize - ATT_HEADER_OVERHEAD) - CHUNK_HEADER_LEN }` — для default MTU=247 даёт 240.
-  - [ ] `pub fn split_packet(packet_id: u16, payload: &[u8], max_chunk_payload: usize) -> Vec<Vec<u8>>` — параметр **explicit `max_chunk_payload`** (не «mtu»), чтобы избежать путаницы. Возвращает `Vec<Vec<u8>>` где каждый element — header(4) + chunk_data(0..=max_chunk_payload). `total_chunks = ((payload.len() + max_chunk_payload - 1) / max_chunk_payload).max(1)`.
-  - [ ] `pub struct Reassembler { ... }` с `feed_chunk(&mut self, bytes: &[u8]) -> Option<Vec<u8>>` и `feed_chunk_at(&mut self, now: Instant, bytes: &[u8]) -> Option<Vec<u8>>` (injectable clock для тестов). `Some` когда **все `total_chunks` собраны** (отслеживается bitmap'ом, не по idx==total-1, потому что chunks могут прийти не по порядку). Per-packet_id buffer + timeout 5s для discard incomplete (вызывается на каждом `feed_chunk_at` — sweep stale-records).
-- [ ] В `bluetooth/mod.rs`: пустой struct `BluetoothLeTransport { rt: EmbeddedRuntime, /* ... */ }` с `pub fn open(cfg: &BluetoothFactoryConfig) -> Result<Self>` (возвращает stub-Err пока).
-- [ ] `impl Transport for BluetoothLeTransport` — все методы возвращают `unimplemented!()` пока. Это позволит factory компилироваться.
-- [ ] Tests в `fragment.rs` (math с учётом 4-байтного ChunkHeader'а):
-  - [ ] `chunk_header_roundtrip` — `ChunkHeader::to_bytes() → from_bytes()` равенство для нескольких значений.
-  - [ ] `max_chunk_payload_default` — `max_chunk_payload(247) == 240`.
-  - [ ] `split_packet_single_chunk` — payload 100 байт, max_chunk_payload=240 → 1 chunk, размер `4 + 100 = 104` байт wire, header `total_chunks=1, chunk_idx=0`.
-  - [ ] `split_packet_multi_chunk` — payload 1000 байт, max_chunk_payload=240 → **5 chunks**, sizes (240+240+240+240+40), wire sizes `(4+240)*4 + (4+40) = 1020 байт`, headers `total_chunks=5`, `chunk_idx 0..4`.
-  - [ ] `split_packet_max_frame` — payload 8192 байт, max_chunk_payload=240 → **35 chunks** (`(8192 + 239) / 240 = 35`).
-  - [ ] `split_packet_empty_payload` — payload 0 байт → 1 empty chunk (`total_chunks=1, chunk_idx=0, no payload`).
-  - [ ] `split_packet_exact_multiple` — payload 480 байт (2*240) → 2 chunks (240+240), нет partial last chunk.
-  - [ ] `reassembler_in_order` — split + feed in-order → возвращает оригинальный payload.
-  - [ ] `reassembler_out_of_order` — feed chunks 2,0,1,3 → собирается тот же payload (не зависит от order).
-  - [ ] `reassembler_drops_incomplete_after_timeout` — feed_at(t=0, chunk[0]) → feed_at(t=5.1s, [новый packet_id chunk]) → старый partial discarded, новый продолжается.
-  - [ ] `reassembler_disambiguates_packet_ids` — concurrent packet_id=1 и packet_id=2 собираются независимо, интерлейв chunks обоих packets корректно.
-- [ ] Запустить `cargo test -p wiredesk-transport -- --test-threads=1` — все pass.
+- [x] Создан `runtime.rs` — `EmbeddedRuntime` с 2 worker threads + thread name `wiredesk-ble`, methods `block_on/spawn`. 3 unit-теста (block_on_runs_to_completion, spawn_runs_on_runtime_threads, block_on_chains_async_calls — последний валидирует `enable_all` для timer).
+- [x] Создан `fragment.rs` с pure-logic chunking/reassembly:
+  - [x] `ChunkHeader { packet_id: u16, chunk_idx: u8, total_chunks: u8 }`, packet_id little-endian, `from_bytes` валидирует short buffer / zero total / chunk_idx >= total.
+  - [x] Constants `ATT_HEADER_OVERHEAD = 3`, `CHUNK_HEADER_LEN = 4`, `DEFAULT_ATT_MTU = 247`, `REASSEMBLY_TIMEOUT = 5s`, `MAX_TOTAL_CHUNKS = 255`.
+  - [x] `max_chunk_payload(att_mtu)` — saturating, для tiny MTU (<7) даёт 0.
+  - [x] `split_packet(packet_id, payload, max_chunk_payload) -> Result<Vec<Vec<u8>>, FragmentError>` — pre-checks `max_chunk_payload > 0`, errors на `TooManyChunks` (>255).
+  - [x] `Reassembler` с per-packet_id slot (bitmap-based progress + first_seen Instant), `feed_chunk_at(now, bytes)` + `feed_chunk(bytes)` convenience. Sweep на каждом feed before processing. Идемпотентность на duplicate chunk arrival. Defensive reset на mismatched total_chunks для одного packet_id.
+- [x] BluetoothLeTransport struct остался stub'ом (Tasks 5/7 будут wire'ить tokio runtime + fragment в реальный send/recv).
+- [x] **17 fragment-тестов**: header roundtrip / rejects (short / zero total / out-of-range), max_chunk_payload (default 240, tiny MTU saturating), split_packet (single-chunk, multi-chunk 1000→5×240+40, max-frame 8192→35 chunks, empty payload, exact-multiple, too-many-chunks), reassembler (in-order, out-of-order, timeout sweep, packet_id disambiguation, idempotent duplicate). +3 runtime-теста = **20 новых tests**.
+- [x] `cargo test -p wiredesk-transport -- --test-threads=1` — 34 passed (20 new + 14 from prior tasks).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 5: Mac BLE Central impl (btleplug) + Info.plist permission
 
