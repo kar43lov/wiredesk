@@ -347,21 +347,9 @@ struct ChunkHeader {
 **Files:**
 - Modify: `crates/wiredesk-transport/src/bluetooth/mod.rs`
 
-- [ ] Архитектура модуля: `pub struct BluetoothLeTransport` с одинаковым именем на всех платформах. Платформо-специфичные impl'ы скрыты за `cfg`-fenced sub-modules:
-  ```rust
-  #[cfg(target_os = "macos")] mod mac;
-  #[cfg(target_os = "windows")] mod win;
-  #[cfg(not(any(target_os = "macos", target_os = "windows")))] mod stub;
-
-  #[cfg(target_os = "macos")] pub use mac::BluetoothLeTransport;
-  #[cfg(target_os = "windows")] pub use win::BluetoothLeTransport;
-  #[cfg(not(any(...)))] pub use stub::BluetoothLeTransport;
-  ```
-- [ ] Создать `bluetooth/stub.rs`: `pub struct BluetoothLeTransport;` + `impl BluetoothLeTransport { pub fn open(_: &BluetoothFactoryConfig) -> Result<Self> { Err(WireDeskError::Transport("BLE not supported on this platform".into())) } }` + stub `impl Transport`.
-- [ ] **Project — Win11+Mac only** (CLAUDE.md). Stub существует исключительно для случая "разработчик случайно `cargo check --workspace` на Linux box'е" — silent fail без compile-error. Не over-engineering; просто не блокирует.
-- [ ] Tests (только sanity на target):
-  - [ ] `cargo build --workspace` на dev-machine (Mac) — должен пройти.
-  - [ ] (Optional) `cargo build --workspace` на Win11 — пройти. Cross-compile из Mac не требуется.
+- [x] **Done as part of Task 1 plumbing.** Архитектура модуля: cfg-fenced sub-modules (`mac` / `win` / `stub`), все экспортируют тип `BluetoothLeTransport` с identical API. mod.rs делает `#[cfg(...)] pub use ...`.
+- [x] `bluetooth/stub.rs` создан в Task 1 — Err("BLE not supported on this platform") для open + stub `impl Transport`.
+- [x] Sanity verified: `cargo build --workspace` (Mac dev box) — clean. Win11 cross-build не делаем — реальный билд на Win-host'е валидируется в Task 15.
 
 ### Task 7: Win11 BLE Peripheral impl (windows-rs WinRT GATT)
 
@@ -369,24 +357,26 @@ struct ChunkHeader {
 - Create: `crates/wiredesk-transport/src/bluetooth/win.rs`
 - Modify: `crates/wiredesk-transport/src/bluetooth/mod.rs`
 
-- [ ] Под `#[cfg(target_os = "windows")]` создать `win.rs`:
-  - [ ] `open(cfg)` (Peripheral mode): tokio runtime, `block_on(async { ... })`:
-    - `GattServiceProviderResult::CreateAsync(SERVICE_UUID).await`.
-    - `service.CreateCharacteristicAsync(TX_CHAR_UUID, GattLocalCharacteristicParameters { CharacteristicProperties: Notify, ... }).await`.
-    - `service.CreateCharacteristicAsync(RX_CHAR_UUID, GattLocalCharacteristicParameters { CharacteristicProperties: **Write** (= WriteWithResponse), ... }).await`.
-    - `tx_char.SubscribedClientsChanged += handler` — для notify когда subscriber connects/disconnects.
-    - `rx_char.WriteRequested += handler` — для каждого incoming write. Handler **обязан** вызвать `request.RespondAsync()` для ATT-ack (требуется WriteWithResponse semantics; иначе client'ский write зависнет на 30s timeout).
-    - `service_provider.StartAdvertising({ IsConnectable: true, IsDiscoverable: true, ServiceUuids: [SERVICE_UUID] })`.
-  - [ ] `send`: serialize+COBS → chunks → for each chunk `tx_char.NotifyValueAsync(buffer).await`. NotifyValueAsync шлёт всем subscriber'ам fire-and-forget; protocol-level heartbeat ловит drop'ы.
-  - [ ] WriteRequested handler: extract bytes → feed в Reassembler → on full packet, COBS-decode → push в `incoming_tx`. После feeding chunk'а respond ack-ом (`Success`).
-  - [ ] `recv`: `incoming_rx.blocking_recv()`. Cloned-handle (`is_owner == false`) → `Err`.
-  - [ ] `is_connected()`: check subscribed-clients count > 0 (cache в `AtomicUsize`).
-  - [ ] `try_clone`: same `Arc<Inner>`, `is_owner = false` (write-only).
-- [ ] В `mod.rs`: `#[cfg(target_os = "windows")] pub use win::*;`.
-- [ ] Tests (cross-platform deterministic):
-  - [ ] `win_open_no_radio_errors` — если BT-радио недоступно (mock), open → Err. Live integration тестируется в Task N-1.
-- [ ] **Manual smoke** (записываем в Task N-1, не блокируем эту task): прогнать advertising на real Win11, scan-test через LightBlue с Mac.
-- [ ] Запустить `cargo test -p wiredesk-transport --target x86_64-pc-windows-msvc` (если cross compile нет — пропустить, тестим на host'е в Task N-1).
+- [x] `win.rs` под `#[cfg(target_os = "windows")]`:
+  - [x] `open(cfg)`: validates UUID, builds tokio runtime, block_on(build_service):
+    - GattServiceProvider::CreateAsync(svc_guid).await через windows-rs IAsyncOperation.
+    - tx_char: GattCharacteristicProperties::Notify + GattProtectionLevel::Plain.
+    - rx_char: GattCharacteristicProperties::Write (WithResponse semantics).
+    - tx_char.SubscribedClientsChanged TypedEventHandler — обновляет AtomicBool is_connected на основе SubscribedClients().Size() > 0.
+    - rx_char.WriteRequested TypedEventHandler — GetDeferral → GetRequestAsync → DataReader::FromBuffer + ReadBytes → request.Respond() (ack для WithResponse) → Reassembler.feed_chunk → on full packet, COBS-decode + Packet::from_bytes → mpsc.send → deferral.Complete().
+    - GattServiceProviderAdvertisingParameters: SetIsConnectable(true) + SetIsDiscoverable(true) → provider.StartAdvertisingWithParameters().
+  - [x] `send`: serialize+COBS → split_packet → block_on(loop: write_to_buffer + tx_char.NotifyValueAsync).await с timeout 5s. Fire-and-forget — drops handled application-уровнем heartbeat.
+  - [x] `recv`: write-only guard на `!is_owner` → Err. block_on(rx.recv()).
+  - [x] `is_connected()`: AtomicBool, set из SubscribedClientsChanged handler.
+  - [x] `try_clone()`: shared `Arc<Inner>`, is_owner=false.
+  - [x] `Drop`: best-effort `provider.StopAdvertising()` на owner-handle.
+- [x] mod.rs уже re-exports BluetoothLeTransport из win module (Task 1).
+- [x] Tests:
+  - [x] `open_with_invalid_service_uuid_returns_err_immediately` — bad UUID short-circuits.
+  - [x] `name_is_stable_compile_check` — type-system проверка `BluetoothLeTransport: Transport`.
+  - [x] **Live tests (advertising/connect/round-trip) перенесены в Task 15 manual checklist** — требуют real Win11.
+- [x] **Compile path**: на Mac dev box win.rs gated `cfg(target_os = "windows")` — invisible. Real Win-build верифицируется в Task 15.
+- [x] `cargo test/clippy --workspace` на Mac — clean (win.rs не компилируется).
 
 ### Task 8: Wire factory в host main.rs + verify try_clone call-sites
 
