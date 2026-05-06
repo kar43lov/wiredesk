@@ -23,6 +23,17 @@ const HEARTBEAT_TIMEOUT_IDLE: Duration = Duration::from_secs(6);
 /// real disconnect.
 const HEARTBEAT_TIMEOUT_BUSY: Duration = Duration::from_secs(30);
 
+/// Pure helper — pick busy or idle heartbeat budget. Extracted so the
+/// branching can be unit-tested without spawning a real `ShellProcess`
+/// (which forks PowerShell on Windows and isn't reachable from CI).
+fn heartbeat_timeout_for(clipboard_busy: bool, shell_open: bool) -> Duration {
+    if clipboard_busy || shell_open {
+        HEARTBEAT_TIMEOUT_BUSY
+    } else {
+        HEARTBEAT_TIMEOUT_IDLE
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum SessionState {
@@ -128,15 +139,32 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             Instant::now() - HEARTBEAT_TIMEOUT_BUSY - Duration::from_secs(1);
     }
 
-    /// Effective heartbeat timeout — extended while a clipboard transfer
-    /// is in flight to avoid false-positive disconnects when the wire is
-    /// saturated by chunk traffic.
+    /// Effective heartbeat timeout — extended while wire is saturated, so
+    /// false-positive disconnects don't kill the channel mid-transfer.
+    /// Two saturation sources today:
+    ///
+    /// 1. **Clipboard** — chunked image / large text transfer in flight.
+    /// 2. **Shell** — `wd --exec` (especially `--ssh ALIAS curl ...`)
+    ///    streaming command output back. With CH340 @ 115200 baud the wire
+    ///    runs at ~11 KB/s; a 24 KB ES `_search` response monopolises it
+    ///    for ~2 seconds plus any server-side delay, and the client's
+    ///    writer thread (which also services heartbeats) can fall further
+    ///    behind if it's writing back too. With the prior 6s idle timeout
+    ///    the channel reliably tore down on every non-trivial ES read.
+    ///    Live-test 2026-05-06: 43s between `opening shell` and
+    ///    `heartbeat timeout — disconnecting` for an ES `_search?size=1`
+    ///    query (~24 KB JSON response). With the busy budget (30s) plus
+    ///    the natural prefix of MOTD / ssh hop the channel survives.
+    ///
+    /// `self.shell.is_some()` is the simplest signal — true between
+    /// `ShellOpen` and `ShellClose`. Worst case if the shell is genuinely
+    /// idle (e.g., user opened a shell and walked away), we wait 30s
+    /// instead of 6s before tearing down. Acceptable.
     fn heartbeat_timeout(&self) -> Duration {
-        if self.clipboard.transfer_in_flight() {
-            HEARTBEAT_TIMEOUT_BUSY
-        } else {
-            HEARTBEAT_TIMEOUT_IDLE
-        }
+        heartbeat_timeout_for(
+            self.clipboard.transfer_in_flight(),
+            self.shell.is_some(),
+        )
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -560,6 +588,38 @@ mod tests {
         assert_eq!(session.clipboard_state().expected_len(), 1024,
             "precondition: in-flight reassembly must be active");
         (session, client)
+    }
+
+    #[test]
+    fn heartbeat_timeout_for_pure_logic() {
+        // Idle: no clipboard, no shell — strict 6s.
+        assert_eq!(
+            heartbeat_timeout_for(false, false),
+            HEARTBEAT_TIMEOUT_IDLE,
+            "with both flags false the budget must be IDLE so unplugged cables fire fast"
+        );
+
+        // Clipboard transfer alive — busy budget. (Pre-existing behaviour.)
+        assert_eq!(
+            heartbeat_timeout_for(true, false),
+            HEARTBEAT_TIMEOUT_BUSY,
+            "clipboard transfer must extend the budget"
+        );
+
+        // Shell open (no clipboard) — busy budget. (Regression for the
+        // 2026-05-06 ES `_search` channel-tear-down: 24 KB JSON response
+        // monopolised the wire long enough to miss the IDLE deadline.)
+        assert_eq!(
+            heartbeat_timeout_for(false, true),
+            HEARTBEAT_TIMEOUT_BUSY,
+            "open shell must extend the budget — wire saturation kills the IDLE deadline"
+        );
+
+        // Both — still busy.
+        assert_eq!(
+            heartbeat_timeout_for(true, true),
+            HEARTBEAT_TIMEOUT_BUSY,
+        );
     }
 
     #[test]
