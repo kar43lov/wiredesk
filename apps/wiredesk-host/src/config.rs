@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
+use wiredesk_core::BluetoothConfig;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -15,6 +16,26 @@ pub struct HostConfig {
     pub height: u16,
     pub host_name: String,
     pub run_on_startup: bool,
+
+    /// Which transport to open on startup. `"serial"` (default) keeps the
+    /// existing behaviour. `"bluetooth"` opens the BLE Peripheral GATT
+    /// server and ignores the serial fields.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+
+    /// If the primary transport fails to open, fall back to this one.
+    /// Currently only `"serial"` makes sense as a fallback. `None` (or
+    /// missing field) = no fallback, error out and exit.
+    #[serde(default)]
+    pub transport_fallback: Option<String>,
+
+    /// Bluetooth-specific settings. Used only when `transport == "bluetooth"`.
+    #[serde(default)]
+    pub bluetooth: BluetoothConfig,
+}
+
+fn default_transport() -> String {
+    "serial".to_string()
 }
 
 impl Default for HostConfig {
@@ -26,6 +47,9 @@ impl Default for HostConfig {
             height: 1440,
             host_name: "wiredesk-host".to_string(),
             run_on_startup: false,
+            transport: default_transport(),
+            transport_fallback: None,
+            bluetooth: BluetoothConfig::default(),
         }
     }
 }
@@ -103,6 +127,11 @@ pub fn merge_args(matches: &ArgMatches, mut cfg: HostConfig) -> HostConfig {
             cfg.height = *v;
         }
     }
+    if from_user(matches.value_source("transport")) {
+        if let Some(v) = matches.get_one::<String>("transport") {
+            cfg.transport = v.clone();
+        }
+    }
     cfg
 }
 
@@ -129,6 +158,9 @@ mod tests {
         assert_eq!(cfg.height, 1440);
         assert_eq!(cfg.host_name, "wiredesk-host");
         assert!(!cfg.run_on_startup);
+        assert_eq!(cfg.transport, "serial");
+        assert!(cfg.transport_fallback.is_none());
+        assert_eq!(cfg.bluetooth, BluetoothConfig::default());
     }
 
     #[test]
@@ -140,12 +172,63 @@ mod tests {
             height: 1080,
             host_name: "test-host".to_string(),
             run_on_startup: true,
+            transport: "serial".to_string(),
+            transport_fallback: None,
+            bluetooth: BluetoothConfig::default(),
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         cfg.save_to(&path).unwrap();
         let loaded = HostConfig::load_from(&path);
         assert_eq!(cfg, loaded);
+    }
+
+    #[test]
+    fn toml_transport_bluetooth_section_roundtrips() {
+        let cfg = HostConfig {
+            transport: "bluetooth".to_string(),
+            transport_fallback: Some("serial".to_string()),
+            bluetooth: BluetoothConfig {
+                service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                peer_name: "TestHost".to_string(),
+                mtu: 244,
+                connect_timeout_secs: 5,
+                reconnect_max_attempts: 3,
+            },
+            ..HostConfig::default()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        cfg.save_to(&path).unwrap();
+        let loaded = HostConfig::load_from(&path);
+        assert_eq!(loaded.transport, "bluetooth");
+        assert_eq!(loaded.transport_fallback.as_deref(), Some("serial"));
+        assert_eq!(loaded.bluetooth.peer_name, "TestHost");
+        assert_eq!(loaded.bluetooth.mtu, 244);
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn partial_toml_without_bluetooth_section_uses_defaults() {
+        // A TOML file written before the BLE plumbing existed must still
+        // load cleanly; the absent [bluetooth] section and `transport`
+        // field deserialize to their defaults via #[serde(default)].
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            "port = \"COM5\"\n\
+             baud = 115200\n\
+             width = 2560\n\
+             height = 1440\n\
+             host_name = \"legacy-host\"\n",
+        )
+        .unwrap();
+        let cfg = HostConfig::load_from(&path);
+        assert_eq!(cfg.port, "COM5");
+        assert_eq!(cfg.transport, "serial");
+        assert!(cfg.transport_fallback.is_none());
+        assert_eq!(cfg.bluetooth, BluetoothConfig::default());
     }
 
     #[test]
@@ -195,6 +278,9 @@ mod tests {
             height: 720,
             host_name: "from-toml".to_string(),
             run_on_startup: true,
+            transport: "serial".to_string(),
+            transport_fallback: None,
+            bluetooth: BluetoothConfig::default(),
         }
     }
 
@@ -240,5 +326,29 @@ mod tests {
         assert_eq!(merged.width, 1920);
         assert_eq!(merged.height, 1080);
         assert!(merged.run_on_startup); // still TOML — no CLI flag
+    }
+
+    #[test]
+    fn merge_cli_transport_overrides_toml() {
+        let matches = Args::command()
+            .try_get_matches_from(["wiredesk-host", "--transport", "bluetooth"])
+            .unwrap();
+        let merged = merge_args(&matches, toml_cfg());
+        assert_eq!(merged.transport, "bluetooth");
+        // Other fields unchanged.
+        assert_eq!(merged.port, "COM_TOML");
+        assert_eq!(merged.baud, 9_600);
+    }
+
+    #[test]
+    fn merge_no_transport_arg_keeps_toml() {
+        let matches = Args::command()
+            .try_get_matches_from(["wiredesk-host"])
+            .unwrap();
+        let mut cfg = toml_cfg();
+        cfg.transport = "bluetooth".to_string();
+        let merged = merge_args(&matches, cfg);
+        // No --transport CLI arg → TOML's "bluetooth" survives.
+        assert_eq!(merged.transport, "bluetooth");
     }
 }

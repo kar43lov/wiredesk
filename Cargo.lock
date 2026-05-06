@@ -5445,6 +5445,8 @@ dependencies = [
  "bitflags 2.11.1",
  "serde",
  "thiserror 2.0.18",
+ "toml 0.8.23",
+ "uuid",
 ]
 
 [[package]]

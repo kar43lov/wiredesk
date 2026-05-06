@@ -270,16 +270,17 @@ struct ChunkHeader {
 - Modify: `apps/wiredesk-host/src/config.rs`
 - Modify: `apps/wiredesk-client/src/config.rs`
 
-- [ ] Создать **shared** `BluetoothConfig` в `wiredesk-core` (single source of truth, чтобы `service_uuid` и `peer_name` гарантированно не разъехались между host и client): fields `service_uuid: String`, `peer_name: String`, `mtu: u16`, `connect_timeout_secs: u32`, `reconnect_max_attempts: u32` (0 = unlimited). `Default` импл с зашитыми значениями (default UUID = `SERVICE_UUID` из uuids.rs as String).
-- [ ] Экспортировать через `wiredesk-core/src/lib.rs`: `pub use bluetooth_config::BluetoothConfig;`.
-- [ ] Добавить в `HostConfig` и `ClientConfig`: `transport: String` (default `"serial"`), `transport_fallback: Option<String>` (default `None`), `bluetooth: BluetoothConfig` (default из core).
-- [ ] Update `merge_args` в обоих файлах — обработать `--transport` CLI flag.
-- [ ] Добавить `--transport` в clap `Args` struct в обоих apps' main.rs.
-- [ ] Update existing test `defaults_match_hardcodes` — assert на новые поля.
-- [ ] Добавить новый test `toml_transport_bluetooth` — TOML с `transport = "bluetooth"` парсится корректно, `bluetooth.service_uuid` загружается.
-- [ ] Добавить test `merge_cli_transport_overrides_toml` — `--transport bluetooth` overrides TOML `serial`.
-- [ ] Добавить test `partial_toml_uses_defaults_for_bluetooth_section` — TOML без `[bluetooth]` секции получает defaults.
-- [ ] Запустить `cargo test -p wiredesk-host -p wiredesk-client -- --test-threads=1` — все pass.
+- [x] Создать `BluetoothConfig` в `crates/wiredesk-core/src/bluetooth_config.rs` со всеми полями + DEFAULT_* константами + Default impl + 4 unit-теста (defaults_match_constants, default_service_uuid_parses_as_uuid, toml_roundtrip, empty_toml_yields_defaults).
+- [x] `wiredesk-core/Cargo.toml` — добавлены `[dev-dependencies] uuid + toml` для тестов.
+- [x] Экспорт через `wiredesk-core/src/lib.rs`: `pub use bluetooth_config::BluetoothConfig;`.
+- [x] HostConfig + ClientConfig: новые поля `transport`, `transport_fallback`, `bluetooth: BluetoothConfig` с `#[serde(default)]`. Default impls обновлены.
+- [x] `merge_args` в обоих apps обрабатывает `--transport` CLI flag.
+- [x] `--transport` flag добавлен в clap `Args` обоих main.rs (default `"serial"`).
+- [x] Existing tests `defaults_match_hardcodes` обновлены под новые поля.
+- [x] Новые тесты: `toml_transport_bluetooth_section_roundtrips`, `partial_toml_without_bluetooth_section_uses_defaults`, `merge_cli_transport_overrides_toml`, `merge_no_transport_arg_keeps_toml` — в обоих apps.
+- [x] `read_form` в host'овском Settings UI расширен `base: &HostConfig` параметром чтобы preserve unedited fields (transport/bluetooth/host_name) при Save через UI.
+- [x] `cargo test --workspace -- --test-threads=1` — passes (170 host + 102 client + 4 wiredesk-core BLE tests).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 3: Transport factory
 

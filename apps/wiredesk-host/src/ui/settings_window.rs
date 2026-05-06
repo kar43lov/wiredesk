@@ -374,20 +374,28 @@ impl SettingsWindow {
     /// Read values out of the form into a typed `HostConfig`. Returns
     /// `Err(message)` on the first validation failure so the caller can
     /// surface it via `set_message`. The input strings are trimmed.
-    pub fn read_form(&self) -> Result<HostConfig, String> {
+    /// Build a `HostConfig` from the form fields, taking unexposed fields
+    /// (transport selection, bluetooth section, etc.) from `base`. The
+    /// caller passes the live config so toggling Save in this view doesn't
+    /// reset settings the user configured elsewhere (e.g. `transport =
+    /// "bluetooth"` set via config.toml or a future Transport tab).
+    pub fn read_form(&self, base: &HostConfig) -> Result<HostConfig, String> {
         let port = format::validate_port(&self.port_input.text())?.to_string();
         let baud = format::validate_baud(&self.baud_input.text())?;
         let width = format::validate_dimension(&self.width_input.text())?;
         let height = format::validate_dimension(&self.height_input.text())?;
-        let host_name = "wiredesk-host".to_string(); // not exposed in this view yet
         let run_on_startup = self.autostart_check.check_state() == nwg::CheckBoxState::Checked;
         Ok(HostConfig {
             port,
             baud,
             width,
             height,
-            host_name,
             run_on_startup,
+            // Preserve fields not edited in this form.
+            host_name: base.host_name.clone(),
+            transport: base.transport.clone(),
+            transport_fallback: base.transport_fallback.clone(),
+            bluetooth: base.bluetooth.clone(),
         })
     }
 

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
+use wiredesk_core::BluetoothConfig;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -72,10 +73,30 @@ pub struct ClientConfig {
     /// re-swaps modifiers locally so Host gets the user-intended scancodes.
     #[serde(default)]
     pub swap_option_command: bool,
+
+    /// Which transport to open on startup. `"serial"` (default) uses the
+    /// existing USB-Serial path. `"bluetooth"` opens the BLE Central and
+    /// scans for a peer matching `bluetooth.peer_name` / `bluetooth.service_uuid`.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+
+    /// If the primary transport fails to open, fall back to this one.
+    /// Currently only `"serial"` makes sense as a fallback. `None` (or
+    /// missing field) = no fallback, error out and exit.
+    #[serde(default)]
+    pub transport_fallback: Option<String>,
+
+    /// Bluetooth-specific settings. Used only when `transport == "bluetooth"`.
+    #[serde(default)]
+    pub bluetooth: BluetoothConfig,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_transport() -> String {
+    "serial".to_string()
 }
 
 /// Custom deserializer for `preferred_monitor` that accepts either a string
@@ -123,6 +144,9 @@ impl Default for ClientConfig {
             send_text: true,
             receive_text: true,
             swap_option_command: false,
+            transport: default_transport(),
+            transport_fallback: None,
+            bluetooth: BluetoothConfig::default(),
         }
     }
 }
@@ -190,6 +214,11 @@ pub fn merge_args(matches: &ArgMatches, mut cfg: ClientConfig) -> ClientConfig {
             cfg.client_name = v.clone();
         }
     }
+    if from_user(matches.value_source("transport")) {
+        if let Some(v) = matches.get_one::<String>("transport") {
+            cfg.transport = v.clone();
+        }
+    }
     cfg
 }
 
@@ -218,6 +247,9 @@ mod tests {
         assert!(cfg.preferred_monitor.is_none());
         assert!(cfg.send_images);
         assert!(cfg.receive_images);
+        assert_eq!(cfg.transport, "serial");
+        assert!(cfg.transport_fallback.is_none());
+        assert_eq!(cfg.bluetooth, BluetoothConfig::default());
     }
 
     #[test]
@@ -234,12 +266,60 @@ mod tests {
             send_text: true,
             receive_text: true,
             swap_option_command: false,
+            transport: "serial".to_string(),
+            transport_fallback: None,
+            bluetooth: BluetoothConfig::default(),
         };
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         cfg.save_to(&path).unwrap();
         let loaded = ClientConfig::load_from(&path);
         assert_eq!(cfg, loaded);
+    }
+
+    #[test]
+    fn toml_transport_bluetooth_section_roundtrips() {
+        let cfg = ClientConfig {
+            transport: "bluetooth".to_string(),
+            transport_fallback: Some("serial".to_string()),
+            bluetooth: BluetoothConfig {
+                service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                peer_name: "TestHost".to_string(),
+                mtu: 244,
+                connect_timeout_secs: 5,
+                reconnect_max_attempts: 3,
+            },
+            ..ClientConfig::default()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        cfg.save_to(&path).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(loaded.transport, "bluetooth");
+        assert_eq!(loaded.transport_fallback.as_deref(), Some("serial"));
+        assert_eq!(loaded.bluetooth.peer_name, "TestHost");
+        assert_eq!(loaded.bluetooth.mtu, 244);
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn partial_toml_without_bluetooth_section_uses_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            "port = \"/dev/cu.legacy\"\n\
+             baud = 115200\n\
+             width = 2560\n\
+             height = 1440\n\
+             client_name = \"legacy-client\"\n",
+        )
+        .unwrap();
+        let cfg = ClientConfig::load_from(&path);
+        assert_eq!(cfg.port, "/dev/cu.legacy");
+        assert_eq!(cfg.transport, "serial");
+        assert!(cfg.transport_fallback.is_none());
+        assert_eq!(cfg.bluetooth, BluetoothConfig::default());
     }
 
     #[test]
@@ -359,6 +439,9 @@ mod tests {
             send_text: true,
             receive_text: true,
             swap_option_command: false,
+            transport: "serial".to_string(),
+            transport_fallback: None,
+            bluetooth: BluetoothConfig::default(),
         }
     }
 
@@ -398,5 +481,26 @@ mod tests {
         assert_eq!(merged.port, "/dev/cu.cli");
         assert_eq!(merged.baud, 57_600);
         assert_eq!(merged.client_name, "cli-name");
+    }
+
+    #[test]
+    fn merge_cli_transport_overrides_toml() {
+        let matches = Args::command()
+            .try_get_matches_from(["wiredesk-client", "--transport", "bluetooth"])
+            .unwrap();
+        let merged = merge_args(&matches, toml_cfg());
+        assert_eq!(merged.transport, "bluetooth");
+        assert_eq!(merged.port, "/dev/cu.from-toml"); // unchanged
+    }
+
+    #[test]
+    fn merge_no_transport_arg_keeps_toml() {
+        let matches = Args::command()
+            .try_get_matches_from(["wiredesk-client"])
+            .unwrap();
+        let mut cfg = toml_cfg();
+        cfg.transport = "bluetooth".to_string();
+        let merged = merge_args(&matches, cfg);
+        assert_eq!(merged.transport, "bluetooth");
     }
 }

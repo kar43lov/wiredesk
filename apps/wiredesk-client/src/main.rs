@@ -40,6 +40,12 @@ pub struct Args {
     /// Client display name. Overrides config.toml.
     #[arg(long, default_value = "wiredesk-client")]
     name: String,
+
+    /// Transport to use: `serial` (USB-Serial null-modem, default) or
+    /// `bluetooth` (BLE Central scanning for the WireDesk host). Overrides
+    /// config.toml.
+    #[arg(long, default_value = "serial")]
+    transport: String,
 }
 
 fn main() {
