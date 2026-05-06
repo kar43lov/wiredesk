@@ -251,42 +251,16 @@ struct ChunkHeader {
 - Create: `crates/wiredesk-transport/src/bluetooth/uuids.rs`
 - Modify: `crates/wiredesk-transport/src/lib.rs`
 
-- [ ] Добавить в `[workspace.dependencies]` корня:
-  ```toml
-  btleplug = "0.11"
-  tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
-  async-trait = "0.1"
-  futures = "0.3"
-  windows = { version = "0.x", features = [
-      "Devices_Bluetooth",
-      "Devices_Bluetooth_GenericAttributeProfile",
-      "Devices_Bluetooth_Advertisement",
-      "Storage_Streams",
-      "Foundation",
-      "Foundation_Collections",
-  ] }
-  ```
-  Версия `windows` — берём текущую в проекте (host уже использует), feature-set — **union** того что host'у нужно сейчас + наши BLE feature-flags. Cargo features unification гарантирует что host получит все фичи без двойного declare'а.
-- [ ] В `wiredesk-transport/Cargo.toml` подтянуть deps из workspace inheritance:
-  ```toml
-  [target.'cfg(target_os = "macos")'.dependencies]
-  btleplug = { workspace = true }
-
-  [target.'cfg(target_os = "windows")'.dependencies]
-  windows = { workspace = true }
-
-  [dependencies]
-  tokio = { workspace = true }
-  async-trait = { workspace = true }
-  futures = { workspace = true }
-  uuid = { workspace = true }
-  ```
-- [ ] Host'овский `apps/wiredesk-host/Cargo.toml` остаётся `windows = { workspace = true }` — Cargo unifies features.
-- [ ] Создать `bluetooth/mod.rs` — `pub mod uuids; pub struct BluetoothLeTransport { ... }` (skeleton, тело в Task 4-7)
-- [ ] Создать `bluetooth/uuids.rs` — `SERVICE_UUID`, `TX_CHAR_UUID`, `RX_CHAR_UUID` через `uuid!()` macro. Сгенерировать **3 random UUIDs** через `uuidgen` (один раз) и зашить.
-- [ ] В `lib.rs` экспортировать `pub use bluetooth::BluetoothLeTransport;`
-- [ ] Запустить `cargo check --workspace` — должен пройти без новых warnings (skeleton без impl Transport ещё не нужен).
-- [ ] Запустить `cargo test --workspace -- --test-threads=1` — все existing тесты должны pass'ить (sanity check на новые deps не сломали build).
+- [x] Добавить в `[workspace.dependencies]` корня: `btleplug 0.11`, `tokio` (rt-multi-thread+sync+time+macros), `async-trait 0.1`, `futures 0.3`, `windows 0.58` с union feature set (Win32_* host + Devices_Bluetooth_* + Storage_Streams + Foundation для transport). Host инлайн-declaration убран в пользу `windows.workspace = true`.
+- [x] В `wiredesk-transport/Cargo.toml` подтянуть deps из workspace: `tokio/async-trait/futures/uuid` в общий `[dependencies]`, `btleplug` в `[target.'cfg(target_os = "macos")'...]`, `windows` в `[target.'cfg(target_os = "windows")'...]`.
+- [x] Host'овский `apps/wiredesk-host/Cargo.toml` использует `windows = { workspace = true }` — Cargo unifies features.
+- [x] Создать `bluetooth/mod.rs` — `pub mod uuids; pub struct BluetoothFactoryConfig { ... }` + cfg-fenced submodule re-exports (mac/win/stub).
+- [x] Создать `bluetooth/uuids.rs` — `SERVICE_UUID = cc7d466c-…`, `TX_CHAR_UUID = 9062d406-…`, `RX_CHAR_UUID = 24bce5b3-…` (random v4 UUIDs от `uuidgen`). + tests `uuids_are_distinct` / `uuids_are_v4`.
+- [x] Создать `bluetooth/{mac,win,stub}.rs` — placeholder structs `BluetoothLeTransport` под cfg-target'ами, `open()` возвращает Err с pending-message, `impl Transport` returns `unimplemented!()`/Err. + tests `name_is_stable` + `open_currently_errors_with_pending_message`.
+- [x] В `lib.rs` экспортировать `pub use bluetooth::BluetoothLeTransport;` + `pub use bluetooth::uuids;`.
+- [x] `cargo check --workspace` — passed clean.
+- [x] `cargo test --workspace -- --test-threads=1` — passed (включая 8 новых: 2 uuids + 2 mac stub + другие existing).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 2: Config schema — transport selection + bluetooth section
 
