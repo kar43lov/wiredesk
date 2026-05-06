@@ -205,7 +205,9 @@ async fn scan_and_connect(
         if tokio::time::Instant::now() >= deadline {
             let _ = adapter.stop_scan().await;
             return Err(WireDeskError::Transport(format!(
-                "BLE: no peer named '{peer_name}' advertising service {service_uuid} within {timeout:?}",
+                "BLE: no peer advertising service {service_uuid} within {timeout:?} \
+                 (configured peer_name '{peer_name}' — advisory). \
+                 Verify Win host is running with transport=\"bluetooth\" and BT radio is on."
             )));
         }
 
@@ -275,15 +277,31 @@ async fn find_matching_peripheral(
     service_uuid: Uuid,
     peer_name: &str,
 ) -> Option<Peripheral> {
+    // Match by **service UUID only**. The 128-bit custom UUID is unique
+    // per project so it disambiguates WireDesk hosts from anything else
+    // on the air. `peer_name` is advisory: we log when the advertised
+    // local_name differs from the configured peer_name (helpful for
+    // multi-host setups), but we don't gate on it — the Win side
+    // typically advertises as the computer hostname (e.g.
+    // `DESKTOP-GSE79B8`), not as the configured peer_name, because
+    // WinRT's advertisement payload is bounded and the local_name
+    // there is the OS computer name.
     let peripherals = adapter.peripherals().await.ok()?;
     for p in peripherals {
         let props = match p.properties().await.ok().flatten() {
             Some(props) => props,
             None => continue,
         };
-        let name_matches = props.local_name.as_deref() == Some(peer_name);
-        let service_advertised = props.services.contains(&service_uuid);
-        if name_matches && service_advertised {
+        if props.services.contains(&service_uuid) {
+            let advertised = props.local_name.as_deref().unwrap_or("(unnamed)");
+            if !peer_name.is_empty() && advertised != peer_name {
+                log::info!(
+                    "BLE: connecting to peer '{advertised}' (configured peer_name '{peer_name}' — \
+                     advisory only, service-UUID matched)"
+                );
+            } else {
+                log::info!("BLE: connecting to peer '{advertised}' (service-UUID matched)");
+            }
             return Some(p);
         }
     }
@@ -418,8 +436,11 @@ mod tests {
     use super::*;
 
     fn cfg_with_short_timeout() -> BluetoothFactoryConfig {
+        // Definitely-not-our-real-service UUID, to keep this test
+        // deterministic even when a real WireDesk host is in radio range.
+        // (Random v4 UUID, unrelated to `uuids::SERVICE_UUID`.)
         BluetoothFactoryConfig {
-            service_uuid: uuids::SERVICE_UUID.to_string(),
+            service_uuid: "00000000-0000-4000-8000-000000000001".to_string(),
             peer_name: "WireDeskNonexistent".to_string(),
             mtu: 247,
             connect_timeout_secs: 1,

@@ -68,8 +68,10 @@ mod tests {
     use super::*;
 
     fn bt_cfg() -> BluetoothFactoryConfig {
+        // Definitely-not-our-real-service UUID — keeps tests deterministic
+        // when a real WireDesk host is advertising in radio range.
         BluetoothFactoryConfig {
-            service_uuid: "cc7d466c-21f3-41ba-a711-991adf9f218e".to_string(),
+            service_uuid: "00000000-0000-4000-8000-000000000001".to_string(),
             peer_name: "TestHost".to_string(),
             mtu: 247,
             connect_timeout_secs: 1,
