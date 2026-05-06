@@ -324,6 +324,57 @@ fn handle_connection(
     if let Err(e) = outgoing_tx.send(Packet::new(Message::ShellClose, 0)) {
         log::warn!("IPC: failed to send ShellClose: {e}");
     }
+
+    // Post-run drain: hold `single_inflight` until the wire goes idle (or
+    // host confirms ShellExit, whichever comes first). Without this the
+    // next IPC handler's ShellOpen lands on a wire still saturated with
+    // the prior cmd's in-flight ShellOutput chunks — host receives our
+    // ShellOpen but its session loop is blocked shipping the leftover
+    // output, the new ShellInput never reaches a fresh shell, and the
+    // run hangs to timeout. Live-test 2026-05-06: a single ES
+    // `_search?size=1` query produced 407 KB of output that kept
+    // streaming for ~30 s after wd-term had already returned 124 — every
+    // subsequent `wd --exec` failed timeout until we manually waited
+    // through that window.
+    //
+    // Strategy: poll for events with a 2 s idle deadline. Each event
+    // received resets the deadline; ShellExit short-circuits. If no event
+    // for 2 s straight, we treat the wire as quiet and return. Hard cap
+    // at SHELL_KILL_GRACE_MAX so a host that never emits ShellExit can't
+    // hold the next client hostage indefinitely.
+    const POST_RUN_IDLE: Duration = Duration::from_secs(2);
+    const SHELL_KILL_GRACE_MAX: Duration = Duration::from_secs(30);
+    let drain_started = std::time::Instant::now();
+    let mut drained_events: u32 = 0;
+    let mut got_exit = false;
+    loop {
+        if drain_started.elapsed() >= SHELL_KILL_GRACE_MAX {
+            log::warn!(
+                "IPC: post-cleanup drain hit max grace ({:?}); releasing single_inflight anyway",
+                SHELL_KILL_GRACE_MAX
+            );
+            break;
+        }
+        match transport.rx.recv_timeout(POST_RUN_IDLE) {
+            Ok(wiredesk_exec_core::ExecEvent::ShellExit(_)) => {
+                got_exit = true;
+                break;
+            }
+            Ok(_) => {
+                drained_events = drained_events.saturating_add(1);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if drained_events > 0 || got_exit {
+        log::info!(
+            "IPC: post-cleanup drain: events_drained={} shell_exit={} elapsed={:?}",
+            drained_events,
+            got_exit,
+            drain_started.elapsed()
+        );
+    }
 }
 
 #[cfg(test)]
