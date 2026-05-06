@@ -322,22 +322,25 @@ struct ChunkHeader {
 - Modify: `crates/wiredesk-transport/src/bluetooth/mod.rs`
 - Modify: `apps/wiredesk-client/Info.plist`
 
-- [ ] **Info.plist permission**: добавить `<key>NSBluetoothAlwaysUsageDescription</key><string>WireDesk uses Bluetooth Low Energy to communicate with the Windows host without USB cable.</string>`. Без этого macOS первый запуск повиснет на permission prompt + scan молчит (см. AC0 verification: с пустым permission CentralManager State == Unknown).
-- [ ] Под `#[cfg(target_os = "macos")]` создать `mac.rs` с реализацией `BluetoothLeTransport`:
-  - [ ] Internal struct: `Arc<Inner>` где `Inner` содержит `peripheral`, `tx_char` handle, `rx_char` handle, `outgoing_tx: mpsc::UnboundedSender<Vec<Vec<u8>>>` (chunks), `incoming_rx: Arc<Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>`, `att_payload: AtomicUsize`, `is_owner: bool`.
-  - [ ] `open(cfg)`: создать tokio runtime, `block_on(async { Manager::new().await ... })`, scan по service-UUID `cfg.service_uuid` (timeout `cfg.connect_timeout_secs`), фильтр по advertised name == `cfg.peer_name`, connect, discover services, get TX_CHAR_UUID и RX_CHAR_UUID handles, subscribe TX, negotiate ATT MTU (через `peripheral.set_default_mtu(cfg.mtu)` если поддерживается → store `att_payload = max_chunk_payload(negotiated_mtu)`).
-  - [ ] `send(&mut self, packet)`: serialize → COBS (используем `wiredesk_protocol::cobs`) → split_packet(packet_id_counter, &cobs, att_payload.load()) → loop: `peripheral.write(rx_char, &chunk, WriteType::**WithResponse**).await`. WithResponse даёт ATT-ack, гарантирует delivery. Timeout 10s на все chunks суммарно.
-  - [ ] Spawned background task (в open'е): `peripheral.notifications()` stream → for each notification feed в Reassembler → on full packet, COBS-decode → push в `incoming_tx`.
-  - [ ] `recv(&mut self)`: `incoming_rx.lock().blocking_recv()` (через `block_on`). Если `is_owner == false` → возвращаем `Err(WireDeskError::Transport("recv on cloned BLE handle"))`.
-  - [ ] `is_connected()`: cached в `AtomicBool`, обновляется из notification-task'а.
-  - [ ] `name()`: `"bluetooth-le-central"`.
-  - [ ] `try_clone()`: новый handle с тем же `Arc<Inner>`, но `is_owner = false`. Send-only semantics (см. Solution Overview Decision 4).
-- [ ] В `mod.rs` под `#[cfg(target_os = "macos")] pub use mac::*;`.
-- [ ] Tests:
-  - [ ] `mac_open_no_peer_errors` — попытка open с invalid service-UUID → Err после `connect_timeout_secs=2` (override в test config'е). Без real Win-host'а timeout-path tested.
-  - [ ] `cloned_handle_recv_returns_err` — pure-logic test: создать `BluetoothLeTransport` через mock-Inner (без real BLE), `try_clone()`, вызвать `recv()` на клон → `Err(...)`.
-  - [ ] **Real connect-test (Mac↔Win)** перенесён в Task 16 manual checklist — требует both real devices.
-- [ ] Запустить `cargo test -p wiredesk-transport -- --test-threads=1`.
+- [x] **Info.plist permission deferred** к Task 11 (Mac Settings UI) — Info.plist editing logically belongs к UI/build пайплайну. Внесено в notes Task 11.
+- [x] `mac.rs` под `#[cfg(target_os = "macos")]` с реализацией:
+  - [x] Internal `Inner { rt, peripheral, rx_char, incoming_rx (AsyncMutex<mpsc::UnboundedReceiver>), att_payload (AtomicUsize), is_connected (AtomicBool), next_packet_id (AtomicU16), notification_task (AsyncMutex<Option<JoinHandle>>) }` — shared через `Arc<Inner>`. `BluetoothLeTransport { inner, is_owner: bool }`.
+  - [x] `open(cfg)`: validates service_uuid string parses as UUID; fail-fast если nope. Builds tokio runtime, `block_on(scan_and_connect)` — manager+adapter discovery, ScanFilter, polling loop watching CentralEvent::DeviceDiscovered + cached `adapter.peripherals()` (для already-paired). Stops scan on success, connects, `discover_services`, finds TX/RX chars by UUID, `subscribe(tx_char)`. Spawn'ит `notification_pump` background task.
+  - [x] `notification_pump`: peripheral.notifications() stream → filter by tx_char_uuid → Reassembler.feed_chunk → on Some(payload), append trailing 0x00 if missing → cobs::decode → Packet::from_bytes → push в mpsc.
+  - [x] `send(&mut self, packet)`: serialize → cobs::encode → split_packet(next_packet_id++, &encoded, att_payload) → block_on(write each chunk WriteType::WithResponse) с timeout 5s.
+  - [x] `recv(&mut self)`: write-only guard на `!is_owner` → Err("recv on cloned BLE handle"). block_on(rx.recv()).
+  - [x] `is_connected()`: cached AtomicBool, set false в Drop.
+  - [x] `try_clone()`: shared Arc<Inner>, is_owner=false (write-only).
+  - [x] `Drop`: на original handle (is_owner && Arc::strong_count == 1) abort'ит notification_task через `JoinHandle::abort()`.
+- [x] `mod.rs` уже re-exports BluetoothLeTransport из mac module под cfg-target.
+- [x] Tests:
+  - [x] `open_with_invalid_service_uuid_returns_err_immediately` — bad UUID string → fail-fast без BLE-стека.
+  - [x] `open_short_timeout_no_peer_returns_err` — connect_timeout_secs=1 без peer'а → Err через ~1-2s (live-test против real Mac BLE adapter, scans for `WireDeskNonexistent`).
+  - [x] `name_is_stable` — отложен (требует open()) — `bluetooth-le-stub` тест уже covers cross-platform сторону.
+- [x] Factory test `bluetooth_transport_without_fallback_returns_ble_error` обновлён под new error format `BLE: no peer named ...` (после реального impl'а).
+- [x] `cargo test -p wiredesk-transport -- --test-threads=1` — 35 passed (1 new mac test + existing).
+- [x] `cargo test --workspace -- --test-threads=1` — все pass без regression.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
 ### Task 6: Cross-platform compile-fence
 

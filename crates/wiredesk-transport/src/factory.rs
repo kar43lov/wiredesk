@@ -146,9 +146,13 @@ mod tests {
 
     #[test]
     fn bluetooth_transport_without_fallback_returns_ble_error() {
-        // BLE impl is still pending (Tasks 5/7) — open() returns Err with
-        // a "Task 5"/"Task 7" pointer. Without fallback the factory
-        // surfaces that error directly.
+        // No advertising peer in the test environment, so BLE open() will
+        // fail. Without fallback the factory surfaces the BLE error
+        // directly. Acceptable error origins:
+        //   - "BLE: ..." (Mac/Win real impls — scan timeout, missing
+        //     adapter, etc.)
+        //   - "Task 7" (Windows placeholder before that task lands)
+        //   - "not supported" (Linux dev box via stub.rs)
         let cfg = TransportConfig {
             transport: "bluetooth".to_string(),
             serial: serial_cfg_invalid(),
@@ -157,13 +161,16 @@ mod tests {
         };
         let err = expect_err(open_transport(&cfg));
         let msg = err.to_string();
-        // Either "Task 5" (mac) or "Task 7" (windows) or "not supported"
-        // (other platforms via stub.rs). All three are valid error origins
-        // proving the factory routed through BluetoothLeTransport::open.
-        let is_ble_origin = msg.contains("Task 5")
+        let is_ble_origin = msg.contains("BLE")
             || msg.contains("Task 7")
             || msg.contains("not supported");
         assert!(is_ble_origin, "expected BLE-origin error, got: {msg}");
+        // Confirm we did NOT accidentally route through the serial path
+        // (would surface "serial open: ...").
+        assert!(
+            !msg.contains("serial open"),
+            "BLE failure must not fall through to serial without fallback, got: {msg}"
+        );
     }
 
     #[test]
