@@ -118,7 +118,8 @@ apps/
 
 - **Threading клиента:** writer / reader / clipboard poll / keyboard tap (CFRunLoop) — serial-порт расщеплён через `Transport::try_clone()`. Латенси UI→провод ~µs.
 - **Протокол:** binary, COBS-framed, CRC-16 packet-level. Header `[magic][type][flags][seq:u16][len:u16]`. **MAX_PAYLOAD = 4096** + matched `MAX_FRAME_SIZE = 8192` в SerialTransport.
-- **Heartbeat:** 2 сек, idle timeout 6с / busy 30с (`Session::heartbeat_timeout()` adaptive когда `clipboard.transfer_in_flight()`).
+- **Heartbeat:** 2 сек, idle timeout 6с / busy 30с. Adaptive когда `clipboard.transfer_in_flight()` **или** `self.shell.is_some()` (PR #20). Без расширения на shell-busy heavy-output cmd'ы (`Get-EventLog`, ES `_search`) saturate'или wire → Mac heartbeat-sender falls behind → host disconnect через 6s.
+- **IPC post-run drain** (`apps/wiredesk-client/src/ipc.rs`, PR #21): после ShellClose handler ждёт пока wire не стихнет (2s idle deadline, ShellExit short-circuit, 30s hard cap) **прежде чем** освободить `single_inflight`. Без этого host продолжал шипить tail предыдущей cmd-output (~30s) и next request попадал на dirty wire → cascade timeouts. Trade-off: +2s overhead на каждый `wd --exec` (даже Ok).
 - **Shell-over-serial:** per-session opcode-discriminator (`ShellOpen=0x40` pipe vs `ShellOpenPty=0x45` PTY + `PtyResize=0x46`). Pipe-mode для `wd --exec` и GUI shell-panel; PTY-mode для interactive `wd` (Win11 only через `portable-pty`).
 - **Loop avoidance в clipboard:** `LastSeen` с раздельными slots per-format + LRU text history (4 entries) против Whispr-style inject pattern. Hash от RGBA bytes (PNG round-trip нестабилен на macOS).
 
