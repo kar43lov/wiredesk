@@ -47,7 +47,12 @@ use super::uuids;
 use super::BluetoothFactoryConfig;
 use crate::transport::Transport;
 
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bumped 5 s → 30 s after live test caught a single congested
+/// notification draining slowly under bidirectional load and tripping
+/// the timeout, killing the transport. 30 s is long enough that
+/// transient congestion is tolerated, short enough that a truly
+/// stuck link still surfaces eventually.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct BluetoothLeTransport {

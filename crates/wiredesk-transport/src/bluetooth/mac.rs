@@ -42,10 +42,16 @@ use super::uuids;
 use super::BluetoothFactoryConfig;
 use crate::transport::Transport;
 
-/// How long to wait for a chunk write before giving up. ATT WithResponse
-/// shouldn't take more than a few hundred ms in practice; 5 s is a
-/// generous upper bound that still surfaces a stalled link.
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for an entire chunk-batch send before giving up.
+/// One BLE connection event is ~30 ms, ATT-ack RTT typically <100 ms,
+/// but under heavy bidirectional load a single WithResponse ack can
+/// be queued behind a backlog of incoming Notifies on the peer and
+/// take several seconds to round-trip. 30 s is a permissive upper
+/// bound — long enough that transient congestion doesn't trip a hard
+/// disconnect, short enough that a truly dead link surfaces eventually.
+/// Bumped from 5 s after live test caught a single congestion spike
+/// killing the whole transport.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to poll between scan-result checks while looking for the peer.
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(250);
