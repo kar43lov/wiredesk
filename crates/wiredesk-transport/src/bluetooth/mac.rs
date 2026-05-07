@@ -379,9 +379,16 @@ impl Transport for BluetoothLeTransport {
         inner.rt.block_on(async {
             let send_fut = async {
                 for chunk in &chunks {
+                    // WriteWithoutResponse: no ATT-ack roundtrip per
+                    // chunk → ~10× throughput vs WithResponse. Drops
+                    // are caught at the protocol layer via heartbeat
+                    // timeout (PR #20). Live test on real hardware
+                    // showed WithResponse capping us at ~1 KB/s
+                    // (11× *slower* than serial); this brings throughput
+                    // back into BLE's expected range.
                     inner
                         .peripheral
-                        .write(&inner.rx_char, chunk, WriteType::WithResponse)
+                        .write(&inner.rx_char, chunk, WriteType::WithoutResponse)
                         .await
                         .map_err(|e| WireDeskError::Transport(format!("BLE write: {e}")))?;
                 }

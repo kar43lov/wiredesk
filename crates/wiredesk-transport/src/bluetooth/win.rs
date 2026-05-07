@@ -178,11 +178,20 @@ fn build_service(
         .Characteristic()
         .map_err(|e| WireDeskError::Transport(format!("BLE TX Characteristic(): {e}")))?;
 
-    // RX: Write (with response — caller must call request.RespondAsync()).
+    // RX: Write | WriteWithoutResponse. Setting both flags lets the
+    // client (Mac btleplug) pick which ATT op-code to use. We default
+    // Mac→Win sends to WriteWithoutResponse for ~10× throughput; the
+    // handler below still respects WithResponse semantics if a future
+    // client / firmware variant uses it. Drops are caught by the
+    // application-layer heartbeat (PR #20), so per-chunk reliability
+    // is unnecessary at the BLE level.
     let rx_params = GattLocalCharacteristicParameters::new()
         .map_err(|e| WireDeskError::Transport(format!("BLE RX params new: {e}")))?;
     rx_params
-        .SetCharacteristicProperties(GattCharacteristicProperties::Write)
+        .SetCharacteristicProperties(
+            GattCharacteristicProperties::Write
+                | GattCharacteristicProperties::WriteWithoutResponse,
+        )
         .map_err(|e| WireDeskError::Transport(format!("BLE RX SetProps: {e}")))?;
     let rx_char_result = service
         .CreateCharacteristicAsync(uuid_to_guid(uuids::RX_CHAR_UUID), &rx_params)
