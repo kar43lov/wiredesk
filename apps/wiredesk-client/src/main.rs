@@ -82,40 +82,50 @@ fn main() {
     log::info!("transport: {} (port={} baud={})", cfg.transport, cfg.port, cfg.baud);
 
     let transport_cfg = config::to_transport_config(&cfg);
+
+    // Channels go up first so we can ship a Disconnected event into the
+    // UI on transport-open failure without crashing the process. The
+    // user *needs* the Settings panel reachable to switch transports
+    // (e.g., flip from `bluetooth` back to `serial` after the Win host
+    // reverted to a wired link) — `process::exit(1)` here would lock
+    // them out of the recovery path.
+    let (events_tx, events_rx) = mpsc::channel();
+    let (outgoing_tx, outgoing_rx) = mpsc::channel();
+    let (tap_events_tx, tap_events_rx) = mpsc::channel();
+
     // The reader thread keeps the original (recv-capable) handle. The
     // writer thread gets the clone — for BLE that clone is write-only by
     // design (see plan Decision 4); for serial it's a duplicate fd.
     // Either way: send-side on the clone, recv-side on the original.
-    let reader_transport = match wiredesk_transport::open_transport(&transport_cfg) {
-        Ok(t) => {
-            log::info!("opened transport: {}", t.name());
-            t
-        }
-        Err(e) => {
-            log::error!("failed to open transport (mode={}): {e}", cfg.transport);
-            eprintln!("Error: {e}");
-            if cfg.transport == "serial" {
-                eprintln!("Available serial ports:");
-                if let Ok(ports) = serialport::available_ports() {
-                    for p in ports {
-                        eprintln!("  {}", p.port_name);
+    let transport_pair: Option<(Box<dyn Transport>, Box<dyn Transport>)> =
+        match wiredesk_transport::open_transport(&transport_cfg) {
+            Ok(reader) => match reader.try_clone() {
+                Ok(writer) => {
+                    log::info!("opened transport: {}", reader.name());
+                    Some((reader, writer))
+                }
+                Err(e) => {
+                    log::error!("transport try_clone failed: {e}");
+                    let _ = events_tx.send(app::TransportEvent::Disconnected(format!(
+                        "transport try_clone: {e}"
+                    )));
+                    None
+                }
+            },
+            Err(e) => {
+                log::error!("failed to open transport (mode={}): {e}", cfg.transport);
+                if cfg.transport == "serial" {
+                    log::warn!("Available serial ports:");
+                    if let Ok(ports) = serialport::available_ports() {
+                        for p in ports {
+                            log::warn!("  {}", p.port_name);
+                        }
                     }
                 }
+                let _ = events_tx.send(app::TransportEvent::Disconnected(format!("{e}")));
+                None
             }
-            std::process::exit(1);
-        }
-    };
-    let writer_transport = match reader_transport.try_clone() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: cannot clone transport for writer thread: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let (events_tx, events_rx) = mpsc::channel();
-    let (outgoing_tx, outgoing_rx) = mpsc::channel();
-    let (tap_events_tx, tap_events_rx) = mpsc::channel();
+        };
 
     // Shared clipboard state — used by both poll thread (which detects local
     // changes) and reader thread (which writes incoming text). Hash-based
@@ -158,22 +168,41 @@ fn main() {
     let outgoing_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let incoming_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Reader/writer threads only spawn when the transport opened
+    // successfully. On open-failure `transport_pair` is None and the
+    // UI launches with a Disconnected status (the open error was
+    // pushed onto events_tx earlier). The user can then open Settings
+    // → Save & Restart with a working transport.
+    let (reader_transport_opt, writer_transport_opt) = match transport_pair {
+        Some((reader, writer)) => (Some(reader), Some(writer)),
+        None => (None, None),
+    };
+
     let writer_events_tx = events_tx.clone();
     let client_name = cfg.client_name.clone();
     let writer_outgoing_progress = outgoing_progress.clone();
     let writer_outgoing_total = outgoing_total.clone();
     let writer_outgoing_cancel = outgoing_cancel.clone();
-    thread::spawn(move || {
-        writer_thread(
-            writer_transport,
-            outgoing_rx,
-            writer_events_tx,
-            client_name,
-            writer_outgoing_progress,
-            writer_outgoing_total,
-            writer_outgoing_cancel,
-        );
-    });
+    if let Some(writer_transport) = writer_transport_opt {
+        thread::spawn(move || {
+            writer_thread(
+                writer_transport,
+                outgoing_rx,
+                writer_events_tx,
+                client_name,
+                writer_outgoing_progress,
+                writer_outgoing_total,
+                writer_outgoing_cancel,
+            );
+        });
+    } else {
+        // Drain outgoing_rx to /dev/null so producers don't block.
+        // The UI may still emit packets (heartbeats, clipboard probes)
+        // until the user restarts via Settings.
+        thread::spawn(move || {
+            while outgoing_rx.recv().is_ok() {}
+        });
+    }
 
     // Reader thread — owns the other half. Just receives and dispatches.
     // Clone `events_tx` ahead of moving the original into reader_thread so the
@@ -225,23 +254,42 @@ fn main() {
     {
         let _ = &exec_slot; // suppress unused on non-Mac
     }
-    thread::spawn(move || {
-        reader_thread(
-            reader_transport,
-            events_tx,
-            reader_outgoing_tx,
-            reader_clipboard,
-            reader_incoming_progress,
-            reader_incoming_total,
-            reader_outgoing_progress,
-            reader_outgoing_total,
-            reader_receive_images,
-            reader_receive_text,
-            reader_incoming_cancel,
-            reader_outgoing_cancel,
-            reader_exec_slot,
-        );
-    });
+    if let Some(reader_transport) = reader_transport_opt {
+        thread::spawn(move || {
+            reader_thread(
+                reader_transport,
+                events_tx,
+                reader_outgoing_tx,
+                reader_clipboard,
+                reader_incoming_progress,
+                reader_incoming_total,
+                reader_outgoing_progress,
+                reader_outgoing_total,
+                reader_receive_images,
+                reader_receive_text,
+                reader_incoming_cancel,
+                reader_outgoing_cancel,
+                reader_exec_slot,
+            );
+        });
+    } else {
+        // Reader thread normally owns events_tx clone; without it the
+        // sender we hold here is the only one alive — drop on the
+        // outer scope so the channel stays open for the UI thread to
+        // observe the Disconnected event we already pushed.
+        let _ = events_tx;
+        let _ = reader_outgoing_tx;
+        let _ = reader_clipboard;
+        let _ = reader_incoming_progress;
+        let _ = reader_incoming_total;
+        let _ = reader_outgoing_progress;
+        let _ = reader_outgoing_total;
+        let _ = reader_receive_images;
+        let _ = reader_receive_text;
+        let _ = reader_incoming_cancel;
+        let _ = reader_outgoing_cancel;
+        let _ = reader_exec_slot;
+    }
 
     // Synthetic-combo dispatcher pieces. Whispr Flow / TextExpander send
     // Cmd+V via CGEventPost, which races against Mac→Host clipboard sync —
