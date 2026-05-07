@@ -1,22 +1,46 @@
 # Bluetooth LE Transport (Plan C)
 
-WireDesk supports an alternative to the default USB-Serial channel:
-**Bluetooth Low Energy** between the Mac client (Central) and the Win11
-host (Peripheral). Throughput is ~5-9× faster than the default
-CH340 @ 115200 baud (~30-100 KB/s vs ~11 KB/s) without buying any
-hardware.
+> **Status 2026-05-07:** infrastructure shipped end-to-end, but **the
+> performance goal was not met on the tested hardware**. Live testing
+> on Mac M4 + Win11 BT 5.x measured **~4-5 KB/s symmetric** — *slower*
+> than the CH340 serial baseline (~11 KB/s). Use BLE only when a
+> cable is genuinely unavailable; default to serial otherwise.
+> Faster real channel-upgrade is **Plan A (FT232H @ 3 Mbaud, ~300 KB/s)**
+> — see `docs/briefs/ft232h-upgrade.md`.
+
+WireDesk supports a Bluetooth Low Energy alternative to the default
+USB-Serial channel between the Mac client (Central) and the Win11 host
+(Peripheral). The infrastructure is correct (custom GATT service,
+fragmentation, reconnect helper, factory-based switching); only the
+real-world wire throughput on this hardware combo turned out lower
+than the original brief's estimate.
 
 ## When to use
 
-| Channel       | Speed        | Hardware              | Setup time    |
-|---------------|--------------|-----------------------|---------------|
-| USB-Serial    | ~11 KB/s     | already have it       | already done  |
-| Bluetooth LE  | ~30-100 KB/s | already have BT radio | one-time pair |
-| FT232H @ 3M   | ~300 KB/s    | $20-30, must order    | wait + plug   |
+| Channel       | Live measured speed | Hardware              | Setup time    |
+|---------------|--------------------|-----------------------|---------------|
+| USB-Serial    | ~11 KB/s           | already have it       | already done  |
+| Bluetooth LE  | **~4-5 KB/s**      | already have BT radio | one-time pair |
+| FT232H @ 3M   | ~300 KB/s (planned) | $20-30, must order   | wait + plug   |
 
-Bluetooth wins on time-to-deliver (no shipping wait) and convenience
-(no cable). FT232H wins on absolute speed. The two coexist — flip via
-`config.toml`, restart, done.
+**BLE measured slower than serial** (4-5 KB/s vs 11 KB/s) on the
+Mac M4 + Win11 reference setup, contrary to the brief's
+~30-100 KB/s estimate. Likely causes:
+
+- macOS CoreBluetooth's WriteWithoutResponse drops silently when the
+  internal queue overflows; we have to interleave WriteWithResponse
+  for backpressure, and each ATT-ack roundtrip eats throughput.
+- WinRT's `NotifyValueAsync.get()` blocks per-notification until the
+  BLE link layer delivers, capping Win→Mac at the connection-event
+  rate (≈30 ms intervals).
+- ATT MTU isn't verified to actually negotiate up to 247 — could be
+  much lower on this hardware combo.
+
+Realistic positioning: BLE is a **no-cable fallback** when serial is
+unavailable. For day-to-day use, keep `transport = "serial"`. For a
+real speed-up, wait on FT232H (Plan A) or a future tuning pass on
+the BLE crate (try `bluest` instead of `btleplug`, manual Connection
+Parameter Update Request, ATT MTU instrumentation).
 
 ## One-time pairing
 
@@ -78,20 +102,30 @@ defaults in `BluetoothConfig::default()` (`wiredesk-core`) are a single
 source of truth so they don't drift; only edit them if you have two
 WireDesk pairs in earshot of each other and need to disambiguate.
 
-## Performance expectations
+## Performance expectations (measured 2026-05-07)
 
-- **Throughput:** sustained ~30-100 KB/s. BT 5.0 2M PHY peers (most
-  Apple Silicon Macs, Win11 BT 5.x adapters) hit the upper end; older
-  BT 4.x peers settle around 30-50 KB/s.
-- **Clipboard:** a 1 MB PNG that takes ~90 s over CH340 @ 115200 takes
-  ~10-30 s over BLE (×3-9 speedup).
-- **Latency:** input events typically 5-15 ms one-way (vs ~3-5 ms over
-  serial). Subjectively imperceptible for mouse/keyboard.
+| Workload              | BLE (measured)     | Serial baseline | Verdict          |
+|-----------------------|--------------------|------------------|------------------|
+| Mouse / keyboard      | usable             | smooth           | OK on BLE        |
+| Small clipboard text  | ~50-200 ms / KB    | comparable       | OK on BLE        |
+| 100 KB PNG image      | ~20-25 s           | ~10 s            | BLE 2× slower    |
+| 500 KB PNG image      | ~100-110 s         | ~50 s            | BLE 2× slower    |
+| 1+ MB PNG image       | unstable / timeout | ~90 s            | BLE not usable   |
+
+- **Throughput:** ~4-5 KB/s sustained, both directions. *Slower than
+  serial.*
+- **Stability:** under sustained bidirectional load, btleplug 0.11
+  occasionally tears down the CoreBluetooth event loop. UI surfaces
+  this as "Disconnected: BLE send timeout" — relaunch needed.
+- **Latency:** input events still feel close to serial after tuning
+  (1/64 events pays an ATT-RTT for backpressure pacing — barely
+  perceptible).
 - **Auto-reconnect:** the `reconnect.rs` backoff helper is in place
   (Task 10) but the runtime hookup in `mac.rs` / `win.rs` is a
-  follow-up — currently a sleep-wake cycle requires manually
-  re-launching the app on Mac. Tracked in
-  `docs/plans/20260506-bluetooth-le-transport.md` Post-Completion.
+  follow-up — currently any disconnect (timeout, sleep-wake)
+  requires manually relaunching the app. Tracked in
+  `docs/plans/completed/20260506-bluetooth-le-transport.md`
+  Post-Completion.
 
 ## Troubleshooting
 

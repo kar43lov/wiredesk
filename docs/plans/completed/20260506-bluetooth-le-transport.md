@@ -1,5 +1,21 @@
 # Bluetooth LE Transport (Plan C)
 
+> **Final status 2026-05-07: SHIPPED-but-PERF-GOAL-NOT-MET.**
+> Infrastructure works end-to-end (AC0/AC1/AC2/AC5/AC6/AC7 ✓), but
+> measured throughput on Mac M4 + Win11 reference setup is ~4-5 KB/s
+> symmetric — *slower* than the CH340 serial baseline (~11 KB/s).
+> AC3 (clipboard ≤30s for 1MB) and AC4 (auto-reconnect ≤5s) are
+> **not met**. The brief's 30-100 KB/s estimate overshot real-world
+> btleplug + WinRT GATT performance by ~10×.
+>
+> User decision 2026-05-07: **keep BLE as a no-cable fallback** with
+> honest perf disclaimer in docs; default remains
+> `transport = "serial"`. PR not yet opened — pending decision on
+> whether to merge as-is or revisit later.
+>
+> Real speedup path = Plan A (FT232H @ 3 Mbaud, ~300 KB/s) — see
+> `docs/briefs/ft232h-upgrade.md`.
+
 ## Overview
 
 Добавить опциональный **BLE-канал** как альтернативу текущему USB-Serial transport'у в WireDesk. Mac выступает BLE Central, Win11 — BLE Peripheral. Custom GATT service с двумя characteristics: `Notify` (Win→Mac) + `WriteWithoutResponse` (Mac→Win). Выбор канала через `transport = "bluetooth" | "serial"` в `config.toml`.
