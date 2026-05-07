@@ -378,17 +378,33 @@ impl Transport for BluetoothLeTransport {
         let inner = Arc::clone(&self.inner);
         inner.rt.block_on(async {
             let send_fut = async {
-                for chunk in &chunks {
-                    // WriteWithoutResponse: no ATT-ack roundtrip per
-                    // chunk → ~10× throughput vs WithResponse. Drops
-                    // are caught at the protocol layer via heartbeat
-                    // timeout (PR #20). Live test on real hardware
-                    // showed WithResponse capping us at ~1 KB/s
-                    // (11× *slower* than serial); this brings throughput
-                    // back into BLE's expected range.
+                // Hybrid WithoutResponse + periodic WithResponse:
+                //
+                // - Pure WriteWithResponse capped throughput at ~1 KB/s
+                //   (one ATT roundtrip per chunk).
+                // - Pure WriteWithoutResponse was queue-fast but
+                //   *silently dropped* writes once macOS CoreBluetooth's
+                //   internal buffer overflowed — clipboard arrived
+                //   empty on the Win side even though Mac logged DONE.
+                //
+                // Every ACK_EVERY-th write (and the last write) uses
+                // WithResponse so the ATT-ack acts as a backpressure
+                // signal. macOS won't accept the next WithoutResponse
+                // write until the queue drains down past the WithResponse
+                // marker, giving us reliability close to pure-WithResponse
+                // at ~7/8 of the throughput of pure-WithoutResponse.
+                const ACK_EVERY: usize = 8;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let is_last = i + 1 == chunks.len();
+                    let want_ack = is_last || (i + 1) % ACK_EVERY == 0;
+                    let write_type = if want_ack {
+                        WriteType::WithResponse
+                    } else {
+                        WriteType::WithoutResponse
+                    };
                     inner
                         .peripheral
-                        .write(&inner.rx_char, chunk, WriteType::WithoutResponse)
+                        .write(&inner.rx_char, chunk, write_type)
                         .await
                         .map_err(|e| WireDeskError::Transport(format!("BLE write: {e}")))?;
                 }
