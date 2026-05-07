@@ -241,14 +241,20 @@ async fn scan_and_connect(
 
     let _ = adapter.stop_scan().await; // best-effort — failure here only delays the next scan
 
+    // btleplug 0.11.8 on macOS: `connect()` itself drives service
+    // discovery internally and stores a "connected_future_state" that
+    // fulfills once CoreBluetooth has reported all services.
+    // **Do not** call `discover_services()` afterwards — that triggers
+    // a second didDiscoverServices callback which hits this assertion
+    // in btleplug's CoreBluetooth event loop:
+    //   panic at internal.rs:289 — "We should still have a future at this point!"
+    // and tears down the entire corebluetooth event loop. The peripheral's
+    // already-discovered characteristics are available via
+    // `peripheral.characteristics()` immediately after `connect()` resolves.
     target
         .connect()
         .await
         .map_err(|e| WireDeskError::Transport(format!("BLE connect: {e}")))?;
-    target
-        .discover_services()
-        .await
-        .map_err(|e| WireDeskError::Transport(format!("BLE discover_services: {e}")))?;
 
     let chars = target.characteristics();
     let rx_char = chars
@@ -412,7 +418,7 @@ impl Transport for BluetoothLeTransport {
                         .write_counter
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
-                    let want_ack = n % ACK_EVERY == 0;
+                    let want_ack = n.is_multiple_of(ACK_EVERY);
                     let write_type = if want_ack {
                         WriteType::WithResponse
                     } else {
