@@ -48,6 +48,8 @@ pub struct SettingsWindow {
     pub connection_title: nwg::Label,
     pub connection_frame: nwg::Frame,
     pub connection_layout: nwg::GridLayout,
+    pub transport_label: nwg::Label,
+    pub transport_combo: nwg::ComboBox<String>,
     pub port_label: nwg::Label,
     pub port_input: nwg::TextInput,
     pub detect_btn: nwg::Button,
@@ -162,6 +164,29 @@ impl SettingsWindow {
                 .parent(&s.window)
                 .flags(nwg::FrameFlags::VISIBLE | nwg::FrameFlags::BORDER)
                 .build(&mut s.connection_frame)?;
+
+            // Transport selector — picks between USB-Serial null-modem
+            // and Bluetooth LE GATT. Save+Restart applies the change.
+            // Bluetooth-specific tuning (peer name, MTU, service UUID,
+            // reconnect attempts) lives in config.toml under
+            // [bluetooth] — they rarely need editing day-to-day.
+            nwg::Label::builder()
+                .text("Transport:")
+                .h_align(nwg::HTextAlign::Right)
+                .parent(&s.connection_frame)
+                .build(&mut s.transport_label)?;
+            let transport_options =
+                vec!["USB-Serial".to_string(), "Bluetooth LE".to_string()];
+            let transport_idx = if config.transport == "bluetooth" {
+                Some(1usize)
+            } else {
+                Some(0usize)
+            };
+            nwg::ComboBox::builder()
+                .collection(transport_options)
+                .selected_index(transport_idx)
+                .parent(&s.connection_frame)
+                .build(&mut s.transport_combo)?;
 
             nwg::Label::builder()
                 .text("Serial port:")
@@ -285,13 +310,16 @@ impl SettingsWindow {
                 .max_column(Some(3))
                 .spacing(4)
                 .margin([6, 6, 6, 6])
-                // Row 0: [label] [port_input] [Detect]
-                .child(0, 0, &s.port_label)
-                .child(1, 0, &s.port_input)
-                .child(2, 0, &s.detect_btn)
-                // Row 1: [label] [baud_input spans cols 1..2]
-                .child(0, 1, &s.baud_label)
-                .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 1, 2, 1))
+                // Row 0: [Transport label] [combo spans cols 1..2]
+                .child(0, 0, &s.transport_label)
+                .child_item(nwg::GridLayoutItem::new(&s.transport_combo, 1, 0, 2, 1))
+                // Row 1: [Serial port label] [port_input] [Detect]
+                .child(0, 1, &s.port_label)
+                .child(1, 1, &s.port_input)
+                .child(2, 1, &s.detect_btn)
+                // Row 2: [Baud label] [baud_input spans cols 1..2]
+                .child(0, 2, &s.baud_label)
+                .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 2, 2, 1))
                 .build(&s.connection_layout)?;
 
             nwg::GridLayout::builder()
@@ -329,31 +357,31 @@ impl SettingsWindow {
 
             // ---- Outer grid: status row + 3 groups (title + frame) +
             // button-bar + message. Each group is two rows: 1-row title,
-            // then a multi-row frame for nested controls. The frame row
-            // height is widened (rowspan) so the bordered box has air.
-            // Window-level grid uses 9 rows × 3 cols.
+            // then a multi-row frame for nested controls. The Connection
+            // frame is now 3 rows tall (Transport / Port / Baud), so all
+            // subsequent rows shift +1 vs pre-Plan-C.
             nwg::GridLayout::builder()
                 .parent(&s.window)
-                .min_size([440, 440])
+                .min_size([440, 470])
                 .max_column(Some(3))
                 .spacing(4)
                 .margin([6, 6, 6, 6])
                 // Row 0: status icon + label
                 .child(0, 0, &s.status_icon)
                 .child_item(nwg::GridLayoutItem::new(&s.status_label, 1, 0, 2, 1))
-                // Row 1: Connection title; rows 2-3: Connection frame
+                // Row 1: Connection title; rows 2-4: Connection frame (Transport / Port / Baud)
                 .child_item(nwg::GridLayoutItem::new(&s.connection_title, 0, 1, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.connection_frame, 0, 2, 3, 2))
-                // Row 4: Display title; rows 5-6: Display frame
-                .child_item(nwg::GridLayoutItem::new(&s.display_title, 0, 4, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.display_frame, 0, 5, 3, 2))
-                // Row 7: System title; rows 8-9: System frame
-                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 7, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 8, 3, 2))
-                // Row 10: button-bar (right-aligned via internal grid)
-                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 10, 3, 1))
-                // Row 11: message label
-                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 11, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.connection_frame, 0, 2, 3, 3))
+                // Row 5: Display title; rows 6-7: Display frame
+                .child_item(nwg::GridLayoutItem::new(&s.display_title, 0, 5, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.display_frame, 0, 6, 3, 2))
+                // Row 8: System title; rows 9-10: System frame
+                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 8, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 9, 3, 2))
+                // Row 11: button-bar (right-aligned via internal grid)
+                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 11, 3, 1))
+                // Row 12: message label
+                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 12, 3, 1))
                 .build(&s.layout)?;
 
             // Hidden by default — caller decides when to reveal.
@@ -375,25 +403,30 @@ impl SettingsWindow {
     /// `Err(message)` on the first validation failure so the caller can
     /// surface it via `set_message`. The input strings are trimmed.
     /// Build a `HostConfig` from the form fields, taking unexposed fields
-    /// (transport selection, bluetooth section, etc.) from `base`. The
-    /// caller passes the live config so toggling Save in this view doesn't
-    /// reset settings the user configured elsewhere (e.g. `transport =
-    /// "bluetooth"` set via config.toml or a future Transport tab).
+    /// (host_name, bluetooth advanced tuning, transport_fallback) from
+    /// `base`. The transport ComboBox drives `cfg.transport`; serial
+    /// port + baud + screen size + autostart come from their own inputs.
+    /// Bluetooth peer_name / mtu / service_uuid stay in config.toml — the
+    /// UI exposes only the transport selector (the day-to-day toggle).
     pub fn read_form(&self, base: &HostConfig) -> Result<HostConfig, String> {
         let port = format::validate_port(&self.port_input.text())?.to_string();
         let baud = format::validate_baud(&self.baud_input.text())?;
         let width = format::validate_dimension(&self.width_input.text())?;
         let height = format::validate_dimension(&self.height_input.text())?;
         let run_on_startup = self.autostart_check.check_state() == nwg::CheckBoxState::Checked;
+        let transport = match self.transport_combo.selection() {
+            Some(1) => "bluetooth".to_string(),
+            _ => "serial".to_string(),
+        };
         Ok(HostConfig {
             port,
             baud,
             width,
             height,
             run_on_startup,
+            transport,
             // Preserve fields not edited in this form.
             host_name: base.host_name.clone(),
-            transport: base.transport.clone(),
             transport_fallback: base.transport_fallback.clone(),
             bluetooth: base.bluetooth.clone(),
         })
