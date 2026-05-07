@@ -416,16 +416,17 @@ impl Transport for BluetoothLeTransport {
                 // WithResponse, so we get backpressure essentially for
                 // free.
                 //
-                // ACK_EVERY=32 is tuned alongside Win-side
-                // notification window=2:
-                //   - Win window=2 keeps handler thread responsive
-                //     to incoming Writes, so the WithResponse ATT-ack
-                //     comes back quickly (no more ~3-min hangs).
-                //   - 32 is sparse enough that input-event jitter is
-                //     imperceptible (1 in 32 events pays an ATT-RTT).
-                //   - 31/32 = 97% of pure-WithoutResponse throughput
-                //     when streaming clipboard.
-                const ACK_EVERY: u64 = 32;
+                // ACK_EVERY=64 — last-ditch tuning attempt after live
+                // tests showed 32 still caps Mac→Win at ~5 KB/s for
+                // multi-MB transfers. Halving the ATT-ack frequency
+                // should roughly double sustained throughput if
+                // WithResponse round-trips are the bottleneck. If
+                // bumping further than 64 starts surfacing silent
+                // drops again (CoreBluetooth queue overflow), that
+                // tells us BLE is genuinely capped at ~5-10 KB/s on
+                // this hardware combo and Plan C as a serial-replacement
+                // is closed.
+                const ACK_EVERY: u64 = 64;
                 for chunk in chunks.iter() {
                     let n = inner
                         .write_counter
