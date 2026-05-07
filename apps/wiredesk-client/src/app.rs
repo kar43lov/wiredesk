@@ -1442,7 +1442,20 @@ impl eframe::App for WireDeskApp {
                 ui.label(status_text);
             });
 
-            ui.label(format!("Serial: {}", self.runtime_serial_port));
+            // Show the actual transport that's open. Pre-Plan-C this was
+            // always "Serial: /dev/cu.…"; with the BLE option in play we
+            // show "Bluetooth: <peer-name>" when transport=bluetooth so
+            // the chrome reflects what actually opened.
+            if self.pending_config.transport == "bluetooth" {
+                let peer = if self.pending_config.bluetooth.peer_name.is_empty() {
+                    "(any host)".to_string()
+                } else {
+                    self.pending_config.bluetooth.peer_name.clone()
+                };
+                ui.label(format!("Bluetooth: {peer}"));
+            } else {
+                ui.label(format!("Serial: {}", self.runtime_serial_port));
+            }
 
             // Clipboard progress line — only renders when a transfer is
             // active. Outgoing and incoming are both possible at the same
