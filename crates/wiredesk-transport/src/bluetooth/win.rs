@@ -350,25 +350,55 @@ impl Transport for BluetoothLeTransport {
         let chunks = split_packet(pid, &encoded, payload_cap)
             .map_err(|e| WireDeskError::Transport(format!("BLE split_packet: {e}")))?;
 
-        // NotifyValueAsync returns IAsyncOperation which doesn't implement
-        // std::future::Future on windows-rs 0.58 — we use .get() for sync
-        // wait. Up to ~35 chunks for an 8 KB packet, each NotifyValueAsync
-        // typically completes in <10 ms; sequential .get() is acceptable.
-        // Timeout enforced inline via Instant deadline (no need to spawn
-        // a separate timer task — keeps Inner free of Send/Sync concerns).
+        // Pipeline notifications with a sliding window so we don't pay
+        // a full BLE connection-event roundtrip per chunk.
+        //
+        // NotifyValueAsync returns IAsyncOperation that completes when
+        // the notification has been *delivered* (one BLE connection
+        // event, typically 15-30 ms on macOS). Calling .get() per
+        // chunk serialised the whole transfer to ~30 ms × N chunks =
+        // ~5 KB/s for a 540 KB image (97 s wall-clock observed live).
+        //
+        // Letting up to WINDOW_SIZE notifications fly before draining
+        // the head of the queue keeps the WinRT stack busy across
+        // connection events without unbounded queueing (which would
+        // risk silent drops on internal buffer overflow). Window=8
+        // is conservative — enough to saturate the link, small
+        // enough that backpressure surfaces quickly on a stalled peer.
+        const WINDOW_SIZE: usize = 8;
         let inner = &self.inner;
         let start = std::time::Instant::now();
+        let mut in_flight: std::collections::VecDeque<_> =
+            std::collections::VecDeque::with_capacity(WINDOW_SIZE);
         for chunk in &chunks {
             if start.elapsed() > SEND_TIMEOUT {
                 return Err(WireDeskError::Transport("BLE send timeout".into()));
             }
             let buf = write_to_buffer(chunk)?;
-            inner
+            let op = inner
                 .tx_char
                 .NotifyValueAsync(&buf)
-                .map_err(|e| WireDeskError::Transport(format!("BLE NotifyValueAsync: {e}")))?
-                .get()
-                .map_err(|e| WireDeskError::Transport(format!("BLE NotifyValueAsync get: {e}")))?;
+                .map_err(|e| WireDeskError::Transport(format!("BLE NotifyValueAsync: {e}")))?;
+            in_flight.push_back(op);
+            if in_flight.len() >= WINDOW_SIZE {
+                in_flight
+                    .pop_front()
+                    .expect("just-pushed")
+                    .get()
+                    .map_err(|e| {
+                        WireDeskError::Transport(format!("BLE NotifyValueAsync get: {e}"))
+                    })?;
+            }
+        }
+        // Drain remaining in-flight ops so we return only after every
+        // notification has been delivered to the BLE link layer.
+        while let Some(op) = in_flight.pop_front() {
+            if start.elapsed() > SEND_TIMEOUT {
+                return Err(WireDeskError::Transport("BLE send drain timeout".into()));
+            }
+            op.get().map_err(|e| {
+                WireDeskError::Transport(format!("BLE NotifyValueAsync drain get: {e}"))
+            })?;
         }
 
         Ok(())
