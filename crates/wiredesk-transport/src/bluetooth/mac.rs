@@ -392,31 +392,48 @@ impl Transport for BluetoothLeTransport {
         let inner = Arc::clone(&self.inner);
         inner.rt.block_on(async {
             let send_fut = async {
-                // Pure WriteWithoutResponse. btleplug on macOS handles
-                // BLE link-layer flow control internally via the
-                // CBPeripheralDelegate `peripheralIsReady(toSendWriteWithout
-                // Response:)` callback — `peripheral.write()` returns
-                // only when the stack is ready for another write.
+                // Hybrid WithoutResponse + sparse WithResponse for
+                // backpressure. btleplug 0.11 on macOS does NOT actually
+                // wait for `peripheralIsReady` before returning from
+                // `peripheral.write(…WithoutResponse)` — it just hands
+                // the bytes to CoreBluetooth and returns immediately.
+                // Without our own flow control, CoreBluetooth's internal
+                // queue overflows and writes are silently dropped (live
+                // test: Mac→Win clipboard never arrived on Win even
+                // though Mac logged DONE).
                 //
-                // Earlier attempts to interleave WriteWithResponse for
-                // backpressure backfired: the WithResponse ATT-ack
-                // had to compete with the Win side's notification
-                // pipeline, causing send timeouts and even hanging
-                // the Win host loop in NotifyValueAsync.get(). With
-                // pure WithoutResponse there is no ATT-ack roundtrip
-                // contending with Win-side notify pumps — both
-                // directions stay independent at the link layer.
+                // Solution: every ACK_EVERY writes (counted globally
+                // across input + clipboard + heartbeat) one is
+                // WriteWithResponse. The ATT-ack acts as a sync point —
+                // CoreBluetooth waits to flush all preceding
+                // WithoutResponse writes before it can ack the
+                // WithResponse, so we get backpressure essentially for
+                // free.
                 //
-                // We still increment write_counter for diagnostics so
-                // future tooling (e.g., a Settings throughput readout)
-                // can read it without re-instrumenting the hot path.
+                // ACK_EVERY=32 is tuned alongside Win-side
+                // notification window=2:
+                //   - Win window=2 keeps handler thread responsive
+                //     to incoming Writes, so the WithResponse ATT-ack
+                //     comes back quickly (no more ~3-min hangs).
+                //   - 32 is sparse enough that input-event jitter is
+                //     imperceptible (1 in 32 events pays an ATT-RTT).
+                //   - 31/32 = 97% of pure-WithoutResponse throughput
+                //     when streaming clipboard.
+                const ACK_EVERY: u64 = 32;
                 for chunk in chunks.iter() {
-                    inner
+                    let n = inner
                         .write_counter
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    let want_ack = n.is_multiple_of(ACK_EVERY);
+                    let write_type = if want_ack {
+                        WriteType::WithResponse
+                    } else {
+                        WriteType::WithoutResponse
+                    };
                     inner
                         .peripheral
-                        .write(&inner.rx_char, chunk, WriteType::WithoutResponse)
+                        .write(&inner.rx_char, chunk, write_type)
                         .await
                         .map_err(|e| WireDeskError::Transport(format!("BLE write: {e}")))?;
                 }
