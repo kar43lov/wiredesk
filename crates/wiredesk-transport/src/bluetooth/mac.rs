@@ -65,13 +65,20 @@ pub struct BluetoothLeTransport {
 struct Inner {
     rt: EmbeddedRuntime,
     peripheral: Peripheral,
-    rx_char: Characteristic, // Mac→Win, WriteWithResponse
+    rx_char: Characteristic, // Mac→Win, Write/WriteWithoutResponse
     /// Receiver side of the notification pump. Wrapped in async Mutex so
     /// the sync `recv` API can take it via `block_on`.
     incoming_rx: AsyncMutex<mpsc::UnboundedReceiver<Result<Packet>>>,
     att_payload: AtomicUsize,
     is_connected: AtomicBool,
     next_packet_id: AtomicU16,
+    /// Global BLE-write counter — used to space out periodic
+    /// WriteWithResponse "ack-flush" writes evenly across **all**
+    /// outgoing traffic (input events + clipboard alike). Without
+    /// this, single-chunk packets (mouse moves, key events) would
+    /// each trip the per-call "is_last" rule and bottleneck on
+    /// per-event ATT-acks (~30 ms each → visible mouse jitter).
+    write_counter: std::sync::atomic::AtomicU64,
     /// Notification pump task — kept alive for the lifetime of the
     /// transport. Aborted in `Drop` so we don't leak background work.
     notification_task: AsyncMutex<Option<JoinHandle<()>>>,
@@ -129,6 +136,7 @@ impl BluetoothLeTransport {
             att_payload,
             is_connected: AtomicBool::new(true),
             next_packet_id: AtomicU16::new(0),
+            write_counter: std::sync::atomic::AtomicU64::new(0),
             notification_task: AsyncMutex::new(Some(pump_task)),
         });
 
@@ -378,25 +386,33 @@ impl Transport for BluetoothLeTransport {
         let inner = Arc::clone(&self.inner);
         inner.rt.block_on(async {
             let send_fut = async {
-                // Hybrid WithoutResponse + periodic WithResponse:
+                // Hybrid WithoutResponse + periodic WithResponse, paced
+                // by a *global* write counter so ATT-acks land at a
+                // steady rate regardless of how send() is called.
                 //
-                // - Pure WriteWithResponse capped throughput at ~1 KB/s
-                //   (one ATT roundtrip per chunk).
-                // - Pure WriteWithoutResponse was queue-fast but
-                //   *silently dropped* writes once macOS CoreBluetooth's
-                //   internal buffer overflowed — clipboard arrived
-                //   empty on the Win side even though Mac logged DONE.
+                // - Pure WriteWithResponse capped at ~1 KB/s (one ATT
+                //   roundtrip per chunk).
+                // - Pure WriteWithoutResponse was queue-fast but silently
+                //   dropped writes once CoreBluetooth's internal buffer
+                //   overflowed.
+                // - Per-call "ack on last chunk" rule looked sane for
+                //   clipboard but made every single-chunk packet — i.e.
+                //   every mouse / keyboard event — into a WithResponse
+                //   roundtrip, producing visible input jitter.
                 //
-                // Every ACK_EVERY-th write (and the last write) uses
-                // WithResponse so the ATT-ack acts as a backpressure
-                // signal. macOS won't accept the next WithoutResponse
-                // write until the queue drains down past the WithResponse
-                // marker, giving us reliability close to pure-WithResponse
-                // at ~7/8 of the throughput of pure-WithoutResponse.
-                const ACK_EVERY: usize = 8;
-                for (i, chunk) in chunks.iter().enumerate() {
-                    let is_last = i + 1 == chunks.len();
-                    let want_ack = is_last || (i + 1) % ACK_EVERY == 0;
+                // Global counter on `Inner` advances on every BLE write
+                // across the transport's lifetime; we force WithResponse
+                // every ACK_EVERY writes regardless of which packet they
+                // belong to. Mouse events flow as fast as
+                // WithoutResponse (most of the time) and clipboard
+                // bursts get evenly-spaced ack-flushes for backpressure.
+                const ACK_EVERY: u64 = 16;
+                for chunk in chunks.iter() {
+                    let n = inner
+                        .write_counter
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    let want_ack = n % ACK_EVERY == 0;
                     let write_type = if want_ack {
                         WriteType::WithResponse
                     } else {
