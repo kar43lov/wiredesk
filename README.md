@@ -8,7 +8,7 @@ You have two computers side by side. One runs Windows with security software ("C
 
 ## Solution
 
-WireDesk sends keyboard/mouse input and clipboard data over a serial connection (USB-to-Serial adapters + null-modem cable). Video comes separately through an HDMI capture card viewed in QuickTime or VLC.
+WireDesk sends keyboard/mouse input and clipboard data over either a **USB-Serial null-modem** (default, ~11 KB/s) or a **Bluetooth LE** link (~30-100 KB/s, no cable — see [`docs/bluetooth-transport.md`](docs/bluetooth-transport.md) for setup). Video comes separately through an HDMI capture card viewed in QuickTime or VLC.
 
 ```
 Host (Windows 11)                       Client (macOS)

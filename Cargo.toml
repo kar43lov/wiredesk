@@ -31,3 +31,27 @@ crc = "3"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 base64 = "0.22"
+
+# Bluetooth LE transport (Plan C) — async runtime + cross-platform BLE bindings
+btleplug = "0.11"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Windows API bindings — union of features used by host (Win32 input/registry/threading)
+# and transport (Devices_Bluetooth_* for BLE Peripheral GATT server). Cargo unifies
+# features across consumers, so a single workspace declaration is the cleanest source.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Bluetooth_Advertisement",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+] }

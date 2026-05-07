@@ -40,5 +40,9 @@
     <string>public.app-category.developer-tools</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>WireDesk needs Accessibility permission to forward keyboard shortcuts (Cmd+Space, Cmd+C, etc.) to the Host machine.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>WireDesk uses Bluetooth Low Energy as an alternative transport to communicate with the Windows host without a USB cable.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>WireDesk uses Bluetooth Low Energy as an alternative transport to communicate with the Windows host without a USB cable.</string>
 </dict>
 </plist>

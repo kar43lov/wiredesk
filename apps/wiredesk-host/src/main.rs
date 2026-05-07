@@ -45,6 +45,11 @@ pub struct Args {
     /// Screen height. Overrides config.toml.
     #[arg(long, default_value = "1440")]
     height: u16,
+
+    /// Transport to use: `serial` (USB-Serial null-modem, default) or
+    /// `bluetooth` (BLE Peripheral GATT server). Overrides config.toml.
+    #[arg(long, default_value = "serial")]
+    transport: String,
 }
 
 fn main() {
@@ -515,8 +520,13 @@ fn handle_save(
     settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
     cfg_holder: &Arc<Mutex<HostConfig>>,
 ) {
+    let base = cfg_holder
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     let s = settings.borrow();
-    match s.read_form() {
+    match s.read_form(&base) {
         Ok(new_cfg) => {
             if let Err(e) = new_cfg.save() {
                 s.set_message(&format!("Save failed: {e}"));
@@ -573,8 +583,13 @@ fn handle_restart(
     // process and stop our own event loop. The new process retries the
     // single-instance mutex acquire (5×100ms in main.rs) so it'll wait
     // out our shutdown without an artificial sleep here.
+    let base = cfg_holder
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     let s = settings.borrow();
-    let new_cfg = match s.read_form() {
+    let new_cfg = match s.read_form(&base) {
         Ok(c) => c,
         Err(e) => {
             s.set_message(&e);

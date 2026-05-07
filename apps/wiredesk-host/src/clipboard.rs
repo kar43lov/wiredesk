@@ -19,7 +19,12 @@ use std::time::{Duration, Instant};
 use wiredesk_protocol::message::{FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
 
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
-pub const CHUNK_SIZE: usize = 256;
+/// Per-chunk byte cap. Bumped 256 → 1024 with the BLE transport: u16
+/// chunk index gives 65535 max chunks, so chunk size sets the upper
+/// bound on any single transfer (1024 × 65535 ≈ 64 MB cap). Each chunk
+/// still fits in `MAX_PAYLOAD = 4096`. Text uses smaller chunks
+/// implicitly because text caps at 256 KB anyway.
+pub const CHUNK_SIZE: usize = 1024;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // text cap
 /// Codex iter2 D3: Session::tick() blocks on `transport.send` for every
 /// message returned by `poll()` before reaching `transport.recv()`. A 1 MB
@@ -31,7 +36,12 @@ const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // text cap
 const MAX_MESSAGES_PER_POLL: usize = 8;
 /// Cap on encoded-PNG length pushed to the peer. Larger payloads are dropped
 /// with a warning log (no UI on Host — see Mac client for toast).
-pub(crate) const MAX_IMAGE_BYTES: usize = 1024 * 1024; // 1 MB encoded
+/// Encoded-PNG cap. Bumped 1 MB → 20 MB after the BLE transport
+/// landed (Plan C): high-res screenshots / multi-monitor captures
+/// no longer hit the cap on day-to-day use. Serial users still
+/// shouldn't push 20 MB through CH340 (would take ~30 minutes); the
+/// cap is generous, not a performance promise.
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB encoded
 
 /// Type-tagged hash of the most recent clipboard content owned/observed by us.
 /// Mirrors the Mac-side enum (CLAUDE.md explicitly allows this duplication).
@@ -1068,7 +1078,9 @@ mod tests {
 
         // --- (a) non-contiguous indices ---
         let mut sync = ClipboardSync::new_for_test();
-        let outgoing = vec![0xAA; 768];
+        // Pick payload = 3 * CHUNK_SIZE so we get exactly 3 chunks
+        // (regardless of whether CHUNK_SIZE is 256 or 1024).
+        let outgoing = vec![0xAA; CHUNK_SIZE * 3];
         for m in build_offer_and_chunks(FORMAT_PNG_IMAGE, &outgoing) {
             sync.pending_outbox.push_back(m);
         }
@@ -1257,14 +1269,23 @@ mod tests {
         // avoids needing a live arboard backend.
         let mut sync = ClipboardSync::new_for_test();
 
-        // 2048 bytes → 1 ClipOffer + 8 chunks = 9 messages total.
-        let payload = vec![0xABu8; 2048];
+        // Payload sized to need MAX_MESSAGES_PER_POLL + 1 messages so the
+        // drain has to spill across two poll() calls. With CHUNK_SIZE=1024
+        // and MAX_MESSAGES_PER_POLL=8, we need 8 chunks to drain in the
+        // first poll and 1 trailing chunk + the offer split across the
+        // second. Pick payload = 8*CHUNK_SIZE so we get exactly 8 chunks.
+        let chunk_count = MAX_MESSAGES_PER_POLL; // ensure first poll fills exactly
+        let payload = vec![0xABu8; CHUNK_SIZE * chunk_count];
         let built = build_offer_and_chunks(FORMAT_TEXT_UTF8, &payload);
-        assert_eq!(built.len(), 9, "fixture: 2048 / 256 = 8 chunks + 1 offer");
+        assert_eq!(
+            built.len(),
+            chunk_count + 1,
+            "fixture: {chunk_count} chunks + 1 offer"
+        );
         for m in built {
             sync.pending_outbox.push_back(m);
         }
-        assert_eq!(sync.pending_outbox.len(), 9);
+        assert_eq!(sync.pending_outbox.len(), chunk_count + 1);
 
         // First poll() call: returns up to MAX_MESSAGES_PER_POLL (= 8).
         let first = sync.poll();
@@ -1273,7 +1294,7 @@ mod tests {
             MAX_MESSAGES_PER_POLL,
             "first poll must return exactly MAX_MESSAGES_PER_POLL messages"
         );
-        // 9 - 8 = 1 message remains in outbox.
+        // (chunks+1) - MAX = 1 message remains in outbox.
         assert_eq!(sync.pending_outbox.len(), 1);
 
         // Second poll() call: drains the remainder (the trailing chunk).

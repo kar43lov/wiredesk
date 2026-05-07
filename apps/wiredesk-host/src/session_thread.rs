@@ -5,7 +5,7 @@ use std::time::Duration;
 use wiredesk_core::error::WireDeskError;
 
 use crate::clipboard::ProgressCounters;
-use crate::config::HostConfig;
+use crate::config::{self, HostConfig};
 use crate::session::{Session, SessionState};
 
 /// Status reported up to the UI thread (tray icon color, settings window
@@ -88,15 +88,28 @@ where
     F: FnOnce(&HostConfig) -> wiredesk_core::error::Result<I> + Send + 'static,
 {
     thread::spawn(move || {
-        let transport =
-            match wiredesk_transport::serial::SerialTransport::open(&config.port, config.baud) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("failed to open serial port {}: {e}", config.port);
-                    let _ = status_tx.send(SessionStatus::Disconnected(format!("serial: {e}")));
-                    return;
-                }
-            };
+        let transport_cfg = config::to_transport_config(&config);
+        let transport = match wiredesk_transport::open_transport(&transport_cfg) {
+            Ok(t) => {
+                log::info!(
+                    "opened transport: {} ({})",
+                    t.name(),
+                    config.transport
+                );
+                t
+            }
+            Err(e) => {
+                log::error!(
+                    "failed to open transport (mode={}): {e}",
+                    config.transport
+                );
+                let _ = status_tx.send(SessionStatus::Disconnected(format!(
+                    "{}: {e}",
+                    config.transport
+                )));
+                return;
+            }
+        };
 
         let injector = match make_injector(&config) {
             Ok(i) => i,

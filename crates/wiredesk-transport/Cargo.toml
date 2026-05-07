@@ -9,3 +9,15 @@ wiredesk-protocol.workspace = true
 thiserror.workspace = true
 log.workspace = true
 serialport.workspace = true
+
+# Bluetooth LE transport — async runtime + UUID + futures (cross-platform).
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+btleplug = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }

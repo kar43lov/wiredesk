@@ -138,14 +138,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> HostConfig {
-        HostConfig {
-            port: "COM3".to_string(),
-            baud: 115_200,
-            width: 2560,
-            height: 1440,
-            host_name: "wiredesk-host".to_string(),
-            run_on_startup: false,
-        }
+        HostConfig::default()
     }
 
     #[test]

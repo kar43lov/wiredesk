@@ -88,6 +88,61 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 
 ---
 
+## Bluetooth LE Transport (Plan C)
+
+Альтернатива USB-Serial — BLE GATT между Mac (Central) и Win11 (Peripheral). Опционально, выбирается через `transport = "bluetooth"` в config.toml. Throughput ~30-100 KB/s, ×3-9 vs CH340. См. user-facing guide [`docs/bluetooth-transport.md`](bluetooth-transport.md). Module map:
+
+```
+crates/wiredesk-transport/src/bluetooth/
+  mod.rs        — BluetoothFactoryConfig + cfg-fenced submodule re-exports
+                  (BluetoothLeTransport одинакового имени на всех platform'ах)
+  uuids.rs      — fixed v4 UUIDs: SERVICE / TX_CHAR (Notify Win→Mac) /
+                  RX_CHAR (WriteWithResponse Mac→Win)
+  fragment.rs   — pure-logic chunking/reassembly. ChunkHeader (4 bytes:
+                  packet_id u16-le + chunk_idx u8 + total_chunks u8),
+                  max_chunk_payload(att_mtu) → 240 для default MTU=247,
+                  split_packet, Reassembler с per-packet_id bitmap +
+                  5s stale-sweep
+  runtime.rs    — EmbeddedRuntime — wrapper над tokio multi-thread runtime
+                  (2 worker threads + thread name "wiredesk-ble"),
+                  block_on/spawn для sync↔async bridging
+  reconnect.rs  — pure helper next_backoff(attempt) → 0s/2s/4s/8s/16s/30s
+                  capped, should_retry(attempt, max). AC4-aware (first
+                  attempt immediate). Runtime hookup в Mac/Win deferred
+                  на follow-up.
+  mac.rs        — #[cfg(target_os="macos")] BLE Central через btleplug 0.11.
+                  Inner { peripheral, rx_char, incoming_rx, ... } за Arc;
+                  scan_and_connect (events stream + cached peripherals
+                  poll), notification_pump async task (notifications →
+                  Reassembler → COBS → Packet → mpsc), sync send/recv
+                  через runtime.block_on. Drop aborts pump task.
+  win.rs        — #[cfg(target_os="windows")] BLE Peripheral через
+                  windows-rs WinRT GattServiceProvider. tx_char.NotifyValueAsync
+                  для send, rx_char.WriteRequested handler для recv с
+                  request.Respond() для WithResponse-ack. Drop stops
+                  advertising.
+  stub.rs       — #[cfg(not(any(macos, windows)))] safe placeholder для
+                  Linux dev-machines: open() возвращает Err.
+```
+
+**Sync facade pattern**: btleplug и windows-rs BLE — async-only, остальной WireDesk codebase sync. Вместо async-trait conversion'а на всех callsite'ах, BluetoothLeTransport владеет `EmbeddedRuntime` и через `block_on` exposes sync `Transport::send/recv`. Cost: 2 worker threads на runtime + минорный overhead block_on.
+
+**try_clone — write-only split**: BLE не позволяет открыть второй connection к peer'у. Cloned handle share'ит `Arc<Inner>` но `is_owner=false` → `recv()` returns Err. Client'ская `main.rs` после Tasks 8/9 переключена на `reader_transport = open_transport(...)` (original, recv-capable) + `writer_transport = reader_transport.try_clone()?` (clone, write-only OK для send'ов).
+
+**Factory** (`crates/wiredesk-transport/src/factory.rs`): `open_transport(&TransportConfig)` switch'ит между `SerialTransport::open` и `BluetoothLeTransport::open`. На BLE failure + `transport_fallback = "serial"` — log::warn + retry serial. Unrecognised fallback strings ignored (no recurse).
+
+**Config** (`wiredesk-core::BluetoothConfig`): single source of truth для shared fields (service_uuid, peer_name, mtu, connect_timeout_secs, reconnect_max_attempts) — гарантирует идентичность между host и client.
+
+**Continent compatibility**: AC0 verified live 2026-05-06. WFP-фильтры Континента работают на IP/TCP/UDP стеке; BT-радио идёт через отдельный device-driver path и не попадает в WFP. Custom service-UUID broadcast + GATT connect/read проходят без вмешательства.
+
+**Известные ограничения / deferred**:
+- Mac/Win runtime auto-reconnect (peripheral swap on disconnect, notification_pump restart) — `feat/bluetooth-reconnect-runtime` follow-up.
+- Win11 nwg Settings UI для transport switching — `feat/bluetooth-host-ui` follow-up. Edit `%APPDATA%\WireDesk\config.toml` напрямую пока.
+- Mac status-bar / Win tray BLE-status indicator — `feat/bluetooth-status-indicator` follow-up. Startup log сейчас даёт baseline visibility.
+- EWMA throughput counter — deferred. Nice-to-have для bench-tool, не в AC.
+
+---
+
 ## Clipboard sync
 
 Симметрично на обеих сторонах:

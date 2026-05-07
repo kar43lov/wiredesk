@@ -19,14 +19,20 @@ use wiredesk_protocol::packet::Packet;
 use crate::app::TransportEvent;
 
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const CHUNK_SIZE: usize = 256;
+/// Per-chunk byte cap. Bumped 256 → 1024 alongside the host-side
+/// constant so a 20 MB image fits within the u16 chunk-index space
+/// (1024 × 65535 ≈ 64 MB). Each chunk stays well under MAX_PAYLOAD = 4096.
+const CHUNK_SIZE: usize = 1024;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap for text
 /// Maximum encoded PNG size we will push to the peer. Larger payloads are
 /// dropped with a warning (and a UI toast wired up in Task 7b). The cap is
 /// applied to the encoded-PNG length, not the RGBA pre-image, because PNG
 /// compression ratios are content-dependent and we cannot predict the size
 /// from raw dimensions.
-pub(crate) const MAX_IMAGE_BYTES: usize = 1024 * 1024; // 1 MB encoded
+/// Bumped 1 MB → 20 MB with the BLE transport (Plan C). Serial path
+/// still won't push 20 MB sensibly (~30-min transfer at 11 KB/s) —
+/// the cap is generous, not a performance guarantee.
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB encoded
 
 /// Hashes of the most recent clipboard content we observed/wrote, kept
 /// in **independent slots per kind**. Without per-kind slots an alternating
