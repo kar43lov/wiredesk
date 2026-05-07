@@ -350,22 +350,16 @@ impl Transport for BluetoothLeTransport {
         let chunks = split_packet(pid, &encoded, payload_cap)
             .map_err(|e| WireDeskError::Transport(format!("BLE split_packet: {e}")))?;
 
-        // Pipeline notifications with a sliding window so we don't pay
-        // a full BLE connection-event roundtrip per chunk.
+        // Pipeline notifications with a small sliding window.
         //
-        // NotifyValueAsync returns IAsyncOperation that completes when
-        // the notification has been *delivered* (one BLE connection
-        // event, typically 15-30 ms on macOS). Calling .get() per
-        // chunk serialised the whole transfer to ~30 ms × N chunks =
-        // ~5 KB/s for a 540 KB image (97 s wall-clock observed live).
-        //
-        // Letting up to WINDOW_SIZE notifications fly before draining
-        // the head of the queue keeps the WinRT stack busy across
-        // connection events without unbounded queueing (which would
-        // risk silent drops on internal buffer overflow). Window=8
-        // is conservative — enough to saturate the link, small
-        // enough that backpressure surfaces quickly on a stalled peer.
-        const WINDOW_SIZE: usize = 8;
+        // Live test showed window=8 caused the Win host to hang for
+        // ~3 minutes when Mac→Win and Win→Mac transfers overlapped —
+        // probably a starvation: the WriteRequested handler thread
+        // couldn't get a turn while NotifyValueAsync.get() blocked
+        // on link-layer events. Reducing the window to 2 keeps the
+        // CPU available for incoming Writes while still pipelining
+        // enough to beat the per-chunk-RTT bottleneck of window=1.
+        const WINDOW_SIZE: usize = 2;
         let inner = &self.inner;
         let start = std::time::Instant::now();
         let mut in_flight: std::collections::VecDeque<_> =

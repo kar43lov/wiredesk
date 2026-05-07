@@ -392,41 +392,31 @@ impl Transport for BluetoothLeTransport {
         let inner = Arc::clone(&self.inner);
         inner.rt.block_on(async {
             let send_fut = async {
-                // Hybrid WithoutResponse + periodic WithResponse, paced
-                // by a *global* write counter so ATT-acks land at a
-                // steady rate regardless of how send() is called.
+                // Pure WriteWithoutResponse. btleplug on macOS handles
+                // BLE link-layer flow control internally via the
+                // CBPeripheralDelegate `peripheralIsReady(toSendWriteWithout
+                // Response:)` callback — `peripheral.write()` returns
+                // only when the stack is ready for another write.
                 //
-                // - Pure WriteWithResponse capped at ~1 KB/s (one ATT
-                //   roundtrip per chunk).
-                // - Pure WriteWithoutResponse was queue-fast but silently
-                //   dropped writes once CoreBluetooth's internal buffer
-                //   overflowed.
-                // - Per-call "ack on last chunk" rule looked sane for
-                //   clipboard but made every single-chunk packet — i.e.
-                //   every mouse / keyboard event — into a WithResponse
-                //   roundtrip, producing visible input jitter.
+                // Earlier attempts to interleave WriteWithResponse for
+                // backpressure backfired: the WithResponse ATT-ack
+                // had to compete with the Win side's notification
+                // pipeline, causing send timeouts and even hanging
+                // the Win host loop in NotifyValueAsync.get(). With
+                // pure WithoutResponse there is no ATT-ack roundtrip
+                // contending with Win-side notify pumps — both
+                // directions stay independent at the link layer.
                 //
-                // Global counter on `Inner` advances on every BLE write
-                // across the transport's lifetime; we force WithResponse
-                // every ACK_EVERY writes regardless of which packet they
-                // belong to. Mouse events flow as fast as
-                // WithoutResponse (most of the time) and clipboard
-                // bursts get evenly-spaced ack-flushes for backpressure.
-                const ACK_EVERY: u64 = 16;
+                // We still increment write_counter for diagnostics so
+                // future tooling (e.g., a Settings throughput readout)
+                // can read it without re-instrumenting the hot path.
                 for chunk in chunks.iter() {
-                    let n = inner
+                    inner
                         .write_counter
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
-                    let want_ack = n.is_multiple_of(ACK_EVERY);
-                    let write_type = if want_ack {
-                        WriteType::WithResponse
-                    } else {
-                        WriteType::WithoutResponse
-                    };
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     inner
                         .peripheral
-                        .write(&inner.rx_char, chunk, write_type)
+                        .write(&inner.rx_char, chunk, WriteType::WithoutResponse)
                         .await
                         .map_err(|e| WireDeskError::Transport(format!("BLE write: {e}")))?;
                 }
