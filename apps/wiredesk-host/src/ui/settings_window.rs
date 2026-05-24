@@ -51,8 +51,14 @@ pub struct SettingsWindow {
     pub transport_label: nwg::Label,
     pub transport_combo: nwg::ComboBox<String>,
     pub port_label: nwg::Label,
-    pub port_input: nwg::TextInput,
+    pub port_combo: nwg::ComboBox<String>,
     pub detect_btn: nwg::Button,
+    pub port_manual_label: nwg::Label,
+    pub port_input: nwg::TextInput,
+    /// Bare COM names index-aligned with `port_combo`'s labels. The labels
+    /// carry a chip hint ("COM7 — FT232H"), so a dropdown selection maps back
+    /// to the value written into config through this side table.
+    pub port_choice_coms: RefCell<Vec<String>>,
     pub baud_label: nwg::Label,
     pub baud_input: nwg::TextInput,
 
@@ -120,7 +126,7 @@ impl SettingsWindow {
                     .expect("malformed bundled app-icon.ico — rebuild assets");
                 let icon_ref = Some(&*window_icon);
                 nwg::Window::builder()
-                    .size((460, 460))
+                    .size((460, 500))
                     .position((300, 300))
                     .title("WireDesk Host Settings")
                     .icon(icon_ref)
@@ -193,17 +199,33 @@ impl SettingsWindow {
                 .h_align(nwg::HTextAlign::Right)
                 .parent(&s.connection_frame)
                 .build(&mut s.port_label)?;
-            nwg::TextInput::builder()
-                .text(&config.port)
+            // Labeled dropdown of detected serial ports (e.g. "COM7 — FT232H").
+            // Populated on every window open and on Detect via
+            // `set_port_choices`; selecting an entry copies its bare COM name
+            // into `port_input` (the canonical value read at Save). Starts
+            // empty — `show()` fills it before the window becomes visible.
+            nwg::ComboBox::builder()
+                .collection(Vec::<String>::new())
                 .parent(&s.connection_frame)
-                .build(&mut s.port_input)?;
-            // Auto-detect button — fills port_input with the discovered COM
-            // port if exactly one CH340 (VID 0x1A86) is plugged in. Handler
-            // wired in main.rs OnButtonClick. Alt+D accelerator.
+                .build(&mut s.port_combo)?;
+            // Auto-detect button — enumerates serial ports, repopulates the
+            // dropdown, and auto-selects a WireDesk adapter (CH340 VID 0x1A86
+            // or FTDI VID 0x0403). Handler in main.rs OnButtonClick. Alt+D.
             nwg::Button::builder()
                 .text("&Detect")
                 .parent(&s.connection_frame)
                 .build(&mut s.detect_btn)?;
+            // Manual override — free-text COM port for ports the dropdown
+            // didn't enumerate (mirrors the Mac client's combo + free-text).
+            nwg::Label::builder()
+                .text("or type:")
+                .h_align(nwg::HTextAlign::Right)
+                .parent(&s.connection_frame)
+                .build(&mut s.port_manual_label)?;
+            nwg::TextInput::builder()
+                .text(&config.port)
+                .parent(&s.connection_frame)
+                .build(&mut s.port_input)?;
 
             nwg::Label::builder()
                 .text("Baud:")
@@ -313,13 +335,16 @@ impl SettingsWindow {
                 // Row 0: [Transport label] [combo spans cols 1..2]
                 .child(0, 0, &s.transport_label)
                 .child_item(nwg::GridLayoutItem::new(&s.transport_combo, 1, 0, 2, 1))
-                // Row 1: [Serial port label] [port_input] [Detect]
+                // Row 1: [Serial port label] [port_combo] [Detect]
                 .child(0, 1, &s.port_label)
-                .child(1, 1, &s.port_input)
+                .child(1, 1, &s.port_combo)
                 .child(2, 1, &s.detect_btn)
-                // Row 2: [Baud label] [baud_input spans cols 1..2]
-                .child(0, 2, &s.baud_label)
-                .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 2, 2, 1))
+                // Row 2: [or type label] [port_input spans cols 1..2]
+                .child(0, 2, &s.port_manual_label)
+                .child_item(nwg::GridLayoutItem::new(&s.port_input, 1, 2, 2, 1))
+                // Row 3: [Baud label] [baud_input spans cols 1..2]
+                .child(0, 3, &s.baud_label)
+                .child_item(nwg::GridLayoutItem::new(&s.baud_input, 1, 3, 2, 1))
                 .build(&s.connection_layout)?;
 
             nwg::GridLayout::builder()
@@ -358,30 +383,32 @@ impl SettingsWindow {
             // ---- Outer grid: status row + 3 groups (title + frame) +
             // button-bar + message. Each group is two rows: 1-row title,
             // then a multi-row frame for nested controls. The Connection
-            // frame is now 3 rows tall (Transport / Port / Baud), so all
-            // subsequent rows shift +1 vs pre-Plan-C.
+            // frame is now 4 rows tall (Transport / Port+Detect / manual /
+            // Baud), so all subsequent rows shift +1 vs the pre-dropdown
+            // layout.
             nwg::GridLayout::builder()
                 .parent(&s.window)
-                .min_size([440, 470])
+                .min_size([440, 510])
                 .max_column(Some(3))
                 .spacing(4)
                 .margin([6, 6, 6, 6])
                 // Row 0: status icon + label
                 .child(0, 0, &s.status_icon)
                 .child_item(nwg::GridLayoutItem::new(&s.status_label, 1, 0, 2, 1))
-                // Row 1: Connection title; rows 2-4: Connection frame (Transport / Port / Baud)
+                // Row 1: Connection title; rows 2-5: Connection frame
+                // (Transport / Port+Detect / manual / Baud — 4 rows)
                 .child_item(nwg::GridLayoutItem::new(&s.connection_title, 0, 1, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.connection_frame, 0, 2, 3, 3))
-                // Row 5: Display title; rows 6-7: Display frame
-                .child_item(nwg::GridLayoutItem::new(&s.display_title, 0, 5, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.display_frame, 0, 6, 3, 2))
-                // Row 8: System title; rows 9-10: System frame
-                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 8, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 9, 3, 2))
-                // Row 11: button-bar (right-aligned via internal grid)
-                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 11, 3, 1))
-                // Row 12: message label
-                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 12, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.connection_frame, 0, 2, 3, 4))
+                // Row 6: Display title; rows 7-8: Display frame
+                .child_item(nwg::GridLayoutItem::new(&s.display_title, 0, 6, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.display_frame, 0, 7, 3, 2))
+                // Row 9: System title; rows 10-11: System frame
+                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 9, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 10, 3, 2))
+                // Row 12: button-bar (right-aligned via internal grid)
+                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 12, 3, 1))
+                // Row 13: message label
+                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 13, 3, 1))
                 .build(&s.layout)?;
 
             // Hidden by default — caller decides when to reveal.
@@ -391,8 +418,46 @@ impl SettingsWindow {
     }
 
     pub fn show(&self) {
+        // Refresh the port dropdown before revealing the window so it always
+        // reflects what's plugged in right now (adapters come and go between
+        // opens). Detect re-runs this on demand with target auto-select.
+        self.refresh_port_choices();
         self.window.set_visible(true);
         self.window.set_focus();
+    }
+
+    /// Re-enumerate serial ports and repopulate the dropdown, pre-selecting
+    /// the entry whose COM matches the current `port_input` value (the
+    /// configured port). Enumeration failure is logged, not surfaced — an
+    /// empty dropdown with the manual field still works.
+    pub fn refresh_port_choices(&self) {
+        match format::enumerate_ports_now() {
+            Ok(ports) => {
+                let current = self.port_input.text();
+                let select = ports.iter().position(|p| p.port_name == current);
+                self.set_port_choices(&ports, select);
+            }
+            Err(e) => log::warn!("serial port enumeration for dropdown failed: {e}"),
+        }
+    }
+
+    /// Fill the port dropdown with `ports`' labels and select `select`,
+    /// stashing the bare COM names index-aligned so a later selection maps
+    /// back to a config value.
+    pub fn set_port_choices(&self, ports: &[format::DetectedPort], select: Option<usize>) {
+        let labels: Vec<String> = ports.iter().map(|p| p.label.clone()).collect();
+        self.port_combo.set_collection(labels);
+        self.port_combo.set_selection(select);
+        *self.port_choice_coms.borrow_mut() =
+            ports.iter().map(|p| p.port_name.clone()).collect();
+    }
+
+    /// Bare COM name of the currently selected dropdown entry, if any. Used by
+    /// the OnComboBoxChanged handler to copy the choice into `port_input`.
+    pub fn selected_port_com(&self) -> Option<String> {
+        self.port_combo
+            .selection()
+            .and_then(|i| self.port_choice_coms.borrow().get(i).cloned())
     }
 
     pub fn hide(&self) {

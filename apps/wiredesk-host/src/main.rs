@@ -460,6 +460,7 @@ fn run_windows(
                     handle == s.restart_btn.handle,
                     handle == s.detect_btn.handle,
                     handle == s.quit_btn.handle,
+                    handle == s.port_combo.handle,
                 ),
                 Err(_) => {
                     log::debug!(
@@ -468,7 +469,7 @@ fn run_windows(
                     return;
                 }
             };
-            let (is_save, is_copy_mac, is_restart, is_detect, is_quit) = probe;
+            let (is_save, is_copy_mac, is_restart, is_detect, is_quit, is_port_combo) = probe;
             match evt {
                 E::OnButtonClick => {
                     if is_save {
@@ -484,6 +485,21 @@ fn run_windows(
                         // of the nwg event loop. Drop'ed guards (mutex,
                         // session thread join handle, etc.) clean up.
                         nwg::stop_thread_dispatch();
+                    }
+                }
+                // nwg spells the selection event "OnComboxBoxSelection"
+                // (typo carried in the crate); it maps to Win32 CBN_SELCHANGE.
+                E::OnComboxBoxSelection => {
+                    if is_port_combo {
+                        // Picking a port from the dropdown copies its bare COM
+                        // into the manual field — the canonical value read at
+                        // Save. try_borrow guards the same re-entrancy the
+                        // probe does (status-bar updates pump Win32 messages).
+                        if let Ok(s) = settings_clone2.try_borrow() {
+                            if let Some(com) = s.selected_port_com() {
+                                s.port_input.set_text(&com);
+                            }
+                        }
                     }
                 }
                 E::OnWindowClose => {
@@ -636,25 +652,45 @@ fn handle_detect(
     settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
 ) {
     let s = settings.borrow();
-    match ui::format::detect_serial_port_now() {
-        ui::format::DetectResult::Found(name) => {
-            s.port_input.set_text(&name);
-            s.set_message(&format!("Detected CH340 on {name}."));
-        }
-        ui::format::DetectResult::Multiple(names) => {
-            s.set_message(&format!(
-                "Multiple CH340 found: {} — pick one.",
-                names.join(", ")
-            ));
-        }
-        ui::format::DetectResult::NotFound => {
-            s.set_message("No CH340/CH341 detected. Plug the cable in and retry.");
-        }
-        ui::format::DetectResult::EnumerationFailed(msg) => {
+    let ports = match ui::format::enumerate_ports_now() {
+        Ok(ports) => ports,
+        Err(msg) => {
             // The OS port-enumeration API failed (driver issue, permission
-            // denied, etc.) — surface the underlying error instead of the
-            // misleading "No CH340 detected" message.
+            // denied, etc.) — surface the underlying error instead of a
+            // misleading "no adapter found" message.
             s.set_message(&format!("Port enumeration failed: {msg}"));
+            return;
+        }
+    };
+    let targets = ui::format::target_indices(&ports);
+    // Always repopulate the dropdown with everything we found; auto-select the
+    // first WireDesk adapter (CH340 / FTDI) so the common single-adapter case
+    // is one click. Non-adapter ports stay listed for manual pick.
+    s.set_port_choices(&ports, targets.first().copied());
+    match targets.first() {
+        Some(&idx) => {
+            let chosen = &ports[idx];
+            s.port_input.set_text(&chosen.port_name);
+            if targets.len() == 1 {
+                s.set_message(&format!("Detected {}.", chosen.label));
+            } else {
+                let coms: Vec<&str> =
+                    targets.iter().map(|&i| ports[i].port_name.as_str()).collect();
+                s.set_message(&format!(
+                    "Multiple adapters found ({}) — selected {}; pick another from the list if needed.",
+                    coms.join(", "),
+                    chosen.port_name
+                ));
+            }
+        }
+        None if ports.is_empty() => {
+            s.set_message("No serial ports found. Plug the adapter in and retry.");
+        }
+        None => {
+            s.set_message(&format!(
+                "No CH340 / FT232H found among {} serial port(s) — pick one from the list or type it.",
+                ports.len()
+            ));
         }
     }
 }
