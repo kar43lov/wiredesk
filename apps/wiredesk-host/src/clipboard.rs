@@ -57,6 +57,18 @@ enum LastKind {
     /// poll path short-circuit the expensive RGBA→PNG re-encode for the same
     /// buffer on every poll tick.
     OversizeImage(u64),
+    /// Content hash of the most recent file sent or received. Independent of
+    /// Image/Text — the system clipboard can carry CF_HDROP alongside other
+    /// formats, and the loop-avoidance dedup must not bleed across kinds.
+    /// Constructed in Tasks 6c / 7c — `#[allow(dead_code)]` until poll-path
+    /// + commit-path land.
+    #[allow(dead_code)]
+    File(u64),
+    /// Content hash of the most recent file rejected by the size cap. Mirrors
+    /// `OversizeImage` — lets the poll path short-circuit re-reading the same
+    /// oversize file each tick.
+    #[allow(dead_code)]
+    OversizeFile(u64),
 }
 
 impl LastKind {
@@ -66,6 +78,16 @@ impl LastKind {
     /// the Mac side — duplication is intentional per CLAUDE.md.
     fn matches_image_hash(&self, hash: u64) -> bool {
         matches!(self, LastKind::Image(h) | LastKind::OversizeImage(h) if *h == hash)
+    }
+
+    /// True when this state has stamped the given content hash either as a
+    /// successfully-sent/received file (loop-avoidance dedup) or as an
+    /// oversize-rejected file. Symmetric with `matches_image_hash` — the
+    /// poll path uses it to skip re-reading the same file on every tick.
+    /// Consumed by Task 6c — `#[allow(dead_code)]` until poll-path lands.
+    #[allow(dead_code)]
+    fn matches_file_hash(&self, hash: u64) -> bool {
+        matches!(self, LastKind::File(h) | LastKind::OversizeFile(h) if *h == hash)
     }
 }
 
@@ -1426,5 +1448,74 @@ mod tests {
             !last_oversize.matches_image_hash(other_hash),
             "different RGBA must re-try encode path"
         );
+    }
+
+    #[test]
+    fn host_lastkind_file_dedup_per_slot() {
+        // LastKind::File holds a content hash. matches_file_hash returns true
+        // for the same hash; matches_image_hash returns false for it
+        // (independent slots, no cross-kind aliasing).
+        let h = 0x1234_5678_u64;
+        let last_file = LastKind::File(h);
+        assert!(last_file.matches_file_hash(h));
+        assert!(
+            !last_file.matches_image_hash(h),
+            "file hash must not match image dedup slot"
+        );
+    }
+
+    #[test]
+    fn host_lastkind_file_oversize_distinct() {
+        // File(h) and OversizeFile(h) carry the same hash but are distinct
+        // variants. Equality must NOT collapse them; both match the file
+        // dedup though (for poll-path short-circuiting).
+        let h = 0xC0DE_u64;
+        let f = LastKind::File(h);
+        let of = LastKind::OversizeFile(h);
+        assert_ne!(f, of, "File and OversizeFile variants must remain distinct");
+        assert!(f.matches_file_hash(h));
+        assert!(of.matches_file_hash(h));
+    }
+
+    #[test]
+    fn host_oversize_file_dedup_skips_repoll() {
+        // Symmetric with host_oversize_dedup_skips_repoll: once an oversize
+        // file hash is stamped, the next poll tick with the same content
+        // must short-circuit (no re-read, no repeat warn-log).
+        let h = 0xABCD_u64;
+        assert!(!LastKind::None.matches_file_hash(h), "first tick must NOT skip");
+
+        let last_oversize = LastKind::OversizeFile(h);
+        assert!(
+            last_oversize.matches_file_hash(h),
+            "repeated oversize file must short-circuit"
+        );
+
+        // Different content → different hash → must NOT skip.
+        let other_hash = h ^ 0xFFFF_FFFF;
+        assert!(
+            !last_oversize.matches_file_hash(other_hash),
+            "different file content must re-try send path"
+        );
+    }
+
+    #[test]
+    fn host_lastkind_text_image_file_slot_independence() {
+        // Smoke check on the three same-hash variants: each variant must
+        // ONLY match its own kind's dedup method — no cross-slot aliasing.
+        let h = 0xFEED_u64;
+        let text = LastKind::Text(h);
+        let image = LastKind::Image(h);
+        let file = LastKind::File(h);
+
+        // image_hash matches Image+OversizeImage only.
+        assert!(image.matches_image_hash(h));
+        assert!(!text.matches_image_hash(h));
+        assert!(!file.matches_image_hash(h));
+
+        // file_hash matches File+OversizeFile only.
+        assert!(file.matches_file_hash(h));
+        assert!(!text.matches_file_hash(h));
+        assert!(!image.matches_file_hash(h));
     }
 }

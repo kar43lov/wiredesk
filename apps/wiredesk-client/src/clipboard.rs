@@ -58,6 +58,18 @@ pub(crate) struct LastSeen {
     /// repeated toast emission) for the same buffer on every 500 ms tick —
     /// AC4 expects one toast per oversize event, not one per poll.
     pub oversize_image: Option<u64>,
+    /// Hash of the most recent file content (raw file bytes) sent or
+    /// received. Independent slot so a file sync doesn't compete with
+    /// text/image dedup — the OS clipboard can carry multiple types.
+    /// Consumed by Tasks 6b / 7b — `#[allow(dead_code)]` until poll-path
+    /// + commit-path land.
+    #[allow(dead_code)]
+    pub file: Option<u64>,
+    /// Hash of the most recent file rejected by the size cap. Mirrors
+    /// `oversize_image` — lets the poll thread short-circuit re-reading
+    /// the same oversize file every tick (and avoid repeated toasts).
+    #[allow(dead_code)]
+    pub oversize_file: Option<u64>,
 }
 
 /// How many recent text hashes the dedup history retains. 4 covers a
@@ -75,6 +87,15 @@ impl LastSeen {
     pub(crate) fn matches_text_hash(&self, hash: u64) -> bool {
         self.text_history.contains(&hash)
     }
+
+    /// True when the given content hash matches either the last sent/received
+    /// file OR the last oversize-rejected file. Poll path uses this to skip
+    /// re-reading the same file (and re-emitting toasts) on every tick.
+    /// Consumed by Task 6b — `#[allow(dead_code)]` until poll-path lands.
+    #[allow(dead_code)]
+    pub(crate) fn matches_file_hash(&self, hash: u64) -> bool {
+        self.file == Some(hash) || self.oversize_file == Some(hash)
+    }
 }
 
 /// Legacy enum kept for unit tests that still use `state.set(LastKind::*)`.
@@ -87,6 +108,8 @@ pub(crate) enum LastKind {
     Text(u64),
     Image(u64),
     OversizeImage(u64),
+    File(u64),
+    OversizeFile(u64),
 }
 
 /// Shared state: per-kind hashes of the last observed clipboard content.
@@ -136,6 +159,26 @@ impl ClipboardState {
         g.oversize_image = Some(hash);
     }
 
+    /// Consumed by Tasks 6b / 7b — `#[allow(dead_code)]` until the poll-path
+    /// and commit-path land.
+    #[allow(dead_code)]
+    pub(crate) fn set_file(&self, hash: u64) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        g.file = Some(hash);
+        // Successful file send/receive clears any prior oversize-stamp
+        // for the same buffer — buffer's now delivered, not rejected.
+        if g.oversize_file == Some(hash) {
+            g.oversize_file = None;
+        }
+    }
+
+    /// Consumed by Task 6b — `#[allow(dead_code)]` until the poll-path lands.
+    #[allow(dead_code)]
+    pub(crate) fn set_oversize_file(&self, hash: u64) {
+        let mut g = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        g.oversize_file = Some(hash);
+    }
+
     /// Test-only legacy setter. Maps `LastKind` variants onto the per-kind
     /// `LastSeen` slots so existing tests don't have to rewrite call sites.
     #[cfg(test)]
@@ -145,6 +188,8 @@ impl ClipboardState {
             LastKind::Text(h) => self.set_text(h),
             LastKind::Image(h) => self.set_image(h),
             LastKind::OversizeImage(h) => self.set_oversize_image(h),
+            LastKind::File(h) => self.set_file(h),
+            LastKind::OversizeFile(h) => self.set_oversize_file(h),
         }
     }
 
@@ -1813,6 +1858,102 @@ mod tests {
         assert_eq!(incoming.received.len(), 0, "post-rejection chunks must not buffer");
         assert_eq!(incoming.received_total, 0);
         assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn lastseen_file_slot_independent_from_image() {
+        // Set the same hash value as image, then as file. Both slots must
+        // hold it independently (R3 coverage — alternating image/file
+        // clipboard mustn't loop the way single-slot dedup would).
+        let state = ClipboardState::new();
+        let h = 0xDEAD_BEEF_u64;
+        state.set_image(h);
+        state.set_file(h);
+        let s = state.get();
+        assert_eq!(s.image, Some(h));
+        assert_eq!(s.file, Some(h));
+        assert!(s.matches_image_hash(h));
+        assert!(s.matches_file_hash(h));
+    }
+
+    #[test]
+    fn lastseen_file_dedup_per_slot() {
+        // Set a file hash. matches_file_hash(same) → true; matches_image_hash
+        // for the same hash → false (slot independence).
+        let state = ClipboardState::new();
+        let h = 0x1234_5678_u64;
+        state.set_file(h);
+        let s = state.get();
+        assert!(s.matches_file_hash(h));
+        assert!(!s.matches_image_hash(h), "file hash must not match image slot");
+        assert!(!s.matches_text_hash(h), "file hash must not match text slot");
+    }
+
+    #[test]
+    fn reset_clears_file_slot() {
+        // set_file → reset → file slot is None.
+        let state = ClipboardState::new();
+        state.set_file(0xAAAA);
+        state.set_oversize_file(0xBBBB);
+        assert_eq!(state.get().file, Some(0xAAAA));
+        assert_eq!(state.get().oversize_file, Some(0xBBBB));
+
+        state.reset();
+
+        let s = state.get();
+        assert!(s.file.is_none(), "reset must clear file slot");
+        assert!(s.oversize_file.is_none(), "reset must clear oversize_file slot");
+    }
+
+    #[test]
+    fn set_file_clears_matching_oversize_stamp() {
+        // Mirror of set_image behaviour: once an oversize-rejected file is
+        // successfully delivered (e.g. user re-copied a smaller version that
+        // hashes to the same content — improbable but possible) the oversize
+        // stamp must be cleared so subsequent reads see it as "ok".
+        let state = ClipboardState::new();
+        let h = 0xC0DE_u64;
+        state.set_oversize_file(h);
+        assert_eq!(state.get().oversize_file, Some(h));
+
+        state.set_file(h);
+
+        let s = state.get();
+        assert_eq!(s.file, Some(h));
+        assert!(s.oversize_file.is_none(), "set_file must clear matching oversize_file");
+    }
+
+    #[test]
+    fn lastseen_rapid_text_image_file_text_no_slot_aliasing() {
+        // sequence: set_text(A) → set_image(B) → set_file(C) → set_text(D).
+        // All four slots must remain independent — no aliasing where one
+        // setter quietly clears another's hash.
+        let state = ClipboardState::new();
+        state.set_text(0xAAAA);
+        state.set_image(0xBBBB);
+        state.set_file(0xCCCC);
+        state.set_text(0xDDDD);
+
+        let s = state.get();
+        assert!(s.matches_text_hash(0xDDDD), "latest text in history");
+        assert!(s.matches_text_hash(0xAAAA), "older text still in history (LRU)");
+        assert_eq!(s.image, Some(0xBBBB), "image survives all text+file writes");
+        assert_eq!(s.file, Some(0xCCCC), "file survives subsequent text write");
+        assert!(s.matches_file_hash(0xCCCC));
+        assert!(!s.matches_file_hash(0xAAAA), "text hash must not match file slot");
+    }
+
+    #[test]
+    fn lastkind_file_oversize_distinct_test_only() {
+        // Test-only LastKind enum: File and OversizeFile map onto distinct
+        // LastSeen slots. Smoke test that the legacy `set()` helper threads
+        // both variants through correctly.
+        let state = ClipboardState::new();
+        state.set(LastKind::File(0x1111));
+        state.set(LastKind::OversizeFile(0x2222));
+        let s = state.get();
+        assert_eq!(s.file, Some(0x1111));
+        assert_eq!(s.oversize_file, Some(0x2222));
     }
 
     #[test]

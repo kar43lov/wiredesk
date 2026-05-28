@@ -270,23 +270,24 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-client/src/clipboard.rs` (Mac LastSeen)
 - Modify: `apps/wiredesk-host/src/clipboard.rs` (Win LastKind)
 
-- [ ] **Mac side**:
-  - Extend `LastSeen` struct: add `pub file: Option<u64>` + `pub oversize_file: Option<u64>`.
-  - Add `LastSeen::matches_file_hash(hash) -> bool` — parallel `matches_image_hash`.
-  - Add `ClipboardState::set_file(hash)`, `set_oversize_file(hash)` — parallel image-сетеров.
-  - Extend `ClipboardState::reset()` — clear file + oversize_file slots.
-  - Extend `LastKind` test enum (cfg(test)): add `File(u64)`, `OversizeFile(u64)` variants.
-- [ ] **Win side**:
-  - Extend `LastKind` enum: add `File(u64)`, `OversizeFile(u64)` variants.
-  - Update `LastKind::matches_image_hash` → renamed/extended `matches_file_hash` (или новый method).
-  - Default behaviour для new variants в любых match'ах (compile-error gate).
-- [ ] Write tests:
-  - `lastseen_file_slot_independent_from_image` — set image hash, set same value as file hash → both slots non-conflicting (R3 coverage).
-  - `lastseen_file_dedup_per_slot` — set file hash, matches_file_hash(same) → true; matches_image_hash(same) → false.
-  - `reset_clears_file_slot` — set file hash, reset, assert None.
-  - `lastkind_file_oversize_distinct` — Win LastKind::File(h) != LastKind::OversizeFile(h).
-  - `lastseen_rapid_text_image_file_text_no_slot_aliasing` — sequence: set_text(A) → set_image(B) → set_file(C) → set_text(D); все slots independent, no aliasing.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 6b.
+- [x] **Mac side**:
+  - Extend `LastSeen` struct: add `pub file: Option<u64>` + `pub oversize_file: Option<u64>` ✓.
+  - Add `LastSeen::matches_file_hash(hash) -> bool` — parallel `matches_image_hash` ✓.
+  - Add `ClipboardState::set_file(hash)`, `set_oversize_file(hash)` — parallel image-сетеров ✓. `set_file` mirrors `set_image` and clears matching oversize stamp.
+  - Extend `ClipboardState::reset()` — clear file + oversize_file slots ✓ (auto via `*g = LastSeen::default()`; covered by `reset_clears_file_slot` test).
+  - Extend `LastKind` test enum (cfg(test)): add `File(u64)`, `OversizeFile(u64)` variants ✓ + `set()` mapping.
+- [x] **Win side**:
+  - Extend `LastKind` enum: add `File(u64)`, `OversizeFile(u64)` variants ✓.
+  - Update `LastKind::matches_image_hash` → renamed/extended `matches_file_hash` (или новый method) ✓ — added new `matches_file_hash` method, kept `matches_image_hash` intact (symmetric pattern).
+  - Default behaviour для new variants в любых match'ах (compile-error gate) ✓ — no exhaustive matches on `LastKind` in production code; `matches!` macros and explicit construction sites unaffected.
+- [x] Write tests:
+  - `lastseen_file_slot_independent_from_image` ✓ (Mac).
+  - `lastseen_file_dedup_per_slot` ✓ (Mac).
+  - `reset_clears_file_slot` ✓ (Mac).
+  - `lastkind_file_oversize_distinct` ✓ (Win → `host_lastkind_file_oversize_distinct`).
+  - `lastseen_rapid_text_image_file_text_no_slot_aliasing` ✓ (Mac).
+  - Bonus: `set_file_clears_matching_oversize_stamp` (Mac), `lastkind_file_oversize_distinct_test_only` (Mac LastKind test-enum), `host_lastkind_file_dedup_per_slot`, `host_oversize_file_dedup_skips_repoll`, `host_lastkind_text_image_file_slot_independence` (Win).
+- [x] Run `cargo test --workspace -- --test-threads=1` — passed: 549 total (+10 net new), 0 failed, 5 ignored. Clippy clean.
 
 ### Task 6b: Mac outbound file sync (poll path extension)
 
