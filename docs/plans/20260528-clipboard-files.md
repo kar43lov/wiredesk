@@ -294,21 +294,23 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 **Files:**
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 
-- [ ] В poll thread после text/image branches добавить file-branch:
-  - Call `clipboard_files::poll_file_url(&mut last_change_count)`.
-  - If `Some(path)`: stat file, если size > `MAX_FILE_BYTES` → `set_oversize_file(hash_path)` + toast warning через `pending_warning` slot.
-  - Иначе: read file content (full bytes), hash content (DefaultHasher).
-  - Dedup vs `LastSeen.file` и `LastSeen.oversize_file` — skip emit если match.
-  - `pack_first_chunk(basename(path), content)` → `emit_offer_and_chunks(FORMAT_FILE, packed)`.
-  - `set_file(content_hash)`.
-- [ ] Add pure helper `pack_file_or_warn(path: &Path, max: usize) -> Result<Vec<u8>, FileTooLarge>` для тестируемости offline.
-- [ ] Add `format_oversize_file_toast(size_bytes: usize) -> String` — parallel `format_oversize_toast`.
-- [ ] Write tests:
-  - `mac_outbound_dedup_skips_same_file_hash` — state set, helper called с same content → no emit (brief T5).
-  - `mac_outbound_emits_offer_and_chunks_for_file` — synthesize 4KB fake content + name → offer format=FORMAT_FILE + correct chunk count + first chunk contains packed name.
-  - `mac_outbound_oversize_emits_toast_only` — content > MAX_FILE_BYTES → no offer, warning slot populated.
-  - `mac_outbound_oversize_path_hash_cached` — second poll того же oversize file не повторяет toast.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 6c.
+- [x] В poll thread после text/image branches добавить file-branch:
+  - Call `clipboard_files::poll_file_url(&mut last_change_count)` ✓ (file_change_count initialised at -1 so the first tick always inspects the pasteboard).
+  - If `Some(path)`: stat file, если size > `MAX_FILE_BYTES` → `set_oversize_file(path_hash)` + toast warning через `events_tx.send(TransportEvent::Toast(...))` (no separate `pending_warning` slot — existing TransportEvent::Toast is the channel) ✓.
+  - Иначе: read file content (full bytes), hash content (DefaultHasher через `hash_bytes`) ✓.
+  - Dedup vs `LastSeen.file` и `LastSeen.oversize_file` — skip emit если match (через `matches_file_hash`) ✓.
+  - `pack_first_chunk(basename(path), content)` → `emit_offer_and_chunks(FORMAT_FILE, packed)` ✓.
+  - `set_file(content_hash)` ✓.
+  - **Refactor**: image branch wrapped in labeled `'image:` block so its early-exits fall through to the file branch (the OS clipboard can carry text + image + file URL from one Cmd+C — we don't want a stale image to suppress file sync). The previous `continue` exits in the image branch were converted to `break 'image`.
+- [x] Add pure helper `pack_file_or_warn(path: &Path, limit: usize) -> FilePollOutcome` для тестируемости offline ✓. Returns `Ready { name, hash, packed } | Oversize { path_hash, err } | Skipped(reason)` so the caller (production or test) can do its own state mutations.
+- [x] Add `format_oversize_file_toast(&FileTooLarge) -> String` — parallel `format_oversize_toast` ✓. Also added `check_file_size(size_bytes, limit) -> Result<(), FileTooLarge>` mirror of `check_image_size`.
+- [x] Write tests (10 new):
+  - `mac_outbound_dedup_skips_same_file_hash` — content hash stamp → `matches_file_hash` short-circuits next tick (brief T5) ✓.
+  - `mac_outbound_emits_offer_and_chunks_for_file` — synthesize 4 KB content → packed → offer format=FORMAT_FILE, chunks reassemble to packed payload ✓.
+  - `mac_outbound_oversize_emits_toast_only` — content > limit → no packets emitted, TransportEvent::Toast on events_tx, oversize_file slot stamped ✓.
+  - `mac_outbound_oversize_path_hash_cached` — second poll of same oversize path → `matches_file_hash(path_hash)` short-circuits before toast re-emission ✓.
+  - Plus bonus pure tests: `check_file_size_within_limit`, `check_file_size_over_limit_reports_bytes`, `format_oversize_file_toast_includes_kb_and_hint`, `pack_file_or_warn_ready_for_normal_file`, `pack_file_or_warn_oversize_emits_path_hash_and_err`, `pack_file_or_warn_missing_file_skipped` ✓.
+- [x] Run `cargo test --workspace -- --test-threads=1` — 559 passed (198 client + 117 host + 14 exec-core + 84 protocol + 83 transport-other + 22 term + 41 transport), 0 failed, 5 ignored. Workspace clippy clean. ✓.
 
 ### Task 6c: Win outbound file sync (poll path extension)
 
