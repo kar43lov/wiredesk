@@ -357,23 +357,24 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 **Files:**
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 
-- [ ] Extend `IncomingClipboard::on_offer` для file size cap check: `total_len_usize > MAX_FILE_BYTES + MAX_FILENAME_LEN + 2` (header overhead) → ClipDecline.
-- [ ] Extend `IncomingClipboard::commit` — branch on `expected_format == FORMAT_FILE`:
+- [x] Extend `IncomingClipboard::on_offer` для file size cap check: `total_len_usize > MAX_FILE_BYTES + MAX_FILENAME_LEN + 2` (header overhead) → silent drop (без ClipDecline — последний reserved for policy refusals, не для broken peers). State reset, чанки потом отбрасываются `expected_len==0` guard'ом в `on_chunk`.
+- [x] Extend `IncomingClipboard::commit` — branch on `expected_format == FORMAT_FILE`:
   - `unpack_first_chunk(payload)` → `(name, content)`.
   - `sanitize_basename(name)` → final basename.
   - `dirs::cache_dir().join("WireDesk").join(basename)` — `fs::create_dir_all` если нет.
-  - `fs::write(path, content)` — на IO error: log::warn + reset reassembly + early return.
+  - `fs::write(path, content)` — на IO error: log::warn + `remove_file` partial + clear in_flight slot + early return.
   - Call `clipboard_files::set_file_url(&path)` — на FFI error: log::warn (file всё равно в cache, user может вручную найти).
   - `state.set_file(content_hash)` — hash content только что reassembled.
-- [ ] Cleanup partial-file on reset/abort: track in-flight write path в IncomingClipboard state; reset() → `fs::remove_file(path).ok()`.
-- [ ] Write tests (pure where possible — inject cache_dir):
-  - `mac_incoming_file_commits_to_cache` — feed offer+chunks → commit → tempdir contains expected file (brief T5).
-  - `mac_incoming_file_sanitizes_traversal` — name `"../evil.sh"` → file written внутри cache_dir, not outside (brief T4 + AC6).
-  - `mac_incoming_file_unicode_filename` — `"привет 🎉.pdf"` → preserved (brief T3 + AC5).
-  - `mac_incoming_file_oversize_declined` — total_len > cap → declined + state reset (AC4).
-  - `mac_incoming_partial_file_cleaned_on_reset` — start file write, reset → partial removed.
-  - Regression: `text_and_image_commit_still_work` — text+image paths не сломались.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 7c.
+- [x] Cleanup partial-file on reset/abort: track in-flight write path в `IncomingClipboard.in_flight_file_path`; `reset()` → `fs::remove_file(path).ok()` с `NotFound` swallow. Stamp ДО write (panic/abort mid-write оставит breadcrumb); clear ПОСЛЕ successful write+set_file_url.
+- [x] Write tests (pure where possible — inject cache_dir):
+  - `mac_incoming_file_commits_to_cache` ✓ — feed offer+chunks → commit → tempdir contains expected file + LastSeen.file stamped (brief T5).
+  - `mac_incoming_file_sanitizes_traversal` ✓ — name `"../evil.sh"` → file written внутри cache_dir, не outside (brief T4 + AC6).
+  - `mac_incoming_file_unicode_filename` ✓ — `"привет 🎉.pdf"` → preserved (brief T3 + AC5).
+  - `mac_incoming_file_oversize_declined` ✓ — total_len > cap → silent drop в on_offer + chunks discarded + cache dir empty (AC4).
+  - `mac_incoming_partial_file_cleaned_on_reset` ✓ — pre-populate partial + stamp in_flight → reset() removes.
+  - `text_and_image_commit_still_work` ✓ — regression (AC3): text + image paths не сломались.
+  - Bonus: `mac_incoming_partial_file_missing_no_panic_on_reset`, `mac_incoming_file_unpack_failure_leaves_state_clean`, `mac_incoming_file_reserved_ntfs_name_prefixed`, `mac_incoming_file_empty_name_falls_back_to_clipboard_bin` ✓.
+- [x] Run `cargo test --workspace -- --test-threads=1` — 586 passed (214 client + 14 exec-core + 84 protocol + 133 host + 83 transport-other + 22 term + 41 transport), 0 failed, 5 ignored. +10 net new tests vs 576 baseline. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ### Task 7c: Win inbound file commit (mirror of 7b)
 
