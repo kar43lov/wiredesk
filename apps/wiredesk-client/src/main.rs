@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod clipboard_files;
 mod config;
 mod exec_bridge;
 #[cfg(target_os = "macos")]

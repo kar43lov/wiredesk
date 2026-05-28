@@ -213,24 +213,26 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-client/Cargo.toml`
 - Modify: `apps/wiredesk-client/src/main.rs` (`mod clipboard_files`)
 
-- [ ] **Resolve current versions first**: run `cargo search objc2-app-kit objc2-foundation objc2` или проверить через context7 → `mcp__plugin_context7_context7__resolve-library-id("objc2-app-kit")` → актуальные мажорные/минорные. Записать resolved versions в Cargo.toml без угадывания.
-- [ ] Add deps в `Cargo.toml`:
+- [x] **Resolve current versions first**: ran `cargo search` (objc2=0.6.4, objc2-app-kit=0.3.2, objc2-foundation=0.3.2). **Decision**: stick with existing project versions (objc2=0.5, objc2-app-kit=0.2, objc2-foundation=0.2) — upgrading the major version would force API migration of `status_bar.rs` / `monitor.rs` / `main.rs` (out-of-scope for clipboard files). Both 0.2.2 and 0.3.2 expose NSPasteboard / NSURL with equivalent shape.
+- [x] Add deps в `Cargo.toml`:
   ```toml
-  objc2 = "<resolved>"
-  objc2-app-kit = { version = "<resolved>", features = ["NSPasteboard"] }
-  objc2-foundation = { version = "<resolved>", features = ["NSURL", "NSArray", "NSString"] }
+  # Already at objc2 = "0.5"; expanded existing app-kit/foundation feature lists:
+  objc2-app-kit = { version = "0.2", features = ["NSScreen", "NSStatusBar", "NSStatusItem", "NSPasteboard", "NSPasteboardItem"] }
+  objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSGeometry", "NSThread", "NSURL"] }
   ```
-- [ ] Create `clipboard_files.rs` со следующими public функциями:
-  - `pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf>` — `NSPasteboard.generalPasteboard.changeCount()`, если изменился И `types contains "public.file-url"` — взять NSURL array, **если len != 1 → return None + log debug "multi-file selection skipped"**, иначе первый URL → PathBuf, обновить `last_change_count`.
-  - `pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError>` — clear pasteboard, write `NSURL.fileURLWithPath:` + `NSPasteboard.writeObjects([url])`.
-  - `pub enum FileClipboardError { PasteboardUnavailable, BadPath, FfiError(String) }`.
-- [ ] Logging: `log::debug!` на каждый poll-tick с file detection, `log::warn!` на FFI errors.
-- [ ] Write tests:
-  - `set_file_url_returns_ok_for_valid_path` — `#[ignore]` + `#[cfg(target_os = "macos")]` smoke (brief T6).
-  - `poll_change_count_increments_dedup` — pure-logic тест на change_count tracking (без FFI).
-  - `polling_multi_file_returns_none` — `#[ignore]` smoke с pre-populated multi-file pasteboard.
-- [ ] Compile-check на Mac: `cargo check -p wiredesk-client`.
-- [ ] Run `cargo test -p wiredesk-client -- --test-threads=1` (skip ignored) — must pass before Task 5.
+- [x] Create `clipboard_files.rs` со следующими public функциями:
+  - `pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf>` — `NSPasteboard.generalPasteboard.changeCount()`, если изменился И `pasteboardItems().count() == 1` И item.stringForType(NSPasteboardTypeFileURL) → parse `file://` URL → PathBuf. Multi-file → None + log debug "multi-file selection skipped, out of Phase 1 scope". Counter bumped eagerly даже на skip — иначе sticky multi-file selection пересканировался бы каждый tick.
+  - `pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError>` — clear pasteboard, write `NSURL.fileURLWithPath:` + `NSPasteboard.writeObjects([url])` через `ProtocolObject<dyn NSPasteboardWriting>` array.
+  - `pub enum FileClipboardError { PasteboardUnavailable, BadPath(String), FfiError(String) }` (thiserror-derived).
+  - Bonus pure helpers: `parse_file_url(&str) -> Option<PathBuf>` + `percent_decode(&str) -> String` — RFC-3986 percent decoding для NSURL-produced strings (spaces, unicode); вынесены чтобы URL-parsing path был unit-tested без AppKit session.
+- [x] Logging: `log::debug!` на multi-file skip / non-file:// URL detected; никаких log::warn! — FFI errors сейчас только из `writeObjects` returning NO и переносятся в `FfiError` для caller'а.
+- [x] Write tests:
+  - `set_file_url_returns_ok_for_valid_path` — `#[ignore]` + `#[cfg(target_os = "macos")]` smoke (brief T6) — ✓.
+  - `poll_change_count_increments_dedup` — pure-logic тест на change_count tracking (без FFI) — ✓.
+  - `polling_multi_file_returns_none` — `#[ignore]` smoke с pre-populated multi-file pasteboard — ✓.
+  - Bonus pure tests: `parse_file_url_simple/with_localhost_host/with_space_encoded/unicode_percent_encoded/rejects_http/rejects_empty_path`, `percent_decode_passthrough_invalid_hex/handles_truncated_tail`, `set_file_url_rejects_empty_path` — 10 passing.
+- [x] Compile-check на Mac: `cargo check -p wiredesk-client` ✓ clean.
+- [x] Run `cargo test -p wiredesk-client -- --test-threads=1` (skip ignored) — 182 passed; 0 failed; 3 ignored. Workspace-wide: 534 passed.
 
 ### Task 5: Win CF_HDROP file FFI module
 
