@@ -16,7 +16,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use wiredesk_protocol::message::{FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
+use wiredesk_protocol::clip_file::{MAX_FILE_BYTES, pack_first_chunk};
+use wiredesk_protocol::message::{FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
+
+use crate::clipboard_files;
 
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Per-chunk byte cap. Bumped 256 → 1024 with the BLE transport: u16
@@ -60,14 +63,11 @@ enum LastKind {
     /// Content hash of the most recent file sent or received. Independent of
     /// Image/Text — the system clipboard can carry CF_HDROP alongside other
     /// formats, and the loop-avoidance dedup must not bleed across kinds.
-    /// Constructed in Tasks 6c / 7c — `#[allow(dead_code)]` until poll-path
-    /// + commit-path land.
-    #[allow(dead_code)]
     File(u64),
-    /// Content hash of the most recent file rejected by the size cap. Mirrors
+    /// Path hash of the most recent file rejected by the size cap. Mirrors
     /// `OversizeImage` — lets the poll path short-circuit re-reading the same
-    /// oversize file each tick.
-    #[allow(dead_code)]
+    /// oversize file each tick. Hash is over the path string (not content)
+    /// because we never read the oversize file's content.
     OversizeFile(u64),
 }
 
@@ -84,8 +84,6 @@ impl LastKind {
     /// successfully-sent/received file (loop-avoidance dedup) or as an
     /// oversize-rejected file. Symmetric with `matches_image_hash` — the
     /// poll path uses it to skip re-reading the same file on every tick.
-    /// Consumed by Task 6c — `#[allow(dead_code)]` until poll-path lands.
-    #[allow(dead_code)]
     fn matches_file_hash(&self, hash: u64) -> bool {
         matches!(self, LastKind::File(h) | LastKind::OversizeFile(h) if *h == hash)
     }
@@ -175,6 +173,107 @@ pub(crate) fn check_image_size(png_len: usize, limit: usize) -> Result<(), Image
     } else {
         Ok(())
     }
+}
+
+/// Pure-helper error returned when a file's on-disk size exceeds the per-
+/// transfer cap. Mirrors `ImageTooLarge` so the poll thread can branch on a
+/// typed error without going through `std::io::Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileTooLarge {
+    pub size_bytes: usize,
+}
+
+/// Pure helper used both by the poll thread (with `MAX_FILE_BYTES`) and the
+/// unit tests (with a low limit so synthetic fixtures can exercise the
+/// oversize branch). Symmetric with `check_image_size`.
+pub(crate) fn check_file_size(size_bytes: usize, limit: usize) -> Result<(), FileTooLarge> {
+    if size_bytes > limit {
+        Err(FileTooLarge { size_bytes })
+    } else {
+        Ok(())
+    }
+}
+
+/// Human-readable toast string for files dropped at the size cap. Reports KB
+/// like the image variant for consistency between image and file caps.
+pub(crate) fn format_oversize_file_toast(e: &FileTooLarge, limit: usize) -> String {
+    let kb = e.size_bytes / 1024;
+    let limit_kb = limit / 1024;
+    format!(
+        "Clipboard file too large to send: {} KB > {} KB limit. \
+         Copy a smaller file.",
+        kb, limit_kb
+    )
+}
+
+/// Result of running the outbound file-poll helper on a single CF_HDROP
+/// pasteboard path. Captures both success and the oversize-skip branch so
+/// the poll thread (and unit tests) can stamp dedup slots / pending warnings
+/// without touching the filesystem from inside the test runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilePollOutcome {
+    /// File read successfully. Caller emits offer + chunks then stamps
+    /// `LastKind::File(hash)`.
+    Ready { name: String, hash: u64, packed: Vec<u8> },
+    /// File exceeded `limit`. Caller stamps `LastKind::OversizeFile(path_hash)`
+    /// and surfaces the toast.
+    Oversize { path_hash: u64, err: FileTooLarge },
+    /// Path failed sanity (empty basename, IO error, pack failure). Caller
+    /// logs at debug and skips this tick without stamping anything.
+    Skipped(&'static str),
+}
+
+/// Pure(-ish) helper for the outbound file branch. Reads `path`, hashes the
+/// content, checks the size cap, and packs the first chunk via
+/// `wiredesk_protocol::clip_file::pack_first_chunk`.
+///
+/// Hashing is over **content** (not filename) — copy-rename-paste produces the
+/// same hash → dedup catches it. Path-hash is used only to stamp the oversize
+/// slot so a sticky too-big file doesn't re-warn every tick.
+///
+/// Symmetric with the Mac side's `pack_file_or_warn` — the duplication is
+/// intentional per CLAUDE.md (both sides poll their own OS clipboard).
+pub(crate) fn pack_file_or_warn(
+    path: &std::path::Path,
+    limit: usize,
+) -> FilePollOutcome {
+    use std::fs;
+
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) if !n.is_empty() => n.to_owned(),
+        _ => return FilePollOutcome::Skipped("empty or non-UTF-8 basename"),
+    };
+
+    // Stat first so we can short-circuit oversize files without reading the
+    // entire content into memory. `metadata().len()` is u64; cast checked.
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return FilePollOutcome::Skipped("stat failed"),
+    };
+    let size_u64 = meta.len();
+    let size_usize = size_u64 as usize;
+    if (size_u64 as u128) != (size_usize as u128) {
+        return FilePollOutcome::Skipped("file larger than usize");
+    }
+
+    if let Err(e) = check_file_size(size_usize, limit) {
+        // Hash the path (not the content) so the dedup stamp is cheap and
+        // stable across ticks without re-reading the oversize file.
+        let path_hash = hash_bytes(path.to_string_lossy().as_bytes());
+        return FilePollOutcome::Oversize { path_hash, err: e };
+    }
+
+    let content = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return FilePollOutcome::Skipped("read failed"),
+    };
+
+    let hash = hash_bytes(&content);
+    let packed = match pack_first_chunk(&name, &content) {
+        Ok(p) => p,
+        Err(_) => return FilePollOutcome::Skipped("pack failed"),
+    };
+    FilePollOutcome::Ready { name, hash, packed }
 }
 
 /// Build a `ClipOffer` + N `ClipChunk` messages for one payload. Pure helper.
@@ -448,68 +547,132 @@ impl ClipboardSync {
         }
 
         // 2) Image path.
-        let img = match clip.get_image() {
-            Ok(i) => i,
-            Err(_) => return Vec::new(),
-        };
+        //
+        // Wrapped in a labeled block so each early-exit falls through to the
+        // file probe below. The OS clipboard can carry CF_HDROP alongside
+        // text/image (rich Explorer copy); a stale image dedup must not
+        // suppress a fresh file sync. Mirror of the Mac side's `'image:`
+        // refactor in Task 6b.
+        'image: {
+            let img = match clip.get_image() {
+                Ok(i) => i,
+                Err(_) => break 'image, // not an image
+            };
 
-        let hash = hash_bytes(&img.bytes);
-        // Short-circuit BEFORE the expensive RGBA→PNG encode for both:
-        // - already-sent images (LastKind::Image),
-        // - already-rejected oversized images (LastKind::OversizeImage).
-        // Otherwise every poll tick re-encodes (~30-150 ms CPU) and re-logs
-        // the warning for the SAME oversize buffer.
-        if self.last.matches_image_hash(hash) {
-            return Vec::new();
-        }
-
-        let png = match encode_rgba_to_png(&img) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("clipboard: PNG encode failed: {e}");
-                return Vec::new();
+            let hash = hash_bytes(&img.bytes);
+            // Short-circuit BEFORE the expensive RGBA→PNG encode for both:
+            // - already-sent images (LastKind::Image),
+            // - already-rejected oversized images (LastKind::OversizeImage).
+            // Otherwise every poll tick re-encodes (~30-150 ms CPU) and re-logs
+            // the warning for the SAME oversize buffer.
+            if self.last.matches_image_hash(hash) {
+                break 'image;
             }
-        };
 
-        if let Err(e) = check_image_size(png.len(), MAX_IMAGE_BYTES) {
-            log::warn!(
-                "clipboard: image too large ({} bytes, limit {}), skipping",
-                e.png_len,
-                MAX_IMAGE_BYTES
+            let png = match encode_rgba_to_png(&img) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("clipboard: PNG encode failed: {e}");
+                    break 'image;
+                }
+            };
+
+            if let Err(e) = check_image_size(png.len(), MAX_IMAGE_BYTES) {
+                log::warn!(
+                    "clipboard: image too large ({} bytes, limit {}), skipping",
+                    e.png_len,
+                    MAX_IMAGE_BYTES
+                );
+                // Surface a transient UI notification — the host has no chrome
+                // panel of its own, so without this the user only sees a log
+                // entry and an unexplained "no transfer started" silence. The
+                // session thread takes the warning out via `take_warning` and
+                // forwards it as a balloon notification.
+                let kb = e.png_len / 1024;
+                let limit_kb = MAX_IMAGE_BYTES / 1024;
+                self.pending_warning = Some(format!(
+                    "Clipboard image too large to send: {} KB > {} KB limit. \
+                     Copy a smaller selection.",
+                    kb, limit_kb
+                ));
+                // Stamp the RGBA hash so the next poll tick short-circuits for
+                // the same buffer. A new RGBA (user re-copied) gives a new hash
+                // and re-tries the encode path.
+                self.last = LastKind::OversizeImage(hash);
+                break 'image;
+            }
+
+            // Codex iter3 E2 (acceptable): sender dedup is set on enqueue, not
+            // on successful send. If transport fails mid-transfer, retry happens
+            // only when clipboard content changes again. Acceptable: heartbeat
+            // covers disconnect within 6s, app restart clears state.
+            self.last = LastKind::Image(hash);
+            log::info!(
+                "clipboard: sending image to peer ({} bytes)",
+                png.len()
             );
-            // Surface a transient UI notification — the host has no chrome
-            // panel of its own, so without this the user only sees a log
-            // entry and an unexplained "no transfer started" silence. The
-            // session thread takes the warning out via `take_warning` and
-            // forwards it as a balloon notification.
-            let kb = e.png_len / 1024;
-            let limit_kb = MAX_IMAGE_BYTES / 1024;
-            self.pending_warning = Some(format!(
-                "Clipboard image too large to send: {} KB > {} KB limit. \
-                 Copy a smaller selection.",
-                kb, limit_kb
-            ));
-            // Stamp the RGBA hash so the next poll tick short-circuits for
-            // the same buffer. A new RGBA (user re-copied) gives a new hash
-            // and re-tries the encode path.
-            self.last = LastKind::OversizeImage(hash);
-            return Vec::new();
+            self.outgoing_total.store(png.len() as u64, Ordering::Relaxed);
+            self.outgoing_progress.store(0, Ordering::Relaxed);
+            self.pending_outbox
+                .extend(build_offer_and_chunks(FORMAT_PNG_IMAGE, &png));
+            return self.drain_outbox();
         }
 
-        // Codex iter3 E2 (acceptable): sender dedup is set on enqueue, not on
-        // successful send. If transport fails mid-transfer, retry happens only
-        // when clipboard content changes again. Acceptable: heartbeat covers
-        // disconnect within 6s, app restart clears state.
-        self.last = LastKind::Image(hash);
-        log::info!(
-            "clipboard: sending image to peer ({} bytes)",
-            png.len()
-        );
-        self.outgoing_total.store(png.len() as u64, Ordering::Relaxed);
-        self.outgoing_progress.store(0, Ordering::Relaxed);
-        self.pending_outbox
-            .extend(build_offer_and_chunks(FORMAT_PNG_IMAGE, &png));
-        self.drain_outbox()
+        // 3) File path. Same shape as Mac side's outbound file branch:
+        // probe CF_HDROP, run pack_file_or_warn, dedup vs LastKind::File /
+        // OversizeFile. File sync is always-on at outbound — the runtime
+        // toggle (`receive_files`) lives on the receive side (Task 7a).
+        'file: {
+            let path = match clipboard_files::poll_cf_hdrop() {
+                Some(p) => p,
+                None => break 'file,
+            };
+
+            match pack_file_or_warn(&path, MAX_FILE_BYTES) {
+                FilePollOutcome::Ready { name, hash, packed } => {
+                    // Dedup against both File and OversizeFile slots.
+                    // matches_file_hash covers both so a re-copied file
+                    // doesn't get re-emitted.
+                    if self.last.matches_file_hash(hash) {
+                        break 'file;
+                    }
+                    self.last = LastKind::File(hash);
+                    log::info!(
+                        "clipboard: sending file '{}' to peer ({} packed bytes)",
+                        name,
+                        packed.len(),
+                    );
+                    self.outgoing_total
+                        .store(packed.len() as u64, Ordering::Relaxed);
+                    self.outgoing_progress.store(0, Ordering::Relaxed);
+                    self.pending_outbox
+                        .extend(build_offer_and_chunks(FORMAT_FILE, &packed));
+                    return self.drain_outbox();
+                }
+                FilePollOutcome::Oversize { path_hash, err } => {
+                    // Use the path hash (not content hash) to stamp the
+                    // oversize slot — we never read the content, and a
+                    // different file at the same path will eventually
+                    // shift the user to copy something new.
+                    if self.last.matches_file_hash(path_hash) {
+                        break 'file;
+                    }
+                    log::warn!(
+                        "clipboard: file too large ({} bytes, limit {}), skipping",
+                        err.size_bytes,
+                        MAX_FILE_BYTES,
+                    );
+                    self.pending_warning =
+                        Some(format_oversize_file_toast(&err, MAX_FILE_BYTES));
+                    self.last = LastKind::OversizeFile(path_hash);
+                }
+                FilePollOutcome::Skipped(reason) => {
+                    log::debug!("clipboard: file poll skipped — {reason}");
+                }
+            }
+        }
+
+        Vec::new()
     }
 
     pub fn on_offer(&mut self, format: u8, total_len: u32) {
@@ -1517,5 +1680,247 @@ mod tests {
         assert!(file.matches_file_hash(h));
         assert!(!text.matches_file_hash(h));
         assert!(!image.matches_file_hash(h));
+    }
+
+    // ------------------------------------------------------------
+    // Task 6c: outbound file sync — pure helpers + dedup behaviour
+    // ------------------------------------------------------------
+
+    #[test]
+    fn host_check_file_size_within_limit() {
+        assert_eq!(check_file_size(100, 1024), Ok(()));
+        assert_eq!(check_file_size(1024, 1024), Ok(()), "boundary is inclusive");
+    }
+
+    #[test]
+    fn host_check_file_size_over_limit_reports_bytes() {
+        let err = check_file_size(2048, 1024).expect_err("expected oversize");
+        assert_eq!(err.size_bytes, 2048);
+    }
+
+    #[test]
+    fn host_format_oversize_file_toast_includes_kb_and_limit() {
+        // Toast must report size + limit in KB and instruct the user to copy
+        // a smaller selection. Pure helper — keeps the wording unit-testable.
+        let e = FileTooLarge { size_bytes: 25_000 * 1024 };
+        let msg = format_oversize_file_toast(&e, MAX_FILE_BYTES);
+        assert!(msg.contains("25000"), "KB count missing: {msg}");
+        assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
+        assert!(msg.contains("too large"), "leading prefix missing: {msg}");
+        assert!(msg.contains("limit"), "limit mention missing: {msg}");
+    }
+
+    #[test]
+    fn host_pack_file_or_warn_ready_for_normal_file() {
+        // Drive the helper with a tempfile containing 4 KB of synthetic
+        // content. Expect Ready { name, hash, packed } with correct shape.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let outcome = pack_file_or_warn(&path, MAX_FILE_BYTES);
+        match outcome {
+            FilePollOutcome::Ready { name, hash, packed } => {
+                assert_eq!(name, path.file_name().unwrap().to_string_lossy());
+                assert_eq!(hash, hash_bytes(&content), "hash must be over file content");
+                // Packed layout: [u16 LE name_len][name][content].
+                assert!(packed.len() > content.len(), "packed must include header");
+                let name_len = u16::from_le_bytes([packed[0], packed[1]]) as usize;
+                assert_eq!(name_len, name.len());
+                let tail = &packed[2 + name_len..];
+                assert_eq!(tail, content.as_slice(), "content must round-trip");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pack_file_or_warn_oversize_emits_path_hash_and_err() {
+        // Synthetic limit much smaller than file → Oversize branch fires
+        // without reading the content (helper short-circuits on stat).
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content = vec![0xAB_u8; 2048];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let outcome = pack_file_or_warn(&path, 512);
+        match outcome {
+            FilePollOutcome::Oversize { path_hash, err } => {
+                assert_eq!(err.size_bytes, 2048);
+                assert_eq!(
+                    path_hash,
+                    hash_bytes(path.to_string_lossy().as_bytes()),
+                    "path hash must be over the path string"
+                );
+            }
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pack_file_or_warn_missing_file_skipped() {
+        // Non-existent path → Skipped("stat failed"). Stable on any platform.
+        let path = std::path::PathBuf::from(
+            "/nonexistent/wiredesk-host-test-FILE-DNE-XYZ.bin",
+        );
+        match pack_file_or_warn(&path, MAX_FILE_BYTES) {
+            FilePollOutcome::Skipped(_) => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_outbound_dedup_skips_same_file_hash() {
+        // Brief T5 mirror (Win side): after stamping LastKind::File(hash),
+        // the production poll-path guard (`matches_file_hash`) short-circuits
+        // the next tick. This test exercises the dedup gate in isolation.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content = vec![0x42_u8; 1024];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let outcome = pack_file_or_warn(&path, MAX_FILE_BYTES);
+        let hash = match outcome {
+            FilePollOutcome::Ready { hash, .. } => hash,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        // Stamp + assert dedup hit.
+        let last = LastKind::File(hash);
+        assert!(
+            last.matches_file_hash(hash),
+            "stamped hash must short-circuit next tick"
+        );
+
+        // Different content → different hash → no dedup.
+        let mut tmp2 = tempfile::NamedTempFile::new().expect("tempfile2");
+        let content2 = vec![0x99_u8; 1024];
+        tmp2.write_all(&content2).expect("write");
+        let outcome2 = pack_file_or_warn(tmp2.path(), MAX_FILE_BYTES);
+        let hash2 = match outcome2 {
+            FilePollOutcome::Ready { hash, .. } => hash,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_ne!(hash, hash2);
+        assert!(
+            !last.matches_file_hash(hash2),
+            "different content hash must NOT dedup"
+        );
+    }
+
+    #[test]
+    fn host_outbound_emits_offer_and_chunks_for_file() {
+        // Drive the poll-path internals: synthesize content → pack via helper
+        // → run through build_offer_and_chunks → assert offer shape
+        // (format=FORMAT_FILE, total_len=packed_len) + chunks reassemble.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> =
+            (0..(CHUNK_SIZE * 4 + 17)).map(|i| (i & 0xFF) as u8).collect();
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let outcome = pack_file_or_warn(&path, MAX_FILE_BYTES);
+        let packed = match outcome {
+            FilePollOutcome::Ready { packed, .. } => packed,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        let msgs = build_offer_and_chunks(FORMAT_FILE, &packed);
+        assert!(msgs.len() > 2, "must emit offer + >=2 chunks for ~4 KB payload");
+
+        // Offer assertion.
+        match &msgs[0] {
+            Message::ClipOffer { format, total_len } => {
+                assert_eq!(*format, FORMAT_FILE);
+                assert_eq!(*total_len as usize, packed.len());
+            }
+            other => panic!("expected ClipOffer, got {other:?}"),
+        }
+
+        // Chunks reassemble byte-for-byte → packed payload (header + content).
+        let mut reassembled = Vec::new();
+        for (i, m) in msgs[1..].iter().enumerate() {
+            match m {
+                Message::ClipChunk { index, data } => {
+                    assert_eq!(*index as usize, i, "chunks must be sequential");
+                    reassembled.extend_from_slice(data);
+                }
+                other => panic!("expected ClipChunk at {i}, got {other:?}"),
+            }
+        }
+        assert_eq!(reassembled, packed);
+    }
+
+    #[test]
+    fn host_outbound_oversize_emits_warning_only() {
+        // Win mirror of Mac's mac_outbound_oversize_emits_toast_only:
+        // - File over limit → Oversize branch fires.
+        // - Code path emits a warning (pending_warning) — NOT a ClipOffer.
+        // - LastKind is stamped with OversizeFile(path_hash) so the next
+        //   tick short-circuits.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content = vec![0u8; 2048];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        // Reproduce the production branch shape on a fresh ClipboardSync.
+        let mut sync = ClipboardSync::new_for_test();
+        match pack_file_or_warn(&path, 256) {
+            FilePollOutcome::Oversize { path_hash, err } => {
+                sync.pending_warning =
+                    Some(format_oversize_file_toast(&err, MAX_FILE_BYTES));
+                sync.last = LastKind::OversizeFile(path_hash);
+            }
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+
+        // No outbox packets emitted (no transfer started).
+        assert!(
+            sync.pending_outbox.is_empty(),
+            "no offer/chunk packets for oversize"
+        );
+
+        // Warning surfaces through take_warning.
+        let warning = sync.take_warning().expect("warning must be set");
+        assert!(warning.contains("too large"), "warning missing prefix: {warning}");
+        assert!(warning.contains("smaller"), "warning missing hint: {warning}");
+        assert!(warning.contains("limit"), "warning missing limit: {warning}");
+
+        // Oversize slot stamped via path hash so next tick short-circuits.
+        let path_hash = hash_bytes(path.to_string_lossy().as_bytes());
+        assert!(
+            sync.last.matches_file_hash(path_hash),
+            "OversizeFile slot must be stamped"
+        );
+    }
+
+    #[test]
+    fn host_outbound_oversize_path_hash_cached() {
+        // Symmetric with mac_outbound_oversize_path_hash_cached: after the
+        // first oversize stamp, the next tick's matches_file_hash gate must
+        // short-circuit BEFORE re-running pack_file_or_warn / re-emitting
+        // the warning (avoid spam every 500ms).
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(&vec![0u8; 4096]).expect("write");
+        let path = tmp.path().to_owned();
+
+        let mut sync = ClipboardSync::new_for_test();
+
+        // First tick: oversize → stamp.
+        let path_hash = hash_bytes(path.to_string_lossy().as_bytes());
+        sync.last = LastKind::OversizeFile(path_hash);
+
+        // Second-tick logic: matches_file_hash must be true → short-circuit.
+        assert!(
+            sync.last.matches_file_hash(path_hash),
+            "repeated oversize path must hit dedup branch"
+        );
     }
 }

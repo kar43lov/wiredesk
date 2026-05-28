@@ -317,13 +317,21 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 **Files:**
 - Modify: `apps/wiredesk-host/src/clipboard.rs`
 
-- [ ] В `ClipboardSync::poll` после text/image branches добавить file branch — same shape как Mac (Task 6b).
-- [ ] Add `pack_file_or_warn` mirror в host clipboard module (или reuse pure helper из protocol/core если разместили там).
-- [ ] Write tests:
-  - `win_outbound_dedup_skips_same_file_hash` (brief T5 mirror).
-  - `win_outbound_emits_offer_and_chunks_for_file`.
-  - `win_outbound_oversize_emits_toast_only`.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 7a.
+- [x] В `ClipboardSync::poll` после text/image branches добавить file branch — same shape как Mac (Task 6b). Image branch теперь обёрнут в labeled `'image:` block так что его early-exits fall through к file branch (OS clipboard может нести CF_HDROP вместе с CF_DIB; stale image dedup не должен подавлять fresh file sync). Mirror of the Mac 6b refactor.
+- [x] Add `pack_file_or_warn` mirror в host clipboard module — реализован inline в `apps/wiredesk-host/src/clipboard.rs` (симметричен Mac side; duplication intentional per CLAUDE.md, протокольный crate остаётся wire-format only).
+- [x] Bonus: добавлены `check_file_size`, `format_oversize_file_toast`, `FileTooLarge`, `FilePollOutcome` — pure helpers с подписями зеркальными Mac side, переиспользованы в тестах для unit-coverage без живого clipboard backend'а. Сняты `#[allow(dead_code)]` с `LastKind::File`/`OversizeFile` и `matches_file_hash` — теперь production users.
+- [x] Oversize warning идёт через существующий `pending_warning` slot (host UI не имеет TransportEvent::Toast — `take_warning()` → tray balloon). Wording консистентно с Mac toast.
+- [x] Write tests (10 new):
+  - `host_check_file_size_within_limit` / `..._over_limit_reports_bytes` — boundary semantic.
+  - `host_format_oversize_file_toast_includes_kb_and_limit` — wording assertions (KB, "smaller", "limit", "too large").
+  - `host_pack_file_or_warn_ready_for_normal_file` — packed layout `[u16 LE name_len][name][content]` byte-equal roundtrip.
+  - `host_pack_file_or_warn_oversize_emits_path_hash_and_err` — short-circuits on stat without reading content.
+  - `host_pack_file_or_warn_missing_file_skipped` — non-existent path → Skipped.
+  - `host_outbound_dedup_skips_same_file_hash` — brief T5 mirror (Win side).
+  - `host_outbound_emits_offer_and_chunks_for_file` — offer shape (FORMAT_FILE, total_len=packed.len()) + chunks reassemble byte-for-byte.
+  - `host_outbound_oversize_emits_warning_only` — `pending_warning` populated, `pending_outbox` empty, `OversizeFile(path_hash)` stamped.
+  - `host_outbound_oversize_path_hash_cached` — repeated oversize path hits dedup short-circuit.
+- [x] Run `cargo test --workspace -- --test-threads=1` — 569 passed (198 client + 14 exec-core + 84 protocol + 127 host + 83 transport-other + 22 term + 41 transport), 0 failed, 5 ignored. +10 net new tests. Clippy clean on macOS target (Windows-target pre-existing warnings unaffected, vetted via git stash baseline). Cross-compile `cargo check --target x86_64-pc-windows-gnu` ✓ clean.
 
 ### Task 7a: receive_files Arc<AtomicBool> threading + flag-off ClipDecline path
 
