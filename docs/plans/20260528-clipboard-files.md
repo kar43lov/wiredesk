@@ -241,31 +241,28 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-host/Cargo.toml` (add windows features if needed)
 - Modify: `apps/wiredesk-host/src/main.rs` (mod clipboard_files)
 
-- [ ] Verify `windows` crate features в `Cargo.toml` уже включают:
-  - `Win32_System_DataExchange` (Open/Close/Get/SetClipboardData/EmptyClipboard)
-  - `Win32_System_Memory` (GlobalAlloc/GlobalLock/GlobalFree)
-  - `Win32_UI_Shell` (CF_HDROP, DROPFILES, DragQueryFileW)
-  - `Win32_Foundation` (HANDLE, BOOL, POINT)
-  Добавить недостающие.
-- [ ] Create `clipboard_files.rs` со следующими public функциями:
-  - `pub fn poll_cf_hdrop() -> Option<PathBuf>` — `OpenClipboard(null)` → `GetClipboardData(CF_HDROP)`. Если есть: `GlobalLock` → HDROP handle. **Сначала `DragQueryFileW(handle, 0xFFFFFFFF, ptr::null_mut(), 0)` — получить total count. Если count != 1 → return None + log debug "multi-file selection skipped, out of scope".** Иначе `DragQueryFileW(handle, 0, buf, len)` → path UTF-16 → PathBuf. `GlobalUnlock` + `CloseClipboard`. None на error / no CF_HDROP.
-  - `pub fn set_cf_hdrop(path: &Path) -> Result<(), FileClipboardError>` — UTF-16 encode path, allocate `DROPFILES + path_wide + \0 + \0`, `OpenClipboard(null)` → `EmptyClipboard` → `SetClipboardData(CF_HDROP, handle)` (ownership of HGLOBAL transfers to clipboard — don't free on success path; free on error).
-  - `pub enum FileClipboardError { ClipboardLocked, BadPath, AllocFailed, FfiError(String) }`.
-- [ ] DROPFILES struct:
-  ```rust
-  #[repr(C)]
-  struct DropFiles { p_files: u32, pt: POINT, f_nc: BOOL, f_wide: BOOL }
-  ```
-  `p_files = size_of::<DropFiles>() as u32`, `f_wide = TRUE`.
-- [ ] Path layout: `<wide path bytes>\0\0` (double-null terminated).
-- [ ] Logging: `log::debug!` на successful read/write, `log::warn!` на error paths.
-- [ ] Write tests:
-  - `dropfiles_layout_offset_correct` — pure unit, assert `size_of::<DropFiles>() == 20`.
-  - `set_then_get_roundtrip` — `#[ignore]` + `#[cfg(target_os = "windows")]` smoke (brief T7).
-  - `poll_returns_none_when_no_cf_hdrop` — `#[ignore]` smoke (text clipboard).
-  - `poll_returns_none_for_multi_file` — `#[ignore]` smoke c multi-file selection.
-- [ ] Compile-check: build на Win runner (cross-compile from Mac не обязательный pass-gate).
-- [ ] Run `cargo test -p wiredesk-host -- --test-threads=1` (skip ignored) — must pass before Task 6a.
+- [x] Verify `windows` crate features в `Cargo.toml` уже включают:
+  - `Win32_System_DataExchange` (Open/Close/Get/SetClipboardData/EmptyClipboard) ✓ added
+  - `Win32_System_Memory` (GlobalAlloc/GlobalLock/GlobalUnlock) ✓ added
+  - `Win32_System_Ole` (CF_HDROP — lives here, not in Shell) ✓ added
+  - `Win32_UI_Shell` (DROPFILES, DragQueryFileW, HDROP) ✓ added
+  - `Win32_Foundation` (HANDLE, BOOL, POINT, HGLOBAL, GlobalFree — lives here) ✓ pre-existing
+- [x] Create `clipboard_files.rs` со следующими public функциями:
+  - `pub fn poll_cf_hdrop() -> Option<PathBuf>` — `OpenClipboard(None)` → `GetClipboardData(CF_HDROP)`. `GlobalLock` → HDROP handle. Count via `DragQueryFileW(handle, 0xFFFFFFFF, None)`; если count != 1 → None + log debug. Иначе query length, allocate `Vec<u16>`, `DragQueryFileW(handle, 0, Some(&mut buf))` → UTF-16 → PathBuf via `String::from_utf16_lossy`. `GlobalUnlock` + `CloseClipboard` в каждой return-ветке.
+  - `pub fn set_cf_hdrop(path: &Path) -> Result<(), FileClipboardError>` — UTF-16 encode path + двойной NUL, `GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT)`, write DROPFILES header + path block via `ptr::write_unaligned` + `copy_nonoverlapping`, `OpenClipboard` → `EmptyClipboard` → `SetClipboardData(CF_HDROP, handle)`. На success — ownership transferred (don't free); на error — `GlobalFree`.
+  - `pub enum FileClipboardError { ClipboardLocked, BadPath(String), AllocFailed, FfiError(String) }` (thiserror-derived; `BadPath` несёт path string для diagnostics).
+- [x] DROPFILES struct — `#[repr(C)]` со scalar fields (p_files, pt_x, pt_y, f_nc, f_wide). `pt: POINT` развёрнут в pt_x/pt_y чтобы не тянуть зависимость от windows-rs Foundation тип (struct nameable в pure unit tests). Compile-time `const _: () = assert!(size_of::<DropFiles>() == 20)` ловит layout drift на all targets.
+- [x] Path layout: `<wide path bytes>\0\0` (double-null terminated). Encoded через `path_str.encode_utf16().collect()` + `push(0)` × 2.
+- [x] Logging: `log::debug!` на OpenClipboard failure + multi-file skip. Error paths возвращают типизированные `FileClipboardError`-варианты — host clipboard.rs позже решает что log'ать (`log::warn!`).
+- [x] Write tests:
+  - `dropfiles_layout_offset_correct` — assert `size_of::<DropFiles>() == 20` + `DROPFILES_SIZE == 20` ✓.
+  - `dropfiles_fields_have_expected_types` — fresh struct size invariant ✓.
+  - `set_then_get_roundtrip` — `#[ignore]` + `#[cfg(target_os = "windows")]` smoke (brief T7) ✓.
+  - `poll_returns_none_when_no_cf_hdrop` — `#[ignore]` smoke (text clipboard) ✓.
+  - `poll_returns_none_for_multi_file` — `#[ignore]` smoke c multi-file selection ✓.
+  - Bonus pure tests: `set_cf_hdrop_rejects_empty_path` + non-Windows stub contract tests (`poll_cf_hdrop_stub_returns_none`, `set_cf_hdrop_stub_returns_unavailable`) — 5 passing on macOS.
+- [x] Compile-check: cross-compile `cargo check -p wiredesk-host --target x86_64-pc-windows-gnu` ✓ clean. macOS `cargo check -p wiredesk-host` ✓ clean.
+- [x] Run `cargo test -p wiredesk-host -- --test-threads=1` (skip ignored) — 113 passed; 0 failed; 2 ignored. Workspace: 539 passing.
 
 ### Task 6a: LastSeen / LastKind file slot extension + dedup helpers
 

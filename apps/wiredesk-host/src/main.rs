@@ -6,6 +6,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod clipboard;
+mod clipboard_files;
 mod config;
 mod injector;
 mod logging;
