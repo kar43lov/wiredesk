@@ -5,9 +5,17 @@ pub const VERSION: u8 = 1;
 
 /// Clipboard payload formats for `Message::ClipOffer { format, .. }`.
 ///
+/// Known values:
+/// - `FORMAT_TEXT_UTF8` (0): UTF-8 text payload.
+/// - `FORMAT_PNG_IMAGE` (1): PNG image payload.
+/// - `FORMAT_FILE` (2): file payload — first chunk carries
+///   `[name_len: u16 LE][name: UTF-8][content bytes...]`, remaining
+///   chunks are raw content bytes.
+///
 /// Receivers MUST treat unknown values as opaque/skip, not as an error.
 pub const FORMAT_TEXT_UTF8: u8 = 0;
 pub const FORMAT_PNG_IMAGE: u8 = 1;
+pub const FORMAT_FILE: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -450,7 +458,20 @@ mod tests {
     fn clip_format_constants_are_distinct() {
         assert_eq!(FORMAT_TEXT_UTF8, 0);
         assert_eq!(FORMAT_PNG_IMAGE, 1);
+        assert_eq!(FORMAT_FILE, 2);
         assert_ne!(FORMAT_TEXT_UTF8, FORMAT_PNG_IMAGE);
+        assert_ne!(FORMAT_FILE, FORMAT_TEXT_UTF8);
+        assert_ne!(FORMAT_FILE, FORMAT_PNG_IMAGE);
+    }
+
+    #[test]
+    fn roundtrip_clip_offer_file() {
+        roundtrip(&Message::ClipOffer { format: FORMAT_FILE, total_len: 65_536 });
+    }
+
+    #[test]
+    fn roundtrip_clip_decline_file() {
+        roundtrip(&Message::ClipDecline { format: FORMAT_FILE });
     }
 
     #[test]

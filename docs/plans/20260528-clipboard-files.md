@@ -149,12 +149,12 @@ Mac `Config` + Win `Config`: `receive_files: bool` (default true). Arc<AtomicBoo
 **Files:**
 - Modify: `crates/wiredesk-protocol/src/message.rs`
 
-- [ ] Add `pub const FORMAT_FILE: u8 = 2;` рядом с существующими `FORMAT_TEXT_UTF8`/`FORMAT_PNG_IMAGE` constants.
-- [ ] Update doc comment над format constants: явно перечислить text/image/file.
-- [ ] Add roundtrip test `roundtrip_clip_offer_file`: `Message::ClipOffer { format: FORMAT_FILE, total_len: 65536 }` → serialize → deserialize → equal (brief T1).
-- [ ] Update `clip_format_constants_are_distinct` test: assert `FORMAT_FILE = 2` + `FORMAT_FILE != FORMAT_TEXT_UTF8` + `FORMAT_FILE != FORMAT_PNG_IMAGE` (brief T2).
-- [ ] Add `roundtrip_clip_decline_file`: `Message::ClipDecline { format: FORMAT_FILE }` roundtrip.
-- [ ] Run `cargo test -p wiredesk-protocol` — must pass before Task 2.
+- [x] Add `pub const FORMAT_FILE: u8 = 2;` рядом с существующими `FORMAT_TEXT_UTF8`/`FORMAT_PNG_IMAGE` constants.
+- [x] Update doc comment над format constants: явно перечислить text/image/file.
+- [x] Add roundtrip test `roundtrip_clip_offer_file`: `Message::ClipOffer { format: FORMAT_FILE, total_len: 65536 }` → serialize → deserialize → equal (brief T1).
+- [x] Update `clip_format_constants_are_distinct` test: assert `FORMAT_FILE = 2` + `FORMAT_FILE != FORMAT_TEXT_UTF8` + `FORMAT_FILE != FORMAT_PNG_IMAGE` (brief T2).
+- [x] Add `roundtrip_clip_decline_file`: `Message::ClipDecline { format: FORMAT_FILE }` roundtrip.
+- [x] Run `cargo test -p wiredesk-protocol` — must pass before Task 2.
 
 ### Task 2: Filename packing helpers + sanitize_basename
 
