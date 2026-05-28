@@ -1,3 +1,4 @@
+pub mod clip_file;
 pub mod cobs;
 pub mod crc;
 pub mod message;

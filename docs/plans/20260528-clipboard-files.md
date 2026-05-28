@@ -162,14 +162,14 @@ Mac `Config` + Win `Config`: `receive_files: bool` (default true). Arc<AtomicBoo
 - Create: `crates/wiredesk-protocol/src/clip_file.rs`
 - Modify: `crates/wiredesk-protocol/src/lib.rs` (mod clip_file + reexport)
 
-- [ ] Create `clip_file.rs` со следующими pure helper'ами:
+- [x] Create `clip_file.rs` со следующими pure helper'ами:
   - `pub fn pack_first_chunk(name: &str, content: &[u8]) -> Result<Vec<u8>, ClipFileError>` — формирует `[u16 LE name_len][name][content]`. Возвращает Err если `name.as_bytes().len() > MAX_FILENAME_LEN`.
   - `pub fn unpack_first_chunk(payload: &[u8]) -> Result<(String, Vec<u8>), ClipFileError>` — парсит обратно. Err на труб'ированный header, invalid UTF-8 в name, name_len > payload.
   - `pub fn sanitize_basename(raw: &str) -> String` — strip path separators (`/`, `\`), отбросить все `..` segments, strip Windows drive-letter (`C:`), strip leading `:` или space. Reserved NTFS names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9` — case-insensitive, до и с extension) префиксуются `_`. Empty → fallback `"clipboard.bin"`.
-- [ ] `pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;` — uniform с PNG cap.
-- [ ] `pub const MAX_FILENAME_LEN: usize = 4096;` — safety cap, ОС лимиты ~255-1024.
-- [ ] Add `pub enum ClipFileError { Truncated, BadUtf8, NameTooLong, EmptyName }`.
-- [ ] Write unit tests:
+- [x] `pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;` — uniform с PNG cap.
+- [x] `pub const MAX_FILENAME_LEN: usize = 4096;` — safety cap, ОС лимиты ~255-1024.
+- [x] Add `pub enum ClipFileError { Truncated, BadUtf8, NameTooLong, EmptyName }`.
+- [x] Write unit tests:
   - `pack_unpack_roundtrip` — ascii name + 1KB content → byte-equal back (brief T3).
   - `pack_unpack_unicode` — `"привет 🎉.pdf"` name + binary content → preserved (brief T3).
   - `unpack_truncated_header` → `Err(Truncated)`.
@@ -182,7 +182,7 @@ Mac `Config` + Win `Config`: `receive_files: bool` (default true). Arc<AtomicBoo
   - `sanitize_dot_dot_only` — `".."` → `"clipboard.bin"`.
   - `sanitize_unicode_basename` — `"папка/файл 🎉.txt"` → `"файл 🎉.txt"`.
   - `pack_name_too_long` — name > `MAX_FILENAME_LEN` → `Err(NameTooLong)`.
-- [ ] Run `cargo test -p wiredesk-protocol` — must pass before Task 3.
+- [x] Run `cargo test -p wiredesk-protocol` — must pass before Task 3.
 
 ### Task 3: Cache vacuum helper (in wiredesk-core)
 
