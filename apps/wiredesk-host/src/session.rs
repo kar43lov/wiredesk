@@ -330,7 +330,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
 
             (SessionState::Connected, Message::ClipOffer { format, total_len }) => {
-                self.clipboard.on_offer(*format, *total_len);
+                if let Some(decline) = self.clipboard.on_offer(*format, *total_len) {
+                    // Forward the policy-decline back to the peer so it
+                    // drops its outbox and stops streaming chunks we're
+                    // going to discard — without this the link's RX
+                    // direction stays full of data we ignore, starving
+                    // TX (mouse, heartbeats, the decline itself).
+                    self.send(decline)?;
+                }
             }
 
             (SessionState::Connected, Message::ClipChunk { index, data }) => {

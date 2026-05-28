@@ -758,6 +758,10 @@ pub struct IncomingClipboard {
     /// Runtime toggle (Settings → Receive text): when off, text offers
     /// (`format=FORMAT_TEXT_UTF8`) are rejected on receipt.
     receive_text: Arc<AtomicBool>,
+    /// Runtime toggle (Settings → Receive files): when off, file offers
+    /// (`format=FORMAT_FILE`) are rejected on receipt with `ClipDecline`.
+    /// Wired in Task 7a; UI surface lands in Task 8.
+    receive_files: Arc<AtomicBool>,
     /// Test-only sink for the last successfully committed payload. Lets unit
     /// tests assert on what would have been written to the local clipboard
     /// without depending on the host platform's actual clipboard backend
@@ -782,6 +786,7 @@ impl IncomingClipboard {
         incoming_total: Arc<AtomicU64>,
         receive_images: Arc<AtomicBool>,
         receive_text: Arc<AtomicBool>,
+        receive_files: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state,
@@ -794,6 +799,7 @@ impl IncomingClipboard {
             incoming_total,
             receive_images,
             receive_text,
+            receive_files,
             #[cfg(test)]
             last_committed: None,
         }
@@ -815,6 +821,7 @@ impl IncomingClipboard {
             incoming_total: Arc::new(AtomicU64::new(0)),
             receive_images: Arc::new(AtomicBool::new(true)),
             receive_text: Arc::new(AtomicBool::new(true)),
+            receive_files: Arc::new(AtomicBool::new(true)),
             last_committed: None,
         }
     }
@@ -843,7 +850,7 @@ impl IncomingClipboard {
         // only fires for known formats). Reset state and bail out — chunks
         // for the unknown format will hit the expected_len==0 guard in
         // on_chunk and be dropped.
-        if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE {
+        if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE && format != FORMAT_FILE {
             log::warn!(
                 "clipboard: incoming offer with unsupported format {format}, ignoring"
             );
@@ -881,6 +888,18 @@ impl IncomingClipboard {
             self.incoming_progress.store(0, Ordering::Relaxed);
             return Some(Message::ClipDecline { format });
         }
+        if format == FORMAT_FILE && !self.receive_files.load(Ordering::Relaxed) {
+            log::info!(
+                "clipboard: incoming file offer ({total_len} bytes) declined — receive_files disabled"
+            );
+            self.expected_len = 0;
+            self.expected_format = 0;
+            self.received.clear();
+            self.received_total = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
+            return Some(Message::ClipDecline { format });
+        }
         // Bound peer-supplied total_len to local caps before allocating any
         // state. Without this a malicious or buggy peer could ask us to
         // allocate up to 4 GB inside `commit()` (Vec::with_capacity).
@@ -888,6 +907,15 @@ impl IncomingClipboard {
         let over_cap = match format {
             FORMAT_PNG_IMAGE => total_len_usize > MAX_IMAGE_BYTES,
             FORMAT_TEXT_UTF8 => total_len_usize > MAX_CLIPBOARD_BYTES,
+            // File caps include 2-byte name_len + max filename + max content.
+            // Task 7b will add the actual file commit path; for now we just
+            // gate so the peer can't ask for >cap bytes of buffer.
+            FORMAT_FILE => {
+                total_len_usize
+                    > MAX_FILE_BYTES
+                        + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
+                        + 2
+            }
             _ => false,
         };
         if over_cap {
@@ -2409,5 +2437,79 @@ mod tests {
             state.get().matches_file_hash(path_hash),
             "repeated oversize path must hit dedup branch"
         );
+    }
+
+    // ------------------------------------------------------------
+    // Task 7a: receive_files flag + ClipDecline path for FORMAT_FILE
+    // ------------------------------------------------------------
+
+    /// Build an IncomingClipboard with `receive_files` pre-set so we can
+    /// drive the policy branch from tests without going through main.rs.
+    fn incoming_with_receive_files(state: ClipboardState, on: bool) -> IncomingClipboard {
+        let mut inc = IncomingClipboard::new_for_test(state);
+        inc.receive_files = Arc::new(AtomicBool::new(on));
+        inc
+    }
+
+    #[test]
+    fn mac_incoming_file_declined_when_flag_off() {
+        // receive_files=false → on_offer(FORMAT_FILE) must emit ClipDecline
+        // AND leave reassembly state un-armed so subsequent chunks for the
+        // declined offer hit the expected_len==0 drop guard.
+        let state = ClipboardState::new();
+        let mut inc = incoming_with_receive_files(state, false);
+
+        let reply = inc.on_offer(FORMAT_FILE, 4096);
+        match reply {
+            Some(Message::ClipDecline { format }) => assert_eq!(format, FORMAT_FILE),
+            other => panic!("expected ClipDecline {{ FORMAT_FILE }}, got {other:?}"),
+        }
+        // No reassembly armed.
+        assert_eq!(inc.expected_len, 0);
+        assert_eq!(inc.expected_format, 0);
+        // Counters cleared.
+        assert_eq!(inc.incoming_total.load(Ordering::Relaxed), 0);
+        assert_eq!(inc.incoming_progress.load(Ordering::Relaxed), 0);
+
+        // Follow-up chunks must be dropped by the expected_len==0 guard.
+        for i in 0..8u16 {
+            inc.on_chunk(i, vec![0u8; 128]);
+        }
+        assert!(inc.received.is_empty(), "post-decline chunks must not buffer");
+        assert_eq!(inc.received_total, 0);
+    }
+
+    #[test]
+    fn mac_incoming_file_accepted_when_flag_on() {
+        // receive_files=true → on_offer(FORMAT_FILE) must NOT decline; it
+        // arms reassembly state ready for chunks. Task 7b adds the actual
+        // commit path; this test only covers the policy gate.
+        let state = ClipboardState::new();
+        let mut inc = incoming_with_receive_files(state, true);
+
+        let reply = inc.on_offer(FORMAT_FILE, 4096);
+        assert!(reply.is_none(), "accepted offer must not return ClipDecline");
+        assert_eq!(inc.expected_len, 4096);
+        assert_eq!(inc.expected_format, FORMAT_FILE);
+        assert_eq!(inc.incoming_total.load(Ordering::Relaxed), 4096);
+        assert_eq!(inc.incoming_progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mac_incoming_file_oversize_offer_dropped_no_decline() {
+        // Even with receive_files=true, an offer past MAX_FILE_BYTES + name
+        // headroom is dropped silently (no ClipDecline — that's reserved for
+        // policy refusals). Reassembly stays un-armed.
+        let state = ClipboardState::new();
+        let mut inc = incoming_with_receive_files(state, true);
+
+        let huge = (MAX_FILE_BYTES
+            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
+            + 2
+            + 1) as u32;
+        let reply = inc.on_offer(FORMAT_FILE, huge);
+        assert!(reply.is_none(), "oversize dropped without ClipDecline");
+        assert_eq!(inc.expected_len, 0);
+        assert_eq!(inc.expected_format, 0);
     }
 }

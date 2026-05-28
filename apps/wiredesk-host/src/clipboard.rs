@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use wiredesk_protocol::clip_file::{MAX_FILE_BYTES, pack_first_chunk};
@@ -356,6 +356,12 @@ pub struct ClipboardSync {
     /// tick overwrite the previous (rare; oversize-skip is the only writer).
     pending_warning: Option<String>,
 
+    /// Runtime toggle (Settings → Receive files): when off, incoming file
+    /// offers (`format = FORMAT_FILE`) are declined with `ClipDecline` and
+    /// no reassembly state is armed. Mirrors the Mac side's flag (Task 7a).
+    /// Wired through `with_counters` — Settings UI surfaces it in Task 8.
+    receive_files: Arc<AtomicBool>,
+
     /// Test-only sink — captures the last successfully committed payload so
     /// unit tests can assert on outcomes without depending on a live arboard
     /// clipboard backend.
@@ -383,6 +389,19 @@ pub struct ProgressCounters {
 
 impl ClipboardSync {
     pub fn with_counters(counters: ProgressCounters) -> Self {
+        // No receive_files toggle wired through callers yet — Settings UI
+        // landing in Task 8 owns the Arc. Default to true so existing
+        // production behaviour is unchanged.
+        Self::with_counters_and_toggles(counters, Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Full constructor — used by the session thread once Task 8 wires the
+    /// runtime `receive_files` toggle from Settings UI. Existing callers go
+    /// through `with_counters` which defaults the flag to `true`.
+    pub fn with_counters_and_toggles(
+        counters: ProgressCounters,
+        receive_files: Arc<AtomicBool>,
+    ) -> Self {
         let mut clip = arboard::Clipboard::new().ok();
         // Pre-stamp existing clipboard content so a fresh host process
         // doesn't try to push whatever the user happened to leave on the
@@ -404,6 +423,7 @@ impl ClipboardSync {
             outgoing_total: counters.outgoing_total,
             pending_outbox: VecDeque::new(),
             pending_warning: None,
+            receive_files,
             #[cfg(test)]
             last_committed: None,
         }
@@ -427,8 +447,17 @@ impl ClipboardSync {
             outgoing_total: Arc::new(AtomicU64::new(0)),
             pending_outbox: VecDeque::new(),
             pending_warning: None,
+            receive_files: Arc::new(AtomicBool::new(true)),
             last_committed: None,
         }
+    }
+
+    /// Test-only setter — flips the `receive_files` Arc so tests can exercise
+    /// both the accept and the ClipDecline branches without spinning the
+    /// real Settings wiring.
+    #[cfg(test)]
+    pub(crate) fn set_receive_files_for_test(&self, on: bool) {
+        self.receive_files.store(on, Ordering::Relaxed);
     }
 
     /// Drain the most recent warning, if any. Called by the session thread
@@ -675,7 +704,14 @@ impl ClipboardSync {
         Vec::new()
     }
 
-    pub fn on_offer(&mut self, format: u8, total_len: u32) {
+    /// Mirrors the Mac client's `IncomingClipboard::on_offer`: returns
+    /// `Some(Message::ClipDecline { format })` when the offer is rejected
+    /// for a *peer-policy* reason (Settings toggle off). The session loop
+    /// must forward the decline back so the sender drops its outbox and
+    /// stops saturating the wire with chunks we're about to discard.
+    /// Unsupported formats and over-cap offers return `None` — those are
+    /// "the peer is broken" cases, not policy refusals.
+    pub fn on_offer(&mut self, format: u8, total_len: u32) -> Option<Message> {
         // Abort an in-progress reassembly if a new offer arrives mid-transfer.
         if self.received_total > 0 && self.received_total < self.expected_len {
             log::warn!(
@@ -690,7 +726,7 @@ impl ClipboardSync {
         // only fires for known formats). Reset state and bail out — chunks
         // for the unknown format will hit the expected_len==0 guard in
         // on_chunk and be dropped.
-        if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE {
+        if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE && format != FORMAT_FILE {
             log::warn!(
                 "clipboard: incoming offer with unsupported format {format}, ignoring"
             );
@@ -700,7 +736,22 @@ impl ClipboardSync {
             self.received_total = 0;
             self.incoming_total.store(0, Ordering::Relaxed);
             self.incoming_progress.store(0, Ordering::Relaxed);
-            return;
+            return None;
+        }
+        // Runtime toggle (Settings → Receive files): drop incoming file offers
+        // when the user disabled file receive. Text and image offers continue
+        // to be processed normally.
+        if format == FORMAT_FILE && !self.receive_files.load(Ordering::Relaxed) {
+            log::info!(
+                "clipboard: incoming file offer ({total_len} bytes) declined — receive_files disabled"
+            );
+            self.expected_len = 0;
+            self.expected_format = 0;
+            self.received.clear();
+            self.received_total = 0;
+            self.incoming_total.store(0, Ordering::Relaxed);
+            self.incoming_progress.store(0, Ordering::Relaxed);
+            return Some(Message::ClipDecline { format });
         }
         // Bound peer-supplied total_len to local caps before allocating any
         // state. Without this a malicious or buggy peer could ask us to
@@ -709,6 +760,15 @@ impl ClipboardSync {
         let over_cap = match format {
             FORMAT_PNG_IMAGE => total_len_usize > MAX_IMAGE_BYTES,
             FORMAT_TEXT_UTF8 => total_len_usize > MAX_CLIPBOARD_BYTES,
+            // File caps include 2-byte name_len + max filename + max content.
+            // Task 7c will add the actual file commit path; for now the gate
+            // just protects against a peer asking for >cap bytes of buffer.
+            FORMAT_FILE => {
+                total_len_usize
+                    > MAX_FILE_BYTES
+                        + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
+                        + 2
+            }
             _ => false,
         };
         if over_cap {
@@ -723,7 +783,7 @@ impl ClipboardSync {
             self.received_total = 0;
             self.incoming_total.store(0, Ordering::Relaxed);
             self.incoming_progress.store(0, Ordering::Relaxed);
-            return;
+            return None;
         }
         self.expected_len = total_len;
         self.expected_format = format;
@@ -732,6 +792,7 @@ impl ClipboardSync {
         self.incoming_total.store(total_len as u64, Ordering::Relaxed);
         self.incoming_progress.store(0, Ordering::Relaxed);
         log::info!("clipboard.recv START format={format} total={total_len} bytes");
+        None
     }
 
     pub fn on_chunk(&mut self, index: u16, data: Vec<u8>) {
@@ -1922,5 +1983,89 @@ mod tests {
             sync.last.matches_file_hash(path_hash),
             "repeated oversize path must hit dedup branch"
         );
+    }
+
+    // ------------------------------------------------------------
+    // Task 7a: receive_files flag + ClipDecline path for FORMAT_FILE
+    // ------------------------------------------------------------
+
+    #[test]
+    fn host_incoming_file_declined_when_flag_off() {
+        // receive_files=false → on_offer(FORMAT_FILE) must return ClipDecline
+        // AND leave reassembly state un-armed so subsequent chunks for the
+        // declined offer hit the expected_len==0 drop guard.
+        let mut sync = ClipboardSync::new_for_test();
+        sync.set_receive_files_for_test(false);
+
+        let reply = sync.on_offer(FORMAT_FILE, 4096);
+        match reply {
+            Some(Message::ClipDecline { format }) => assert_eq!(format, FORMAT_FILE),
+            other => panic!("expected ClipDecline {{ FORMAT_FILE }}, got {other:?}"),
+        }
+        assert_eq!(sync.expected_len, 0);
+        assert_eq!(sync.expected_format, 0);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
+
+        for i in 0..8u16 {
+            sync.on_chunk(i, vec![0u8; 128]);
+        }
+        assert!(sync.received.is_empty(), "post-decline chunks must not buffer");
+        assert_eq!(sync.received_total, 0);
+    }
+
+    #[test]
+    fn host_incoming_file_accepted_when_flag_on() {
+        // receive_files=true → on_offer(FORMAT_FILE) must NOT decline; it
+        // arms reassembly state ready for chunks. Task 7c adds the actual
+        // commit path; this test only covers the policy gate.
+        let mut sync = ClipboardSync::new_for_test();
+        sync.set_receive_files_for_test(true);
+
+        let reply = sync.on_offer(FORMAT_FILE, 4096);
+        assert!(reply.is_none(), "accepted offer must not return ClipDecline");
+        assert_eq!(sync.expected_len, 4096);
+        assert_eq!(sync.expected_format, FORMAT_FILE);
+        assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 4096);
+        assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn host_incoming_file_oversize_offer_dropped_no_decline() {
+        // Even with receive_files=true, an offer past MAX_FILE_BYTES + name
+        // headroom is dropped silently (no ClipDecline — that's reserved for
+        // policy refusals). Reassembly stays un-armed.
+        let mut sync = ClipboardSync::new_for_test();
+        sync.set_receive_files_for_test(true);
+
+        let huge = (MAX_FILE_BYTES
+            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
+            + 2
+            + 1) as u32;
+        let reply = sync.on_offer(FORMAT_FILE, huge);
+        assert!(reply.is_none(), "oversize dropped without ClipDecline");
+        assert_eq!(sync.expected_len, 0);
+        assert_eq!(sync.expected_format, 0);
+    }
+
+    #[test]
+    fn host_incoming_text_image_unaffected_by_receive_files_flag() {
+        // Regression: flipping receive_files=false must NOT affect text or
+        // image offers — they continue to be processed normally.
+        let mut sync = ClipboardSync::new_for_test();
+        sync.set_receive_files_for_test(false);
+
+        // Text accepted.
+        let r1 = sync.on_offer(FORMAT_TEXT_UTF8, 64);
+        assert!(r1.is_none());
+        assert_eq!(sync.expected_format, FORMAT_TEXT_UTF8);
+        // Reset state before image (otherwise the next on_offer triggers
+        // mid-reassembly abort warning, harmless but noisy).
+        sync.reset_reassembly();
+
+        // Image accepted.
+        let r2 = sync.on_offer(FORMAT_PNG_IMAGE, 1024);
+        assert!(r2.is_none());
+        assert_eq!(sync.expected_format, FORMAT_PNG_IMAGE);
     }
 }

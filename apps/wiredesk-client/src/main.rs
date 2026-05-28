@@ -149,6 +149,11 @@ fn main() {
     let receive_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_images));
     let send_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_text));
     let receive_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_text));
+    // Files runtime toggle. Task 8 wires it through ClientConfig + Settings UI;
+    // until then the constructor below defaults it to `true` (sane default,
+    // matches images/text behaviour). This Arc lives here so the future
+    // Settings checkbox can `store()` into it without restarting the session.
+    let receive_files = Arc::new(std::sync::atomic::AtomicBool::new(true));
     // Karabiner-Elements `left_command ↔ left_option` compensation (see
     // ClientConfig::swap_option_command). Read once on startup and surfaced
     // through Settings; flipping the checkbox at runtime takes effect on the
@@ -225,6 +230,7 @@ fn main() {
     let reader_outgoing_total = outgoing_total.clone();
     let reader_receive_images = receive_images.clone();
     let reader_receive_text = receive_text.clone();
+    let reader_receive_files = receive_files.clone();
     let reader_incoming_cancel = incoming_cancel.clone();
     let reader_outgoing_cancel = outgoing_cancel.clone();
     let reader_outgoing_tx = outgoing_tx.clone();
@@ -268,6 +274,7 @@ fn main() {
                 reader_outgoing_total,
                 reader_receive_images,
                 reader_receive_text,
+                reader_receive_files,
                 reader_incoming_cancel,
                 reader_outgoing_cancel,
                 reader_exec_slot,
@@ -287,6 +294,7 @@ fn main() {
         let _ = reader_outgoing_total;
         let _ = reader_receive_images;
         let _ = reader_receive_text;
+        let _ = reader_receive_files;
         let _ = reader_incoming_cancel;
         let _ = reader_outgoing_cancel;
         let _ = reader_exec_slot;
@@ -596,6 +604,7 @@ fn reader_thread(
     outgoing_total: Arc<AtomicU64>,
     receive_images: Arc<std::sync::atomic::AtomicBool>,
     receive_text: Arc<std::sync::atomic::AtomicBool>,
+    receive_files: Arc<std::sync::atomic::AtomicBool>,
     incoming_cancel: Arc<std::sync::atomic::AtomicBool>,
     outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
     exec_slot: exec_bridge::ExecEventSlot,
@@ -624,6 +633,7 @@ fn reader_thread(
         incoming_total,
         receive_images,
         receive_text,
+        receive_files,
     );
     // Cancel-batch state — same role as the writer-side counters: log a
     // single START and a single END line per cancel sweep instead of one

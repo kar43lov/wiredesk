@@ -341,15 +341,16 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-client/src/main.rs` (wire pass-through)
 - Modify: `apps/wiredesk-host/src/main.rs`/`session.rs` (wire pass-through)
 
-- [ ] Add `receive_files: Arc<AtomicBool>` field в `IncomingClipboard` (Mac) — пройти через constructor signature.
-- [ ] Same для Win `ClipboardSync` ctor (или session-level state).
-- [ ] Wire через `reset_session_state` / IPC handlers — параллельно с `receive_text`/`receive_images` paths.
-- [ ] Extend `on_offer(format == FORMAT_FILE)` — if flag off → emit `Message::ClipDecline { format: FORMAT_FILE }`, не arm reassembly. Mirror на обеих сторонах.
-- [ ] Write tests:
-  - `mac_incoming_file_declined_when_flag_off` — receive_files = false → on_offer FORMAT_FILE → ClipDecline emitted, no reassembly state.
-  - `mac_incoming_file_accepted_when_flag_on` — receive_files = true → on_offer FORMAT_FILE → expected_format set, ready for chunks.
-  - Win mirrors.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 7b.
+- [x] Add `receive_files: Arc<AtomicBool>` field в `IncomingClipboard` (Mac) — пройти через constructor signature ✓.
+- [x] Same для Win `ClipboardSync` ctor (или session-level state) ✓ — добавил `with_counters_and_toggles(counters, receive_files)` ctor, default-`true` shim в существующем `with_counters` для backward compat. Поле `receive_files: Arc<AtomicBool>` на самом `ClipboardSync` (session-level — proxy уровня Session не требуется).
+- [x] Wire через `reset_session_state` / IPC handlers — параллельно с `receive_text`/`receive_images` paths ✓ (Mac main.rs: добавил `receive_files = Arc::new(AtomicBool::new(true))` рядом с receive_text/receive_images; reader_thread сигнатура расширена; reset_session_state живёт на client side и Arc проходит без дополнительной работы т.к. clipboard_state.reset() уже сбрасывает все). На Win — sole consumer уже владеет Arc'ом, нет отдельной reset-логики.
+- [x] Extend `on_offer(format == FORMAT_FILE)` — if flag off → emit `Message::ClipDecline { format: FORMAT_FILE }`, не arm reassembly. Mirror на обеих сторонах ✓. На Win `on_offer` signature изменена `-> Option<Message>` (раньше `()`); session.rs forwards through `self.send()`. Mac return type не менялся (уже было `Option<Message>`).
+- [x] Write tests ✓:
+  - `mac_incoming_file_declined_when_flag_off` — receive_files = false → on_offer FORMAT_FILE → ClipDecline emitted, no reassembly state, чанки в следующих on_chunk дропаются ✓.
+  - `mac_incoming_file_accepted_when_flag_on` — receive_files = true → on_offer FORMAT_FILE → expected_format set, ready for chunks ✓.
+  - Win mirrors ✓ (`host_incoming_file_declined_when_flag_off`, `host_incoming_file_accepted_when_flag_on`).
+  - Bonus: `mac_incoming_file_oversize_offer_dropped_no_decline`, `host_incoming_file_oversize_offer_dropped_no_decline` (cap > MAX_FILE_BYTES + MAX_FILENAME_LEN + 2 → silent drop, не ClipDecline — last is reserved for policy refusals), `host_incoming_text_image_unaffected_by_receive_files_flag` (regression — flag off не ломает text/image приём).
+- [x] Run `cargo test --workspace -- --test-threads=1` — 576 passed (201 client + 14 exec-core + 84 protocol + 131 host + 83 transport-other + 22 term + 41 transport), 0 failed, 5 ignored ✓. +7 net new tests vs 569 baseline. `cargo clippy --workspace --all-targets -- -D warnings` clean. Windows cross-compile `cargo check --target x86_64-pc-windows-gnu` clean.
 
 ### Task 7b: Mac inbound file commit (unpack + sanitize + write)
 
