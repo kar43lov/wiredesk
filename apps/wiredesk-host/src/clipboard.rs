@@ -12,11 +12,14 @@
 //! background thread).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use wiredesk_protocol::clip_file::{MAX_FILE_BYTES, pack_first_chunk};
+use wiredesk_protocol::clip_file::{
+    MAX_FILE_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
+};
 use wiredesk_protocol::message::{FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
 
 use crate::clipboard_files;
@@ -362,6 +365,19 @@ pub struct ClipboardSync {
     /// Wired through `with_counters` — Settings UI surfaces it in Task 8.
     receive_files: Arc<AtomicBool>,
 
+    /// Optional override for the cache directory used by inbound file
+    /// commits. Production code leaves this `None` and the commit path falls
+    /// back to `%TEMP%\WireDesk` (with `dirs::cache_dir()` and
+    /// `std::env::temp_dir()` as further fallbacks). Tests inject a tempdir
+    /// so the file-write branch can be exercised without polluting the real
+    /// cache. Mirror of the Mac client `IncomingClipboard.cache_dir_override`.
+    cache_dir_override: Option<PathBuf>,
+    /// Path of the file most recently materialized by `commit_file()`. Tracked
+    /// so that `reset()` (called on disconnect / new HelloAck / mid-transfer
+    /// abort) can remove a partially-written file rather than leaving stale
+    /// fragments in the cache. Cleared after a successful commit_file.
+    in_flight_file_path: Option<PathBuf>,
+
     /// Test-only sink — captures the last successfully committed payload so
     /// unit tests can assert on outcomes without depending on a live arboard
     /// clipboard backend.
@@ -374,6 +390,10 @@ pub struct ClipboardSync {
 pub(crate) enum CommittedPayload {
     Text(String),
     Image { width: usize, height: usize, bytes: Vec<u8> },
+    /// File materialized into the cache dir. Carries the absolute path, the
+    /// sanitized basename used to compose it, and the raw content bytes so
+    /// tests can assert on byte-equal roundtrip.
+    File { path: PathBuf, name: String, content: Vec<u8> },
 }
 
 /// Bundle of progress atomics shared between `ClipboardSync` and any
@@ -424,6 +444,8 @@ impl ClipboardSync {
             pending_outbox: VecDeque::new(),
             pending_warning: None,
             receive_files,
+            cache_dir_override: None,
+            in_flight_file_path: None,
             #[cfg(test)]
             last_committed: None,
         }
@@ -448,8 +470,18 @@ impl ClipboardSync {
             pending_outbox: VecDeque::new(),
             pending_warning: None,
             receive_files: Arc::new(AtomicBool::new(true)),
+            cache_dir_override: None,
+            in_flight_file_path: None,
             last_committed: None,
         }
+    }
+
+    /// Test-only: redirect file commits to a caller-provided directory so
+    /// tempdir-backed tests don't pollute the real `%TEMP%\WireDesk`. Mirror
+    /// of the Mac client's `IncomingClipboard::set_cache_dir_override`.
+    #[cfg(test)]
+    fn set_cache_dir_override(&mut self, dir: PathBuf) {
+        self.cache_dir_override = Some(dir);
     }
 
     /// Test-only setter — flips the `receive_files` Arc so tests can exercise
@@ -873,6 +905,24 @@ impl ClipboardSync {
         // wipe the "Sending X" string, not leave a stale 100% banner.
         self.outgoing_progress.store(0, Ordering::Relaxed);
         self.outgoing_total.store(0, Ordering::Relaxed);
+        // Cache cleanup: a partial file from an aborted inbound transfer must
+        // not survive into the next session. After a successful commit_file
+        // the slot is cleared inline, so this branch only fires on the abort
+        // path (mid-write panic / explicit reset between offer and full
+        // delivery). Mirror of the Mac client (Task 7b).
+        if let Some(path) = self.in_flight_file_path.take() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log::debug!(
+                    "clipboard: removed in-flight file on reset: {}",
+                    path.display()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!(
+                    "clipboard: failed to remove in-flight file {}: {e}",
+                    path.display()
+                ),
+            }
+        }
     }
 
     /// Cleanup that zeros reassembly state but preserves `self.last` (sender
@@ -944,15 +994,19 @@ impl ClipboardSync {
         match self.expected_format {
             FORMAT_TEXT_UTF8 => self.commit_text(buf),
             FORMAT_PNG_IMAGE => self.commit_image(&buf),
+            FORMAT_FILE => self.commit_file(&buf),
             other => {
                 log::warn!("clipboard: unknown format {other}, skipping {} bytes", buf.len());
             }
         }
 
         // End-of-commit cleanup: zero reassembly counters but keep the
-        // freshly-stamped `self.last` (commit_text/image just set it) and
-        // any queued outbound work. `received` is already drained via
+        // freshly-stamped `self.last` (commit_text/image/file just set it)
+        // and any queued outbound work. `received` is already drained via
         // mem::take above, so the BTreeMap clear is a no-op.
+        // After a successful commit_file the `in_flight_file_path` slot is
+        // cleared inline (the file is now "delivered"), so this reset is a
+        // no-op for the file-cleanup branch.
         self.reset_reassembly();
     }
 
@@ -1025,6 +1079,124 @@ impl ClipboardSync {
         if wrote_ok {
             self.last = LastKind::Image(hash);
         }
+    }
+
+    /// Commit a reassembled `FORMAT_FILE` payload: unpack
+    /// `[name_len][name][content]`, sanitize the basename, write the content
+    /// to the cache directory (`%TEMP%\WireDesk` by default), then point the
+    /// system clipboard at the resulting path via
+    /// `clipboard_files::set_cf_hdrop`.
+    ///
+    /// Failures (unpack / sanitize / IO) leave the receiver ready for a new
+    /// offer. `set_cf_hdrop` errors are logged but don't fail the commit —
+    /// the file is still in the cache and the user can drag it manually
+    /// from the cache dir as a fallback.
+    ///
+    /// The dedup hash (`LastKind::File`) is stamped on the *content* hash
+    /// (matching the outbound branch in `pack_file_or_warn`) so a
+    /// copy-rename-paste roundtrip doesn't loop. Mirror of the Mac client's
+    /// `IncomingClipboard::commit_file` (Task 7b).
+    fn commit_file(&mut self, buf: &[u8]) {
+        let (raw_name, content) = match unpack_first_chunk(buf) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "clipboard: file unpack failed ({e}), dropping {} bytes",
+                    buf.len()
+                );
+                return;
+            }
+        };
+        let basename = sanitize_basename(&raw_name);
+        let dir = self.resolve_cache_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("clipboard: cache dir create failed at {}: {e}", dir.display());
+            return;
+        }
+        let path = dir.join(&basename);
+        let hash = hash_bytes(&content);
+
+        // Stamp the in-flight path BEFORE writing so a panic/abort mid-write
+        // leaves a reset()-removable breadcrumb. After a successful write the
+        // path is cleared (the file is "delivered" and the user owns it).
+        self.in_flight_file_path = Some(path.clone());
+
+        if let Err(e) = std::fs::write(&path, &content) {
+            log::warn!("clipboard: file write failed at {}: {e}", path.display());
+            // Clean up any partial bytes the OS wrote before the error. Clear
+            // the in_flight slot so a subsequent reset() doesn't double-remove
+            // a non-existent path.
+            let _ = std::fs::remove_file(&path);
+            self.in_flight_file_path = None;
+            return;
+        }
+
+        #[cfg(test)]
+        {
+            self.last_committed = Some(CommittedPayload::File {
+                path: path.clone(),
+                name: basename.clone(),
+                content: content.clone(),
+            });
+        }
+
+        log::info!(
+            "clipboard: received file from peer ({} content bytes, name={basename:?})",
+            content.len()
+        );
+
+        // Point the system clipboard at the new file. FFI errors are non-
+        // fatal — the bytes are on disk and the user can still recover them.
+        // We skip the FFI call on non-Windows builds (the stub returns
+        // `ClipboardLocked` and there's no real clipboard backend anyway).
+        #[cfg(windows)]
+        {
+            if let Err(e) = clipboard_files::set_cf_hdrop(&path) {
+                log::warn!(
+                    "clipboard: set_cf_hdrop failed for {}: {e}",
+                    path.display()
+                );
+            } else {
+                log::debug!(
+                    "clipboard: wrote file {} ({} content bytes) from peer",
+                    path.display(),
+                    content.len()
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            log::debug!(
+                "clipboard: wrote file {} ({} content bytes) from peer (no CF_HDROP backend)",
+                path.display(),
+                content.len()
+            );
+        }
+
+        self.last = LastKind::File(hash);
+        // Successfully delivered → file no longer "in-flight"; reset() won't
+        // remove it on next disconnect.
+        self.in_flight_file_path = None;
+    }
+
+    /// Resolve the directory where inbound files are materialised. Honours
+    /// the test override; otherwise prefers `%TEMP%\WireDesk` (Windows convention
+    /// for ephemeral data per the plan), with `dirs::cache_dir()/WireDesk`
+    /// and finally `std::env::temp_dir()/WireDesk` as fallbacks for unusual
+    /// environments where `TEMP` is unset.
+    fn resolve_cache_dir(&self) -> PathBuf {
+        if let Some(dir) = self.cache_dir_override.as_ref() {
+            return dir.clone();
+        }
+        if let Ok(temp) = std::env::var("TEMP") {
+            if !temp.is_empty() {
+                return PathBuf::from(temp).join("WireDesk");
+            }
+        }
+        if let Some(cache) = dirs::cache_dir() {
+            return cache.join("WireDesk");
+        }
+        std::env::temp_dir().join("WireDesk")
     }
 }
 
@@ -2067,5 +2239,312 @@ mod tests {
         let r2 = sync.on_offer(FORMAT_PNG_IMAGE, 1024);
         assert!(r2.is_none());
         assert_eq!(sync.expected_format, FORMAT_PNG_IMAGE);
+    }
+
+    // ------------------------------------------------------------
+    // Task 7c: Win inbound file commit (unpack + sanitize + write)
+    // Mirror of Mac Task 7b. Win CF_HDROP FFI is skipped on macOS hosts
+    // (cfg(not(windows)) stub returns ClipboardLocked, which commit_file
+    // logs as a warning and otherwise continues — the file is still on
+    // disk in the cache override dir for the test assertions).
+    // ------------------------------------------------------------
+
+    /// Build a `ClipboardSync` with `receive_files=true` and a tempdir
+    /// override for the cache. Returns (sync, tempdir) — caller keeps the
+    /// tempdir alive for the duration of the test (drop = cleanup).
+    fn sync_with_tempdir() -> (ClipboardSync, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sync = ClipboardSync::new_for_test();
+        sync.set_cache_dir_override(dir.path().to_path_buf());
+        (sync, dir)
+    }
+
+    #[test]
+    fn host_incoming_file_commits_to_cache() {
+        // Feed a ClipOffer + chunks for a small file, then verify the file
+        // landed in the cache override directory with byte-equal content
+        // and LastKind::File got stamped with the content hash. Brief T5
+        // mirror (Win side).
+        let (mut sync, dir) = sync_with_tempdir();
+
+        let name = "contract.pdf";
+        let content: Vec<u8> = (0..2048).map(|i| (i & 0xFF) as u8).collect();
+        let packed = pack_first_chunk(name, &content).expect("pack");
+
+        feed_offer(&mut sync, FORMAT_FILE, &packed);
+
+        let expected = dir.path().join(name);
+        assert!(expected.exists(), "file must land in cache dir");
+        let on_disk = std::fs::read(&expected).expect("read written file");
+        assert_eq!(on_disk, content, "content must round-trip byte-for-byte");
+
+        // LastKind::File must hold the content hash (loop avoidance — next
+        // tick reading the same CF_HDROP must short-circuit on
+        // matches_file_hash).
+        let expected_hash = hash_bytes(&content);
+        assert!(
+            sync.last.matches_file_hash(expected_hash),
+            "LastKind::File must be stamped with content hash"
+        );
+        assert!(matches!(sync.last, LastKind::File(_)));
+
+        // CommittedPayload mirror for in-test introspection.
+        match sync.last_committed.as_ref().expect("committed") {
+            CommittedPayload::File { path, name: n, content: c } => {
+                assert_eq!(path, &expected);
+                assert_eq!(n, name);
+                assert_eq!(c, &content);
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+
+        // After successful delivery the in-flight stamp is cleared — a
+        // subsequent reset() must NOT remove the file the user now owns.
+        assert!(
+            sync.in_flight_file_path.is_none(),
+            "successful commit must clear in_flight_file_path"
+        );
+        sync.reset();
+        assert!(expected.exists(), "delivered file must survive reset()");
+    }
+
+    #[test]
+    fn host_incoming_file_sanitizes_traversal() {
+        // Path-traversal name "../evil.exe" — sanitize_basename strips path
+        // components and "..", leaving "evil.exe". The file must land inside
+        // the cache dir, never one directory up (brief T4 + AC6).
+        let (mut sync, dir) = sync_with_tempdir();
+
+        let content = b"MZ\x00\x00 fake PE header".to_vec();
+        let packed = pack_first_chunk("../evil.exe", &content).expect("pack");
+
+        feed_offer(&mut sync, FORMAT_FILE, &packed);
+
+        let safe = dir.path().join("evil.exe");
+        assert!(safe.exists(), "sanitized file must land inside cache dir");
+
+        // No "../evil.exe" outside the cache dir.
+        let parent_evil = dir.path().parent().unwrap().join("evil.exe");
+        assert!(
+            !parent_evil.exists(),
+            "traversal must not write outside cache: {}",
+            parent_evil.display()
+        );
+
+        let on_disk = std::fs::read(&safe).expect("read");
+        assert_eq!(on_disk, content);
+    }
+
+    #[test]
+    fn host_incoming_file_unicode_filename() {
+        // "привет 🎉.pdf" must round-trip as the actual on-disk basename
+        // (brief T3 + AC5). NTFS is UTF-16 native so the basename is
+        // byte-equal to the input on a Windows host; on macOS dev the
+        // tempdir is on APFS which is also UTF-8 native.
+        let (mut sync, dir) = sync_with_tempdir();
+
+        let name = "привет 🎉.pdf";
+        let content = vec![0xAB_u8; 1024];
+        let packed = pack_first_chunk(name, &content).expect("pack");
+
+        feed_offer(&mut sync, FORMAT_FILE, &packed);
+
+        let expected = dir.path().join(name);
+        assert!(
+            expected.exists(),
+            "unicode filename must round-trip: {}",
+            expected.display()
+        );
+        assert_eq!(std::fs::read(&expected).expect("read"), content);
+    }
+
+    #[test]
+    fn host_incoming_file_oversize_declined() {
+        // total_len > MAX_FILE_BYTES + MAX_FILENAME_LEN + 2 → silent drop in
+        // on_offer (no ClipDecline — reserved for policy refusals). State
+        // stays un-armed, no file is written (AC4).
+        let (mut sync, dir) = sync_with_tempdir();
+
+        let huge = (MAX_FILE_BYTES
+            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
+            + 2
+            + 1) as u32;
+        let reply = sync.on_offer(FORMAT_FILE, huge);
+        assert!(reply.is_none(), "silent drop, no ClipDecline");
+        assert_eq!(sync.expected_len, 0);
+        assert_eq!(sync.expected_format, 0);
+
+        // Even if a peer keeps sending chunks past the reject, they must be
+        // dropped by the expected_len==0 guard and no file is created.
+        sync.on_chunk(0, vec![0u8; 256]);
+        let dir_empty = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .next()
+            .is_none();
+        assert!(
+            dir_empty,
+            "cache dir must remain empty after oversize reject"
+        );
+        assert!(sync.last_committed.is_none());
+    }
+
+    #[test]
+    fn host_incoming_partial_file_cleaned_on_reset() {
+        // Simulate the mid-write abort scenario: commit_file stamps
+        // `in_flight_file_path` BEFORE writing; if reset() fires before
+        // the slot is cleared (e.g. write panic, manual abort injection,
+        // or a disconnect mid-transfer), the partial file is removed so
+        // a stale fragment doesn't survive the session boundary.
+        let (mut sync, dir) = sync_with_tempdir();
+        let partial = dir.path().join("partial.bin");
+        // Materialize a "partial" file the way commit_file would mid-write:
+        // some bytes are on disk but the commit hasn't completed yet.
+        std::fs::write(&partial, b"partial").expect("write partial");
+        sync.in_flight_file_path = Some(partial.clone());
+        assert!(partial.exists(), "fixture: partial file must exist");
+
+        sync.reset();
+
+        assert!(
+            !partial.exists(),
+            "reset must remove the in-flight partial file: {}",
+            partial.display()
+        );
+        assert!(
+            sync.in_flight_file_path.is_none(),
+            "reset must clear the in-flight path slot"
+        );
+    }
+
+    #[test]
+    fn host_incoming_partial_file_missing_no_panic_on_reset() {
+        // Defensive: if reset() runs after the partial file has already been
+        // deleted (vacuum tick, external process, AV quarantine), the
+        // cleanup branch must swallow `NotFound` without logging an error
+        // or panicking.
+        let (mut sync, dir) = sync_with_tempdir();
+        let ghost = dir.path().join("ghost.bin");
+        // Stamp but don't actually create the file.
+        sync.in_flight_file_path = Some(ghost);
+
+        sync.reset(); // must not panic
+
+        assert!(sync.in_flight_file_path.is_none());
+    }
+
+    #[test]
+    fn host_text_and_image_commit_still_work() {
+        // Regression: after extending commit() with the FORMAT_FILE branch
+        // and changing the reset() lifecycle, the existing text and image
+        // paths must still commit normally. AC3 in the brief — Win side.
+        let (mut sync, _dir) = sync_with_tempdir();
+
+        // Text path.
+        feed_offer(&mut sync, FORMAT_TEXT_UTF8, b"hello, world");
+        match sync.last_committed.as_ref().expect("text committed") {
+            CommittedPayload::Text(s) => assert_eq!(s, "hello, world"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+
+        // Image path. Use a synthetic 4×4 RGBA → encoded PNG.
+        let original = synthetic_rgba_4x4();
+        let png = encode_rgba_to_png(&original).expect("encode");
+        feed_offer(&mut sync, FORMAT_PNG_IMAGE, &png);
+        match sync.last_committed.as_ref().expect("image committed") {
+            CommittedPayload::Image { width, height, bytes } => {
+                assert_eq!(*width, original.width);
+                assert_eq!(*height, original.height);
+                assert_eq!(bytes.as_slice(), &*original.bytes);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_incoming_file_unpack_failure_leaves_state_clean() {
+        // Bogus first-chunk payload (declared name_len > actual buffer)
+        // makes unpack_first_chunk return Truncated. commit() must log and
+        // skip without panicking or stamping anything. A subsequent valid
+        // offer must commit normally — no lingering state.
+        let (mut sync, dir) = sync_with_tempdir();
+
+        // Fabricate a payload with name_len=99 but only 4 bytes total.
+        let bogus = vec![99, 0, b'A', b'B'];
+        feed_offer(&mut sync, FORMAT_FILE, &bogus);
+
+        assert!(sync.last_committed.is_none(), "no commit on unpack failure");
+        let dir_empty = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .next()
+            .is_none();
+        assert!(dir_empty, "cache dir stays empty on unpack failure");
+
+        // Receiver must be ready for a fresh offer.
+        assert_eq!(sync.expected_len, 0);
+        assert_eq!(sync.expected_format, 0);
+        assert!(
+            matches!(sync.last, LastKind::None),
+            "no stamp on unpack failure: {:?}",
+            sync.last
+        );
+
+        // Follow-up valid file commit succeeds.
+        let content = b"valid".to_vec();
+        let packed = pack_first_chunk("good.txt", &content).expect("pack");
+        feed_offer(&mut sync, FORMAT_FILE, &packed);
+        assert!(
+            dir.path().join("good.txt").exists(),
+            "next file must commit"
+        );
+    }
+
+    #[test]
+    fn host_incoming_file_reserved_ntfs_name_prefixed() {
+        // CON.txt → _CON.txt on disk (sanitize_basename rule for reserved
+        // NTFS device names). Especially relevant on the Windows host — a
+        // raw "CON.txt" would either fail or open the console device.
+        let (mut sync, dir) = sync_with_tempdir();
+        let content = b"CON device test".to_vec();
+        let packed = pack_first_chunk("CON.txt", &content).expect("pack");
+
+        feed_offer(&mut sync, FORMAT_FILE, &packed);
+
+        assert!(
+            dir.path().join("_CON.txt").exists(),
+            "NTFS reserved stem must be prefixed: _CON.txt"
+        );
+        assert!(
+            !dir.path().join("CON.txt").exists(),
+            "raw reserved name must not appear"
+        );
+    }
+
+    #[test]
+    fn host_incoming_file_empty_name_falls_back_to_clipboard_bin() {
+        // Empty raw name (or one stripped to "" by sanitize) → fallback
+        // "clipboard.bin". Forms an end-to-end test of the FALLBACK_BASENAME
+        // path inside commit_file.
+        let (mut sync, dir) = sync_with_tempdir();
+        // Use ".." as the name — sanitize_basename collapses to fallback.
+        let content = b"data".to_vec();
+        let packed = pack_first_chunk("..", &content).expect("pack");
+
+        feed_offer(&mut sync, FORMAT_FILE, &packed);
+
+        assert!(
+            dir.path().join("clipboard.bin").exists(),
+            "fallback basename must materialize"
+        );
+    }
+
+    #[test]
+    fn host_resolve_cache_dir_honours_override() {
+        // The cache_dir_override slot (test-only setter) bypasses both
+        // TEMP and dirs::cache_dir(). Sanity check before we trust the
+        // tempdir injection across the rest of the suite.
+        let mut sync = ClipboardSync::new_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        sync.set_cache_dir_override(dir.path().to_path_buf());
+        assert_eq!(sync.resolve_cache_dir(), dir.path().to_path_buf());
     }
 }

@@ -381,13 +381,26 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 **Files:**
 - Modify: `apps/wiredesk-host/src/clipboard.rs`
 
-- [ ] Mirror Mac inbound (Task 7b) на Win-side:
-  - Write to `env::var("TEMP")/WireDesk/<basename>` (или `dirs::cache_dir()`).
-  - `clipboard_files::set_cf_hdrop(&path)`.
-  - Stamp `LastKind::File(content_hash)`.
-  - Partial-file cleanup on reset.
-- [ ] Write tests — Mac tests mirror (brief T3/T4/T5 Win-side coverage).
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 7d.
+- [x] Mirror Mac inbound (Task 7b) на Win-side:
+  - Write to `%TEMP%\WireDesk\<basename>` (с fallback на `dirs::cache_dir()` и `std::env::temp_dir()` для misconfigured environments) ✓.
+  - `clipboard_files::set_cf_hdrop(&path)` под `#[cfg(windows)]`; на non-Windows builds skip + debug log (FFI stub returns `ClipboardLocked`, не нужно туда стучать) ✓.
+  - Stamp `LastKind::File(content_hash)` ✓ — hash от content (не от name), параллельно outbound branch, чтобы copy-rename-paste не зацикливался.
+  - Partial-file cleanup on reset ✓ — `in_flight_file_path` slot stamped ДО write (panic/abort breadcrumb), очищается ПОСЛЕ successful write+set_cf_hdrop; `reset()` swallow'ит `NotFound`.
+  - `cache_dir_override: Option<PathBuf>` + `#[cfg(test)] fn set_cache_dir_override` — tempdir injection для тестов (зеркало Mac 7b).
+  - `CommittedPayload::File { path, name, content }` test-only variant — введён test introspection.
+- [x] Write tests (11 new, Mac 7b mirror):
+  - `host_incoming_file_commits_to_cache` ✓ — feed offer+chunks → commit → tempdir contains expected file + `LastKind::File(content_hash)` stamped (brief T5 Win mirror).
+  - `host_incoming_file_sanitizes_traversal` ✓ — name `"../evil.exe"` → file written внутри cache_dir, не outside (brief T4 + AC6).
+  - `host_incoming_file_unicode_filename` ✓ — `"привет 🎉.pdf"` → preserved byte-equal на disk (brief T3 + AC5).
+  - `host_incoming_file_oversize_declined` ✓ — total_len > cap → silent drop в on_offer + chunks discarded + cache dir пустая (AC4).
+  - `host_incoming_partial_file_cleaned_on_reset` ✓ — pre-populated partial + stamped `in_flight_file_path` → reset() removes.
+  - `host_incoming_partial_file_missing_no_panic_on_reset` ✓ — `NotFound` swallowed (vacuum tick / AV quarantine race).
+  - `host_text_and_image_commit_still_work` ✓ — regression (AC3): text + image paths не сломались после расширения commit() и reset() lifecycle.
+  - `host_incoming_file_unpack_failure_leaves_state_clean` ✓ — bogus payload (`name_len=99` but only 4 bytes) → drop + ready for next offer.
+  - `host_incoming_file_reserved_ntfs_name_prefixed` ✓ — `"CON.txt"` → `"_CON.txt"` (особенно важно для Win-host'а — raw `CON.txt` открыл бы console device).
+  - `host_incoming_file_empty_name_falls_back_to_clipboard_bin` ✓ — `".."` → `"clipboard.bin"` fallback.
+  - `host_resolve_cache_dir_honours_override` ✓ — sanity check для test-injection slot.
+- [x] Run `cargo test --workspace -- --test-threads=1` — 597 passed (211 client + 14 exec-core + 84 protocol + 142 host + 83 transport-other + 22 term + 41 transport), 0 failed, 5 ignored. +11 net new tests vs 586 baseline. `cargo clippy --workspace --all-targets -- -D warnings` clean. Windows cross-compile `cargo check --target x86_64-pc-windows-gnu` ✓ clean (clippy на этом target имеет 3 pre-existing warnings из `transfer_overlay.rs` и `session.rs`, vetted via baseline stash — не относятся к 7c).
 
 ### Task 7d: Progress label + cancel + send-decline toast for FORMAT_FILE
 
