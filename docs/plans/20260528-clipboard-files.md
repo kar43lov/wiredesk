@@ -192,19 +192,19 @@ Mac `Config` + Win `Config`: `receive_files: bool` (default true). Arc<AtomicBoo
 
 Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time` — это не место для protocol crate (pure wire-format). Размещаю в `wiredesk-core` — он уже общий crate с error/types и используется обоими apps.
 
-- [ ] Create `cache_vacuum.rs`:
+- [x] Create `cache_vacuum.rs`:
   - `pub fn vacuum_cache_dir(dir: &Path, older_than: Duration) -> Result<usize, std::io::Error>` — read_dir, для каждого regular file: mtime > older_than → remove. Возвращает count удалённых. Silent skip для read errors на отдельных файлах (log::warn). Non-existent dir → Ok(0).
-- [ ] Pure helper для тестируемости:
+- [x] Pure helper для тестируемости:
   - `pub fn should_remove(mtime: SystemTime, now: SystemTime, older_than: Duration) -> bool` — `now.duration_since(mtime).map(|d| d > older_than).unwrap_or(false)`.
-- [ ] Write tests (brief T8):
+- [x] Write tests (brief T8):
   - `should_remove_old_file` — mtime = now - 25h, older_than = 24h → true.
   - `should_remove_young_file` — mtime = now - 23h → false.
   - `should_remove_future_mtime` — mtime > now (clock skew) → false (no panic).
   - `vacuum_dir_removes_old_files` — tempdir + create 2 files, set mtime via `filetime` crate, vacuum, assert old removed/new survives.
   - `vacuum_dir_ignores_subdirs` — поддиректории не трогать (только regular files).
   - `vacuum_missing_dir_ok` — non-existent path → Ok(0).
-- [ ] Add `filetime` dev-dep если нужно для setting mtime в тестах.
-- [ ] Run `cargo test -p wiredesk-core` — must pass before Task 4.
+- [x] Add `filetime` dev-dep если нужно для setting mtime в тестах.
+- [x] Run `cargo test -p wiredesk-core` — must pass before Task 4.
 
 ### Task 4: Mac NSPasteboard file FFI module
 
