@@ -1,8 +1,31 @@
 # Бриф: апгрейд канала CH340 → FT232H
 
-**Дата:** 2026-05-02
+**Дата брейншторма:** 2026-05-02
 **Автор брейншторма:** /pg.brainstorm
 **Триггер:** разговор о замене serial на USB/Thunderbolt ради скорости и видео.
+
+---
+
+## Status: SHIPPED & VERIFIED LIVE 2026-05-28
+
+Реализовано на двух **CJMCU-FT232H** breakout (genuine FTDI, VID `0x0403` PID `0x6014`; один FT232HQ/QFN, другой FT232HL/LQFP) соединённых null-modem'ом (`AD0(TX) ↔ AD1(RX)` cross + `GND ↔ GND`, экран на GND с одного конца, VCC/+5V не соединены). Подняли `baud` поэтапно `115200 → 1_000_000 → 3_000_000` — оба промежуточных и целевой прошли чисто (capture, clipboard, heartbeat без CRC-ошибок и disconnect'ов). Изменения в коде — **только** `baud = 3000000` в обоих `config.toml`.
+
+**Результат vs AC:**
+- AC1 ✓ FT232H с обеих сторон null-modem'а.
+- AC2 ✓ `baud = 3_000_000` принят без ошибок.
+- AC3 ✓ 1 MB clipboard едет ~3 сек (×30 от тогдашних ~90 сек; цель была <2 сек, фактически ~3 сек — но это уже комфортнее любого user scenario, целевая ratio достигнута).
+- AC4 ✓ Heartbeat без потерь на sustained-load.
+- AC5 ✓ Continent-АП не среагировал.
+- AC6 ✓ Все тесты прошли (test count в README/CLAUDE.md обновлён до 491).
+
+**Lessons learned (не попало в исходный бриф):**
+- **Перепрошивка EEPROM на CJMCU-FT232H не нужна.** Платы приходят в async-RS232 (`Single RS232-HS`), VCP сам поднимается. Самый рискованный пункт оригинального плана (FT_PROG / `ftx_prog`) отпал.
+- **Win11 требует FTDI CDM driver** (https://ftdichip.com/drivers/vcp-drivers/). Без него FT232H появляется как "USB Serial Converter" в Universal Serial Bus controllers, но **без** строки в Ports (COM & LPT) — Detect возвращает пустой список. Лекарство: установить CDM, после reset устройства COM-port появится. На macOS VCP встроен — install не нужен.
+- **macOS reuse'ает `/dev/cu.usbserial-NNN` номер по physical USB port location-ID, не по чипу.** Если воткнуть FT232H в тот же физический порт где раньше был CH340 — имя останется тем же (например `usbserial-140`). Не пугаться что номер «как у старого».
+- **Поднимать baud СИНХРОННО на обеих сторонах.** Mismatch (1M ↔ 115200) = garbage / no handshake / disconnect.
+- **Win11 PnP edge case:** иногда плата садится как `USB Serial Converter` **без** VCP-shim даже после установки CDM. Device Manager → Properties → Advanced → ☑ **Load VCP** → перевоткнуть.
+
+Plan B (Pi Zero 2W WinUSB bridge) остаётся актуален **только** как путь к видео по тому же каналу (~30-40 MB/s через USB 2.0 bulk), не как backup на скорость — Plan A полностью закрыл speedup-цель.
 
 ---
 
