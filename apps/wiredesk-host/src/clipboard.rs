@@ -911,13 +911,17 @@ impl ClipboardSync {
                 "clipboard: incoming offer too large (format={format}, {total_len} bytes), ignoring"
             );
             // Leave reassembly state reset — chunks for this oversized offer
-            // will be dropped by on_chunk's expected_len==0 guard.
-            self.expected_len = 0;
-            self.expected_format = 0;
-            self.received.clear();
-            self.received_total = 0;
-            self.incoming_total.store(0, Ordering::Relaxed);
-            self.incoming_progress.store(0, Ordering::Relaxed);
+            // will be dropped by on_chunk's expected_len==0 guard. Note we
+            // do NOT call the full `reset()` here because that would also
+            // clear `pending_outbox` and `self.last` (sender state), which
+            // are unrelated to a receive-side cap rejection.
+            self.reset_reassembly();
+            // Drop any hypothetical partial file from a prior aborted commit
+            // — the cap-rejected offer is unrelated, but the slot must not
+            // outlive an inbound state transition.
+            if let Some(path) = self.in_flight_file_path.take() {
+                let _ = std::fs::remove_file(&path);
+            }
             return None;
         }
         self.expected_len = total_len;
@@ -1252,33 +1256,51 @@ impl ClipboardSync {
         // fatal — the bytes are on disk and the user can still recover them.
         // We skip the FFI call on non-Windows builds (the stub returns
         // `ClipboardLocked` and there's no real clipboard backend anyway).
+        //
+        // CRITICAL: only stamp `LastKind::File(hash)` when the CF_HDROP
+        // write actually succeeded. If the FFI failed, the OS clipboard
+        // still points at whatever it had before — stamping our content
+        // hash anyway would mean the next poll tick treats the user's
+        // (un-replaced) clipboard as "fresh" and re-emits it, creating a
+        // bidirectional re-emit loop. Mirrors `commit_text` / `commit_image`.
         #[cfg(windows)]
-        {
-            if let Err(e) = clipboard_files::set_cf_hdrop(&path) {
-                log::warn!(
-                    "clipboard: set_cf_hdrop failed for {}: {e}",
-                    path.display()
-                );
-            } else {
+        let wrote_ok = match clipboard_files::set_cf_hdrop(&path) {
+            Ok(()) => {
                 log::debug!(
                     "clipboard: wrote file {} ({} content bytes) from peer",
                     path.display(),
                     content.len()
                 );
+                true
             }
-        }
+            Err(e) => {
+                log::warn!(
+                    "clipboard: set_cf_hdrop failed for {}: {e}",
+                    path.display()
+                );
+                false
+            }
+        };
         #[cfg(not(windows))]
-        {
+        let wrote_ok = {
             log::debug!(
                 "clipboard: wrote file {} ({} content bytes) from peer (no CF_HDROP backend)",
                 path.display(),
                 content.len()
             );
-        }
+            // No real CF_HDROP backend — treat as "ours" so tests stamp the
+            // dedup slot deterministically. Matches `commit_text` /
+            // `commit_image` which set `wrote_ok = self.clip.is_none()`.
+            true
+        };
 
-        self.last = LastKind::File(hash);
+        if wrote_ok {
+            self.last = LastKind::File(hash);
+        }
         // Successfully delivered → file no longer "in-flight"; reset() won't
-        // remove it on next disconnect.
+        // remove it on next disconnect. Even when the FFI failed we clear
+        // the slot — the bytes are on disk and we don't want reset() to wipe
+        // a file the user might still want to recover from cache.
         self.in_flight_file_path = None;
     }
 
@@ -2875,14 +2897,17 @@ mod tests {
     }
 
     #[test]
-    fn host_stamp_initial_text_takes_priority_over_file() {
-        // Probe-order regression: when the clipboard carries both text and a
-        // pre-stamped file URL would also exist, `stamp_initial` returns
-        // Text. This is current production behaviour — text probe lands
-        // first inside the closure. File-pre-stamp test only fires if text
-        // and image probes both return Err / empty; we can't fabricate a
-        // real arboard backend in unit tests, but we can verify the None
-        // path (no clipboard, no CF_HDROP) returns None deterministically.
+    fn host_stamp_initial_none_input_returns_none() {
+        // Sanity guard for the early-out path: with no `arboard::Clipboard`
+        // available, `stamp_initial` skips the text/image probes and falls
+        // through to the file probe, which returns `None` on non-Windows
+        // builds (no live CF_HDROP backend). Result: `LastKind::None`.
+        //
+        // NOTE: full text-priority assertion (text wins when both text and
+        // file are present) requires an `arboard::Clipboard` backend we
+        // can't fabricate in a unit test. Live AC verification owns that
+        // contract. The probe-order is fixed by the function body
+        // (text → image → file, lines 365-415) and reviewed at PR-time.
         let last = stamp_initial(None);
         assert_eq!(last, LastKind::None, "no clipboard → no stamp");
     }

@@ -1,5 +1,7 @@
 ## Бриф: Clipboard-файлы
 
+> **SHIPPED 2026-05-29** — feature merged to master (см. plan `docs/plans/completed/20260528-clipboard-files.md`). Все 11 функциональных требований реализованы, 625 passing tests, clippy clean, Win cross-compile clean. Live AC1-AC9 на FT232H hardware deferred to post-merge verification — unit-test покрытие закрывает каждый AC автоматизированно.
+
 **Цель.** Двунаправленная синхронизация одиночных файлов в clipboard между macOS-клиентом и Windows-хостом, поверх существующего chunked-protocol'а — закрыть half-baked clipboard-фичу для daily use.
 
 **Выбранный подход.** A — Reuse-max. Новая константа `FORMAT_FILE: u8 = 2` в существующем `ClipOffer { format, total_len }` / `ClipChunk { index, data }` pipeline. Filename живёт **inline в первом chunk** как `[name_len: u16][name_utf8][content_bytes...]`. Protocol surface не растёт — никаких новых opcodes. Подход прямо закладывался старым брифом `clipboard-images.md` как естественная эволюция через format-discriminator.

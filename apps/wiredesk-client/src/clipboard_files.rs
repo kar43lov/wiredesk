@@ -197,6 +197,13 @@ pub(crate) fn parse_file_url(url: &str) -> Option<PathBuf> {
     if decoded.is_empty() {
         return None;
     }
+    // Reject relative paths from malformed `file:` URIs (e.g. `file:foo/bar`,
+    // which strips to `foo/bar` and would otherwise leak CWD-relative reads).
+    // NSURL always produces absolute paths; any input that decodes to a
+    // non-absolute string is by definition malformed and unsafe to honour.
+    if !decoded.starts_with('/') {
+        return None;
+    }
     Some(PathBuf::from(decoded))
 }
 
@@ -279,6 +286,19 @@ mod tests {
     fn parse_file_url_rejects_empty_path() {
         // `file://` alone has no path; reject so we don't return ""/.
         assert!(parse_file_url("file://").is_none());
+    }
+
+    #[test]
+    fn parse_file_url_rejects_relative_path() {
+        // Malformed `file:` URIs that decode to a relative path are unsafe —
+        // honouring them would leak CWD-relative reads. NSURL always emits
+        // absolute paths, so this only happens with hand-crafted input.
+        assert!(parse_file_url("file:relative/path").is_none());
+        assert!(parse_file_url("file:foo.pdf").is_none());
+        assert!(
+            parse_file_url("file://localhostrelative/path").is_none(),
+            "localhost-prefix collision still requires absolute path after host strip"
+        );
     }
 
     #[test]

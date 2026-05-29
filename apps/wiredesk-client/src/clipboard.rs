@@ -559,6 +559,25 @@ pub fn apply_clip_decline(format: u8, outgoing_cancel: &Arc<AtomicBool>) -> Stri
     send_decline_toast(format)
 }
 
+/// Same as [`apply_clip_decline`] but also clears the `current_outgoing_label`
+/// slot. When a FORMAT_FILE offer is declined mid-flight, the writer thread
+/// drops queued ClipOffer/ClipChunk packets without ever running
+/// [`apply_outgoing_progress_with_label`] (which clears the label on DONE),
+/// so the status bar would otherwise stick at "Sending file 'X.pdf' — 0/N KB"
+/// until disconnect or the next outgoing file. Clearing the slot here keeps
+/// the UI honest.
+pub fn apply_clip_decline_with_label(
+    format: u8,
+    outgoing_cancel: &Arc<AtomicBool>,
+    current_outgoing_label: &Arc<Mutex<String>>,
+) -> String {
+    let toast = apply_clip_decline(format, outgoing_cancel);
+    if let Ok(mut g) = current_outgoing_label.lock() {
+        g.clear();
+    }
+    toast
+}
+
 /// Format-label string for the wire-progress START/DONE log line.
 ///
 /// Task 7d: distinct labels for text / image / file make grep/tail of
@@ -1149,14 +1168,11 @@ impl IncomingClipboard {
             log::warn!(
                 "clipboard: incoming offer too large (format={format}, {total_len} bytes), ignoring"
             );
-            // Leave reassembly state reset — chunks for this oversized offer
+            // Full reset() — drops reassembly state AND removes any hypothetical
+            // partial file from a prior aborted commit (reset() handles the
+            // in_flight_file_path slot). Chunks for this oversized offer
             // will be dropped by on_chunk's expected_len==0 guard.
-            self.expected_len = 0;
-            self.expected_format = 0;
-            self.received.clear();
-            self.received_total = 0;
-            self.incoming_total.store(0, Ordering::Relaxed);
-            self.incoming_progress.store(0, Ordering::Relaxed);
+            self.reset();
             return None;
         }
         self.expected_len = total_len;
@@ -1399,33 +1415,51 @@ impl IncomingClipboard {
         // — the bytes are on disk and the user can still recover them. We
         // skip the FFI call entirely on non-macOS (the stub returns
         // `PasteboardUnavailable`, which is noisy on the log but expected).
+        //
+        // CRITICAL: only stamp `LastSeen.file` when the pasteboard write
+        // actually succeeded. If the FFI failed, the OS clipboard still
+        // points at whatever the user had before — stamping our content
+        // hash anyway would mean the next poll tick treats the user's
+        // (un-replaced) clipboard as "fresh" and re-emits it, creating a
+        // bidirectional re-emit loop. Mirrors `commit_text` / `commit_image`.
         #[cfg(target_os = "macos")]
-        {
-            if let Err(e) = clipboard_files::set_file_url(&path) {
-                log::warn!(
-                    "clipboard: set_file_url failed for {}: {e}",
-                    path.display()
-                );
-            } else {
+        let wrote_ok = match clipboard_files::set_file_url(&path) {
+            Ok(()) => {
                 log::debug!(
                     "clipboard: wrote file {} ({} content bytes) from host",
                     path.display(),
                     content.len()
                 );
+                true
             }
-        }
+            Err(e) => {
+                log::warn!(
+                    "clipboard: set_file_url failed for {}: {e}",
+                    path.display()
+                );
+                false
+            }
+        };
         #[cfg(not(target_os = "macos"))]
-        {
+        let wrote_ok = {
             log::debug!(
                 "clipboard: wrote file {} ({} content bytes) from host (no pasteboard backend)",
                 path.display(),
                 content.len()
             );
-        }
+            // No real pasteboard backend — treat as "ours" so tests stamp the
+            // dedup slot deterministically. Matches `commit_text` / `commit_image`
+            // which set `wrote_ok = self.clip.is_none()`.
+            true
+        };
 
-        self.state.set_file(hash);
+        if wrote_ok {
+            self.state.set_file(hash);
+        }
         // Successfully delivered → file no longer "in-flight"; reset() won't
-        // remove it on next disconnect.
+        // remove it on next disconnect. Even when the FFI failed we clear
+        // the slot — the bytes are on disk and we don't want reset() to wipe
+        // a file the user might still want to recover from cache.
         self.in_flight_file_path = None;
     }
 
@@ -3309,6 +3343,41 @@ mod tests {
         let cancel2 = Arc::new(AtomicBool::new(false));
         let toast_text = apply_clip_decline(FORMAT_TEXT_UTF8, &cancel2);
         assert_eq!(toast_text, "Host declined the clipboard transfer");
+    }
+
+    #[test]
+    fn clip_decline_with_label_clears_filename_slot() {
+        // Quality-review fix: when the peer declines a FORMAT_FILE offer
+        // mid-flight, the writer thread drains queued ClipOffer/ClipChunk
+        // packets WITHOUT ever running apply_outgoing_progress_with_label
+        // (which is normally responsible for clearing the label on DONE).
+        // So the reader-thread decline handler must clear the slot itself
+        // — otherwise the status bar sticks at "Sending file 'X.pdf'"
+        // until the next outgoing transfer or disconnect.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let label = Arc::new(Mutex::new(String::from("contract.pdf")));
+
+        let toast = apply_clip_decline_with_label(FORMAT_FILE, &cancel, &label);
+
+        assert_eq!(toast, "Peer declined file (Receive files off)");
+        assert!(cancel.load(Ordering::Acquire), "cancel must be armed");
+        assert!(
+            label.lock().unwrap().is_empty(),
+            "filename slot must be cleared on decline so the status bar stops showing 'Sending file ...'"
+        );
+    }
+
+    #[test]
+    fn clip_decline_with_label_clears_slot_even_for_text_format() {
+        // Defensive: clearing the label is unconditional. If a future caller
+        // accidentally puts a label there for text/image transfers, the
+        // decline path still cleans up — easier to debug than a sticky UI.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let label = Arc::new(Mutex::new(String::from("stale.txt")));
+
+        let _ = apply_clip_decline_with_label(FORMAT_TEXT_UTF8, &cancel, &label);
+
+        assert!(label.lock().unwrap().is_empty(), "slot cleared unconditionally");
     }
 
     // --- Task 9a: cache vacuum startup hookup -------------------------------

@@ -251,6 +251,7 @@ fn main() {
     let reader_incoming_cancel = incoming_cancel.clone();
     let reader_outgoing_cancel = outgoing_cancel.clone();
     let reader_outgoing_tx = outgoing_tx.clone();
+    let reader_current_outgoing_label = current_outgoing_label.clone();
     // Shell-event broadcast slot for the IPC handler (Task 6).
     // None until a `wd --exec` connection arrives; reader_thread
     // checks it on every shell event and fans out a parallel copy
@@ -295,6 +296,7 @@ fn main() {
                 reader_incoming_cancel,
                 reader_outgoing_cancel,
                 reader_exec_slot,
+                reader_current_outgoing_label,
             );
         });
     } else {
@@ -633,6 +635,7 @@ fn reader_thread(
     incoming_cancel: Arc<std::sync::atomic::AtomicBool>,
     outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
     exec_slot: exec_bridge::ExecEventSlot,
+    current_outgoing_label: Arc<std::sync::Mutex<String>>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -707,13 +710,20 @@ fn reader_thread(
                 }
                 Message::ClipDecline { format } => {
                     // Host doesn't want our offer (its receive_* toggle
-                    // is off, or it tripped a size cap). `apply_clip_decline`
+                    // is off, or it tripped a size cap). `apply_clip_decline_with_label`
                     // flips outgoing_cancel so writer_thread drops queued
                     // ClipOffer/ClipChunk packets instead of pumping them
-                    // onto the wire to be discarded; the returned string is
-                    // the format-specific toast (FORMAT_FILE → "Peer
-                    // declined file (Receive files off)").
-                    let toast = clipboard::apply_clip_decline(format, &outgoing_cancel);
+                    // onto the wire to be discarded, clears the filename
+                    // status-line slot (otherwise "Sending file 'X.pdf'"
+                    // would persist past decline since writer drops chunks
+                    // without ever running the apply_outgoing_progress DONE
+                    // path), and returns the format-specific toast
+                    // (FORMAT_FILE → "Peer declined file (Receive files off)").
+                    let toast = clipboard::apply_clip_decline_with_label(
+                        format,
+                        &outgoing_cancel,
+                        &current_outgoing_label,
+                    );
                     let _ = events_tx.send(TransportEvent::Toast(toast));
                 }
                 Message::ClipChunk { index, data } => {

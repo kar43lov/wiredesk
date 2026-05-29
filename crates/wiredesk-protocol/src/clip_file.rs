@@ -78,12 +78,21 @@ pub fn pack_first_chunk(name: &str, content: &[u8]) -> Result<Vec<u8>, ClipFileE
 ///
 /// # Errors
 /// - `Truncated` if payload is too short for the header / declared name.
+/// - `NameTooLong` if `name_len` exceeds [`MAX_FILENAME_LEN`].
 /// - `BadUtf8` if the name bytes are not valid UTF-8.
 pub fn unpack_first_chunk(payload: &[u8]) -> Result<(String, Vec<u8>), ClipFileError> {
     if payload.len() < 2 {
         return Err(ClipFileError::Truncated);
     }
     let name_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    // Defense-in-depth: a peer (malicious or buggy) could send `name_len`
+    // up to 65535. `pack_first_chunk` rejects > MAX_FILENAME_LEN on emit,
+    // but the receiver must not trust the wire. Without this check, we'd
+    // try to sanitize and `fs::write` a multi-kilobyte filename, getting
+    // ENAMETOOLONG and log spam.
+    if name_len > MAX_FILENAME_LEN {
+        return Err(ClipFileError::NameTooLong);
+    }
     let name_end = 2 + name_len;
     if payload.len() < name_end {
         return Err(ClipFileError::Truncated);
@@ -113,6 +122,11 @@ const NTFS_RESERVED: &[&str] = &[
 /// - Windows drive-letter prefixes (`C:`, `Z:foo`).
 /// - Leading `:` or whitespace.
 ///
+/// Replaces with `_`:
+/// - Windows-reserved chars (`<>:"|?*`) — `fs::write` returns
+///   `InvalidInput` on Win otherwise, silently dropping the file.
+/// - NUL (`\0`) — illegal in filenames on every host OS.
+///
 /// NTFS reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`,
 /// `LPT1..9`) — match against the stem, case-insensitive — are
 /// prefixed with `_` (e.g. `CON.txt` → `_CON.txt`). Prefix-only
@@ -139,14 +153,27 @@ pub fn sanitize_basename(raw: &str) -> String {
         return FALLBACK_BASENAME.to_owned();
     }
 
+    // Replace Windows-reserved chars (`<>:"|?*`) and NUL with `_`. Files
+    // like `foo|bar.txt` are valid on macOS, so the Mac sender accepts them
+    // and packs them into the wire; on the Win receiver, `fs::write` would
+    // fail with InvalidInput and the file would be silently lost. Substitute
+    // here so the cross-platform paste-back path survives.
+    let escaped: String = trimmed
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+
     // Reserved-name check: match against stem (before first '.').
-    let stem = trimmed.split('.').next().unwrap_or("");
+    let stem = escaped.split('.').next().unwrap_or("");
     let stem_upper = stem.to_ascii_uppercase();
     if NTFS_RESERVED.iter().any(|r| *r == stem_upper) {
-        return format!("_{trimmed}");
+        return format!("_{escaped}");
     }
 
-    trimmed.to_owned()
+    escaped
 }
 
 /// Strip Windows drive-letter prefix like `C:`, `Z:foo`, `c:\path`.
@@ -254,6 +281,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unpack_name_too_long_rejected() {
+        // A peer (malicious or buggy) could declare `name_len` up to 65535.
+        // `pack_first_chunk` rejects > MAX_FILENAME_LEN on emit, but the
+        // receiver must not trust the wire — otherwise we'd sanitize and
+        // try to fs::write a multi-kilobyte filename, getting ENAMETOOLONG
+        // and log spam.
+        let oversize = MAX_FILENAME_LEN + 1;
+        let mut payload = Vec::with_capacity(2 + oversize);
+        payload.extend_from_slice(&(oversize as u16).to_le_bytes());
+        payload.resize(payload.len() + oversize, b'A');
+        assert_eq!(
+            unpack_first_chunk(&payload).unwrap_err(),
+            ClipFileError::NameTooLong,
+            "name_len > MAX_FILENAME_LEN must be rejected before any allocation/sanitization"
+        );
+    }
+
+    #[test]
+    fn unpack_name_at_max_length_accepted() {
+        // Boundary case — MAX_FILENAME_LEN itself is still valid.
+        let mut payload = Vec::with_capacity(2 + MAX_FILENAME_LEN);
+        payload.extend_from_slice(&(MAX_FILENAME_LEN as u16).to_le_bytes());
+        payload.resize(payload.len() + MAX_FILENAME_LEN, b'A');
+        let (name, content) = unpack_first_chunk(&payload).expect("MAX_FILENAME_LEN must be accepted");
+        assert_eq!(name.len(), MAX_FILENAME_LEN);
+        assert!(content.is_empty());
+    }
+
     // ---- sanitize_basename: path strip ----
 
     #[test]
@@ -295,6 +351,27 @@ mod tests {
         assert_eq!(sanitize_basename("console.txt"), "console.txt");
         assert_eq!(sanitize_basename("comma.csv"), "comma.csv");
         assert_eq!(sanitize_basename("auxiliary.log"), "auxiliary.log");
+    }
+
+    // ---- sanitize_basename: Windows-reserved chars ----
+
+    #[test]
+    fn sanitize_replaces_windows_reserved_chars() {
+        // Mac and Linux allow `<>:"|?*` in filenames; Windows fs::write
+        // returns InvalidInput, silently losing the file. Substitute with
+        // `_` so the cross-platform paste-back path survives.
+        assert_eq!(sanitize_basename("foo|bar.txt"), "foo_bar.txt");
+        assert_eq!(sanitize_basename("a<b>c?d*e\"f.dat"), "a_b_c_d_e_f.dat");
+        // ':' inside a name (not as drive separator) is replaced too —
+        // strip_drive_letter only consumes the leading `X:`.
+        assert_eq!(sanitize_basename("foo:bar"), "foo_bar");
+    }
+
+    #[test]
+    fn sanitize_replaces_nul_byte() {
+        // Embedded NUL bytes are illegal in filenames on every host OS;
+        // replace with `_`.
+        assert_eq!(sanitize_basename("foo\0bar.txt"), "foo_bar.txt");
     }
 
     // ---- sanitize_basename: empty / fallback ----

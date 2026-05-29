@@ -232,15 +232,28 @@ mod tests {
 
     #[test]
     fn vacuum_zero_threshold_removes_everything() {
-        // older_than = 0 → any file with mtime <= now gets removed.
+        // older_than = 0 → any file with mtime strictly less than now gets removed.
         let dir = TempDir::new().expect("tempdir");
         let f1 = dir.path().join("a.bin");
         let f2 = dir.path().join("b.bin");
         fs::write(&f1, b"a").expect("write a");
         fs::write(&f2, b"b").expect("write b");
 
-        // Make sure mtime is strictly less than now (>0 duration_since).
-        std::thread::sleep(Duration::from_millis(10));
+        // Back-date both files explicitly via `filetime` so the assertion
+        // does not depend on filesystem mtime resolution (FAT32/Windows
+        // coarse-granularity clocks could leave a freshly-written file at
+        // mtime == now after a brief sleep, defeating the strict-`>`
+        // comparison in `should_remove`).
+        let earlier = filetime::FileTime::from_unix_time(
+            (SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("now after epoch")
+                .as_secs() as i64)
+                - 60,
+            0,
+        );
+        filetime::set_file_mtime(&f1, earlier).expect("set mtime f1");
+        filetime::set_file_mtime(&f2, earlier).expect("set mtime f2");
 
         let removed = vacuum_cache_dir(dir.path(), Duration::from_secs(0)).expect("vacuum");
         assert_eq!(removed, 2);
