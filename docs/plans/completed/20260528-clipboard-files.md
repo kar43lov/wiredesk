@@ -502,15 +502,16 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `README.md` (известное ограничение про файлы убрать)
 - Move: `docs/plans/20260528-clipboard-files.md` → `docs/plans/completed/`
 
-- [ ] Update `CLAUDE.md`:
-  - Strip line "Файлы (file URLs / CF_HDROP) — не передаются" из секции "Известные ограничения".
-  - Add line про clipboard files в основное описание features.
-  - Update test counts (~520+).
-- [ ] Update `README.md`:
-  - Если есть аналогичная строка про known limitation — strip.
-  - Если упоминаются supported clipboard formats — добавить files.
-- [ ] Move plan: `mkdir -p docs/plans/completed && mv docs/plans/20260528-clipboard-files.md docs/plans/completed/`.
-- [ ] Final `cargo test --workspace -- --test-threads=1` + `cargo clippy` green.
+- [x] Update `CLAUDE.md`:
+  - Stripped "Файлы (file URLs / CF_HDROP) — не передаются" line; replaced with "single-file ≤20 MB" entry that calls out multi-file/directory follow-ups.
+  - Added clipboard-files description to the main "Clipboard" feature bullet (file URLs/CF_HDROP, packed first-chunk layout, sanitize, cache + 24 h vacuum, 5-checkbox panel).
+  - Updated test counts: 491 → 625 passing (+5 ignored = 630 total), refreshed per-crate breakdown (231 client + 155 host + 83 exec-core + 84 protocol + 41 transport + 22 term + 14 wiredesk-core).
+- [x] Update `README.md`:
+  - "What WireDesk does" clipboard bullet now reads **text, PNG images, and single files** with cache paths and sanitize hint; toggle count bumped to five.
+  - "What WireDesk does NOT do" reframed: bulk/multi-file/directories explicitly out of scope (single files ≤20 MB still go through the clipboard).
+  - Status paragraph extended with file-sync details, Win Clipboard group's "Receive files" checkbox, refreshed test counts (625 passing / 5 ignored = 630 total).
+- [x] Move plan: `git mv docs/plans/20260528-clipboard-files.md docs/plans/completed/` ✓ — plan now lives under `docs/plans/completed/`.
+- [x] Final `cargo test --workspace -- --test-threads=1` → 625 passed; 0 failed; 5 ignored. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Post-Completion
 
