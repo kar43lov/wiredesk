@@ -480,20 +480,20 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 **Files:**
 - No new code; live verification
 
-- [ ] Run `cargo test --workspace -- --test-threads=1` — full suite green (was 491 → expect ~520+ with new tests).
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings` — clean.
-- [ ] Build release: `./scripts/build-mac-app.sh` (Mac) + cross-check Win build compiles.
-- [ ] **Live AC1** (brief AC1): Cmd+C `contract.pdf` (5 MB) in Mac Finder → ≤ 30 сек на 3 Mbaud → Cmd+V in Win Explorer → file landed with same sha256 + filename.
-- [ ] **Live AC2** (brief AC2): Win Explorer Cmd+C → Mac Finder Cmd+V → same content + filename.
-- [ ] **Live AC3** (brief AC3): text+image roundtrip продолжает работать (regression).
-- [ ] **Live AC4** (brief AC4): 25 MB file → toast "File too large", nothing sent.
-- [ ] **Live AC5** (brief AC5): `"привет 🎉.pdf"` → preserved both directions.
-- [ ] **Live AC6** (brief AC6): filename с `../../evil` → sanitized на receive, file landed только в cache dir.
-- [ ] **Live AC7** (brief AC7): paste файла обратно в течение 10 сек → no round-trip (LastSeen dedup).
-- [ ] **Live AC8** (brief AC8): cancel в progress-bar mid-transfer → ничего не висит на receive-стороне.
-- [ ] **Live AC9** (brief AC9): receive_files = false → toast "Receive files off" на send-стороне.
-- [ ] **Live AC10** (brief AC10): clippy/tests clean (verified выше).
-- [ ] If any AC fails: add failure to plan as ⚠️ + fix + retest.
+- [x] Run `cargo test --workspace -- --test-threads=1` — full suite green: **625 passed; 0 failed; 5 ignored** (228 client + 14 exec-core + 84 protocol + 153 host + 83 transport-other + 22 term + 41 transport). Up from 491 baseline at plan start (+134 net new).
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings` — clean (no warnings, no errors).
+- [x] Build release: `./scripts/build-mac-app.sh` ✓ — Bundle `target/release/WireDesk.app` assembled, icon generated, ad-hoc codesigned. Win cross-compile `cargo check -p wiredesk-host --target x86_64-pc-windows-gnu` ✓ clean.
+- [x] **Live AC1** (brief AC1): Cmd+C `contract.pdf` (5 MB) Mac → Win → sha256 + filename match. **live test deferred (requires FT232H hardware — covered by Post-Completion)**.
+- [x] **Live AC2** (brief AC2): Win Explorer Cmd+C → Mac Finder Cmd+V → same content + filename. **live test deferred (requires FT232H hardware — covered by Post-Completion)**.
+- [x] **Live AC3** (brief AC3): text+image roundtrip regression. **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: covered by unit-test regressions (`text_and_image_commit_still_work` Mac + `host_text_and_image_commit_still_work` Win in Tasks 7b/7c).
+- [x] **Live AC4** (brief AC4): 25 MB file → toast "File too large", nothing sent. **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: unit-tested via `mac_outbound_oversize_emits_toast_only` + `host_outbound_oversize_emits_warning_only` (Tasks 6b/6c).
+- [x] **Live AC5** (brief AC5): `"привет 🎉.pdf"` preserved both directions. **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: unit-tested via `mac_incoming_file_unicode_filename` + `host_incoming_file_unicode_filename` (Tasks 7b/7c) and `pack_unpack_unicode` (Task 2).
+- [x] **Live AC6** (brief AC6): filename `../../evil` sanitized on receive. **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: unit-tested via `mac_incoming_file_sanitizes_traversal` + `host_incoming_file_sanitizes_traversal` (Tasks 7b/7c) and `sanitize_strips_path` (Task 2).
+- [x] **Live AC7** (brief AC7): paste file back within 10s → no round-trip (LastSeen dedup). **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: unit-tested via `mac_outbound_dedup_skips_same_file_hash` + `host_outbound_dedup_skips_same_file_hash` (Tasks 6b/6c).
+- [x] **Live AC8** (brief AC8): cancel mid-transfer → nothing pending on receive. **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: `clip_decline_file_drops_pending_outbox` (Task 7d) covers writer-side drain logic.
+- [x] **Live AC9** (brief AC9): receive_files=false → toast "Peer declined file (Receive files off)". **live test deferred (requires FT232H hardware — covered by Post-Completion)**. Note: unit-tested via `clip_decline_file_emits_toast` + `mac_incoming_file_declined_when_flag_off` + `host_incoming_file_declined_when_flag_off` (Tasks 7a/7d).
+- [x] **Live AC10** (brief AC10): clippy/tests clean — verified above (625 passed; 0 failed; clippy clean; Win cross-check clean; Mac release build OK).
+- [x] If any AC fails: add failure to plan as ⚠️ + fix + retest. No failures — all automatable checks pass; live AC1-AC9 deferred to Post-Completion hardware run.
 
 ### Task 11: Update documentation + finalize
 
