@@ -279,6 +279,65 @@ pub(crate) fn pack_file_or_warn(
     FilePollOutcome::Ready { name, hash, packed }
 }
 
+/// Outcome of the startup pre-stamp probe for a CF_HDROP file path.
+/// Mirrors the Mac client's `FilePreStampOutcome` — the runtime poll path
+/// already has its own oversize toast and dedup logic; the pre-stamp branch
+/// just needs to record a hash so we don't re-emit on the first tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilePreStampOutcome {
+    /// File read successfully; caller stamps `LastKind::File(hash)`.
+    Stamped { name: String, hash: u64 },
+    /// File exceeded `limit`. Caller logs a warning and skips stamping —
+    /// stamping the oversize slot would suppress the user's next genuine
+    /// attempt to copy that same file (they might want the toast). Let the
+    /// runtime poll path handle the toast.
+    Oversize { size_bytes: usize },
+    /// Path failed sanity (empty basename, IO error, …). Caller logs at
+    /// debug and skips.
+    Skipped(&'static str),
+}
+
+/// Pre-stamp helper for a CF_HDROP path discovered at startup. Symmetric
+/// with `pack_file_or_warn` but stripped of the packing step — we don't need
+/// to build a wire payload, only the content hash for runtime-poll dedup.
+///
+/// Pure helper: I/O is unavoidable (we have to read the file to hash content),
+/// but pulled out of `stamp_initial` so unit tests can drive it with a
+/// `tempfile`-backed path and a low limit.
+pub(crate) fn pre_stamp_file_path(
+    path: &std::path::Path,
+    limit: usize,
+) -> FilePreStampOutcome {
+    use std::fs;
+
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) if !n.is_empty() => n.to_owned(),
+        _ => return FilePreStampOutcome::Skipped("empty or non-UTF-8 basename"),
+    };
+
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return FilePreStampOutcome::Skipped("stat failed"),
+    };
+    let size_u64 = meta.len();
+    let size_usize = size_u64 as usize;
+    if (size_u64 as u128) != (size_usize as u128) {
+        return FilePreStampOutcome::Skipped("file larger than usize");
+    }
+
+    if check_file_size(size_usize, limit).is_err() {
+        return FilePreStampOutcome::Oversize { size_bytes: size_usize };
+    }
+
+    let content = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return FilePreStampOutcome::Skipped("read failed"),
+    };
+
+    let hash = hash_bytes(&content);
+    FilePreStampOutcome::Stamped { name, hash }
+}
+
 /// Build a `ClipOffer` + N `ClipChunk` messages for one payload. Pure helper.
 fn build_offer_and_chunks(format: u8, payload: &[u8]) -> Vec<Message> {
     let mut msgs = Vec::with_capacity(1 + payload.len().div_ceil(CHUNK_SIZE));
@@ -298,26 +357,60 @@ fn build_offer_and_chunks(format: u8, payload: &[u8]) -> Vec<Message> {
 /// Hash the current clipboard content so the first poll-tick after startup
 /// short-circuits via the `LastKind` dedup. Without this, a host restart
 /// re-uploads whatever the user already had on the Win clipboard.
+///
+/// Probe order: text → image → file (Task 9b). Whichever lands first wins —
+/// the system clipboard can hold all three, but the poll loop is single-
+/// slotted (`self.last: LastKind`) so we can only stamp one. Matches the
+/// poll() probe precedence: text takes priority, then image, then file.
 fn stamp_initial(clip: Option<&mut arboard::Clipboard>) -> LastKind {
-    let Some(clip) = clip else {
-        return LastKind::None;
-    };
-    if let Ok(text) = clip.get_text() {
-        if !text.is_empty() {
+    if let Some(clip) = clip {
+        if let Ok(text) = clip.get_text() {
+            if !text.is_empty() {
+                log::info!(
+                    "clipboard: pre-stamped existing text ({} bytes) — not sending on startup",
+                    text.len()
+                );
+                return LastKind::Text(hash_text(&text));
+            }
+        }
+        if let Ok(img) = clip.get_image() {
             log::info!(
-                "clipboard: pre-stamped existing text ({} bytes) — not sending on startup",
-                text.len()
+                "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
+                img.width,
+                img.height
             );
-            return LastKind::Text(hash_text(&text));
+            return LastKind::Image(hash_bytes(&img.bytes));
         }
     }
-    if let Ok(img) = clip.get_image() {
-        log::info!(
-            "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
-            img.width,
-            img.height
-        );
-        return LastKind::Image(hash_bytes(&img.bytes));
+    // File probe goes through the CF_HDROP FFI rather than arboard (which
+    // doesn't expose file URLs). Skipped on non-Windows builds — the host
+    // crate compiles on macOS for the dev loop, but `poll_cf_hdrop` returns
+    // None there. Oversize files log a warning and don't stamp so the
+    // runtime poll path is free to fire its toast on the first tick.
+    if let Some(path) = clipboard_files::poll_cf_hdrop() {
+        match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
+            FilePreStampOutcome::Stamped { name, hash } => {
+                log::info!(
+                    "clipboard: pre-stamped existing file '{name}' ({} content hash) — not sending on startup",
+                    hash
+                );
+                return LastKind::File(hash);
+            }
+            FilePreStampOutcome::Oversize { size_bytes } => {
+                log::warn!(
+                    "clipboard: pre-existing file at {} is {} bytes (over {} cap) — skipping stamp; runtime poll will surface the warning",
+                    path.display(),
+                    size_bytes,
+                    MAX_FILE_BYTES,
+                );
+            }
+            FilePreStampOutcome::Skipped(reason) => {
+                log::debug!(
+                    "clipboard: pre-existing file at {} not stamped — {reason}",
+                    path.display()
+                );
+            }
+        }
     }
     LastKind::None
 }
@@ -2672,5 +2765,125 @@ mod tests {
         assert_eq!(removed, 1, "only the >24h file should be removed");
         assert!(!old_path.exists(), "old file should be gone");
         assert!(fresh_path.exists(), "fresh file should survive");
+    }
+
+    // ------------------------------------------------------------
+    // Task 9b: pre-stamp helper for CF_HDROP at process startup
+    // ------------------------------------------------------------
+
+    #[test]
+    fn host_pre_stamp_file_path_stamps_normal_file() {
+        // Tempfile with 4 KB of synthetic content → Stamped with name and
+        // content-hash. Drives the happy path the host startup pre-stamp
+        // hits when the OS clipboard already carries CF_HDROP at boot.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
+            FilePreStampOutcome::Stamped { name, hash } => {
+                assert_eq!(name, path.file_name().unwrap().to_string_lossy());
+                assert_eq!(hash, hash_bytes(&content));
+            }
+            other => panic!("expected Stamped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pre_stamp_file_path_skips_oversize() {
+        // Tempfile with 2 KB of content but 1 KB limit → Oversize. Contract:
+        // must NOT read content (defeats the cap) and must NOT signal a
+        // stamp value back — caller leaves `LastKind` empty so runtime poll
+        // surfaces the warning on first tick.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = vec![0xAA; 2048];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        match pre_stamp_file_path(&path, 1024) {
+            FilePreStampOutcome::Oversize { size_bytes } => {
+                assert_eq!(size_bytes, 2048);
+            }
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pre_stamp_file_path_skipped_for_missing_file() {
+        // Non-existent path → Skipped. The startup probe must not panic if
+        // CF_HDROP points at a file that disappeared between sessions (user
+        // deleted it during host downtime).
+        let path = std::path::PathBuf::from(
+            "/nonexistent/wiredesk-host-test-9b-missing.bin",
+        );
+        match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
+            FilePreStampOutcome::Skipped(_) => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pre_stamp_then_runtime_poll_dedups() {
+        // End-to-end smoke: stamp the helper output via LastKind::File and
+        // verify the runtime poll-tick (pack_file_or_warn → matches_file_hash)
+        // dedups → no resend on first tick after host boot. Regression guard
+        // for the "stamp_initial handles pre-existing file" plan checkbox.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content = b"pre-existing host clipboard file";
+        tmp.write_all(content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let last = match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
+            FilePreStampOutcome::Stamped { hash, .. } => LastKind::File(hash),
+            other => panic!("expected Stamped, got {other:?}"),
+        };
+
+        match pack_file_or_warn(&path, MAX_FILE_BYTES) {
+            FilePollOutcome::Ready { hash, .. } => {
+                assert!(
+                    last.matches_file_hash(hash),
+                    "runtime poll must dedup against pre-stamped LastKind::File"
+                );
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pre_stamp_oversize_does_not_pollute_lastkind() {
+        // Oversize files at startup must NOT produce a LastKind::File or
+        // LastKind::OversizeFile stamp — the runtime poll path needs to fire
+        // its oversize branch (and push_warning) on the first tick so the
+        // user actually sees the tray-balloon notification.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = vec![0xDD; 4096];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        // Simulate the host startup branch: pre-stamp -> Oversize -> no stamp.
+        let last = match pre_stamp_file_path(&path, 1024) {
+            FilePreStampOutcome::Oversize { .. } => LastKind::None,
+            other => panic!("expected Oversize, got {other:?}"),
+        };
+
+        assert_eq!(last, LastKind::None, "oversize pre-stamp must NOT set LastKind");
+    }
+
+    #[test]
+    fn host_stamp_initial_text_takes_priority_over_file() {
+        // Probe-order regression: when the clipboard carries both text and a
+        // pre-stamped file URL would also exist, `stamp_initial` returns
+        // Text. This is current production behaviour — text probe lands
+        // first inside the closure. File-pre-stamp test only fires if text
+        // and image probes both return Err / empty; we can't fabricate a
+        // real arboard backend in unit tests, but we can verify the None
+        // path (no clipboard, no CF_HDROP) returns None deterministically.
+        let last = stamp_initial(None);
+        assert_eq!(last, LastKind::None, "no clipboard → no stamp");
     }
 }

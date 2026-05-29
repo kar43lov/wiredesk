@@ -468,12 +468,12 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-client/src/clipboard.rs`
 - Modify: `apps/wiredesk-host/src/clipboard.rs`
 
-- [ ] **Mac**: при init `ClipboardState` (или в poll thread first tick): если NSPasteboard содержит fileURL — hash content + `state.set_file(hash)`. Skip stamping (log warning) для файлов > MAX_FILE_BYTES — let user manually re-copy.
-- [ ] **Win**: extend `stamp_initial` в `clipboard.rs` для CF_HDROP detection + content hash. Same > cap skip.
-- [ ] Write tests:
-  - `stamp_initial_handles_pre_existing_file` — pre-stamped file hash не emits offer на first poll tick.
-  - `stamp_initial_skips_oversize_file` — file > cap → no hash, log warning.
-- [ ] Run `cargo test --workspace -- --test-threads=1` + `cargo clippy --workspace --all-targets -- -D warnings` — both pass before Task 10.
+- [x] **Mac**: при init poll thread first tick: extend startup pre-stamp block с file-URL probe. `pre_stamp_file_path` pure helper (stat → check_file_size → read → hash → FilePreStampOutcome). На Stamped → `state.set_file(hash)`. На Oversize → log warning, skip stamping (let runtime poll surface toast). На Skipped → log debug. `poll_file_url(&mut file_change_count)` вызывается **до** loop body чтобы counter совпадал с pasteboard state — иначе runtime first-tick поймал бы то же URL как "new" и re-emit через outbound branch несмотря на стамп.
+- [x] **Win**: extend `stamp_initial` для CF_HDROP detection через `clipboard_files::poll_cf_hdrop()`. Mirror Mac helper as `pre_stamp_file_path` (host-side). Probe order: text → image → file (mirrors poll() precedence). Skipped on non-Windows builds (FFI stub returns None). Oversize → no stamp (runtime poll path owns the warning).
+- [x] Write tests (11 new):
+  - Mac (5): `pre_stamp_file_path_stamps_normal_file`, `pre_stamp_file_path_skips_oversize`, `pre_stamp_file_path_skipped_for_missing_file`, `pre_stamp_then_runtime_poll_dedups` (regression — pre-stamp + pack_file_or_warn dedup via matches_file_hash), `pre_stamp_oversize_does_not_pollute_file_slot`.
+  - Win (6): `host_pre_stamp_file_path_stamps_normal_file`, `host_pre_stamp_file_path_skips_oversize`, `host_pre_stamp_file_path_skipped_for_missing_file`, `host_pre_stamp_then_runtime_poll_dedups`, `host_pre_stamp_oversize_does_not_pollute_lastkind`, `host_stamp_initial_text_takes_priority_over_file` (None-input regression).
+- [x] Run `cargo test --workspace -- --test-threads=1` — 625 passed (231 client + 14 exec-core + 84 protocol + 155 host + 83 transport-other + 22 term + 41 transport + 0 core doc-tests), 0 failed, 5 ignored. +11 net new tests vs 614 baseline. `cargo clippy --workspace --all-targets -- -D warnings` clean on macOS. Windows cross-compile `cargo check -p wiredesk-host --target x86_64-pc-windows-gnu` ✓ clean.
 
 ### Task 10: Verify acceptance criteria + full test suite
 

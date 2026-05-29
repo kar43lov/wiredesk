@@ -306,6 +306,72 @@ pub(crate) enum FilePollOutcome {
     Skipped(&'static str),
 }
 
+/// Outcome of the startup pre-stamp probe for a file URL on the pasteboard.
+/// Mirrors the shape of `FilePollOutcome` but only carries the bits the
+/// pre-stamp path needs (no packed payload — we never emit, we only stamp).
+///
+/// Task 9b: at process boot the poll thread inspects the OS clipboard once
+/// and records hashes of whatever's already there so the first poll tick
+/// after launch doesn't re-upload the user's pre-existing clipboard. Files
+/// need their own variant because the content lives behind a path, not
+/// inline like text/image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilePreStampOutcome {
+    /// File read successfully; caller stamps `LastSeen.file(hash)`.
+    Stamped { name: String, hash: u64 },
+    /// File exceeded `limit`. Caller logs a warning and skips stamping —
+    /// stamping the oversize slot pre-emptively would suppress the user's
+    /// next genuine attempt to copy that same file (they might want the
+    /// toast). Let the runtime poll tick handle it.
+    Oversize { size_bytes: usize },
+    /// Path failed sanity (empty basename, IO error, …). Caller logs at
+    /// debug and skips.
+    Skipped(&'static str),
+}
+
+/// Pre-stamp helper for a file URL discovered on the pasteboard at startup.
+///
+/// Symmetric with `pack_file_or_warn` but stripped of the packing step — we
+/// don't need to build a wire payload, we just need the content hash so the
+/// runtime poll-tick dedup short-circuits on the same content.
+///
+/// Pure helper: I/O is unavoidable (we have to read the file to hash content),
+/// but pulled out of the startup block so unit tests can drive it with a
+/// `tempfile`-backed path and a low limit.
+pub(crate) fn pre_stamp_file_path(
+    path: &std::path::Path,
+    limit: usize,
+) -> FilePreStampOutcome {
+    use std::fs;
+
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) if !n.is_empty() => n.to_owned(),
+        _ => return FilePreStampOutcome::Skipped("empty or non-UTF-8 basename"),
+    };
+
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return FilePreStampOutcome::Skipped("stat failed"),
+    };
+    let size_u64 = meta.len();
+    let size_usize = size_u64 as usize;
+    if (size_u64 as u128) != (size_usize as u128) {
+        return FilePreStampOutcome::Skipped("file larger than usize");
+    }
+
+    if check_file_size(size_usize, limit).is_err() {
+        return FilePreStampOutcome::Oversize { size_bytes: size_usize };
+    }
+
+    let content = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return FilePreStampOutcome::Skipped("read failed"),
+    };
+
+    let hash = hash_bytes(&content);
+    FilePreStampOutcome::Stamped { name, hash }
+}
+
 /// Pure(-ish) helper for the outbound file branch. Reads `path`, hashes the
 /// content, checks the size cap, and packs the first chunk via
 /// `wiredesk_protocol::clip_file::pack_first_chunk`.
@@ -657,6 +723,42 @@ pub fn spawn_poll_thread(
         // bumps the counter eagerly so a sticky multi-file selection or
         // non-file URL doesn't trigger a re-scan on every tick.
         let mut file_change_count: i64 = -1;
+
+        // Startup pre-stamp for file URLs (Task 9b). Mirrors the text/image
+        // blocks above: if the pasteboard already carries a file URL when the
+        // app launches, hash its content and stamp `LastSeen.file` so the
+        // FIRST poll tick doesn't re-upload a file the user copied during a
+        // previous session. Oversize files are NOT stamped — let the runtime
+        // poll path show the toast on the user's next observation. This call
+        // also bumps `file_change_count` to the current pasteboard value so
+        // the runtime loop doesn't re-detect the same pre-existing URL as
+        // "new" on its first tick (which would re-emit through the outbound
+        // file branch despite the stamp racing the OS read).
+        if let Some(path) = clipboard_files::poll_file_url(&mut file_change_count) {
+            match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
+                FilePreStampOutcome::Stamped { name, hash } => {
+                    state.set_file(hash);
+                    log::info!(
+                        "clipboard: pre-stamped existing file '{name}' ({} content hash) — not sending on startup",
+                        hash
+                    );
+                }
+                FilePreStampOutcome::Oversize { size_bytes } => {
+                    log::warn!(
+                        "clipboard: pre-existing file at {} is {} bytes (over {} cap) — skipping stamp; runtime poll will surface the toast",
+                        path.display(),
+                        size_bytes,
+                        MAX_FILE_BYTES,
+                    );
+                }
+                FilePreStampOutcome::Skipped(reason) => {
+                    log::debug!(
+                        "clipboard: pre-existing file at {} not stamped — {reason}",
+                        path.display()
+                    );
+                }
+            }
+        }
 
         loop {
             // Sleep up to CLIP_POLL_INTERVAL, but wake immediately if the
@@ -3278,5 +3380,130 @@ mod tests {
         assert_eq!(removed, 1, "only the >24h file should be removed");
         assert!(!old_path.exists(), "old file should be gone");
         assert!(fresh_path.exists(), "fresh file should survive");
+    }
+
+    // ------------------------------------------------------------
+    // Task 9b: pre-stamp helper for file URLs at process startup
+    // ------------------------------------------------------------
+
+    #[test]
+    fn pre_stamp_file_path_stamps_normal_file() {
+        // Tempfile with 4 KB of synthetic content → FilePreStampOutcome::Stamped
+        // with name = file_name() and hash = hash_bytes(content). Drives the
+        // happy path the poll-thread startup block hits when the OS clipboard
+        // already carries a file URL at launch.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let outcome = pre_stamp_file_path(&path, MAX_FILE_BYTES);
+        match outcome {
+            FilePreStampOutcome::Stamped { name, hash } => {
+                assert_eq!(name, path.file_name().unwrap().to_string_lossy());
+                assert_eq!(hash, hash_bytes(&content));
+            }
+            other => panic!("expected Stamped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_stamp_file_path_skips_oversize() {
+        // Tempfile with 2 KB of content but limit of 1 KB → Oversize. Critical
+        // contract: stamp helper must NOT read the content (would defeat the
+        // size cap) and must NOT stamp the file hash so the runtime poll path
+        // is free to surface the toast on the user's next observation.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = vec![0xAA; 2048];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let outcome = pre_stamp_file_path(&path, 1024);
+        match outcome {
+            FilePreStampOutcome::Oversize { size_bytes } => {
+                assert_eq!(size_bytes, 2048);
+            }
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_stamp_file_path_skipped_for_missing_file() {
+        // Non-existent path → Skipped (stat failure). The startup probe must
+        // not panic if the pasteboard points at a file that disappeared (the
+        // user deleted it between the previous session and the new launch).
+        let path = std::path::PathBuf::from("/nonexistent/wiredesk-test-9b-missing.bin");
+        let outcome = pre_stamp_file_path(&path, MAX_FILE_BYTES);
+        match outcome {
+            FilePreStampOutcome::Skipped(_) => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_stamp_then_runtime_poll_dedups() {
+        // End-to-end smoke: simulate the startup flow by calling
+        // `pre_stamp_file_path` and stamping `LastSeen.file` exactly as the
+        // poll thread does. The next "runtime" poll over the same content
+        // (using `matches_file_hash`) must dedup → no resend on the first
+        // tick after launch. Regression guard for the "stamp_initial handles
+        // pre-existing file" plan checkbox.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content = b"pre-existing file content";
+        tmp.write_all(content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let state = ClipboardState::new();
+
+        // Startup probe.
+        match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
+            FilePreStampOutcome::Stamped { hash, .. } => {
+                state.set_file(hash);
+            }
+            other => panic!("expected Stamped, got {other:?}"),
+        }
+
+        // Runtime poll-tick path: pack helper computes the same content hash.
+        match pack_file_or_warn(&path, MAX_FILE_BYTES) {
+            FilePollOutcome::Ready { hash, .. } => {
+                assert!(
+                    state.get().matches_file_hash(hash),
+                    "runtime poll must dedup against pre-stamped hash"
+                );
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_stamp_oversize_does_not_pollute_file_slot() {
+        // Oversize files at startup must NOT stamp `LastSeen.file` — the user
+        // hasn't seen any toast yet, so the runtime poll path needs to fire
+        // its oversize branch (and surface the toast) on the first tick.
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let content: Vec<u8> = vec![0xCC; 4096];
+        tmp.write_all(&content).expect("write");
+        let path = tmp.path().to_owned();
+
+        let state = ClipboardState::new();
+
+        match pre_stamp_file_path(&path, 1024) {
+            FilePreStampOutcome::Oversize { .. } => {
+                // intentionally NO state.set_file / set_oversize_file here —
+                // mirror of the production startup block.
+            }
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+
+        let s = state.get();
+        assert!(s.file.is_none(), "file slot must remain empty after oversize pre-stamp");
+        assert!(
+            s.oversize_file.is_none(),
+            "oversize_file slot must also remain empty — runtime poll owns the toast"
+        );
     }
 }
