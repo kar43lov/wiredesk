@@ -1339,10 +1339,7 @@ impl IncomingClipboard {
         if let Some(dir) = self.cache_dir_override.as_ref() {
             return dir.clone();
         }
-        match dirs::cache_dir() {
-            Some(d) => d.join("WireDesk"),
-            None => std::env::temp_dir().join("WireDesk"),
-        }
+        default_cache_dir()
     }
 
     fn commit_image(&mut self, buf: &[u8]) {
@@ -1385,6 +1382,54 @@ impl IncomingClipboard {
         }
         if wrote_ok {
             self.state.set_image(hash);
+        }
+    }
+}
+
+/// Resolve the WireDesk cache directory used by inbound-file commits.
+///
+/// Mac convention: `dirs::cache_dir()` → `~/Library/Caches/WireDesk`.
+/// `dirs::cache_dir()` only returns `None` if `$HOME` is unset (extremely
+/// rare), in which case we fall back to `std::env::temp_dir()/WireDesk`
+/// so callers always get a usable path. Shared with the startup vacuum
+/// hook (`run_startup_vacuum`) so the directory it cleans matches the
+/// one `IncomingClipboard::commit` writes into.
+pub(crate) fn default_cache_dir() -> PathBuf {
+    match dirs::cache_dir() {
+        Some(d) => d.join("WireDesk"),
+        None => std::env::temp_dir().join("WireDesk"),
+    }
+}
+
+/// Run the cache-vacuum sweep at process startup. Removes inbound-file
+/// cache entries older than `older_than` from `default_cache_dir()`.
+///
+/// Non-fatal: per-file errors are absorbed by `vacuum_cache_dir` (logged
+/// at `warn`); a missing directory returns `Ok(0)` (first-run case);
+/// any enumeration failure is logged at `warn` and the process keeps
+/// booting. The 24h default matches the brief: cache lives a day, then
+/// gets cleared on next start. Callers (main.rs) pass
+/// `Duration::from_secs(24 * 3600)` for production.
+pub fn run_startup_vacuum(older_than: Duration) {
+    let dir = default_cache_dir();
+    match wiredesk_core::cache_vacuum::vacuum_cache_dir(&dir, older_than) {
+        Ok(0) => {
+            log::debug!(
+                "cache vacuum: nothing to remove under {}",
+                dir.display()
+            );
+        }
+        Ok(n) => {
+            log::info!(
+                "cache vacuum: removed {n} stale file(s) under {}",
+                dir.display()
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "cache vacuum: enumeration of {} failed: {e}",
+                dir.display()
+            );
         }
     }
 }
@@ -3162,5 +3207,76 @@ mod tests {
         let cancel2 = Arc::new(AtomicBool::new(false));
         let toast_text = apply_clip_decline(FORMAT_TEXT_UTF8, &cancel2);
         assert_eq!(toast_text, "Host declined the clipboard transfer");
+    }
+
+    // --- Task 9a: cache vacuum startup hookup -------------------------------
+
+    #[test]
+    fn mac_default_cache_dir_ends_in_wiredesk() {
+        // Smoke check: the resolution chain (dirs::cache_dir() →
+        // env::temp_dir()) always yields *something* on every supported
+        // target. We don't care which branch wins — only that the call
+        // never returns an empty path that would later fail
+        // `create_dir_all`, and that the final segment is "WireDesk" so
+        // the path can be told apart from a foreign cache root.
+        let p = default_cache_dir();
+        assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("WireDesk"));
+    }
+
+    #[test]
+    fn mac_run_startup_vacuum_handles_missing_dir() {
+        // The underlying core helper must return Ok(0) on a missing
+        // directory — that's the contract `run_startup_vacuum` relies on
+        // for first-run boots when ~/Library/Caches/WireDesk doesn't
+        // exist yet. Test against an explicit missing path to pin the
+        // behaviour; then call the production helper to assert it
+        // doesn't panic against whatever the live resolver yields.
+        let missing = std::env::temp_dir()
+            .join("wd-mac-cache-vacuum-doesnotexist-9a-startup");
+        let _ = std::fs::remove_dir_all(&missing);
+        let res = wiredesk_core::cache_vacuum::vacuum_cache_dir(
+            &missing,
+            Duration::from_secs(24 * 3600),
+        );
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 0);
+
+        // And the helper itself must not panic when called against
+        // whatever the production resolver yields — even if the path
+        // doesn't exist yet.
+        run_startup_vacuum(Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn mac_run_startup_vacuum_removes_old_files_via_core() {
+        // Drive the underlying core helper directly against a tempdir
+        // (the standalone `run_startup_vacuum` resolves
+        // dirs::cache_dir() — we can't divert it without an env mutation
+        // that would race other tests). Asserts the end-to-end contract
+        // production relies on: old files get removed, fresh files
+        // survive.
+        use filetime::{FileTime, set_file_mtime};
+        use std::fs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_path = dir.path().join("old.bin");
+        let fresh_path = dir.path().join("fresh.bin");
+        fs::write(&old_path, b"old").expect("write old");
+        fs::write(&fresh_path, b"fresh").expect("write fresh");
+
+        let old_ft = FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(30 * 3600),
+        );
+        set_file_mtime(&old_path, old_ft).expect("set old mtime");
+
+        let removed = wiredesk_core::cache_vacuum::vacuum_cache_dir(
+            dir.path(),
+            Duration::from_secs(24 * 3600),
+        )
+        .expect("vacuum");
+
+        assert_eq!(removed, 1, "only the >24h file should be removed");
+        assert!(!old_path.exists(), "old file should be gone");
+        assert!(fresh_path.exists(), "fresh file should survive");
     }
 }

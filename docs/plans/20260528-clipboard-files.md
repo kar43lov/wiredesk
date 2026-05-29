@@ -453,15 +453,14 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-client/src/main.rs`
 - Modify: `apps/wiredesk-host/src/main.rs`
 
-- [ ] **Mac startup** (`main.rs`): early в `main()` call `wiredesk_core::cache_vacuum::vacuum_cache_dir(cache_path, Duration::from_secs(24 * 3600))`.
-  - `cache_path = dirs::cache_dir()?.join("WireDesk")`.
-  - Log: `info: "cache vacuum removed N files"`.
-  - Errors → log::warn, не блокировать startup.
-- [ ] **Win startup**: same with `env::var("TEMP")?.join("WireDesk")`.
-- [ ] Write tests:
-  - `cache_vacuum_startup_handles_missing_dir` — non-existent → no panic, log warning.
-  - Integration-style (если можно): создать old file в tempdir, run vacuum helper, assert removed.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 9b.
+- [x] **Mac startup** (`main.rs`): early в `main()` call `clipboard::run_startup_vacuum(Duration::from_secs(24 * 3600))`. Helper resolves `dirs::cache_dir().join("WireDesk")` (with `env::temp_dir()` fallback), delegates to `wiredesk_core::cache_vacuum::vacuum_cache_dir`, logs result at `info` (count removed) / `debug` (nothing to do) / `warn` (enumeration error). Non-fatal — boot continues regardless.
+- [x] **Win startup**: same shape via host `clipboard::run_startup_vacuum`. Resolution chain `%TEMP%\WireDesk` → `dirs::cache_dir()/WireDesk` → `std::env::temp_dir()/WireDesk` (matching `IncomingClipboard::resolve_cache_dir` so vacuum cleans exactly what commit writes). Both sides refactored: `default_cache_dir()` free fn is the single source of truth, `resolve_cache_dir` delegates when no test override is set.
+- [x] Write tests (+6 net new):
+  - Mac: `mac_default_cache_dir_ends_in_wiredesk`, `mac_run_startup_vacuum_handles_missing_dir`, `mac_run_startup_vacuum_removes_old_files_via_core` (tempdir + 30h-old file + fresh file via `filetime` crate — old removed, fresh survives).
+  - Win mirror: `host_default_cache_dir_returns_some_path`, `host_run_startup_vacuum_handles_missing_dir`, `host_run_startup_vacuum_removes_old_files_via_core`.
+  - Production `run_startup_vacuum` resolves `dirs::cache_dir()`/`%TEMP%` unconditionally — diverting it via env mutation would race other tests, so the end-to-end assertion drives `wiredesk_core::cache_vacuum::vacuum_cache_dir` directly against a tempdir (same call the helper makes). Smoke `run_startup_vacuum(...)` call inside the missing-dir test guards against panic regressions against the live resolver path.
+  - Added `filetime = "0.2"` as a dev-dep for both apps (matches `wiredesk-core`'s existing pin).
+- [x] Run `cargo test --workspace -- --test-threads=1` — 614 passed (223 client + 14 core + 84 protocol + 147 host + 83 exec-core + 22 term + 41 transport), 0 failed, 5 ignored. +6 net new tests vs 608 baseline. `cargo clippy --workspace --all-targets -- -D warnings` clean on macOS target. Windows cross-compile `cargo check -p wiredesk-host --target x86_64-pc-windows-gnu` clean.
 
 ### Task 9b: stamp_initial extension for file slot (both sides)
 

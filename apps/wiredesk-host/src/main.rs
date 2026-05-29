@@ -129,6 +129,12 @@ fn main() {
     log::info!("serial: {} @ {} baud", cfg.port, cfg.baud);
     log::info!("screen: {}x{}", cfg.width, cfg.height);
 
+    // Cache vacuum: clear stale inbound-file cache entries older than 24h.
+    // Runs synchronously before the session thread spawns — a file-paste
+    // landing within the first poll tick never races a half-finished
+    // vacuum on the same directory.
+    clipboard::run_startup_vacuum(std::time::Duration::from_secs(24 * 3600));
+
     let (status_tx, status_rx) = mpsc::channel();
 
     // Shared progress atomics — session thread writes; overlay UI thread

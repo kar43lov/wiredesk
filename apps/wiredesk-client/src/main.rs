@@ -82,6 +82,13 @@ fn main() {
     log::info!("config: {}", ClientConfig::config_path().display());
     log::info!("transport: {} (port={} baud={})", cfg.transport, cfg.port, cfg.baud);
 
+    // Cache vacuum: clear stale inbound-file cache entries older than 24h.
+    // Runs synchronously — the directory is small (≤20 MB per file × few
+    // entries), enumeration is fast, and doing it before any IO thread
+    // spins up means a file-paste landing within the first poll tick
+    // never races a half-finished vacuum on the same directory.
+    clipboard::run_startup_vacuum(Duration::from_secs(24 * 3600));
+
     let transport_cfg = config::to_transport_config(&cfg);
 
     // Channels go up first so we can ship a Disconnected event into the
