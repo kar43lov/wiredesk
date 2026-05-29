@@ -1,4 +1,5 @@
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -120,13 +121,21 @@ where
             }
         };
 
-        let mut sess = Session::with_counters(
+        // `receive_files` toggle: Settings UI persists `HostConfig.receive_files`
+        // and Save-and-Restart respawns the whole host process, so this Arc
+        // is effectively read-once at boot. Wrapping in an Arc keeps the
+        // signature aligned with `with_counters_and_toggles` (which also
+        // serves Mac-style live mutation; we just never call `store` on the
+        // host side).
+        let receive_files = Arc::new(AtomicBool::new(config.receive_files));
+        let mut sess = Session::with_counters_and_toggles(
             transport,
             injector,
             config.host_name.clone(),
             config.width,
             config.height,
             counters,
+            receive_files,
         );
 
         let _ = status_tx.send(SessionStatus::Waiting);

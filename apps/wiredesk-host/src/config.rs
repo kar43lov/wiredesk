@@ -19,6 +19,17 @@ pub struct HostConfig {
     pub host_name: String,
     pub run_on_startup: bool,
 
+    /// Accept incoming files from Mac → Host. When false, an incoming
+    /// `ClipOffer{format=FILE}` is rejected on receipt — the Mac side
+    /// sees a `ClipDecline` and `ClipboardSync` stays idle (no reassembly
+    /// state). Wired through `ClipboardSync::with_counters_and_toggles`
+    /// at session-thread startup (Task 8, follow-up from Task 7a).
+    /// Backwards-compatible default `true`: pre-existing config files
+    /// without the field deserialize to "on", so users don't lose the
+    /// feature on upgrade.
+    #[serde(default = "default_true")]
+    pub receive_files: bool,
+
     /// Which transport to open on startup. `"serial"` (default) keeps the
     /// existing behaviour. `"bluetooth"` opens the BLE Peripheral GATT
     /// server and ignores the serial fields.
@@ -40,6 +51,14 @@ fn default_transport() -> String {
     "serial".to_string()
 }
 
+/// `#[serde(default = ...)]` helper for `Option<bool>`-flavoured fields that
+/// should round-trip as "on" when missing from disk. Used by
+/// `receive_files` so pre-existing TOML configs (without the field) load
+/// with the same behaviour as a freshly built default.
+fn default_true() -> bool {
+    true
+}
+
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
@@ -49,6 +68,7 @@ impl Default for HostConfig {
             height: 1440,
             host_name: "wiredesk-host".to_string(),
             run_on_startup: false,
+            receive_files: true,
             transport: default_transport(),
             transport_fallback: None,
             bluetooth: BluetoothConfig::default(),
@@ -181,6 +201,7 @@ mod tests {
         assert_eq!(cfg.height, 1440);
         assert_eq!(cfg.host_name, "wiredesk-host");
         assert!(!cfg.run_on_startup);
+        assert!(cfg.receive_files);
         assert_eq!(cfg.transport, "serial");
         assert!(cfg.transport_fallback.is_none());
         assert_eq!(cfg.bluetooth, BluetoothConfig::default());
@@ -195,6 +216,7 @@ mod tests {
             height: 1080,
             host_name: "test-host".to_string(),
             run_on_startup: true,
+            receive_files: true,
             transport: "serial".to_string(),
             transport_fallback: None,
             bluetooth: BluetoothConfig::default(),
@@ -301,6 +323,7 @@ mod tests {
             height: 720,
             host_name: "from-toml".to_string(),
             run_on_startup: true,
+            receive_files: true,
             transport: "serial".to_string(),
             transport_fallback: None,
             bluetooth: BluetoothConfig::default(),
@@ -373,6 +396,62 @@ mod tests {
         let merged = merge_args(&matches, cfg);
         // No --transport CLI arg → TOML's "bluetooth" survives.
         assert_eq!(merged.transport, "bluetooth");
+    }
+
+    #[test]
+    fn config_roundtrip_with_receive_files() {
+        // Task 8: explicit `receive_files = false` must survive a TOML
+        // serialize → deserialize cycle. Without the field on the struct
+        // the value would silently round-trip as `true` (the default),
+        // breaking the Settings checkbox state across host restarts.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rfiles.toml");
+        let cfg = HostConfig {
+            receive_files: false,
+            ..HostConfig::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = HostConfig::load_from(&path);
+        assert!(!loaded.receive_files);
+        assert_eq!(loaded, cfg);
+
+        // And the inverse — explicit `true` survives too (sanity check
+        // that the field isn't being skipped on serialize/elided on read).
+        let cfg_on = HostConfig {
+            receive_files: true,
+            ..HostConfig::default()
+        };
+        let path_on = dir.path().join("rfiles_on.toml");
+        cfg_on.save_to(&path_on).unwrap();
+        let loaded_on = HostConfig::load_from(&path_on);
+        assert!(loaded_on.receive_files);
+    }
+
+    #[test]
+    fn config_back_compat_missing_receive_files() {
+        // Task 8: a TOML file written before the field existed must load
+        // with `receive_files = true` (default-on, preserves pre-Task-8
+        // behaviour). Without `#[serde(default = "default_true")]` on the
+        // field a missing key would fail the whole struct and `load_from`
+        // would wipe every other persisted field back to defaults.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            "port = \"COM5\"\n\
+             baud = 57600\n\
+             width = 1920\n\
+             height = 1080\n\
+             host_name = \"legacy-host\"\n\
+             run_on_startup = true\n",
+        )
+        .unwrap();
+        let cfg = HostConfig::load_from(&path);
+        assert_eq!(cfg.port, "COM5");
+        assert_eq!(cfg.baud, 57_600);
+        assert!(cfg.run_on_startup);
+        // The missing field falls back to the default-on closure.
+        assert!(cfg.receive_files);
     }
 
     #[test]

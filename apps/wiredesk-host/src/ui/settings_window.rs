@@ -71,6 +71,15 @@ pub struct SettingsWindow {
     pub height_label: nwg::Label,
     pub height_input: nwg::TextInput,
 
+    // --- Clipboard group (Task 8) ---
+    // Single checkbox today — "Receive files" — but kept in its own group so
+    // future toggles (send_files, send_images, receive_images) can join
+    // without a layout shift. Mirrors the Mac client Clipboard group.
+    pub clipboard_title: nwg::Label,
+    pub clipboard_frame: nwg::Frame,
+    pub clipboard_layout: nwg::GridLayout,
+    pub receive_files_check: nwg::CheckBox,
+
     // --- System group ---
     pub system_title: nwg::Label,
     pub system_frame: nwg::Frame,
@@ -126,7 +135,7 @@ impl SettingsWindow {
                     .expect("malformed bundled app-icon.ico — rebuild assets");
                 let icon_ref = Some(&*window_icon);
                 nwg::Window::builder()
-                    .size((460, 500))
+                    .size((460, 560))
                     .position((300, 300))
                     .title("WireDesk Host Settings")
                     .icon(icon_ref)
@@ -267,6 +276,32 @@ impl SettingsWindow {
                 .parent(&s.display_frame)
                 .build(&mut s.height_input)?;
 
+            // ---- Clipboard group (Task 8) ----
+            // "Receive files" mirror of the Mac client's checkbox. When off,
+            // incoming FORMAT_FILE offers are declined (ClipboardSync's
+            // `on_offer` returns ClipDecline; reassembly stays idle). Save +
+            // Restart respawns the host process — the new boot reads the
+            // updated TOML and stores `false` into the session-thread Arc.
+            nwg::Label::builder()
+                .text("Clipboard")
+                .parent(&s.window)
+                .build(&mut s.clipboard_title)?;
+            nwg::Frame::builder()
+                .parent(&s.window)
+                .flags(nwg::FrameFlags::VISIBLE | nwg::FrameFlags::BORDER)
+                .build(&mut s.clipboard_frame)?;
+
+            let receive_files_initial = if config.receive_files {
+                nwg::CheckBoxState::Checked
+            } else {
+                nwg::CheckBoxState::Unchecked
+            };
+            nwg::CheckBox::builder()
+                .text("Receive files (Mac → Host)")
+                .check_state(receive_files_initial)
+                .parent(&s.clipboard_frame)
+                .build(&mut s.receive_files_check)?;
+
             // ---- System group ----
             nwg::Label::builder()
                 .text("System")
@@ -359,6 +394,14 @@ impl SettingsWindow {
                 .build(&s.display_layout)?;
 
             nwg::GridLayout::builder()
+                .parent(&s.clipboard_frame)
+                .max_column(Some(3))
+                .spacing(4)
+                .margin([6, 6, 6, 6])
+                .child_item(nwg::GridLayoutItem::new(&s.receive_files_check, 0, 0, 3, 1))
+                .build(&s.clipboard_layout)?;
+
+            nwg::GridLayout::builder()
                 .parent(&s.system_frame)
                 .max_column(Some(3))
                 .spacing(4)
@@ -388,7 +431,7 @@ impl SettingsWindow {
             // layout.
             nwg::GridLayout::builder()
                 .parent(&s.window)
-                .min_size([440, 510])
+                .min_size([440, 560])
                 .max_column(Some(3))
                 .spacing(4)
                 .margin([6, 6, 6, 6])
@@ -402,13 +445,18 @@ impl SettingsWindow {
                 // Row 6: Display title; rows 7-8: Display frame
                 .child_item(nwg::GridLayoutItem::new(&s.display_title, 0, 6, 3, 1))
                 .child_item(nwg::GridLayoutItem::new(&s.display_frame, 0, 7, 3, 2))
-                // Row 9: System title; rows 10-11: System frame
-                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 9, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 10, 3, 2))
-                // Row 12: button-bar (right-aligned via internal grid)
-                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 12, 3, 1))
-                // Row 13: message label
-                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 13, 3, 1))
+                // Row 9: Clipboard title; rows 10-11: Clipboard frame
+                // (single checkbox today — Task 8). Frame height matches
+                // Display so the visual grid stays even.
+                .child_item(nwg::GridLayoutItem::new(&s.clipboard_title, 0, 9, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.clipboard_frame, 0, 10, 3, 2))
+                // Row 12: System title; rows 13-14: System frame
+                .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 12, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 13, 3, 2))
+                // Row 15: button-bar (right-aligned via internal grid)
+                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 15, 3, 1))
+                // Row 16: message label
+                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 16, 3, 1))
                 .build(&s.layout)?;
 
             // Hidden by default — caller decides when to reveal.
@@ -479,6 +527,13 @@ impl SettingsWindow {
         let width = format::validate_dimension(&self.width_input.text())?;
         let height = format::validate_dimension(&self.height_input.text())?;
         let run_on_startup = self.autostart_check.check_state() == nwg::CheckBoxState::Checked;
+        // Task 8: file clipboard receive toggle. Checkbox lives in the
+        // Clipboard group; mirrors the Mac client's `receive_files` toggle.
+        // Save-and-Restart respawns the host process so the value takes
+        // effect on the next session (no live re-arm — matches the existing
+        // baud/port/transport pattern).
+        let receive_files =
+            self.receive_files_check.check_state() == nwg::CheckBoxState::Checked;
         let transport = match self.transport_combo.selection() {
             Some(1) => "bluetooth".to_string(),
             _ => "serial".to_string(),
@@ -489,6 +544,7 @@ impl SettingsWindow {
             width,
             height,
             run_on_startup,
+            receive_files,
             transport,
             // Preserve fields not edited in this form.
             host_name: base.host_name.clone(),

@@ -408,10 +408,12 @@ pub struct ProgressCounters {
 }
 
 impl ClipboardSync {
+    /// Convenience shim with a default-on `receive_files` toggle. Task 8
+    /// moved every production call site to `with_counters_and_toggles` so
+    /// this lives on for legacy/test use. `#[allow(dead_code)]` is set
+    /// because the workspace `-D warnings` lint would otherwise flag it.
+    #[allow(dead_code)]
     pub fn with_counters(counters: ProgressCounters) -> Self {
-        // No receive_files toggle wired through callers yet — Settings UI
-        // landing in Task 8 owns the Arc. Default to true so existing
-        // production behaviour is unchanged.
         Self::with_counters_and_toggles(counters, Arc::new(AtomicBool::new(true)))
     }
 

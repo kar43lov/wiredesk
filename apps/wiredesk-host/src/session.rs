@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wiredesk_core::error::{Result, WireDeskError};
@@ -74,6 +76,12 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         )
     }
 
+    /// Convenience shim with a default-on `receive_files` toggle. Task 8
+    /// moved the production `session_thread::spawn` path to
+    /// `with_counters_and_toggles`; `Session::new` (cfg(test)) still funnels
+    /// through here. `#[allow(dead_code)]` suppresses the workspace
+    /// `-D warnings` lint when the test cfg path is excluded.
+    #[allow(dead_code)]
     pub fn with_counters(
         transport: T,
         injector: I,
@@ -81,6 +89,34 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         screen_w: u16,
         screen_h: u16,
         counters: ProgressCounters,
+    ) -> Self {
+        Self::with_counters_and_toggles(
+            transport,
+            injector,
+            host_name,
+            screen_w,
+            screen_h,
+            counters,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    /// Same as `with_counters` plus a `receive_files` runtime toggle threaded
+    /// through to `ClipboardSync::with_counters_and_toggles`. Production
+    /// session-thread spawn wires the toggle from `HostConfig.receive_files`
+    /// so a `false` in TOML disables incoming `FORMAT_FILE` offers at boot;
+    /// the Settings UI's Save-and-Restart respawns the host process, so the
+    /// flag isn't live-mutable from outside the session loop (matches the
+    /// existing send_images/receive_images pattern on the Mac side, which
+    /// uses Arc only because the Mac UI has live config without restart).
+    pub fn with_counters_and_toggles(
+        transport: T,
+        injector: I,
+        host_name: String,
+        screen_w: u16,
+        screen_h: u16,
+        counters: ProgressCounters,
+        receive_files: Arc<AtomicBool>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -94,7 +130,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_w,
             screen_h,
             shell: None,
-            clipboard: ClipboardSync::with_counters(counters),
+            clipboard: ClipboardSync::with_counters_and_toggles(counters, receive_files),
             client_name: None,
         }
     }

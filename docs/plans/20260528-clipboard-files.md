@@ -430,22 +430,22 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-host/src/settings_ui.rs`
 - Modify: `apps/wiredesk-host/src/config.rs` (если отдельный)
 
-- [ ] **Config (TOML)**:
-  - Mac: add `receive_files: bool` default `true` в Config struct с `#[serde(default = "default_true")]`.
-  - Win: same.
-  - Verify TOML serialize/deserialize round trip + default values работают (back-compat: existing config files без поля → true).
-- [ ] **Mac UI** (`app.rs`):
-  - Add `receive_files: Arc<AtomicBool>` field в `WireDeskApp`.
-  - Add `Config.receive_files` field.
-  - В Settings panel рядом с "Receive images (Host → Mac)" добавить checkbox "Receive files (Host → Mac)".
-  - Wire через `store(...)` параллельно `receive_images` (рядом строки 643-667 в app.rs).
-- [ ] **Win UI** (`settings_ui.rs`):
-  - Add checkbox "Receive files" в nwg layout. Group: Clipboard (или where receive_images уже стоит).
-  - Wire Arc<AtomicBool> + write back to Config on Save.
-- [ ] Write tests:
-  - `config_roundtrip_with_receive_files` — TOML serialize + deserialize, default = true.
-  - `config_back_compat_missing_receive_files` — TOML без поля → default true (используя `#[serde(default = ...)]`).
-- [ ] Run `cargo test --workspace -- --test-threads=1` — all pass before Task 9a.
+- [x] **Config (TOML)**:
+  - Mac: добавил `receive_files: bool` default `true` в `ClientConfig` с `#[serde(default = "default_true")]`. Поле сидит рядом с `receive_text` (зеркало receive_images/receive_text шаблона). `defaults_match_hardcodes` обновлён + добавлены `config_roundtrip_with_receive_files`, `config_back_compat_missing_receive_files`.
+  - Win: добавил `receive_files` в `HostConfig` симметрично (плюс новый `fn default_true()` helper — host'у он раньше не требовался). `defaults_match_hardcodes` + те же 2 новых back-compat теста.
+- [x] **Mac UI** (`app.rs`):
+  - Добавил `receive_files: Arc<AtomicBool>` поле в `WireDeskApp` + extended `WireDeskApp::new` signature.
+  - `make_app` test fixture обновлён (Arc<AtomicBool>::new(true) после receive_text).
+  - В Settings panel сразу после "Receive images (Host → Mac)" добавил checkbox "Receive files (Host → Mac)" — flipping the checkbox `store()`s в Arc и в `cfg.receive_files`, takes effect on next incoming offer (no restart, mirror of receive_images).
+  - `main.rs` теперь инициализирует Arc из `cfg.receive_files` (не хардкодит `true`), и пробрасывает Arc в `WireDeskApp::new` (reader_thread уже имел clone из Task 7a).
+- [x] **Win UI** (`settings_window.rs`):
+  - Добавил новую группу "Clipboard" между Display и System группами с одним checkbox'ом "Receive files (Mac → Host)". Расширил outer GridLayout (rows 9-11 = clipboard title+frame, System shifted к rows 12-14, button-bar to 15, message label to 16). Window size bumped 460×500 → 460×560.
+  - `read_form` теперь читает `receive_files_check.check_state()` и пишет в новое `HostConfig.receive_files` поле. Save-and-Restart pattern respawns host process; на следующем boot session_thread читает field из TOML.
+  - `session_thread::spawn` теперь оборачивает `HostConfig.receive_files` в `Arc<AtomicBool>` и вызывает `Session::with_counters_and_toggles` (новый ctor, симметричный с `with_counters` но threadает Arc через ClipboardSync). `Session::with_counters` и `ClipboardSync::with_counters` остаются как `#[allow(dead_code)]` shim (тесты идут через `new_for_test` напрямую; production через _toggles).
+- [x] Write tests:
+  - `config_roundtrip_with_receive_files` — explicit `receive_files=false` round-trips TOML byte-equal (+ inverse sanity check on `true`). Mac и Win obe sides. ✓
+  - `config_back_compat_missing_receive_files` — pre-Task-8 TOML без поля → load с `receive_files=true` через `#[serde(default = "default_true")]`; existing fields (port, baud, send_images, etc.) сохраняются. Mac и Win обе стороны. ✓
+- [x] Run `cargo test --workspace -- --test-threads=1` — 608 passed (+4 net new vs 604 baseline), 0 failed, 5 ignored. `cargo clippy --workspace --all-targets -- -D warnings` clean. Windows cross-compile `cargo check -p wiredesk-host --target x86_64-pc-windows-gnu` ✓ clean (clippy на этом target имеет 3 pre-existing warnings из transfer_overlay.rs / session.rs `has_shell`, не из Task 8 — baseline since aaee62c May 2026).
 
 ### Task 9a: Cache vacuum startup hookup (both sides)
 

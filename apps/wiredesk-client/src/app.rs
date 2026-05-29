@@ -139,6 +139,13 @@ pub struct WireDeskApp {
     receive_images: Arc<AtomicBool>,
     send_text: Arc<AtomicBool>,
     receive_text: Arc<AtomicBool>,
+    /// Accept incoming files from Host → Mac. Shared with the reader thread's
+    /// `IncomingClipboard.receive_files`; flipping the Settings checkbox
+    /// takes effect on the next incoming `ClipOffer{format=FILE}` without a
+    /// restart (matches `receive_images` pattern). Task 8 wired through from
+    /// `ClientConfig.receive_files` at startup so a `false` in TOML disables
+    /// the feature on boot.
+    receive_files: Arc<AtomicBool>,
     /// Karabiner-Elements `left_command ↔ left_option` compensation. Shared
     /// with the keyboard tap thread; flipping the Settings checkbox takes
     /// effect on the next FlagsChanged / KeyDown the tap sees.
@@ -318,6 +325,7 @@ impl WireDeskApp {
         receive_images: Arc<AtomicBool>,
         send_text: Arc<AtomicBool>,
         receive_text: Arc<AtomicBool>,
+        receive_files: Arc<AtomicBool>,
         swap_option_command: Arc<AtomicBool>,
         outgoing_cancel: Arc<AtomicBool>,
         incoming_cancel: Arc<AtomicBool>,
@@ -371,6 +379,7 @@ impl WireDeskApp {
             receive_images,
             send_text,
             receive_text,
+            receive_files,
             swap_option_command,
             outgoing_cancel,
             incoming_cancel,
@@ -672,6 +681,20 @@ impl WireDeskApp {
                 {
                     cfg.receive_images = recv_imgs;
                     self.receive_images.store(recv_imgs, Ordering::Relaxed);
+                    dirty = true;
+                }
+                // Task 8: "Receive files (Host → Mac)" — when off, incoming
+                // `ClipOffer{format=FILE}` is declined on receipt (mirrors
+                // receive_images shape). Lives in this Clipboard group so
+                // the user can disable just the file channel without
+                // touching text/image.
+                let mut recv_files = cfg.receive_files;
+                if ui
+                    .checkbox(&mut recv_files, "Receive files (Host → Mac)")
+                    .changed()
+                {
+                    cfg.receive_files = recv_files;
+                    self.receive_files.store(recv_files, Ordering::Relaxed);
                     dirty = true;
                 }
                 let mut send_txt = cfg.send_text;
@@ -1868,6 +1891,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            // receive_files (Task 8)
             Arc::new(AtomicBool::new(true)),
             swap_flag,
             outgoing_cancel,

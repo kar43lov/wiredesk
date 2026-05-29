@@ -155,11 +155,13 @@ fn main() {
     let receive_images = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_images));
     let send_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_text));
     let receive_text = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_text));
-    // Files runtime toggle. Task 8 wires it through ClientConfig + Settings UI;
-    // until then the constructor below defaults it to `true` (sane default,
-    // matches images/text behaviour). This Arc lives here so the future
-    // Settings checkbox can `store()` into it without restarting the session.
-    let receive_files = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Files runtime toggle. Task 8: wired through ClientConfig +
+    // Settings UI — flipping the checkbox calls `store()` here without a
+    // session restart, parallel to `receive_images` behaviour. Default
+    // value sourced from `cfg.receive_files` (default-on for back-compat
+    // with pre-Task-8 TOML configs).
+    let receive_files =
+        Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_files));
     // Karabiner-Elements `left_command ↔ left_option` compensation (see
     // ClientConfig::swap_option_command). Read once on startup and surfaced
     // through Settings; flipping the checkbox at runtime takes effect on the
@@ -402,6 +404,7 @@ fn main() {
         receive_images,
         send_text,
         receive_text,
+        receive_files,
         swap_option_command,
         outgoing_cancel,
         incoming_cancel,

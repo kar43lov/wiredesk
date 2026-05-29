@@ -66,6 +66,15 @@ pub struct ClientConfig {
     /// Accept incoming text from Host → Mac.
     #[serde(default = "default_true")]
     pub receive_text: bool,
+    /// Accept incoming files from Host → Mac. When false, incoming
+    /// `ClipOffer{format=FILE}` is rejected on receipt — the host sees a
+    /// `ClipDecline` and `IncomingClipboard` stays idle (no reassembly
+    /// state). Wired through to `IncomingClipboard.receive_files` at startup
+    /// (Task 8 follow-up from Task 7a). Backwards-compatible default `true`:
+    /// pre-existing config files without the field deserialize to "on", so
+    /// users don't lose the feature on upgrade.
+    #[serde(default = "default_true")]
+    pub receive_files: bool,
     /// Compensate Karabiner-Elements `left_command ↔ left_option` swap when
     /// forwarding modifiers and detecting local hotkeys. With Karabiner
     /// remapping the two keys at the HID level (so the same physical
@@ -145,6 +154,7 @@ impl Default for ClientConfig {
             receive_images: true,
             send_text: true,
             receive_text: true,
+            receive_files: true,
             swap_option_command: false,
             transport: default_transport(),
             transport_fallback: None,
@@ -269,6 +279,7 @@ mod tests {
         assert!(cfg.preferred_monitor.is_none());
         assert!(cfg.send_images);
         assert!(cfg.receive_images);
+        assert!(cfg.receive_files);
         assert_eq!(cfg.transport, "serial");
         assert!(cfg.transport_fallback.is_none());
         assert_eq!(cfg.bluetooth, BluetoothConfig::default());
@@ -287,6 +298,7 @@ mod tests {
             receive_images: true,
             send_text: true,
             receive_text: true,
+            receive_files: true,
             swap_option_command: false,
             transport: "serial".to_string(),
             transport_fallback: None,
@@ -460,6 +472,7 @@ mod tests {
             receive_images: true,
             send_text: true,
             receive_text: true,
+            receive_files: true,
             swap_option_command: false,
             transport: "serial".to_string(),
             transport_fallback: None,
@@ -524,6 +537,64 @@ mod tests {
         cfg.transport = "bluetooth".to_string();
         let merged = merge_args(&matches, cfg);
         assert_eq!(merged.transport, "bluetooth");
+    }
+
+    #[test]
+    fn config_roundtrip_with_receive_files() {
+        // Task 8: explicit `receive_files = false` must survive a TOML
+        // serialize → deserialize cycle. Without the field on the struct
+        // the value would silently round-trip as `true` (the default),
+        // breaking the Settings checkbox state across host restarts.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rfiles.toml");
+        let cfg = ClientConfig {
+            receive_files: false,
+            ..ClientConfig::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert!(!loaded.receive_files);
+        assert_eq!(loaded, cfg);
+
+        // And the inverse — explicit `true` survives too (sanity check
+        // that the field isn't being skipped on serialize/elided on read).
+        let cfg_on = ClientConfig {
+            receive_files: true,
+            ..ClientConfig::default()
+        };
+        let path_on = dir.path().join("rfiles_on.toml");
+        cfg_on.save_to(&path_on).unwrap();
+        let loaded_on = ClientConfig::load_from(&path_on);
+        assert!(loaded_on.receive_files);
+    }
+
+    #[test]
+    fn config_back_compat_missing_receive_files() {
+        // Task 8: a TOML file written before the field existed must load
+        // with `receive_files = true` (default-on, preserves pre-Task-8
+        // behaviour). Without `#[serde(default = "default_true")]` on the
+        // field the deserializer would fail the whole struct and `load_from`
+        // would wipe every other persisted field back to defaults.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        fs::write(
+            &path,
+            "port = \"/dev/cu.legacy\"\n\
+             baud = 57600\n\
+             width = 1920\n\
+             height = 1080\n\
+             client_name = \"legacy-client\"\n\
+             send_images = false\n\
+             receive_images = false\n",
+        )
+        .unwrap();
+        let cfg = ClientConfig::load_from(&path);
+        assert_eq!(cfg.port, "/dev/cu.legacy");
+        assert_eq!(cfg.baud, 57_600);
+        assert!(!cfg.send_images);
+        assert!(!cfg.receive_images);
+        // The missing field falls back to the default-on closure.
+        assert!(cfg.receive_files);
     }
 
     #[test]
