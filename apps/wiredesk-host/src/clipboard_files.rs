@@ -33,11 +33,6 @@
 //! `Err(FileClipboardError::ClipboardLocked)` so we don't litter call sites
 //! with `#[cfg]` guards.
 
-// Public API is wired up by Task 6c (outbound poll path) and Task 7c
-// (inbound commit path). Until then the helpers are referenced only from
-// unit tests — silence dead_code so the module compiles cleanly on its own.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// Errors interacting with the Windows clipboard for file URLs.
@@ -50,6 +45,9 @@ use std::path::{Path, PathBuf};
 /// condition; never observed in practice but distinguished for diagnostics).
 /// `FfiError` wraps any other Win32-side failure with a human-readable
 /// description (typically `windows::core::Error::message()`).
+// Allowed even when only stub variants are referenced on the active target
+// (non-Windows builds only construct `ClipboardLocked` via the stub fns).
+#[allow(dead_code)]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FileClipboardError {
     #[error("clipboard unavailable (non-Windows build or OpenClipboard failed)")]
@@ -286,7 +284,11 @@ pub fn set_cf_hdrop(path: &Path) -> Result<(), FileClipboardError> {
     }
 }
 
+// Stub for non-Windows builds — production callers are gated on
+// `cfg(target_os = "windows")`, but the stub is still kept compiled so
+// non-Windows tests can exercise the "feature unavailable" contract.
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn set_cf_hdrop(_path: &Path) -> Result<(), FileClipboardError> {
     Err(FileClipboardError::ClipboardLocked)
 }

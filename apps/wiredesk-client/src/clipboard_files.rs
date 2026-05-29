@@ -38,11 +38,6 @@
 //! `Err(FileClipboardError::PasteboardUnavailable)` so we don't litter call
 //! sites with `#[cfg]` guards.
 
-// Public API is wired up by Task 6b (outbound poll path) and Task 7b
-// (inbound commit path). Until then the helpers are referenced only from
-// unit tests — silence dead_code so the module compiles cleanly on its own.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// Errors writing to the macOS pasteboard.
@@ -53,6 +48,10 @@ use std::path::{Path, PathBuf};
 /// non-UTF-8 or empty paths that can't be reasonably round-tripped through
 /// NSString. `FfiError` wraps any unexpected AppKit-side failure (e.g.,
 /// `writeObjects:` returning NO) with a human-readable description.
+// Allowed even when only stub variants are referenced on the active target
+// (the macOS production path constructs `BadPath` / `FfiError` but never
+// `PasteboardUnavailable` — that comes from the non-macOS stub).
+#[allow(dead_code)]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FileClipboardError {
     #[error("pasteboard unavailable (non-macOS build or no AppKit session)")]

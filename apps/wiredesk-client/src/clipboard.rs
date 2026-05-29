@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use wiredesk_protocol::clip_file::{
-    MAX_FILE_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
+    MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
 };
 use wiredesk_protocol::message::{FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
 use wiredesk_protocol::packet::Packet;
@@ -283,7 +283,14 @@ pub(crate) fn check_file_size(size_bytes: usize, limit: usize) -> Result<(), Fil
 
 /// Human-readable toast string for files dropped at the size cap. Reports KB
 /// like `format_oversize_toast` for consistency between image and file caps.
-pub(crate) fn format_oversize_file_toast(e: &FileTooLarge) -> String {
+///
+/// Signature takes `limit` for parity with the host-side variant; the Mac
+/// wording stays terse on purpose because the chrome panel toast slot is
+/// narrow and the user already knows the cap. The host variant is verbose
+/// because it surfaces through a Win11 tray balloon where the formal
+/// `"X KB > Y KB limit"` phrasing reads better. Same divergence applies to
+/// the image-cap path (`format_oversize_toast` vs the host inline format).
+pub(crate) fn format_oversize_file_toast(e: &FileTooLarge, _limit: usize) -> String {
     format!(
         "file too large ({} KB), copy a smaller file",
         e.size_bytes / 1024
@@ -943,8 +950,9 @@ pub fn spawn_poll_thread(
                             err.size_bytes,
                             MAX_FILE_BYTES,
                         );
-                        let _ = events_tx
-                            .send(TransportEvent::Toast(format_oversize_file_toast(&err)));
+                        let _ = events_tx.send(TransportEvent::Toast(
+                            format_oversize_file_toast(&err, MAX_FILE_BYTES),
+                        ));
                         state.set_oversize_file(path_hash);
                     }
                     FilePollOutcome::Skipped(reason) => {
@@ -1153,15 +1161,10 @@ impl IncomingClipboard {
         let over_cap = match format {
             FORMAT_PNG_IMAGE => total_len_usize > MAX_IMAGE_BYTES,
             FORMAT_TEXT_UTF8 => total_len_usize > MAX_CLIPBOARD_BYTES,
-            // File caps include 2-byte name_len + max filename + max content.
-            // Task 7b will add the actual file commit path; for now we just
-            // gate so the peer can't ask for >cap bytes of buffer.
-            FORMAT_FILE => {
-                total_len_usize
-                    > MAX_FILE_BYTES
-                        + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
-                        + 2
-            }
+            // File cap = MAX_FILE_BYTES + MAX_FILENAME_LEN + 2-byte name_len
+            // header. Centralised in `clip_file::MAX_FILE_PAYLOAD_BYTES` so
+            // both sides stay in sync with `pack_first_chunk`'s wire layout.
+            FORMAT_FILE => total_len_usize > MAX_FILE_PAYLOAD_BYTES,
             _ => false,
         };
         if over_cap {
@@ -2643,11 +2646,14 @@ mod tests {
     }
 
     #[test]
-    fn format_oversize_file_toast_includes_kb_and_hint() {
+    fn mac_format_oversize_file_toast_includes_kb_and_hint() {
         // Toast must report KB precision near the cap + actionable hint so
-        // the user knows what to do next.
+        // the user knows what to do next. Mirrors host-side
+        // `host_format_oversize_file_toast_includes_kb_and_limit`; the
+        // wording diverges by design (chrome-panel toast vs Win11 tray
+        // balloon) — see `format_oversize_file_toast` doc-comment.
         let e = FileTooLarge { size_bytes: 25_000 * 1024 };
-        let msg = format_oversize_file_toast(&e);
+        let msg = format_oversize_file_toast(&e, MAX_FILE_BYTES);
         assert!(msg.contains("25000"), "KB count missing: {msg}");
         assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
         assert!(msg.contains("too large"), "leading prefix missing: {msg}");
@@ -2827,7 +2833,7 @@ mod tests {
         match pack_file_or_warn(&path, 256) {
             FilePollOutcome::Oversize { path_hash, err } => {
                 events_tx
-                    .send(TransportEvent::Toast(format_oversize_file_toast(&err)))
+                    .send(TransportEvent::Toast(format_oversize_file_toast(&err, 256)))
                     .expect("toast send");
                 state.set_oversize_file(path_hash);
             }
@@ -2945,10 +2951,7 @@ mod tests {
         let state = ClipboardState::new();
         let mut inc = incoming_with_receive_files(state, true);
 
-        let huge = (MAX_FILE_BYTES
-            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
-            + 2
-            + 1) as u32;
+        let huge = (MAX_FILE_PAYLOAD_BYTES + 1) as u32;
         let reply = inc.on_offer(FORMAT_FILE, huge);
         assert!(reply.is_none(), "oversize dropped without ClipDecline");
         assert_eq!(inc.expected_len, 0);
@@ -3065,15 +3068,12 @@ mod tests {
 
     #[test]
     fn mac_incoming_file_oversize_declined() {
-        // total_len > MAX_FILE_BYTES + MAX_FILENAME_LEN + 2 → silent drop in
-        // on_offer (no ClipDecline — reserved for policy refusals). State
-        // stays un-armed, no file is written (AC4).
+        // total_len > MAX_FILE_PAYLOAD_BYTES → silent drop in on_offer (no
+        // ClipDecline — reserved for policy refusals). State stays un-armed,
+        // no file is written (AC4).
         let (mut inc, dir) = incoming_with_tempdir();
 
-        let huge = (MAX_FILE_BYTES
-            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
-            + 2
-            + 1) as u32;
+        let huge = (MAX_FILE_PAYLOAD_BYTES + 1) as u32;
         let reply = inc.on_offer(FORMAT_FILE, huge);
         assert!(reply.is_none(), "silent drop, no ClipDecline");
         assert_eq!(inc.expected_len, 0);

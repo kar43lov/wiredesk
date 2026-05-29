@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use wiredesk_protocol::clip_file::{
-    MAX_FILE_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
+    MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
 };
 use wiredesk_protocol::message::{FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
 
@@ -53,6 +53,19 @@ pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB encoded
 /// Mirrors the Mac-side enum (CLAUDE.md explicitly allows this duplication).
 /// Image hash is taken over the RGBA buffer because PNG encode is not
 /// deterministic across peers.
+///
+/// **Cross-format dedup gap** (pre-existing, not file-feature-specific):
+/// `LastKind` is single-slot — stamping `Text(h)` overwrites a prior
+/// `Image(h')` or `File(h'')`. The Mac side uses a multi-slot `LastSeen`
+/// struct (separate `text_history` LRU, `image`, `oversize_image`, `file`,
+/// `oversize_file`) so it can dedup independently per format on the same
+/// poll tick. The Win side gets away with the single slot because the
+/// outbound poll path probes text → image → file in priority order and
+/// commits at most one format per tick; cross-format aliasing only matters
+/// when a single Cmd+C carries multiple formats AND each format flips
+/// between identical/different hashes between ticks — rare in practice.
+/// Migrating Win to per-kind slots is a follow-up; the gap is not a
+/// regression introduced by `FORMAT_FILE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LastKind {
     #[default]
@@ -199,6 +212,13 @@ pub(crate) fn check_file_size(size_bytes: usize, limit: usize) -> Result<(), Fil
 
 /// Human-readable toast string for files dropped at the size cap. Reports KB
 /// like the image variant for consistency between image and file caps.
+///
+/// Wording diverges from the Mac client's `format_oversize_file_toast` by
+/// design: the host surfaces this through a Win11 tray balloon (formal
+/// `"X KB > Y KB limit"` reads better) while the Mac side renders into a
+/// narrow chrome panel toast (terse phrasing). Same divergence applies to
+/// the image-cap path — see `pending_warning` site at the image-too-large
+/// branch.
 pub(crate) fn format_oversize_file_toast(e: &FileTooLarge, limit: usize) -> String {
     let kb = e.size_bytes / 1024;
     let limit_kb = limit / 1024;
@@ -873,9 +893,10 @@ impl ClipboardSync {
             self.incoming_progress.store(0, Ordering::Relaxed);
             return None;
         }
-        // Runtime toggle (Settings → Receive files): drop incoming file offers
-        // when the user disabled file receive. Text and image offers continue
-        // to be processed normally.
+        // Runtime toggle (Settings → Receive files): drop incoming file
+        // offers when the user disabled file receive. The text/image path
+        // has no per-format receive toggle today — only files do — so this
+        // check is FORMAT_FILE-specific.
         if format == FORMAT_FILE && !self.receive_files.load(Ordering::Relaxed) {
             log::info!(
                 "clipboard: incoming file offer ({total_len} bytes) declined — receive_files disabled"
@@ -895,15 +916,10 @@ impl ClipboardSync {
         let over_cap = match format {
             FORMAT_PNG_IMAGE => total_len_usize > MAX_IMAGE_BYTES,
             FORMAT_TEXT_UTF8 => total_len_usize > MAX_CLIPBOARD_BYTES,
-            // File caps include 2-byte name_len + max filename + max content.
-            // Task 7c will add the actual file commit path; for now the gate
-            // just protects against a peer asking for >cap bytes of buffer.
-            FORMAT_FILE => {
-                total_len_usize
-                    > MAX_FILE_BYTES
-                        + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
-                        + 2
-            }
+            // File cap = MAX_FILE_BYTES + MAX_FILENAME_LEN + 2-byte name_len
+            // header. Centralised in `clip_file::MAX_FILE_PAYLOAD_BYTES` so
+            // both sides stay in sync with `pack_first_chunk`'s wire layout.
+            FORMAT_FILE => total_len_usize > MAX_FILE_PAYLOAD_BYTES,
             _ => false,
         };
         if over_cap {
@@ -1263,7 +1279,7 @@ impl ClipboardSync {
         // hash anyway would mean the next poll tick treats the user's
         // (un-replaced) clipboard as "fresh" and re-emits it, creating a
         // bidirectional re-emit loop. Mirrors `commit_text` / `commit_image`.
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         let wrote_ok = match clipboard_files::set_cf_hdrop(&path) {
             Ok(()) => {
                 log::debug!(
@@ -1281,7 +1297,7 @@ impl ClipboardSync {
                 false
             }
         };
-        #[cfg(not(windows))]
+        #[cfg(not(target_os = "windows"))]
         let wrote_ok = {
             log::debug!(
                 "clipboard: wrote file {} ({} content bytes) from peer (no CF_HDROP backend)",
@@ -2381,10 +2397,7 @@ mod tests {
         let mut sync = ClipboardSync::new_for_test();
         sync.set_receive_files_for_test(true);
 
-        let huge = (MAX_FILE_BYTES
-            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
-            + 2
-            + 1) as u32;
+        let huge = (MAX_FILE_PAYLOAD_BYTES + 1) as u32;
         let reply = sync.on_offer(FORMAT_FILE, huge);
         assert!(reply.is_none(), "oversize dropped without ClipDecline");
         assert_eq!(sync.expected_len, 0);
@@ -2531,15 +2544,12 @@ mod tests {
 
     #[test]
     fn host_incoming_file_oversize_declined() {
-        // total_len > MAX_FILE_BYTES + MAX_FILENAME_LEN + 2 → silent drop in
-        // on_offer (no ClipDecline — reserved for policy refusals). State
-        // stays un-armed, no file is written (AC4).
+        // total_len > MAX_FILE_PAYLOAD_BYTES → silent drop in on_offer (no
+        // ClipDecline — reserved for policy refusals). State stays un-armed,
+        // no file is written (AC4).
         let (mut sync, dir) = sync_with_tempdir();
 
-        let huge = (MAX_FILE_BYTES
-            + wiredesk_protocol::clip_file::MAX_FILENAME_LEN
-            + 2
-            + 1) as u32;
+        let huge = (MAX_FILE_PAYLOAD_BYTES + 1) as u32;
         let reply = sync.on_offer(FORMAT_FILE, huge);
         assert!(reply.is_none(), "silent drop, no ClipDecline");
         assert_eq!(sync.expected_len, 0);

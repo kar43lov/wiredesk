@@ -25,6 +25,12 @@ pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
 /// this is a defense-in-depth guard against pathological inputs.
 pub const MAX_FILENAME_LEN: usize = 4096;
 
+/// Total wire-payload cap for a `FORMAT_FILE` transfer: max content + max
+/// filename + 2-byte name_len header. Used by both sides' `on_offer` size
+/// gate to reject peer-supplied `total_len` values that would force an
+/// oversize `Vec::with_capacity` allocation during reassembly.
+pub const MAX_FILE_PAYLOAD_BYTES: usize = MAX_FILE_BYTES + MAX_FILENAME_LEN + 2;
+
 /// Fallback basename when sanitization strips everything.
 pub const FALLBACK_BASENAME: &str = "clipboard.bin";
 
@@ -433,5 +439,18 @@ mod tests {
         assert_eq!(MAX_FILE_BYTES, 20 * 1024 * 1024);
         assert_eq!(MAX_FILENAME_LEN, 4096);
         assert!(!FALLBACK_BASENAME.is_empty());
+    }
+
+    #[test]
+    fn max_file_payload_bytes_matches_components() {
+        // The wire-payload cap must stay in sync with its three component
+        // limits — if any of them shifts and this constant doesn't, the
+        // size-gate at both sides' `on_offer` will diverge from
+        // `pack_first_chunk`'s actual output and we'll either over-allocate
+        // (gap > limit) or silently drop valid offers (gap < limit).
+        assert_eq!(
+            MAX_FILE_PAYLOAD_BYTES,
+            MAX_FILE_BYTES + MAX_FILENAME_LEN + 2
+        );
     }
 }
