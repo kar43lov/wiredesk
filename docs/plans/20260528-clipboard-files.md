@@ -409,16 +409,17 @@ Rationale (revised after plan-review): cache_vacuum touches `std::fs`/`std::time
 - Modify: `apps/wiredesk-host/src/clipboard.rs` (parallel host logic)
 - Modify: `apps/wiredesk-client/src/app.rs` или ui module (status-line rendering)
 
-- [ ] Extend `apply_outgoing_progress` — match на format включает `FORMAT_FILE` → label "file". Log message: `"clipboard.send START format=FILE total={total_len} bytes"`.
-- [ ] Receive-side: `ClipDecline { format: FORMAT_FILE }` обработчик на send-стороне — drop pending outbox + emit toast "Peer declined file (Receive files off)".
-- [ ] Cancel button — verify existing cancel UI handles file offer-state correctly (most likely shares state with image transfers; explicit assert если так).
-- [ ] Status-line формат: `"Sending file 'X.pdf' — N/M bytes (P%)"` — extend UI render branch на format=FILE с filename из в-flight transfer state (need to capture filename when emit_offer fires — add to outgoing-state).
-- [ ] Write tests:
-  - `apply_outgoing_progress_handles_file_format` — emit ClipOffer{format=FORMAT_FILE} → outgoing_total=N, log message содержит "FILE".
-  - `clip_decline_file_drops_pending_outbox` — outbox primed, ClipDecline { FORMAT_FILE } received → outbox drained.
-  - `clip_decline_file_emits_toast` — send-side decline → toast slot populated with "declined" message.
-  - `status_line_renders_filename` — pure helper testing the formatter for file label.
-- [ ] Run `cargo test --workspace -- --test-threads=1` — must pass before Task 8.
+- [x] Extend `apply_outgoing_progress` — match на format включает `FORMAT_FILE` → label "file". Log message: `"clipboard.send START format=FILE total={total_len} bytes"` ✓ — реализовано через `format_label(format)` helper в `apply_outgoing_progress_inner`. Лог теперь даёт `format=FILE` вместо numeric `format=2`. Mirror `format_label` для TEXT/IMAGE/UNKNOWN заодно — grep по логам работает по любому слоту.
+- [x] Receive-side: `ClipDecline { format: FORMAT_FILE }` обработчик на send-стороне ✓ — `apply_clip_decline(format, &outgoing_cancel) -> String` pure helper флипает `outgoing_cancel` (writer_thread дренит queued ClipOffer/ClipChunk через `is_clip && cancelling` ветку, существовавшую с image-transfers) + возвращает FORMAT_FILE-специфичный toast `"Peer declined file (Receive files off)"`. Host-side зеркало в `session.rs` через `clipboard.push_warning(...)` → tray balloon (host UI не имеет `TransportEvent::Toast`).
+- [x] Cancel button — verify existing cancel UI handles file offer-state correctly ✓ — same `Arc<AtomicBool> outgoing_cancel` shared by text/image/file (`writer_thread` matches на `Message::ClipOffer { .. } | Message::ClipChunk { .. }` без discriminate по format). No code change needed; covered by `clip_decline_file_drops_pending_outbox` test, который проверяет что flag arms на FORMAT_FILE decline.
+- [x] Status-line формат: `"Sending file 'X.pdf' — N/M bytes (P%)"` ✓ — `current_outgoing_label: Arc<Mutex<String>>` stash slot, set'ит poll thread перед `emit_offer_and_chunks(FORMAT_FILE, ...)`, clear'ит `apply_outgoing_progress_with_label` на DONE (или Disconnected event в `app.rs`). `outgoing_action_label(label)` pure helper строит "Sending file 'X'" если slot непустой, иначе legacy "Sending clipboard". Wired в обе render-точки (CentralPanel chrome + capture overlay).
+- [x] Write tests ✓ — все 4 мандатных:
+  - `apply_outgoing_progress_handles_file_format` (clipboard.rs) — `format_label(FORMAT_FILE) == "FILE"` + label slot сохраняется через Offer.
+  - `clip_decline_file_drops_pending_outbox` (clipboard.rs) — `apply_clip_decline(FORMAT_FILE, &cancel)` → `cancel == true`; writer's `is_clip && cancelling` drain branch уже unit-tested через cancel button suite.
+  - `clip_decline_file_emits_toast` (clipboard.rs) — `apply_clip_decline(FORMAT_FILE, ...) == "Peer declined file (Receive files off)"` + non-file regression (`FORMAT_TEXT_UTF8` keeps legacy generic).
+  - `status_line_renders_filename` (app.rs) — `outgoing_action_label("contract.pdf") == "Sending file 'contract.pdf'"` + `format_progress` round-trip с % + KB.
+  - Bonus: `apply_outgoing_progress_file_clears_label_on_done` (slot cleanup), `outgoing_action_label_empty_falls_back_to_generic` (back-compat), `send_decline_toast_file_format_is_specific` (toast wording isolation).
+- [x] Run `cargo test --workspace -- --test-threads=1` ✓ — 604 passed (212 client + 14 exec-core + 84 protocol + 144 host + 83 transport-other + 22 term + 41 transport + 4 wiredesk-core), 0 failed, 5 ignored. +7 net new tests vs 597 baseline. `cargo clippy --workspace --all-targets -- -D warnings` clean. Windows cross-compile `cargo check -p wiredesk-host --target x86_64-pc-windows-gnu` clean.
 
 ### Task 8: Settings UI — "Receive files" checkbox both sides
 

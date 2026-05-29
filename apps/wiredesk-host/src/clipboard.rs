@@ -499,6 +499,14 @@ impl ClipboardSync {
         self.pending_warning.take()
     }
 
+    /// Stash a warning to be surfaced as a tray-balloon on the next
+    /// session tick. Task 7d: session.rs uses this from the ClipDecline
+    /// handler so the Win user sees a UI notification when the Mac peer
+    /// refuses a file (parity with Mac's `TransportEvent::Toast`).
+    pub fn push_warning(&mut self, msg: String) {
+        self.pending_warning = Some(msg);
+    }
+
     /// `true` while either side of clipboard sync is mid-transfer:
     /// outgoing chunks queued in `pending_outbox`, or incoming reassembly
     /// armed by a `ClipOffer` and not yet committed/aborted. Used by

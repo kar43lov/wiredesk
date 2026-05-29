@@ -124,6 +124,12 @@ pub struct WireDeskApp {
     outgoing_total: Arc<AtomicU64>,
     incoming_progress: Arc<AtomicU64>,
     incoming_total: Arc<AtomicU64>,
+    /// Task 7d: filename for the in-flight outgoing FORMAT_FILE transfer.
+    /// Empty string when idle or when the transfer is text/image — the
+    /// status-line falls back to the generic "Sending clipboard" label.
+    /// Set by the clipboard poll thread; cleared by
+    /// `apply_outgoing_progress_with_label` on DONE (or by Disconnected).
+    current_outgoing_label: Arc<std::sync::Mutex<String>>,
     /// Runtime image-clipboard toggles (Settings). Both flags share their
     /// `Arc` with the poll thread (`send_images`) and the reader thread's
     /// `IncomingClipboard` (`receive_images`) — toggling here takes effect on
@@ -191,6 +197,23 @@ const CAPTURE_BTN_MIN_SIZE: egui::Vec2 = egui::vec2(200.0, 32.0);
 
 /// Numbered-step glyph size on the Accessibility permission screen.
 const STEP_NUMBER_SIZE: f32 = 20.0;
+
+/// Pick the action prefix for the outgoing status-line based on whether
+/// a filename has been stashed by the poll thread (Task 7d: FORMAT_FILE
+/// branch sets it; text/image leave it empty).
+///
+/// Returns either the generic `"Sending clipboard"` or a file-specific
+/// `"Sending file 'X.pdf'"`. The filename is rendered verbatim without
+/// truncation — a giant base64 blob for a name would look ugly but is not
+/// a security concern (we already sanitize the basename before write on
+/// the receive side).
+pub fn outgoing_action_label(label: &str) -> String {
+    if label.is_empty() {
+        "Sending clipboard".to_string()
+    } else {
+        format!("Sending file '{label}'")
+    }
+}
 
 /// Render a clipboard-transfer progress fragment for the chrome status row.
 ///
@@ -298,6 +321,7 @@ impl WireDeskApp {
         swap_option_command: Arc<AtomicBool>,
         outgoing_cancel: Arc<AtomicBool>,
         incoming_cancel: Arc<AtomicBool>,
+        current_outgoing_label: Arc<std::sync::Mutex<String>>,
     ) -> Self {
         let runtime_serial_port = initial_config.port.clone();
         let runtime_preferred_monitor = initial_config.preferred_monitor.clone();
@@ -342,6 +366,7 @@ impl WireDeskApp {
             outgoing_total,
             incoming_progress,
             incoming_total,
+            current_outgoing_label,
             send_images,
             receive_images,
             send_text,
@@ -1138,6 +1163,13 @@ impl WireDeskApp {
         // top row (the area users click most). LeftBottom anchor +
         // full width via set_width works around `Area::default_width`
         // not respecting `set_width` after layout starts.
+        let out_label_action = outgoing_action_label(
+            &self
+                .current_outgoing_label
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
+        );
         egui::Area::new(egui::Id::new("capture_progress_overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
@@ -1145,7 +1177,7 @@ impl WireDeskApp {
                 ui.set_max_width((screen_rect.width() - 32.0).max(200.0));
                 if let (Some(ratio), Some(text)) = (
                     progress_ratio(out_cur, out_tot),
-                    format_progress("Sending clipboard", out_cur, out_tot),
+                    format_progress(&out_label_action, out_cur, out_tot),
                 ) {
                     render_progress_row(
                         ui,
@@ -1311,6 +1343,12 @@ impl eframe::App for WireDeskApp {
                     self.outgoing_total.store(0, Ordering::Relaxed);
                     self.incoming_progress.store(0, Ordering::Relaxed);
                     self.incoming_total.store(0, Ordering::Relaxed);
+                    // Task 7d: drop in-flight file-label too — without this
+                    // a reconnect would show "Sending file 'X.pdf'" until
+                    // the next FORMAT_FILE transfer's DONE clears it.
+                    if let Ok(mut g) = self.current_outgoing_label.lock() {
+                        g.clear();
+                    }
                 }
                 TransportEvent::ClipboardFromHost(text) => {
                     self.clipboard_text = text;
@@ -1475,9 +1513,16 @@ impl eframe::App for WireDeskApp {
             let out_tot = self.outgoing_total.load(Ordering::Relaxed);
             let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
             let inc_tot = self.incoming_total.load(Ordering::Relaxed);
+            let out_label_action = outgoing_action_label(
+                &self
+                    .current_outgoing_label
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default(),
+            );
             if let (Some(ratio), Some(text)) = (
                 progress_ratio(out_cur, out_tot),
-                format_progress("Sending clipboard", out_cur, out_tot),
+                format_progress(&out_label_action, out_cur, out_tot),
             ) {
                 render_progress_row(
                     ui,
@@ -1827,6 +1872,7 @@ mod tests {
             swap_flag,
             outgoing_cancel,
             incoming_cancel,
+            Arc::new(std::sync::Mutex::new(String::new())),
         )
     }
 
@@ -2031,5 +2077,28 @@ mod tests {
         app.capturing = false;
         app.fullscreen = false;
         assert!(app.should_show_chrome());
+    }
+
+    #[test]
+    fn outgoing_action_label_empty_falls_back_to_generic() {
+        // Task 7d: idle slot → generic "Sending clipboard" label is
+        // unchanged from text/image transfers. Backward-compat for
+        // existing UI screenshots and the test suite.
+        assert_eq!(outgoing_action_label(""), "Sending clipboard");
+    }
+
+    #[test]
+    fn status_line_renders_filename() {
+        // Task 7d (status_line_renders_filename): non-empty slot →
+        // "Sending file 'X.pdf' — N/M bytes (P%)" verbatim with the brief's
+        // single-quote wrapping.
+        let action = outgoing_action_label("contract.pdf");
+        assert_eq!(action, "Sending file 'contract.pdf'");
+        let line =
+            format_progress(&action, 340 * 1024, 780 * 1024).expect("active");
+        assert!(line.contains("Sending file 'contract.pdf'"), "label: {line}");
+        assert!(line.contains("340"), "current KB: {line}");
+        assert!(line.contains("780"), "total KB: {line}");
+        assert!(line.contains("43%"), "percent: {line}");
     }
 }

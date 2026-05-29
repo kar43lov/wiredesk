@@ -141,6 +141,12 @@ fn main() {
     let outgoing_total = Arc::new(AtomicU64::new(0));
     let incoming_progress = Arc::new(AtomicU64::new(0));
     let incoming_total = Arc::new(AtomicU64::new(0));
+    // Task 7d: filename slot for the outgoing FORMAT_FILE transfer. Set
+    // by the poll thread before `emit_offer_and_chunks(FORMAT_FILE, ...)`,
+    // cleared by `apply_outgoing_progress_with_label` on DONE. UI reads it
+    // to switch the status-line from "Sending clipboard" → "Sending file
+    // 'X.pdf' — ...". Empty string == fall back to generic label.
+    let current_outgoing_label = Arc::new(std::sync::Mutex::new(String::new()));
 
     // Runtime image-clipboard toggles (Settings panel). Initial values come
     // from the loaded config; UI flips them at runtime — no restart required.
@@ -189,6 +195,7 @@ fn main() {
     let writer_outgoing_progress = outgoing_progress.clone();
     let writer_outgoing_total = outgoing_total.clone();
     let writer_outgoing_cancel = outgoing_cancel.clone();
+    let writer_current_outgoing_label = current_outgoing_label.clone();
     if let Some(writer_transport) = writer_transport_opt {
         thread::spawn(move || {
             writer_thread(
@@ -199,6 +206,7 @@ fn main() {
                 writer_outgoing_progress,
                 writer_outgoing_total,
                 writer_outgoing_cancel,
+                writer_current_outgoing_label,
             );
         });
     } else {
@@ -327,6 +335,7 @@ fn main() {
         send_text.clone(),
         outgoing_text_in_flight.clone(),
         poll_kick_rx,
+        current_outgoing_label.clone(),
     );
 
     // Synthetic dispatcher thread — see comment above. Holds each combo
@@ -396,6 +405,7 @@ fn main() {
         swap_option_command,
         outgoing_cancel,
         incoming_cancel,
+        current_outgoing_label,
     );
 
     let options = eframe::NativeOptions {
@@ -482,6 +492,7 @@ pub(crate) unsafe fn force_dock_icon_from_bundle() {
 /// AFTER each successful `transport.send`, so the UI sees real wire-state
 /// progress (≥2 increments visible during typical 500 KB transfers, AC5)
 /// rather than instant jumps to 100% as packets queue into the unbounded mpsc.
+#[allow(clippy::too_many_arguments)]
 fn writer_thread(
     mut transport: Box<dyn Transport>,
     outgoing_rx: mpsc::Receiver<Packet>,
@@ -490,6 +501,7 @@ fn writer_thread(
     outgoing_progress: Arc<AtomicU64>,
     outgoing_total: Arc<AtomicU64>,
     outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
+    current_outgoing_label: Arc<std::sync::Mutex<String>>,
 ) {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -552,10 +564,13 @@ fn writer_thread(
                 }
                 // Update progress AFTER send returns — atomic reflects bytes
                 // actually written to the UART, not bytes queued in mpsc.
-                clipboard::apply_outgoing_progress(
+                // The label-aware variant clears `current_outgoing_label`
+                // when the transfer reaches DONE (Task 7d).
+                clipboard::apply_outgoing_progress_with_label(
                     &packet.message,
                     &outgoing_progress,
                     &outgoing_total,
+                    &current_outgoing_label,
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -682,17 +697,14 @@ fn reader_thread(
                 }
                 Message::ClipDecline { format } => {
                     // Host doesn't want our offer (its receive_* toggle
-                    // is off, or it tripped a size cap). Set the
-                    // outgoing-cancel flag so writer_thread drops the
-                    // queued ClipOffer/ClipChunk packets instead of
-                    // pumping them onto the wire to be discarded.
-                    log::info!(
-                        "clipboard: host declined our offer (format={format}); aborting send"
-                    );
-                    outgoing_cancel.store(true, Ordering::Release);
-                    let _ = events_tx.send(TransportEvent::Toast(
-                        "Host declined the clipboard transfer".into(),
-                    ));
+                    // is off, or it tripped a size cap). `apply_clip_decline`
+                    // flips outgoing_cancel so writer_thread drops queued
+                    // ClipOffer/ClipChunk packets instead of pumping them
+                    // onto the wire to be discarded; the returned string is
+                    // the format-specific toast (FORMAT_FILE → "Peer
+                    // declined file (Receive files off)").
+                    let toast = clipboard::apply_clip_decline(format, &outgoing_cancel);
+                    let _ = events_tx.send(TransportEvent::Toast(toast));
                 }
                 Message::ClipChunk { index, data } => {
                     if incoming_cancel.load(Ordering::Acquire) {

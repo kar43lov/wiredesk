@@ -357,6 +357,15 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                         "clipboard: peer declined offer (format={format}); dropped {dropped} queued packets"
                     );
                 }
+                // Task 7d: surface a tray-balloon for FORMAT_FILE so the
+                // user has parity with the Mac toast "Peer declined file".
+                // Other formats already had no UI feedback historically —
+                // keeping that behaviour to avoid noise.
+                if *format == wiredesk_protocol::message::FORMAT_FILE {
+                    self.clipboard.push_warning(
+                        "Peer declined file (Receive files off)".into(),
+                    );
+                }
             }
 
             (SessionState::Connected, Message::ShellOpen { shell }) => {

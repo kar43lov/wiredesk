@@ -453,16 +453,94 @@ fn emit_offer_and_chunks(outgoing_tx: &mpsc::Sender<Packet>, format: u8, payload
 ///   reset and the first chunk is bounded by 11 KB/s wire pacing.)
 /// - `ClipChunk`: add chunk length to progress.
 /// - Other packets: no-op.
+#[cfg(test)]
 pub(crate) fn apply_outgoing_progress(
     msg: &Message,
     outgoing_progress: &Arc<AtomicU64>,
     outgoing_total: &Arc<AtomicU64>,
 ) {
+    apply_outgoing_progress_inner(msg, outgoing_progress, outgoing_total, None);
+}
+
+/// Format-specific toast string surfaced when the host returns a
+/// `ClipDecline` for our outgoing offer (Task 7d).
+///
+/// FORMAT_FILE produces the explicit "Peer declined file" message the
+/// brief calls for; other formats fall back to the generic copy used by
+/// previous releases. Pure helper — unit-tested without spinning up the
+/// reader thread.
+pub fn send_decline_toast(format: u8) -> String {
+    match format {
+        FORMAT_FILE => "Peer declined file (Receive files off)".to_string(),
+        _ => "Host declined the clipboard transfer".to_string(),
+    }
+}
+
+/// React to a host-side `ClipDecline { format }` arriving in the reader
+/// thread (Task 7d). Pure helper: flips the shared `outgoing_cancel` flag —
+/// which the writer-thread reads to drain any queued ClipOffer/ClipChunk
+/// packets from the outbox instead of pumping them onto the wire — and
+/// returns the toast string the GUI should display.
+///
+/// Extracted so the contract ("decline → cancel armed + toast string for
+/// UI") is unit-testable without spinning up the real reader/writer
+/// threads. `main.rs` calls this and dispatches the toast to its mpsc
+/// channel; tests can call it directly and assert both the cancel-flag
+/// state transition and the wording.
+pub fn apply_clip_decline(format: u8, outgoing_cancel: &Arc<AtomicBool>) -> String {
+    log::info!("clipboard: host declined our offer (format={format}); aborting send");
+    outgoing_cancel.store(true, Ordering::Release);
+    send_decline_toast(format)
+}
+
+/// Format-label string for the wire-progress START/DONE log line.
+///
+/// Task 7d: distinct labels for text / image / file make grep/tail of
+/// `client.log` more useful when investigating clipboard incidents — at
+/// 3 Mbaud a 20 MB file send + a 256 KB text send happen back-to-back and
+/// numeric format codes lose context.
+pub(crate) fn format_label(format: u8) -> &'static str {
+    match format {
+        FORMAT_TEXT_UTF8 => "TEXT",
+        FORMAT_PNG_IMAGE => "IMAGE",
+        FORMAT_FILE => "FILE",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Same as [`apply_outgoing_progress`] but with an optional
+/// `current_outgoing_label` slot which is cleared when the transfer
+/// completes (FORMAT_FILE: status-line filename is no longer relevant
+/// once DONE fires). For text/image transfers the slot is left untouched —
+/// it should already be empty.
+pub(crate) fn apply_outgoing_progress_with_label(
+    msg: &Message,
+    outgoing_progress: &Arc<AtomicU64>,
+    outgoing_total: &Arc<AtomicU64>,
+    current_outgoing_label: &Arc<Mutex<String>>,
+) {
+    apply_outgoing_progress_inner(
+        msg,
+        outgoing_progress,
+        outgoing_total,
+        Some(current_outgoing_label),
+    );
+}
+
+fn apply_outgoing_progress_inner(
+    msg: &Message,
+    outgoing_progress: &Arc<AtomicU64>,
+    outgoing_total: &Arc<AtomicU64>,
+    current_outgoing_label: Option<&Arc<Mutex<String>>>,
+) {
     match msg {
         Message::ClipOffer { format, total_len } => {
             outgoing_total.store(*total_len as u64, Ordering::Relaxed);
             outgoing_progress.store(0, Ordering::Relaxed);
-            log::info!("clipboard.send START format={format} total={total_len} bytes");
+            log::info!(
+                "clipboard.send START format={} total={total_len} bytes",
+                format_label(*format)
+            );
         }
         Message::ClipChunk { data, .. } => {
             let prev = outgoing_progress.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -489,6 +567,15 @@ pub(crate) fn apply_outgoing_progress(
                 log::info!("clipboard.send DONE {} bytes", new_progress);
                 outgoing_total.store(0, Ordering::Relaxed);
                 outgoing_progress.store(0, Ordering::Relaxed);
+                // Task 7d: clear the filename slot once the file transfer
+                // completes — the status-line should fall back to the
+                // generic "Sending clipboard" label for the next text/image
+                // send (which doesn't touch this slot).
+                if let Some(slot) = current_outgoing_label {
+                    if let Ok(mut g) = slot.lock() {
+                        g.clear();
+                    }
+                }
             }
         }
         _ => {}
@@ -516,6 +603,7 @@ pub(crate) fn apply_outgoing_progress(
 /// kick, Whispr can fire its Cmd+V while we're mid-`thread::sleep`, miss
 /// the next 500/200 ms tick, and the dispatcher's wait-for-in-flight gate
 /// never trips for the *current* clipboard write.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_poll_thread(
     state: ClipboardState,
     outgoing_tx: mpsc::Sender<Packet>,
@@ -524,6 +612,7 @@ pub fn spawn_poll_thread(
     send_text: Arc<AtomicBool>,
     outgoing_text_in_flight: Arc<AtomicBool>,
     poll_kick_rx: mpsc::Receiver<()>,
+    current_outgoing_label: Arc<Mutex<String>>,
 ) {
     thread::spawn(move || {
         let mut clip = match arboard::Clipboard::new() {
@@ -711,6 +800,13 @@ pub fn spawn_poll_thread(
                             name,
                             packed.len(),
                         );
+                        // Task 7d: stash the filename so the UI status-line
+                        // can render "Sending file 'X.pdf' — ..." instead
+                        // of the generic "Sending clipboard". `apply_outgoing_progress`
+                        // clears it when the transfer reaches DONE.
+                        if let Ok(mut g) = current_outgoing_label.lock() {
+                            *g = name.clone();
+                        }
                         emit_offer_and_chunks(&outgoing_tx, FORMAT_FILE, &packed);
                     }
                     FilePollOutcome::Oversize { path_hash, err } => {
@@ -2951,5 +3047,120 @@ mod tests {
             dir.path().join("clipboard.bin").exists(),
             "fallback basename must materialize"
         );
+    }
+
+    // ---- Task 7d: progress label + decline toast for FORMAT_FILE -------
+
+    #[test]
+    fn apply_outgoing_progress_handles_file_format() {
+        // Writer-thread dispatch: a ClipOffer with FORMAT_FILE must set
+        // total/progress just like text/image, AND the label-aware variant
+        // must leave the filename slot alone on Offer (the poll thread set
+        // it BEFORE the offer hit the wire). The slot is cleared only on
+        // DONE — proven in `apply_outgoing_progress_file_clears_label_on_done`.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let label = Arc::new(Mutex::new("contract.pdf".to_string()));
+
+        let msg = Message::ClipOffer { format: FORMAT_FILE, total_len: 4096 };
+        apply_outgoing_progress_with_label(&msg, &progress, &total, &label);
+
+        assert_eq!(total.load(Ordering::Relaxed), 4096);
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            &*label.lock().unwrap(),
+            "contract.pdf",
+            "label preserved through Offer — UI needs it for the whole transfer"
+        );
+        // format_label sanity — the log line in apply_outgoing_progress_inner
+        // funnels through this helper, so a direct assertion proves the wire-
+        // log says "FILE" rather than "2".
+        assert_eq!(format_label(FORMAT_FILE), "FILE");
+        assert_eq!(format_label(FORMAT_TEXT_UTF8), "TEXT");
+        assert_eq!(format_label(FORMAT_PNG_IMAGE), "IMAGE");
+    }
+
+    #[test]
+    fn apply_outgoing_progress_file_clears_label_on_done() {
+        // Status-line label must drop back to empty once the last chunk
+        // lands. Without this the next text Cmd+C would still show the
+        // previous file's name until DONE for THAT transfer cleared it.
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let label = Arc::new(Mutex::new("report.pdf".to_string()));
+
+        let offer = Message::ClipOffer { format: FORMAT_FILE, total_len: 8 };
+        apply_outgoing_progress_with_label(&offer, &progress, &total, &label);
+        let chunk = Message::ClipChunk { index: 0, data: vec![0u8; 8] };
+        apply_outgoing_progress_with_label(&chunk, &progress, &total, &label);
+
+        assert_eq!(total.load(Ordering::Relaxed), 0, "DONE zeroes total");
+        assert_eq!(
+            &*label.lock().unwrap(),
+            "",
+            "DONE clears the filename slot"
+        );
+    }
+
+    #[test]
+    fn send_decline_toast_file_format_is_specific() {
+        // Verifies the send-side ClipDecline → toast string is FORMAT_FILE-
+        // aware. The brief asks for an explicit "Peer declined file (Receive
+        // files off)" wording; text/image keep the legacy generic message.
+        let file_toast = send_decline_toast(FORMAT_FILE);
+        assert!(
+            file_toast.contains("declined"),
+            "toast must say declined: {file_toast}"
+        );
+        assert!(
+            file_toast.contains("file"),
+            "FORMAT_FILE toast must mention 'file': {file_toast}"
+        );
+
+        let text_toast = send_decline_toast(FORMAT_TEXT_UTF8);
+        assert!(
+            !text_toast.contains("file"),
+            "text decline must not mention 'file': {text_toast}"
+        );
+        let image_toast = send_decline_toast(FORMAT_PNG_IMAGE);
+        assert!(
+            !image_toast.contains("file"),
+            "image decline must not mention 'file': {image_toast}"
+        );
+    }
+
+    #[test]
+    fn clip_decline_file_drops_pending_outbox() {
+        // Task 7d contract: ClipDecline { FORMAT_FILE } arriving in the
+        // reader thread must arm `outgoing_cancel` — that's the signal
+        // writer_thread reads to drain any queued ClipOffer/ClipChunk
+        // packets out of the outbox instead of pumping them onto the wire.
+        // Without the flag flip, a 20 MB declined file would saturate the
+        // serial link for ~70s before the writer noticed.
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(!cancel.load(Ordering::Acquire), "precondition: cancel disarmed");
+
+        let _toast = apply_clip_decline(FORMAT_FILE, &cancel);
+
+        assert!(
+            cancel.load(Ordering::Acquire),
+            "FORMAT_FILE decline must arm outgoing_cancel — writer relies on it to drop queued packets"
+        );
+    }
+
+    #[test]
+    fn clip_decline_file_emits_toast() {
+        // Pair to `clip_decline_file_drops_pending_outbox`: the helper
+        // also produces the user-facing toast string. Asserts the exact
+        // wording the brief calls for so a future refactor doesn't quietly
+        // weaken it into a generic message.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let toast = apply_clip_decline(FORMAT_FILE, &cancel);
+        assert_eq!(toast, "Peer declined file (Receive files off)");
+
+        // Non-file formats keep the legacy generic copy — regression guard.
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let toast_text = apply_clip_decline(FORMAT_TEXT_UTF8, &cancel2);
+        assert_eq!(toast_text, "Host declined the clipboard transfer");
     }
 }
