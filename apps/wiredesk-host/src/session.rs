@@ -161,6 +161,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // consumed by tests that are themselves platform-gated
     pub fn has_shell(&self) -> bool {
         self.shell.is_some()
     }

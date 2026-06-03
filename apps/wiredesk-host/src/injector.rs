@@ -108,7 +108,7 @@ impl InputInjector for WindowsInjector {
 
         // Extended scancodes (0xE0xx) need KEYEVENTF_EXTENDEDKEY flag
         let (scan, flags) = if scancode & 0xFF00 == 0xE000 {
-            ((scancode & 0xFF) as u16, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
+            (scancode & 0xFF, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
         } else {
             (scancode, KEYEVENTF_SCANCODE)
         };
@@ -133,7 +133,7 @@ impl InputInjector for WindowsInjector {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
         let (scan, base_flags) = if scancode & 0xFF00 == 0xE000 {
-            ((scancode & 0xFF) as u16, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
+            (scancode & 0xFF, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY)
         } else {
             (scancode, KEYEVENTF_SCANCODE)
         };

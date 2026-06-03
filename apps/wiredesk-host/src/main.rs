@@ -496,16 +496,14 @@ fn run_windows(
                 }
                 // nwg spells the selection event "OnComboxBoxSelection"
                 // (typo carried in the crate); it maps to Win32 CBN_SELCHANGE.
-                E::OnComboxBoxSelection => {
-                    if is_port_combo {
-                        // Picking a port from the dropdown copies its bare COM
-                        // into the manual field — the canonical value read at
-                        // Save. try_borrow guards the same re-entrancy the
-                        // probe does (status-bar updates pump Win32 messages).
-                        if let Ok(s) = settings_clone2.try_borrow() {
-                            if let Some(com) = s.selected_port_com() {
-                                s.port_input.set_text(&com);
-                            }
+                E::OnComboxBoxSelection if is_port_combo => {
+                    // Picking a port from the dropdown copies its bare COM
+                    // into the manual field — the canonical value read at
+                    // Save. try_borrow guards the same re-entrancy the
+                    // probe does (status-bar updates pump Win32 messages).
+                    if let Ok(s) = settings_clone2.try_borrow() {
+                        if let Some(com) = s.selected_port_com() {
+                            s.port_input.set_text(&com);
                         }
                     }
                 }

@@ -13,6 +13,10 @@
 //! must list this binary. Without it CGEventTap creation succeeds but the
 //! tap never fires. We don't auto-prompt — UX guides the user instead.
 
+// This whole module is macOS CGEventTap machinery with no-op stubs on other
+// targets, so its hotkey constants/helpers are dead in a non-macOS build.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;

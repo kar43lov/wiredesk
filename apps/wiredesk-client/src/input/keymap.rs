@@ -101,6 +101,8 @@ pub fn egui_key_to_scancode(key: &egui::Key) -> Option<u16> {
 /// as egui_key_to_scancode — Host's WindowsInjector treats both identically.
 ///
 /// Source for Mac VK codes: /System/Library/Frameworks/Carbon.framework/...Events.h.
+// Used only by the macOS CGEventTap path; dead on other targets.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cgkeycode_to_scancode(keycode: u16) -> Option<u16> {
     Some(match keycode {
         // Letters

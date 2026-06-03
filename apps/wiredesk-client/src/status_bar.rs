@@ -34,6 +34,9 @@ use std::sync::atomic::AtomicU64;
 ///
 /// Bytes-format: percentage only, no KB/B suffix. The status bar is the
 /// glanceable summary; users who want bytes look at the in-app status row.
+// Consumed by the macOS poll_loop and by unit tests on all platforms; dead
+// only in a non-macOS *bin* build (the status bar is a no-op there).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn format_status_bar_title(
     out_progress: u64,
     out_total: u64,
@@ -50,6 +53,7 @@ pub fn format_status_bar_title(
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn pct(current: u64, total: u64) -> Option<u64> {
     if total == 0 {
         return None;
@@ -61,6 +65,9 @@ fn pct(current: u64, total: u64) -> Option<u64> {
 /// Bundle of progress atomics shared with the status bar polling thread.
 /// All four counters are written by the writer/reader threads (sole
 /// writers per direction); the polling thread only reads.
+// Fields are read by the macOS poll_loop; on other targets `init` ignores
+// the struct, so the fields are never read there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone)]
 pub struct StatusBarCounters {
     pub outgoing_progress: Arc<AtomicU64>,

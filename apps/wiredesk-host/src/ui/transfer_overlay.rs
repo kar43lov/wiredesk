@@ -234,14 +234,14 @@ mod windows_impl {
             .build(label)?;
 
         // Layout: single label filling the whole window.
-        let mut layout = nwg::GridLayout::default();
+        let layout = nwg::GridLayout::default();
         nwg::GridLayout::builder()
             .parent(&*window)
             .max_column(Some(1))
             .spacing(0)
             .margin([6, 6, 6, 6])
             .child(0, 0, &*label)
-            .build(&mut layout)?;
+            .build(&layout)?;
         // Layout is owned by the closure scope — nwg keeps it alive via
         // the parent window. Safe to drop here.
         std::mem::forget(layout);

@@ -99,7 +99,9 @@ pub struct WireDeskApp {
     /// NSApp init can overwrite the icon ~1s after creator runs, so we
     /// re-apply periodically until macOS settles on our icon. Three or
     /// four passes during the first 10 seconds is enough.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     last_dock_icon_apply: Option<Instant>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     dock_icon_apply_count: u8,
     // Saved outer position before entering fullscreen on a non-active monitor.
     // Restored on fullscreen exit so the chrome window returns to where the

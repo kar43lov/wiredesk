@@ -454,7 +454,15 @@ fn main() {
             // is to keep the NSStatusItem alive — once dropped, AppKit
             // removes the menu bar item.
             let _handle = status_bar::init(creator_status_bar_counters);
+            // On macOS the handle pins the NSStatusItem for the program's
+            // lifetime — leak it so AppKit keeps the menu-bar item alive. On
+            // other targets the handle is an empty no-Drop placeholder, so
+            // there's nothing to keep alive (and `mem::forget` on a non-Drop
+            // type is a no-op clippy rejects under `-D warnings`).
+            #[cfg(target_os = "macos")]
             std::mem::forget(_handle);
+            #[cfg(not(target_os = "macos"))]
+            let _ = _handle;
             Ok(Box::new(app))
         }),
     ) {
