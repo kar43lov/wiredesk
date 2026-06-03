@@ -909,16 +909,23 @@ pub fn spawn_poll_thread(
             // the runtime toggle for files lives on the receive side
             // (`receive_files`), wired up in Task 7a.
             'file: {
-                // Opt-in: skip the file-URL probe entirely unless the user
-                // enabled "Send files" in Settings. Default is off, so a
-                // plain Cmd+C on a file never leaves the Mac.
-                if !send_files.load(Ordering::Relaxed) {
-                    break 'file;
-                }
+                // Always poll so `file_change_count` tracks the pasteboard
+                // even while the opt-in is OFF. If we skipped the probe when
+                // disabled, the counter would go stale; enabling "Send files"
+                // later would then make the next tick treat an
+                // already-copied file as new and send it WITHOUT a fresh
+                // Cmd+C — leaking a file the user copied while sending was
+                // off, breaking the opt-in privacy guarantee (Codex review).
                 let path = match clipboard_files::poll_file_url(&mut file_change_count) {
                     Some(p) => p,
                     None => break 'file,
                 };
+                // Detection done (counter synced) — only SEND when the
+                // "Send files (Mac → Host)" toggle is on. Default off, so a
+                // plain Cmd+C on a file never leaves the Mac.
+                if !send_files.load(Ordering::Relaxed) {
+                    break 'file;
+                }
 
                 match pack_file_or_warn(&path, MAX_FILE_BYTES) {
                     FilePollOutcome::Ready { name, hash, packed } => {
