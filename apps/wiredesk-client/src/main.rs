@@ -169,6 +169,10 @@ fn main() {
     // with pre-Task-8 TOML configs).
     let receive_files =
         Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_files));
+    // Outbound file toggle. Opt-in (default false): a Cmd+C on a file only
+    // reaches the wire when the user explicitly enables "Send files" in
+    // Settings. Shared with the poll thread, flipped live by the checkbox.
+    let send_files = Arc::new(std::sync::atomic::AtomicBool::new(cfg.send_files));
     // Karabiner-Elements `left_command ↔ left_option` compensation (see
     // ClientConfig::swap_option_command). Read once on startup and surfaced
     // through Settings; flipping the checkbox at runtime takes effect on the
@@ -344,6 +348,7 @@ fn main() {
         poll_events_tx,
         send_images.clone(),
         send_text.clone(),
+        send_files.clone(),
         outgoing_text_in_flight.clone(),
         poll_kick_rx,
         current_outgoing_label.clone(),
@@ -414,6 +419,7 @@ fn main() {
         send_text,
         receive_text,
         receive_files,
+        send_files,
         swap_option_command,
         outgoing_cancel,
         incoming_cancel,

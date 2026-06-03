@@ -704,6 +704,7 @@ pub fn spawn_poll_thread(
     events_tx: mpsc::Sender<TransportEvent>,
     send_images: Arc<AtomicBool>,
     send_text: Arc<AtomicBool>,
+    send_files: Arc<AtomicBool>,
     outgoing_text_in_flight: Arc<AtomicBool>,
     poll_kick_rx: mpsc::Receiver<()>,
     current_outgoing_label: Arc<Mutex<String>>,
@@ -908,6 +909,12 @@ pub fn spawn_poll_thread(
             // the runtime toggle for files lives on the receive side
             // (`receive_files`), wired up in Task 7a.
             'file: {
+                // Opt-in: skip the file-URL probe entirely unless the user
+                // enabled "Send files" in Settings. Default is off, so a
+                // plain Cmd+C on a file never leaves the Mac.
+                if !send_files.load(Ordering::Relaxed) {
+                    break 'file;
+                }
                 let path = match clipboard_files::poll_file_url(&mut file_change_count) {
                     Some(p) => p,
                     None => break 'file,

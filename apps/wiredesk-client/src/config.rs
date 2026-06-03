@@ -75,6 +75,14 @@ pub struct ClientConfig {
     /// users don't lose the feature on upgrade.
     #[serde(default = "default_true")]
     pub receive_files: bool,
+    /// Send files from Mac → Host. **Opt-in: default `false`.** Unlike text,
+    /// a file copy can be large and is rarely meant to leave the Mac, so the
+    /// user enables this explicitly per session. When false the poll thread
+    /// skips the file-URL probe entirely (a plain Cmd+C on a file never
+    /// touches the wire). Missing field in an older TOML → `false` (the safe
+    /// default), so upgrading never starts leaking files without consent.
+    #[serde(default)]
+    pub send_files: bool,
     /// Compensate Karabiner-Elements `left_command ↔ left_option` swap when
     /// forwarding modifiers and detecting local hotkeys. With Karabiner
     /// remapping the two keys at the HID level (so the same physical
@@ -155,6 +163,7 @@ impl Default for ClientConfig {
             send_text: true,
             receive_text: true,
             receive_files: true,
+            send_files: false,
             swap_option_command: false,
             transport: default_transport(),
             transport_fallback: None,
@@ -280,6 +289,7 @@ mod tests {
         assert!(cfg.send_images);
         assert!(cfg.receive_images);
         assert!(cfg.receive_files);
+        assert!(!cfg.send_files, "send_files is opt-in, default off");
         assert_eq!(cfg.transport, "serial");
         assert!(cfg.transport_fallback.is_none());
         assert_eq!(cfg.bluetooth, BluetoothConfig::default());
@@ -299,6 +309,7 @@ mod tests {
             send_text: true,
             receive_text: true,
             receive_files: true,
+            send_files: true,
             swap_option_command: false,
             transport: "serial".to_string(),
             transport_fallback: None,
@@ -473,6 +484,7 @@ mod tests {
             send_text: true,
             receive_text: true,
             receive_files: true,
+            send_files: false,
             swap_option_command: false,
             transport: "serial".to_string(),
             transport_fallback: None,
@@ -595,6 +607,31 @@ mod tests {
         assert!(!cfg.receive_images);
         // The missing field falls back to the default-on closure.
         assert!(cfg.receive_files);
+        // send_files is opt-in: a TOML without the field must load as `false`
+        // so upgrading never silently starts sending files to the host.
+        assert!(!cfg.send_files);
+    }
+
+    #[test]
+    fn config_roundtrip_with_send_files() {
+        // Explicit `send_files = true` must survive a serialize → deserialize
+        // cycle, and the opt-in default (`false`) must round-trip too.
+        let dir = tempdir().unwrap();
+        let cfg_on = ClientConfig {
+            send_files: true,
+            ..ClientConfig::default()
+        };
+        let path_on = dir.path().join("sfiles_on.toml");
+        cfg_on.save_to(&path_on).unwrap();
+        let loaded_on = ClientConfig::load_from(&path_on);
+        assert!(loaded_on.send_files);
+        assert_eq!(loaded_on, cfg_on);
+
+        let cfg_off = ClientConfig::default(); // send_files == false
+        let path_off = dir.path().join("sfiles_off.toml");
+        cfg_off.save_to(&path_off).unwrap();
+        let loaded_off = ClientConfig::load_from(&path_off);
+        assert!(!loaded_off.send_files);
     }
 
     #[test]

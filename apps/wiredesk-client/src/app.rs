@@ -148,6 +148,11 @@ pub struct WireDeskApp {
     /// `ClientConfig.receive_files` at startup so a `false` in TOML disables
     /// the feature on boot.
     receive_files: Arc<AtomicBool>,
+    /// Send files from Mac → Host. **Opt-in (default off).** Shared with the
+    /// poll thread; when false the file-URL probe is skipped entirely so a
+    /// Cmd+C on a file never leaves the Mac. Flipping the Settings checkbox
+    /// takes effect on the next poll tick, no restart.
+    send_files: Arc<AtomicBool>,
     /// Karabiner-Elements `left_command ↔ left_option` compensation. Shared
     /// with the keyboard tap thread; flipping the Settings checkbox takes
     /// effect on the next FlagsChanged / KeyDown the tap sees.
@@ -328,6 +333,7 @@ impl WireDeskApp {
         send_text: Arc<AtomicBool>,
         receive_text: Arc<AtomicBool>,
         receive_files: Arc<AtomicBool>,
+        send_files: Arc<AtomicBool>,
         swap_option_command: Arc<AtomicBool>,
         outgoing_cancel: Arc<AtomicBool>,
         incoming_cancel: Arc<AtomicBool>,
@@ -382,6 +388,7 @@ impl WireDeskApp {
             send_text,
             receive_text,
             receive_files,
+            send_files,
             swap_option_command,
             outgoing_cancel,
             incoming_cancel,
@@ -697,6 +704,19 @@ impl WireDeskApp {
                 {
                     cfg.receive_files = recv_files;
                     self.receive_files.store(recv_files, Ordering::Relaxed);
+                    dirty = true;
+                }
+                // "Send files (Mac → Host)" — opt-in (default off). When off,
+                // the poll thread skips the file-URL probe so a Cmd+C on a
+                // file never leaves the Mac. Separate from text/image send so
+                // the user can keep files local while still syncing text.
+                let mut send_files = cfg.send_files;
+                if ui
+                    .checkbox(&mut send_files, "Send files (Mac → Host)")
+                    .changed()
+                {
+                    cfg.send_files = send_files;
+                    self.send_files.store(send_files, Ordering::Relaxed);
                     dirty = true;
                 }
                 let mut send_txt = cfg.send_text;
@@ -1896,6 +1916,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             // receive_files (Task 8)
             Arc::new(AtomicBool::new(true)),
+            // send_files (opt-in, default off — test uses off)
+            Arc::new(AtomicBool::new(false)),
             swap_flag,
             outgoing_cancel,
             incoming_cancel,
