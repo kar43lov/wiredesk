@@ -14,6 +14,15 @@
 //! - Only file URLs (`file://` scheme) are accepted; arbitrary `NSURL`s
 //!   (http/data/etc.) are ignored — we can't write them to the remote disk.
 //!
+//! ## Reference URLs
+//!
+//! Finder copies expose the file as a **reference URL**
+//! (`file:///.file/id=6571367.30275677`), not a path URL — the raw string is
+//! useless for `fs::*`. `poll_file_url` resolves it through `NSURL.path`,
+//! which turns the reference form into the real `/Users/…/foo.pdf` (and is a
+//! no-op for plain path URLs). The pure `parse_file_url` helper below handles
+//! only the plain form and is kept for unit coverage, not the live path.
+//!
 //! ## Threading
 //!
 //! `poll_file_url` and `set_file_url` both touch the AppKit general pasteboard
@@ -79,6 +88,7 @@ pub enum FileClipboardError {
 #[cfg(target_os = "macos")]
 pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    use objc2_foundation::NSURL;
 
     // SAFETY: `generalPasteboard` is callable off the main thread per Apple
     // docs (NSPasteboard is thread-safe at the API surface). Returned
@@ -107,16 +117,34 @@ pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
     }
 
     let item = unsafe { items.objectAtIndex(0) };
-    // `stringForType:` on `public.file-url` returns the URL as an NSString
-    // (e.g., "file:///Users/.../foo.pdf"). NSURL round-trip would be more
-    // strictly typed, but stringForType is sufficient and keeps the FFI
-    // surface narrow.
-    let url_str = unsafe { item.stringForType(NSPasteboardTypeFileURL) }?;
-    let url = url_str.to_string();
-    parse_file_url(&url).or_else(|| {
-        log::debug!("clipboard: pasteboard URL not a file:// path: {url}");
-        None
-    })
+    // `stringForType:` on `public.file-url` returns the URL as an NSString.
+    // Crucially, Finder copies expose this as a **file reference URL**
+    // (`file:///.file/id=6571367.30275677`), NOT a path URL — the raw string
+    // is useless for `fs::*`. Some copies expose it only at the pasteboard
+    // level rather than on the item, so fall back to `pb.stringForType`.
+    let url_str = match unsafe { item.stringForType(NSPasteboardTypeFileURL) } {
+        Some(s) => s,
+        // Some Finder copies expose the file URL only at the pasteboard level.
+        None => unsafe { pb.stringForType(NSPasteboardTypeFileURL) }?,
+    };
+
+    // Resolve the (possibly reference-form) URL to a real filesystem path.
+    // `NSURL.path` turns `file:///.file/id=…` into `/Users/…/foo.pdf` and is a
+    // no-op for plain path URLs — so this handles both Finder and
+    // programmatic `file://` copies. Doing the resolution in AppKit avoids
+    // reimplementing reference-URL lookup ourselves.
+    let nsurl = unsafe { NSURL::URLWithString(&url_str) }?;
+    let path_nsstring = unsafe { nsurl.path() }?;
+    let path = PathBuf::from(path_nsstring.to_string());
+    if !path.is_absolute() {
+        log::warn!(
+            "clipboard: resolved file path is not absolute: {}",
+            path.display()
+        );
+        return None;
+    }
+    log::debug!("clipboard: detected file copy → {}", path.display());
+    Some(path)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -181,9 +209,12 @@ pub fn set_file_url(_path: &Path) -> Result<(), FileClipboardError> {
 /// path is percent-decoded so spaces, unicode, and other RFC-3986 escapes
 /// round-trip cleanly. Extracted as a pure function so the URL parsing path
 /// has unit-test coverage without an AppKit session.
-// Used by the macOS `poll_file_url` and by unit tests on all platforms;
-// dead only in a non-macOS *bin* build (no caller there).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+//
+// NOTE: the production poll path now resolves file URLs via `NSURL.path`
+// (which also handles Finder's `file:///.file/id=…` reference form that this
+// pure parser does *not*). Kept as a tested helper for plain `file://`
+// parsing; dead outside the test build.
+#[allow(dead_code)]
 pub(crate) fn parse_file_url(url: &str) -> Option<PathBuf> {
     // Strip the scheme. We accept both `file:///abs/path` and `file:/abs/path`
     // (older NSURL output) — anything that doesn't start with `file:` is
@@ -213,7 +244,7 @@ pub(crate) fn parse_file_url(url: &str) -> Option<PathBuf> {
 /// Minimal RFC-3986 percent-decoder: `%HH` → byte, anything else passes
 /// through. Invalid hex pairs (`%ZZ`) are passed through literally — the
 /// expected input is NSURL-produced strings, which are well-formed.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[allow(dead_code)]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -236,7 +267,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[allow(dead_code)]
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
