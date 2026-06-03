@@ -170,6 +170,7 @@ pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)] // production caller is cfg(macos)-gated; stub documents the contract
 pub fn set_file_url(_path: &Path) -> Result<(), FileClipboardError> {
     Err(FileClipboardError::PasteboardUnavailable)
 }
@@ -180,6 +181,9 @@ pub fn set_file_url(_path: &Path) -> Result<(), FileClipboardError> {
 /// path is percent-decoded so spaces, unicode, and other RFC-3986 escapes
 /// round-trip cleanly. Extracted as a pure function so the URL parsing path
 /// has unit-test coverage without an AppKit session.
+// Used by the macOS `poll_file_url` and by unit tests on all platforms;
+// dead only in a non-macOS *bin* build (no caller there).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_file_url(url: &str) -> Option<PathBuf> {
     // Strip the scheme. We accept both `file:///abs/path` and `file:/abs/path`
     // (older NSURL output) — anything that doesn't start with `file:` is
@@ -209,6 +213,7 @@ pub(crate) fn parse_file_url(url: &str) -> Option<PathBuf> {
 /// Minimal RFC-3986 percent-decoder: `%HH` → byte, anything else passes
 /// through. Invalid hex pairs (`%ZZ`) are passed through literally — the
 /// expected input is NSURL-produced strings, which are well-formed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -231,6 +236,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),

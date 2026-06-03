@@ -638,16 +638,18 @@ fn apply_outgoing_progress_inner(
             let prev = outgoing_progress.fetch_add(data.len() as u64, Ordering::Relaxed);
             let new_progress = prev + data.len() as u64;
             let total = outgoing_total.load(Ordering::Relaxed);
-            // Milestone logging — every 25% of total.
-            if total > 0 {
-                let prev_q = (prev * 4) / total;
-                let new_q = (new_progress * 4) / total;
+            // Milestone logging — every 25% of total. `checked_div` keeps
+            // the divide-by-zero guard idiomatic (total == 0 → None → no log)
+            // instead of a manual `if total > 0` wrapper.
+            if let (Some(prev_q), Some(new_q)) =
+                ((prev * 4).checked_div(total), (new_progress * 4).checked_div(total))
+            {
                 if new_q > prev_q {
                     log::info!(
                         "clipboard.send {}/{} bytes ({}%)",
                         new_progress,
                         total,
-                        (new_progress * 100) / total
+                        (new_progress * 100).checked_div(total).unwrap_or(0)
                     );
                 }
             }
