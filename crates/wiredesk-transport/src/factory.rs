@@ -146,7 +146,19 @@ mod tests {
         );
     }
 
+    // These three tests assert the factory's *fallback* behaviour, which is
+    // only observable when `BluetoothLeTransport::open()` fails. That holds on
+    // the Mac/Central side (open() scans for a peer and times out when none is
+    // advertising). On Windows the BLE side is a GATT *Peripheral* — open()
+    // just builds the service and starts advertising, which succeeds with no
+    // peer present, so open() returns Ok and there's no error path to assert.
+    // Ignored on Windows rather than deleted: the fallback logic itself is
+    // cross-platform and still worth covering on the Central side.
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "BLE open() is success-on-advertise on the Win Peripheral side; no error path to assert"
+    )]
     fn bluetooth_transport_without_fallback_returns_ble_error() {
         // No advertising peer in the test environment, so BLE open() will
         // fail. Without fallback the factory surfaces the BLE error
@@ -176,6 +188,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "BLE open() is success-on-advertise on the Win Peripheral side; fallback never triggers"
+    )]
     fn bluetooth_init_fail_falls_back_to_serial() {
         // BLE fails (impl pending) → fallback "serial" kicks in → serial
         // also fails (invalid port) → final error is from SerialTransport,
@@ -195,6 +211,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "BLE open() is success-on-advertise on the Win Peripheral side; no error path to assert"
+    )]
     fn unknown_fallback_value_does_not_recurse() {
         // Only "serial" is a valid fallback string. Anything else means
         // "no fallback" — the primary BLE error surfaces directly without
