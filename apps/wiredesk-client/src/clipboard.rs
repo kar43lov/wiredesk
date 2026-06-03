@@ -931,7 +931,18 @@ pub fn spawn_poll_thread(
                         if state.get().matches_file_hash(hash) {
                             break 'file;
                         }
-                        state.set_file(hash);
+                        // NB: do NOT stamp `state.set_file(hash)` here. The
+                        // pasteboard `changeCount` guard in `poll_file_url`
+                        // already prevents re-emitting the same clipboard on
+                        // later ticks, so a send-side stamp is redundant — and
+                        // it broke retry: after a host ClipDecline (receive
+                        // files off) or a user cancel, a re-copy of the *same*
+                        // file would match the stale stamp and never resend
+                        // (Codex review). Loop-avoidance for the Host→Mac
+                        // receive path is handled by `commit_file`, which
+                        // stamps the content hash before writing the file URL
+                        // back to the pasteboard. The `matches_file_hash`
+                        // check above still consults that commit stamp.
                         log::debug!(
                             "clipboard: pushing file '{}' to host ({} content bytes)",
                             name,

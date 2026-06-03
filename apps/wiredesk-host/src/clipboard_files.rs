@@ -182,6 +182,28 @@ pub fn poll_cf_hdrop() -> Option<PathBuf> {
     None
 }
 
+/// Current Windows clipboard sequence number. Bumps on every clipboard
+/// write (any owner, any format) — the Win equivalent of macOS
+/// `NSPasteboard.changeCount`. Used to gate the file-send probe so we only
+/// re-emit when the clipboard actually changed: this prevents per-tick
+/// re-sends without a sender-side dedup stamp, which in turn lets a re-copy
+/// of the same file after a peer ClipDecline / cancel be re-sent (Codex
+/// review). No `OpenClipboard` needed — the call is lock-free.
+#[cfg(windows)]
+pub fn current_clipboard_seq() -> u32 {
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    // SAFETY: GetClipboardSequenceNumber takes no args and is safe to call
+    // from any thread without holding the clipboard lock.
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+/// Non-Windows stub: there is no real clipboard backend, and `poll_cf_hdrop`
+/// already returns `None`, so the value is never consulted meaningfully.
+#[cfg(not(windows))]
+pub fn current_clipboard_seq() -> u32 {
+    0
+}
+
 /// Replace the system clipboard with a single CF_HDROP entry pointing at
 /// `path`.
 ///

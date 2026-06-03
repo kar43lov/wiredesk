@@ -490,6 +490,15 @@ pub struct ClipboardSync {
     /// abort) can remove a partially-written file rather than leaving stale
     /// fragments in the cache. Cleared after a successful commit_file.
     in_flight_file_path: Option<PathBuf>,
+    /// Last observed Windows clipboard sequence number (see
+    /// `clipboard_files::current_clipboard_seq`). The file-send probe only
+    /// runs when this changes — the Win equivalent of the Mac client's
+    /// `changeCount` gate. Without it the file branch (which no longer stamps
+    /// a sender-side dedup hash, so re-copy after a decline can retry) would
+    /// re-emit the same file every poll tick. Initialised to the current
+    /// sequence at construction so a clipboard untouched since startup isn't
+    /// treated as "changed".
+    last_clipboard_seq: u32,
 
     /// Test-only sink — captures the last successfully committed payload so
     /// unit tests can assert on outcomes without depending on a live arboard
@@ -561,6 +570,7 @@ impl ClipboardSync {
             receive_files,
             cache_dir_override: None,
             in_flight_file_path: None,
+            last_clipboard_seq: clipboard_files::current_clipboard_seq(),
             #[cfg(test)]
             last_committed: None,
         }
@@ -587,6 +597,7 @@ impl ClipboardSync {
             receive_files: Arc::new(AtomicBool::new(true)),
             cache_dir_override: None,
             in_flight_file_path: None,
+            last_clipboard_seq: 0,
             last_committed: None,
         }
     }
@@ -807,6 +818,22 @@ impl ClipboardSync {
         // OversizeFile. File sync is always-on at outbound — the runtime
         // toggle (`receive_files`) lives on the receive side (Task 7a).
         'file: {
+            // Gate on the clipboard sequence number (Win equivalent of the
+            // Mac `changeCount`): only probe for a file when the clipboard
+            // actually changed since our last file probe. This is what stops
+            // per-tick re-emits now that the file branch no longer stamps a
+            // sender-side dedup hash on enqueue — and dropping that stamp is
+            // what lets a re-copy of the same file after a peer ClipDecline
+            // or cancel be re-sent (Codex review). Loop-avoidance for the
+            // Mac→Host receive path still works: `commit_file` stamps
+            // `LastKind::File(hash)` before writing CF_HDROP, and the
+            // `matches_file_hash` check below consults that stamp.
+            let seq = clipboard_files::current_clipboard_seq();
+            if seq == self.last_clipboard_seq {
+                break 'file;
+            }
+            self.last_clipboard_seq = seq;
+
             let path = match clipboard_files::poll_cf_hdrop() {
                 Some(p) => p,
                 None => break 'file,
@@ -814,13 +841,12 @@ impl ClipboardSync {
 
             match pack_file_or_warn(&path, MAX_FILE_BYTES) {
                 FilePollOutcome::Ready { name, hash, packed } => {
-                    // Dedup against both File and OversizeFile slots.
-                    // matches_file_hash covers both so a re-copied file
-                    // doesn't get re-emitted.
+                    // Dedup only against the commit/receive stamp (loop
+                    // avoidance) — NOT a send-enqueue stamp. See the seq-gate
+                    // comment above for why we no longer stamp on send.
                     if self.last.matches_file_hash(hash) {
                         break 'file;
                     }
-                    self.last = LastKind::File(hash);
                     log::info!(
                         "clipboard: sending file '{}' to peer ({} packed bytes)",
                         name,

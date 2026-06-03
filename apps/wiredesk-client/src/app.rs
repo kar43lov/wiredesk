@@ -275,6 +275,13 @@ fn render_progress_row(
     cancel_flag: &Arc<AtomicBool>,
     progress_atomic: &Arc<AtomicU64>,
     total_atomic: &Arc<AtomicU64>,
+    // For the outgoing row only: the filename label slot. On cancel the
+    // writer drops queued chunks without ever running the DONE path that
+    // normally clears the label, so the next text/image transfer would
+    // render as "Sending file 'old-name'" until it completes. Clearing it
+    // here keeps the status-line honest (Codex review). `None` for the
+    // incoming row (it has no filename label).
+    cancel_label: Option<&Arc<std::sync::Mutex<String>>>,
 ) {
     ui.horizontal(|ui| {
         let bar_width = ui.available_width() - 70.0;
@@ -290,6 +297,11 @@ fn render_progress_row(
             cancel_flag.store(true, Ordering::Release);
             progress_atomic.store(0, Ordering::Relaxed);
             total_atomic.store(0, Ordering::Relaxed);
+            if let Some(label) = cancel_label {
+                if let Ok(mut g) = label.lock() {
+                    g.clear();
+                }
+            }
         }
     });
 }
@@ -1231,6 +1243,7 @@ impl WireDeskApp {
                         &self.outgoing_cancel,
                         &self.outgoing_progress,
                         &self.outgoing_total,
+                        Some(&self.current_outgoing_label),
                     );
                 }
                 if let (Some(ratio), Some(text)) = (
@@ -1244,6 +1257,7 @@ impl WireDeskApp {
                         &self.incoming_cancel,
                         &self.incoming_progress,
                         &self.incoming_total,
+                        None,
                     );
                 }
             });
@@ -1576,6 +1590,7 @@ impl eframe::App for WireDeskApp {
                     &self.outgoing_cancel,
                     &self.outgoing_progress,
                     &self.outgoing_total,
+                    Some(&self.current_outgoing_label),
                 );
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
@@ -1590,6 +1605,7 @@ impl eframe::App for WireDeskApp {
                     &self.incoming_cancel,
                     &self.incoming_progress,
                     &self.incoming_total,
+                    None,
                 );
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
