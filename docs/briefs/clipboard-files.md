@@ -31,7 +31,8 @@
 - F11. UI feedback: status-line "Sending file 'X.pdf' — N/M bytes (P%)", toast при отказе/overcap.
 
 **Нефункциональные:**
-- Autosend семантика (как у картинок). Никаких prompt'ов перед Cmd+C.
+- **Receive** (Host→Mac) — autosend как у картинок, без prompt'ов.
+- **Send** (Mac→Host) — **opt-in, default OFF** (галка «Send files (Mac → Host)»). Уточнение по требованию пользователя (2026-06-03): в Континент-АП среде автоматически слать любой скопированный файл на Host нежелательно, поэтому отправка файлов включается явно. Изначальный «autosend для обеих сторон» отменён — приём остаётся autosend, отправка opt-in.
 - Single-file scope. Multi-select из Finder/Explorer — Phase 2 отдельным брифом.
 - No directory support. Phase 4 (если когда-нибудь).
 
