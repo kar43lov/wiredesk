@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wiredesk_core::error::{Result, WireDeskError};
+use wiredesk_core::storm::{StormCounter, DEFAULT_STORM_THRESHOLD};
 use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
@@ -58,6 +59,10 @@ pub struct Session<T: Transport, I: InputInjector> {
     clipboard: ClipboardSync,
     /// Latest client display name reported via Hello (None until handshake).
     client_name: Option<String>,
+    /// Frame-error storm detector. Incremented on each `Protocol` recv error
+    /// (via `note_protocol_error`), reset on each successfully decoded
+    /// packet (in `tick`). When it fires, `session_thread` reopens the port.
+    storm: StormCounter,
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
@@ -132,6 +137,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             shell: None,
             clipboard: ClipboardSync::with_counters_and_toggles(counters, receive_files),
             client_name: None,
+            storm: StormCounter::new(DEFAULT_STORM_THRESHOLD),
         }
     }
 
@@ -260,7 +266,35 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         };
 
         self.handle_packet(packet)?;
+        // A real packet decoded → the channel is alive; clear the storm run.
+        // This is the SINGLE reset site: the other Ok-paths of tick()
+        // (heartbeat-timeout, recv-timeout) return without a decoded packet,
+        // and resetting there would break "timeouts don't participate".
+        self.storm.on_valid_packet();
         Ok(true)
+    }
+
+    /// Record one protocol (decode) error from the recv path. Returns `true`
+    /// once the consecutive-error run reaches the storm threshold, signalling
+    /// `session_thread` to reopen the transport. Delegates to the internal
+    /// [`StormCounter`]; `tick` resets the run on every decoded packet.
+    pub fn note_protocol_error(&mut self) -> bool {
+        self.storm.on_protocol_error()
+    }
+
+    /// Current consecutive protocol-error count (test/diagnostic hook).
+    #[cfg(test)]
+    pub fn storm_count(&self) -> u32 {
+        self.storm.count()
+    }
+
+    /// Decompose the session, returning the injector and dropping the
+    /// transport (which releases the underlying COM-port handle). Used by
+    /// the reopen loop: the injector is built once via a `FnOnce` and must
+    /// survive across transport reopens, so the old session is dismantled
+    /// and the injector migrates into the freshly-opened one.
+    pub fn into_injector(self) -> I {
+        self.injector
     }
 
     /// Drain any stdout/stderr from running shell into outbound packets.
@@ -778,5 +812,63 @@ mod tests {
             }
         }
         assert!(saw_error, "expected Message::Error from non-Windows pty-spawn");
+    }
+
+    #[test]
+    fn storm_fires_after_threshold_consecutive_errors() {
+        let (mut session, _client) = setup();
+        // threshold-1 reports → no storm yet
+        for _ in 0..DEFAULT_STORM_THRESHOLD - 1 {
+            assert!(!session.note_protocol_error());
+        }
+        assert_eq!(session.storm_count(), DEFAULT_STORM_THRESHOLD - 1);
+        // threshold-th report → storm
+        assert!(session.note_protocol_error());
+        assert_eq!(session.storm_count(), DEFAULT_STORM_THRESHOLD);
+    }
+
+    #[test]
+    fn storm_resets_on_valid_packet_via_tick() {
+        let (mut session, mut client) = setup();
+        // Handshake so subsequent packets are processed in Connected state.
+        client.send(&Packet::new(
+            Message::Hello { version: 1, client_name: "test".into() },
+            0,
+        )).unwrap();
+        session.tick().unwrap();
+        let _ack = client.recv().unwrap();
+        assert_eq!(session.storm_count(), 0, "handshake decode already reset");
+
+        // Accumulate a partial storm run.
+        for _ in 0..5 {
+            assert!(!session.note_protocol_error());
+        }
+        assert_eq!(session.storm_count(), 5);
+
+        // A real decoded packet (heartbeat) through tick() must reset the run.
+        client.send(&Packet::new(Message::Heartbeat, 1)).unwrap();
+        session.tick().unwrap();
+        assert_eq!(session.storm_count(), 0, "decoded packet must reset storm run");
+    }
+
+    #[test]
+    fn storm_count_persists_without_valid_packet() {
+        // The storm run is reset ONLY by a decoded packet (via tick's
+        // on_valid_packet call). Nothing else — including a heartbeat-timeout
+        // or recv-timeout, which both return Ok(false) without decoding —
+        // touches it. MockTransport::recv() blocks instead of timing out, so
+        // we can't drive an empty tick here without hanging; the invariant
+        // we assert is that the counter only moves via note_protocol_error /
+        // on_valid_packet and never self-resets between error reports.
+        let (mut session, _client) = setup();
+        for _ in 0..3 {
+            session.note_protocol_error();
+        }
+        assert_eq!(session.storm_count(), 3);
+        // More errors with no interleaved valid packet keep climbing.
+        for _ in 0..2 {
+            session.note_protocol_error();
+        }
+        assert_eq!(session.storm_count(), 5, "run must persist without a decoded packet");
     }
 }
