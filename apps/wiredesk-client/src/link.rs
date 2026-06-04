@@ -195,6 +195,17 @@ pub fn spawn_supervisor(
                 }
             };
 
+            // Drain duplicate requests BEFORE spawning the fresh link. Stale
+            // duplicates (reader + writer of the dead link both emitting
+            // Disconnected) have piled up during teardown + backoff — eat them
+            // now. Draining AFTER the spawn instead would swallow a legitimate
+            // request from the fresh link itself (e.g. its HELLO send fails
+            // right away on a still-broken port) and auto-reconnect would
+            // stall on a dead transport (Codex P2). A stale duplicate arriving
+            // after this point merely causes one extra teardown/reopen blip —
+            // a safe failure mode, unlike a permanently dead link.
+            while reconnect_request_rx.try_recv().is_ok() {}
+
             let shutdown = Arc::new(AtomicBool::new(false));
             handles = Some(spawn_link(
                 reader_t,
@@ -205,10 +216,6 @@ pub fn spawn_supervisor(
                 ctx.clone(),
             ));
             link_up.store(true, Ordering::Release);
-
-            // Drain duplicate requests that piled up while we were
-            // reconnecting so we don't immediately tear down the fresh link.
-            while reconnect_request_rx.try_recv().is_ok() {}
         }
     })
 }
@@ -1075,8 +1082,9 @@ mod tests {
             other => panic!("expected Reconnecting{{1}}, got {other:?}"),
         }
         wait_up();
-        // Let the post-spawn drain run so our next request triggers a real
-        // teardown instead of being swallowed by the drain loop.
+        // Small settle so the supervisor is back in recv() before we ask for
+        // a teardown (the drain runs pre-spawn, so our request can't be
+        // swallowed — this sleep just de-flakes the event ordering).
         thread::sleep(Duration::from_millis(20));
 
         // Tear down the live link and reopen. The second Reconnecting event is
@@ -1090,5 +1098,80 @@ mod tests {
         wait_up();
 
         drop(request_tx);
+    }
+
+    #[test]
+    fn supervisor_honors_request_from_instantly_dead_link() {
+        // Codex P2 regression: a fresh link whose HELLO send fails right away
+        // emits Disconnected immediately after spawn. The UI answers with a
+        // reconnect request — which the old post-spawn drain would swallow as
+        // a "stale duplicate", leaving the supervisor parked in recv() with a
+        // dead transport forever. With the drain moved BEFORE the spawn, that
+        // request must drive a second reopen cycle.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (events_tx, events_rx) = mpsc::channel();
+        let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let (request_tx, request_rx) = mpsc::channel::<()>();
+        let link_up = Arc::new(AtomicBool::new(false));
+
+        // 1st open → send-broken transport (HELLO fails instantly, writer
+        // exits with Disconnected). 2nd open → healthy idle transport.
+        let mut calls = 0u32;
+        let open_fn = move || -> Result<Box<dyn Transport>> {
+            calls += 1;
+            Ok(Box::new(ScriptedTransport::new(vec![], calls > 1)) as Box<dyn Transport>)
+        };
+
+        let link_up_c = link_up.clone();
+        let _sup = spawn_supervisor(
+            open_fn,
+            |_| Duration::from_millis(5),
+            outgoing_rx,
+            events_tx,
+            request_rx,
+            link_up_c,
+            ctx,
+        );
+
+        // Kick the initial open → broken link spawns and dies immediately.
+        request_tx.send(()).unwrap();
+        let mut saw_disconnect = false;
+        // Pump events until the writer's Disconnected surfaces.
+        let start = Instant::now();
+        while !saw_disconnect {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "never saw the instant-death Disconnected"
+            );
+            if let Ok(TransportEvent::Disconnected(_)) =
+                events_rx.recv_timeout(Duration::from_millis(200))
+            {
+                saw_disconnect = true;
+            }
+        }
+
+        // Play the UI's role: answer the Disconnected with a request. With the
+        // old post-spawn drain this could be eaten; now it must start a second
+        // reopen cycle. NOTE: `link_up` can't be the success signal here — it
+        // is still true from the first (instantly-dead) link — so we assert on
+        // the second cycle's Reconnecting event instead.
+        request_tx.send(()).unwrap();
+
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "supervisor swallowed the fresh link's reconnect request"
+            );
+            match events_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(TransportEvent::Reconnecting { .. }) => break, // second cycle started
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("events channel died: {e}"),
+            }
+        }
+
+        drop(request_tx);
+        // Silence unused warning — the flag is intentionally not the signal.
+        let _ = link_up.load(Ordering::Acquire);
     }
 }
