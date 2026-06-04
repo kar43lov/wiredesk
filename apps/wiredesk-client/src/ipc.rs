@@ -224,6 +224,20 @@ fn handle_connection(
         );
     }
 
+    // Recheck the link AFTER acquiring the slot (Codex P2 race): a request
+    // that passed the early gate while the link was up may have waited here
+    // (up to ~90 s behind a stuck run) through a disconnect. Without this
+    // recheck it would queue ShellOpen into a reconnecting transport and
+    // time out instead of failing fast with exit 125.
+    if !link_up.load(Ordering::Relaxed) {
+        log::info!("IPC handler: link went down while waiting for slot — refusing run");
+        let _ = write_response(
+            &mut stream,
+            &IpcResponse::TransportUnavailable("transport reconnecting — retry shortly".into()),
+        );
+        return;
+    }
+
     // Private mpsc for the duration of this run. Reader thread fans
     // ShellOutput / ShellExit / shell-Error into here via the slot
     // guard; runner pulls them as `ExecEvent`s.

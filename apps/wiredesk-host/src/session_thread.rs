@@ -191,7 +191,21 @@ where
                         }
                         log::warn!("dropping bad frame: {msg}");
                     }
+                    Err(WireDeskError::Transport(ref msg)) => {
+                        // Fatal serial error (local cable unplug, USB device
+                        // reset, read/write failure) — the fd is dead, so
+                        // retrying the same Session forever can't recover
+                        // (Codex P2). Dismantle and fall into the reopen loop;
+                        // if the port is truly gone the open-loop's backoff
+                        // keeps retrying until it reappears.
+                        log::error!("fatal transport error: {msg} — reopening transport");
+                        injector = sess.into_injector();
+                        thread::sleep(Duration::from_millis(500));
+                        continue 'reopen;
+                    }
                     Err(e) => {
+                        // Non-transport session error (e.g. injector failure)
+                        // — the port itself is fine, keep the session alive.
                         log::error!("session error: {e}");
                         thread::sleep(Duration::from_secs(1));
                     }
