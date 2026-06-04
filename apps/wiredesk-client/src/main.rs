@@ -7,24 +7,21 @@ mod exec_bridge;
 mod ipc;
 mod input;
 mod keyboard_tap;
+mod link;
 mod logging;
 mod monitor;
 mod restart;
 mod status_bar;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
 use eframe::egui;
-use wiredesk_protocol::message::{Message, VERSION};
-use wiredesk_protocol::packet::Packet;
-use wiredesk_transport::transport::Transport;
 
-use app::{TransportEvent, WireDeskApp};
+use app::WireDeskApp;
 use config::ClientConfig;
 
 #[derive(Parser)]
@@ -100,40 +97,13 @@ fn main() {
     let (events_tx, events_rx) = mpsc::channel();
     let (outgoing_tx, outgoing_rx) = mpsc::channel();
     let (tap_events_tx, tap_events_rx) = mpsc::channel();
-
-    // The reader thread keeps the original (recv-capable) handle. The
-    // writer thread gets the clone — for BLE that clone is write-only by
-    // design (see plan Decision 4); for serial it's a duplicate fd.
-    // Either way: send-side on the clone, recv-side on the original.
-    let transport_pair: Option<(Box<dyn Transport>, Box<dyn Transport>)> =
-        match wiredesk_transport::open_transport(&transport_cfg) {
-            Ok(reader) => match reader.try_clone() {
-                Ok(writer) => {
-                    log::info!("opened transport: {}", reader.name());
-                    Some((reader, writer))
-                }
-                Err(e) => {
-                    log::error!("transport try_clone failed: {e}");
-                    let _ = events_tx.send(app::TransportEvent::Disconnected(format!(
-                        "transport try_clone: {e}"
-                    )));
-                    None
-                }
-            },
-            Err(e) => {
-                log::error!("failed to open transport (mode={}): {e}", cfg.transport);
-                if cfg.transport == "serial" {
-                    log::warn!("Available serial ports:");
-                    if let Ok(ports) = serialport::available_ports() {
-                        for p in ports {
-                            log::warn!("  {}", p.port_name);
-                        }
-                    }
-                }
-                let _ = events_tx.send(app::TransportEvent::Disconnected(format!("{e}")));
-                None
-            }
-        };
+    // Reconnect-request channel + link-up flag drive the LinkSupervisor.
+    // The UI thread pushes `()` here on every Disconnected event; the
+    // supervisor reopens the transport (with backoff) and respawns the
+    // reader/writer pair. The initial open at startup goes through the same
+    // path — see the `reconnect_request_tx.send(())` kick below.
+    let (reconnect_request_tx, reconnect_request_rx) = mpsc::channel::<()>();
+    let link_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Shared clipboard state — used by both poll thread (which detects local
     // changes) and reader thread (which writes incoming text). Hash-based
@@ -179,97 +149,22 @@ fn main() {
     // next FlagsChanged / KeyDown the tap sees.
     let swap_option_command = Arc::new(std::sync::atomic::AtomicBool::new(cfg.swap_option_command));
 
-    // Writer thread — owns one half of the port. Drains outgoing channel,
-    // sends heartbeats, sends Hello on startup. UI never blocks because this
-    // thread has zero shared locks with the egui thread.
-    //
-    // Owns outgoing_progress/total updates (M3 fix): increments AFTER each
-    // successful transport.send so the UI reflects real wire-state progress
-    // (≥2 visible increments during typical 500 KB transfers, AC5).
-    // Cancel atomics need to be in scope before writer/reader spawn — both
-    // threads observe them to drop in-flight clipboard packets when the UI
-    // hits the Cancel button. (See `outgoing_text_in_flight` block below
-    // for the full set of clipboard-orchestration atomics.)
+    // Cancel atomics — both reader and writer observe them to drop in-flight
+    // clipboard packets when the UI hits the Cancel button. Shared with the
+    // app and (via LinkContext) every reader/writer spawned across reconnects.
     let outgoing_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let incoming_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Reader/writer threads only spawn when the transport opened
-    // successfully. On open-failure `transport_pair` is None and the
-    // UI launches with a Disconnected status (the open error was
-    // pushed onto events_tx earlier). The user can then open Settings
-    // → Save & Restart with a working transport.
-    let (reader_transport_opt, writer_transport_opt) = match transport_pair {
-        Some((reader, writer)) => (Some(reader), Some(writer)),
-        None => (None, None),
-    };
+    // Shell-event broadcast slot for the IPC handler (Task 6). None until a
+    // `wd --exec` connection arrives; the reader thread checks it on every
+    // shell event and fans out a parallel copy when set. Shared (Arc) with
+    // every reader spawned across reconnects via LinkContext.
+    let exec_slot: exec_bridge::ExecEventSlot = Arc::new(std::sync::Mutex::new(None));
 
-    let writer_events_tx = events_tx.clone();
-    let client_name = cfg.client_name.clone();
-    let writer_outgoing_progress = outgoing_progress.clone();
-    let writer_outgoing_total = outgoing_total.clone();
-    let writer_outgoing_cancel = outgoing_cancel.clone();
-    let writer_current_outgoing_label = current_outgoing_label.clone();
-    if let Some(writer_transport) = writer_transport_opt {
-        thread::spawn(move || {
-            writer_thread(
-                writer_transport,
-                outgoing_rx,
-                writer_events_tx,
-                client_name,
-                writer_outgoing_progress,
-                writer_outgoing_total,
-                writer_outgoing_cancel,
-                writer_current_outgoing_label,
-            );
-        });
-    } else {
-        // Drain outgoing_rx to /dev/null so producers don't block.
-        // The UI may still emit packets (heartbeats, clipboard probes)
-        // until the user restarts via Settings.
-        thread::spawn(move || {
-            while outgoing_rx.recv().is_ok() {}
-        });
-    }
-
-    // Reader thread — owns the other half. Just receives and dispatches.
-    // Clone `events_tx` ahead of moving the original into reader_thread so the
-    // clipboard poll thread can surface transient warnings (currently the
-    // oversized-image toast, Task 7b) through the same UI event channel.
-    //
-    // Codex iter5 fix: outgoing_progress/total are also passed in so the
-    // reader thread can zero them at the same handshake/disconnect/error
-    // sites where it already zeroes incoming counters via
-    // `IncomingClipboard::reset()`. Previously the UI thread cleared them on
-    // `TransportEvent::Connected` — that raced with a peer ClipOffer arriving
-    // between event-emit and next egui frame and wiped `incoming_total` mid
-    // transfer, blanking the status line for the rest of that transfer.
-    let poll_events_tx = events_tx.clone();
-    let reader_clipboard = clipboard_state.clone();
-    let reader_incoming_progress = incoming_progress.clone();
-    let reader_incoming_total = incoming_total.clone();
-    let reader_outgoing_progress = outgoing_progress.clone();
-    let reader_outgoing_total = outgoing_total.clone();
-    let reader_receive_images = receive_images.clone();
-    let reader_receive_text = receive_text.clone();
-    let reader_receive_files = receive_files.clone();
-    let reader_incoming_cancel = incoming_cancel.clone();
-    let reader_outgoing_cancel = outgoing_cancel.clone();
-    let reader_outgoing_tx = outgoing_tx.clone();
-    let reader_current_outgoing_label = current_outgoing_label.clone();
-    // Shell-event broadcast slot for the IPC handler (Task 6).
-    // None until a `wd --exec` connection arrives; reader_thread
-    // checks it on every shell event and fans out a parallel copy
-    // when set. Lifecycle managed by ExecSlotGuard RAII so a panicking
-    // handler doesn't strand the slot.
-    let exec_slot: exec_bridge::ExecEventSlot =
-        Arc::new(std::sync::Mutex::new(None));
-    let reader_exec_slot = exec_slot.clone();
-
-    // Spawn the IPC acceptor so `wd --exec` can run in parallel with
-    // an active GUI (Mac-only — non-Mac builds are unsupported by
-    // design, but the cfg keeps cross-compilation working). Bind
-    // failure is non-fatal: GUI continues, term falls back to direct
-    // serial.
+    // Spawn the IPC acceptor so `wd --exec` can run in parallel with an
+    // active GUI (Mac-only — non-Mac builds are unsupported by design, but the
+    // cfg keeps cross-compilation working). Bind failure is non-fatal: GUI
+    // continues, term falls back to direct serial.
     #[cfg(target_os = "macos")]
     {
         let ipc_outgoing_tx = outgoing_tx.clone();
@@ -283,45 +178,52 @@ fn main() {
     {
         let _ = &exec_slot; // suppress unused on non-Mac
     }
-    if let Some(reader_transport) = reader_transport_opt {
-        thread::spawn(move || {
-            reader_thread(
-                reader_transport,
-                events_tx,
-                reader_outgoing_tx,
-                reader_clipboard,
-                reader_incoming_progress,
-                reader_incoming_total,
-                reader_outgoing_progress,
-                reader_outgoing_total,
-                reader_receive_images,
-                reader_receive_text,
-                reader_receive_files,
-                reader_incoming_cancel,
-                reader_outgoing_cancel,
-                reader_exec_slot,
-                reader_current_outgoing_label,
-            );
-        });
-    } else {
-        // Reader thread normally owns events_tx clone; without it the
-        // sender we hold here is the only one alive — drop on the
-        // outer scope so the channel stays open for the UI thread to
-        // observe the Disconnected event we already pushed.
-        let _ = events_tx;
-        let _ = reader_outgoing_tx;
-        let _ = reader_clipboard;
-        let _ = reader_incoming_progress;
-        let _ = reader_incoming_total;
-        let _ = reader_outgoing_progress;
-        let _ = reader_outgoing_total;
-        let _ = reader_receive_images;
-        let _ = reader_receive_text;
-        let _ = reader_receive_files;
-        let _ = reader_incoming_cancel;
-        let _ = reader_outgoing_cancel;
-        let _ = reader_exec_slot;
+
+    // LinkContext bundles every shared value the reader/writer threads need
+    // and that must survive a reconnect. The supervisor clones it per link.
+    let link_ctx = link::LinkContext {
+        client_name: cfg.client_name.clone(),
+        clipboard_state: clipboard_state.clone(),
+        outgoing_progress: outgoing_progress.clone(),
+        outgoing_total: outgoing_total.clone(),
+        incoming_progress: incoming_progress.clone(),
+        incoming_total: incoming_total.clone(),
+        receive_images: receive_images.clone(),
+        receive_text: receive_text.clone(),
+        receive_files: receive_files.clone(),
+        incoming_cancel: incoming_cancel.clone(),
+        outgoing_cancel: outgoing_cancel.clone(),
+        exec_slot: exec_slot.clone(),
+        current_outgoing_label: current_outgoing_label.clone(),
+        reader_outgoing_tx: outgoing_tx.clone(),
+    };
+
+    // Spawn the link supervisor. It owns the reader/writer pair and reopens
+    // the transport (with 1s→30s backoff) on every reconnect request. The
+    // initial open is just the first request, sent right after. The UI boots
+    // regardless of whether the transport is up — recovery via Settings stays
+    // reachable (memory: feedback_ui_recovery_on_transport_failure).
+    {
+        let supervisor_transport_cfg = transport_cfg.clone();
+        let supervisor_events_tx = events_tx.clone();
+        let supervisor_link_up = link_up.clone();
+        let open_fn =
+            move || wiredesk_transport::open_transport(&supervisor_transport_cfg);
+        link::spawn_supervisor(
+            open_fn,
+            link::backoff_delay,
+            outgoing_rx,
+            supervisor_events_tx,
+            reconnect_request_rx,
+            supervisor_link_up,
+            link_ctx,
+        );
     }
+    // Kick the initial connection through the supervisor path.
+    let _ = reconnect_request_tx.send(());
+
+    // Clone for the clipboard poll thread (surfaces oversize-image toasts).
+    let poll_events_tx = events_tx.clone();
 
     // Synthetic-combo dispatcher pieces. Whispr Flow / TextExpander send
     // Cmd+V via CGEventPost, which races against Mac→Host clipboard sync —
@@ -404,7 +306,7 @@ fn main() {
         incoming_total: incoming_total.clone(),
     };
 
-    let app = WireDeskApp::new(
+    let mut app = WireDeskApp::new(
         cfg,
         events_rx,
         outgoing_tx,
@@ -425,6 +327,8 @@ fn main() {
         incoming_cancel,
         current_outgoing_label,
     );
+    // Let the UI ask the supervisor to reconnect on each Disconnected event.
+    app.set_reconnect_request_tx(reconnect_request_tx);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -508,308 +412,4 @@ pub(crate) unsafe fn force_dock_icon_from_bundle() {
     let _: () = msg_send![app, setApplicationIconImage: image];
     // Drop the image — NSApplication retains it internally.
     let _: Retained<AnyObject> = Retained::from_raw(image).expect("image was just constructed");
-}
-
-/// Sole writer to the serial port. Any UI-driven packet hits the wire within
-/// one channel hop (~µs) — no waiting on a recv timeout.
-///
-/// M3 fix: this thread is the SOLE updater of `outgoing_progress` /
-/// `outgoing_total`. Counters are bumped via `clipboard::apply_outgoing_progress`
-/// AFTER each successful `transport.send`, so the UI sees real wire-state
-/// progress (≥2 increments visible during typical 500 KB transfers, AC5)
-/// rather than instant jumps to 100% as packets queue into the unbounded mpsc.
-#[allow(clippy::too_many_arguments)]
-fn writer_thread(
-    mut transport: Box<dyn Transport>,
-    outgoing_rx: mpsc::Receiver<Packet>,
-    events_tx: mpsc::Sender<TransportEvent>,
-    client_name: String,
-    outgoing_progress: Arc<AtomicU64>,
-    outgoing_total: Arc<AtomicU64>,
-    outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
-    current_outgoing_label: Arc<std::sync::Mutex<String>>,
-) {
-    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-
-    if let Err(e) = transport.send(&Packet::new(
-        Message::Hello { version: VERSION, client_name },
-        0,
-    )) {
-        log::error!("failed to send HELLO: {e}");
-        let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
-        return;
-    }
-
-    let mut last_heartbeat = Instant::now();
-    // Per-cancel-batch counter. We log a single INFO at the start of a
-    // cancel sweep and another summary INFO when it ends — emitting one
-    // line per dropped chunk floods the log (an 80 KB image is ~320
-    // chunks, a 500 KB image is ~2000).
-    let mut cancel_drop_count: u32 = 0;
-    let mut cancel_active = false;
-
-    loop {
-        let timeout = HEARTBEAT_INTERVAL
-            .saturating_sub(last_heartbeat.elapsed())
-            .max(Duration::from_millis(1));
-
-        match outgoing_rx.recv_timeout(timeout) {
-            Ok(packet) => {
-                let is_clip = matches!(
-                    packet.message,
-                    Message::ClipOffer { .. } | Message::ClipChunk { .. }
-                );
-                let cancelling = outgoing_cancel.load(Ordering::Acquire);
-                if is_clip && cancelling {
-                    // User pressed Cancel mid-transfer. Drop the queued
-                    // clip packet without writing it to the wire so Host
-                    // never sees the rest of the offer.
-                    if !cancel_active {
-                        log::info!("clipboard.send CANCELLED — dropping queued packets");
-                        cancel_active = true;
-                        cancel_drop_count = 0;
-                    }
-                    cancel_drop_count = cancel_drop_count.saturating_add(1);
-                    continue;
-                }
-                if cancelling && !is_clip {
-                    // Drained the cancelled batch. Re-arm for next transfer.
-                    outgoing_cancel.store(false, Ordering::Release);
-                    if cancel_active {
-                        log::info!(
-                            "clipboard.send cancel complete ({cancel_drop_count} packets dropped)"
-                        );
-                        cancel_active = false;
-                        cancel_drop_count = 0;
-                    }
-                }
-                if let Err(e) = transport.send(&packet) {
-                    log::error!("send error: {e}");
-                    let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
-                    return;
-                }
-                // Update progress AFTER send returns — atomic reflects bytes
-                // actually written to the UART, not bytes queued in mpsc.
-                // The label-aware variant clears `current_outgoing_label`
-                // when the transfer reaches DONE (Task 7d).
-                clipboard::apply_outgoing_progress_with_label(
-                    &packet.message,
-                    &outgoing_progress,
-                    &outgoing_total,
-                    &current_outgoing_label,
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Queue empty. If a cancel was pending, the only way to
-                // be here is that we've dropped every queued clip packet —
-                // safe to clear the flag.
-                if outgoing_cancel.load(Ordering::Acquire) {
-                    outgoing_cancel.store(false, Ordering::Release);
-                }
-                if cancel_active {
-                    log::info!(
-                        "clipboard.send cancel complete ({cancel_drop_count} packets dropped)"
-                    );
-                    cancel_active = false;
-                    cancel_drop_count = 0;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-
-        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            let _ = transport.send(&Packet::new(Message::Heartbeat, 0));
-            last_heartbeat = Instant::now();
-        }
-    }
-}
-
-/// Sole reader of the serial port. Translates incoming packets to UI events.
-///
-/// Codex iter5 fix: also owns the zeroing of `outgoing_progress` /
-/// `outgoing_total` at the handshake (HelloAck), Disconnect, and transport
-/// error sites. Doing it here — instead of in the UI thread on
-/// `TransportEvent::Connected` — closes a race window where a peer ClipOffer
-/// arriving between event-emit and the next egui frame would have its freshly
-/// stored `incoming_total` wiped to 0, blanking the status line for the rest
-/// of the transfer.
-#[allow(clippy::too_many_arguments)]
-fn reader_thread(
-    mut transport: Box<dyn Transport>,
-    events_tx: mpsc::Sender<TransportEvent>,
-    outgoing_tx: mpsc::Sender<Packet>,
-    clipboard_state: clipboard::ClipboardState,
-    incoming_progress: Arc<AtomicU64>,
-    incoming_total: Arc<AtomicU64>,
-    outgoing_progress: Arc<AtomicU64>,
-    outgoing_total: Arc<AtomicU64>,
-    receive_images: Arc<std::sync::atomic::AtomicBool>,
-    receive_text: Arc<std::sync::atomic::AtomicBool>,
-    receive_files: Arc<std::sync::atomic::AtomicBool>,
-    incoming_cancel: Arc<std::sync::atomic::AtomicBool>,
-    outgoing_cancel: Arc<std::sync::atomic::AtomicBool>,
-    exec_slot: exec_bridge::ExecEventSlot,
-    current_outgoing_label: Arc<std::sync::Mutex<String>>,
-) {
-    use std::sync::atomic::Ordering;
-
-    // Helper closure — keeps the three reset sites identical and prevents
-    // future drift. `IncomingClipboard::reset()` already zeroes incoming_*;
-    // we also zero outgoing_* (sole owner is writer_thread, which only ever
-    // increments — safe to clobber from here at session boundaries).
-    let reset_session_state = |incoming_clip: &mut clipboard::IncomingClipboard| {
-        incoming_clip.reset();
-        clipboard_state.reset();
-        outgoing_progress.store(0, Ordering::Relaxed);
-        outgoing_total.store(0, Ordering::Relaxed);
-    };
-
-    // Keep our own handle to the sender-side state so we can clear its dedup
-    // hash on disconnect (Codex iter4 F1 — without this, a mid-transfer abort
-    // leaves `LastKind` stamped and the next poll after reconnect dedups
-    // → silent lost-update). `IncomingClipboard` gets a clone for its receive
-    // path; both refer to the same `Arc<Mutex<LastKind>>`.
-    let mut incoming_clip = clipboard::IncomingClipboard::new(
-        clipboard_state.clone(),
-        incoming_progress,
-        incoming_total,
-        receive_images,
-        receive_text,
-        receive_files,
-    );
-    // Cancel-batch state — same role as the writer-side counters: log a
-    // single START and a single END line per cancel sweep instead of one
-    // per dropped chunk.
-    let mut cancel_seen = false;
-    let mut cancel_drop_count: u32 = 0;
-    loop {
-        match transport.recv() {
-            Ok(p) => match p.message {
-                Message::HelloAck { host_name, screen_w, screen_h, .. } => {
-                    log::info!("connected to '{host_name}' ({screen_w}x{screen_h})");
-                    // New session — drop any stale partial reassembly from a
-                    // previous (now-defunct) connection so the progress UI
-                    // doesn't carry over old counters. Also clear the
-                    // sender-side dedup hash so the post-reconnect poll-tick
-                    // resends the current OS-clipboard contents instead of
-                    // dedup-skipping (Codex iter4 F1). Outgoing progress is
-                    // zeroed here (Codex iter5) instead of in the UI thread,
-                    // closing the race vs. an incoming ClipOffer that fires
-                    // between Connected emit and the next egui frame.
-                    reset_session_state(&mut incoming_clip);
-                    let _ = events_tx.send(TransportEvent::Connected {
-                        host_name,
-                        screen_w,
-                        screen_h,
-                    });
-                }
-                Message::Heartbeat => {
-                    let _ = events_tx.send(TransportEvent::Heartbeat);
-                }
-                Message::ClipOffer { format, total_len } => {
-                    if incoming_cancel.swap(false, Ordering::AcqRel) && cancel_seen {
-                        log::info!(
-                            "clipboard.recv cancel complete ({cancel_drop_count} chunks dropped)"
-                        );
-                    }
-                    cancel_seen = false;
-                    cancel_drop_count = 0;
-                    if let Some(decline) = incoming_clip.on_offer(format, total_len) {
-                        // Tell host to drop its outbox — without this it
-                        // would keep streaming chunks we're going to
-                        // discard, saturating RX and starving TX
-                        // (mouse / heartbeats can't squeeze through).
-                        let _ = outgoing_tx.send(Packet::new(decline, 0));
-                    }
-                }
-                Message::ClipDecline { format } => {
-                    // Host doesn't want our offer (its receive_* toggle
-                    // is off, or it tripped a size cap). `apply_clip_decline_with_label`
-                    // flips outgoing_cancel so writer_thread drops queued
-                    // ClipOffer/ClipChunk packets instead of pumping them
-                    // onto the wire to be discarded, clears the filename
-                    // status-line slot (otherwise "Sending file 'X.pdf'"
-                    // would persist past decline since writer drops chunks
-                    // without ever running the apply_outgoing_progress DONE
-                    // path), and returns the format-specific toast
-                    // (FORMAT_FILE → "Peer declined file (Receive files off)").
-                    let toast = clipboard::apply_clip_decline_with_label(
-                        format,
-                        &outgoing_cancel,
-                        &current_outgoing_label,
-                    );
-                    let _ = events_tx.send(TransportEvent::Toast(toast));
-                }
-                Message::ClipChunk { index, data } => {
-                    if incoming_cancel.load(Ordering::Acquire) {
-                        // Drop chunks of the cancelled offer silently after
-                        // logging the first one — an 80 KB image is ~320
-                        // chunks and per-chunk INFO floods the log.
-                        if !cancel_seen {
-                            log::info!(
-                                "clipboard.recv CANCELLED — dropping chunks (first idx {index})"
-                            );
-                            incoming_clip.reset();
-                            cancel_seen = true;
-                            cancel_drop_count = 0;
-                        }
-                        cancel_drop_count = cancel_drop_count.saturating_add(1);
-                        // Flag stays set: more chunks from the same offer
-                        // are still on the wire, drop them too. Cleared on
-                        // the next ClipOffer (above).
-                        continue;
-                    }
-                    incoming_clip.on_chunk(index, data);
-                }
-                Message::ShellOutput { data } => {
-                    exec_bridge::broadcast_exec_event(
-                        &exec_slot,
-                        wiredesk_exec_core::ExecEvent::ShellOutput(data.clone()),
-                    );
-                    let _ = events_tx.send(TransportEvent::ShellOutput(data));
-                }
-                Message::ShellExit { code } => {
-                    exec_bridge::broadcast_exec_event(
-                        &exec_slot,
-                        wiredesk_exec_core::ExecEvent::ShellExit(code),
-                    );
-                    let _ = events_tx.send(TransportEvent::ShellExit(code));
-                }
-                Message::Error { code, msg } => {
-                    log::warn!("error from host: code={code} msg={msg}");
-                    if msg.contains("shell") {
-                        // Fan-out to IPC slot first — it doesn't subscribe
-                        // to the GUI's `events_tx` ShellError filter, but
-                        // a host-error during a `wd --exec` run is exactly
-                        // what the runner wants to surface as HostError.
-                        exec_bridge::broadcast_exec_event(
-                            &exec_slot,
-                            wiredesk_exec_core::ExecEvent::HostError(msg.clone()),
-                        );
-                        let _ = events_tx.send(TransportEvent::ShellError(msg));
-                    }
-                }
-                Message::Disconnect => {
-                    log::info!("host disconnected");
-                    reset_session_state(&mut incoming_clip);
-                    let _ = events_tx.send(TransportEvent::Disconnected("host disconnected".into()));
-                    return;
-                }
-                other => {
-                    log::debug!("ignored message: {other:?}");
-                }
-            },
-            Err(ref e) if e.to_string().contains("timeout") => continue,
-            Err(wiredesk_core::error::WireDeskError::Protocol(ref msg)) => {
-                log::warn!("dropping bad frame: {msg}");
-                continue;
-            }
-            Err(e) => {
-                log::error!("transport error: {e}");
-                reset_session_state(&mut incoming_clip);
-                let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
-                return;
-            }
-        }
-    }
 }

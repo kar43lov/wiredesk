@@ -31,10 +31,15 @@ impl std::fmt::Display for ConnectionState {
 }
 
 /// Messages from the transport thread to the UI.
+#[derive(Debug)]
 #[allow(dead_code)]
 pub enum TransportEvent {
     Connected { host_name: String, screen_w: u16, screen_h: u16 },
     Disconnected(String),
+    /// The link supervisor is reopening the transport after a disconnect.
+    /// `attempt` is the 1-based reopen attempt number (drives the
+    /// "Reconnecting… (attempt N)" status, Task 5).
+    Reconnecting { attempt: u32 },
     ClipboardFromHost(String),
     Heartbeat,
     ShellOutput(Vec<u8>),
@@ -175,6 +180,11 @@ pub struct WireDeskApp {
     /// belongs to the Settings panel — this one is chrome-wide so it shows up
     /// regardless of whether the Settings collapse is open.
     transient_toast: Option<(String, Instant)>,
+    /// Channel to the link supervisor: a `()` here asks it to reopen the
+    /// transport. Sent once per disconnect episode (the supervisor drains
+    /// duplicates after a successful reconnect). `None` only in unit tests
+    /// that construct the app without a supervisor.
+    reconnect_request_tx: Option<mpsc::Sender<()>>,
 }
 
 // ---- UI palette / sizing constants ---------------------------------------
@@ -405,7 +415,16 @@ impl WireDeskApp {
             outgoing_cancel,
             incoming_cancel,
             transient_toast: None,
+            reconnect_request_tx: None,
         }
+    }
+
+    /// Wire the supervisor's reconnect-request channel into the app. Called
+    /// once from `main` after the supervisor is spawned. Kept off `new()` to
+    /// avoid growing its already-long signature and so unit tests can build
+    /// the app without a live supervisor.
+    pub fn set_reconnect_request_tx(&mut self, tx: mpsc::Sender<()>) {
+        self.reconnect_request_tx = Some(tx);
     }
 
     fn refresh_available_ports(&mut self) {
@@ -1414,6 +1433,18 @@ impl eframe::App for WireDeskApp {
                     if let Ok(mut g) = self.current_outgoing_label.lock() {
                         g.clear();
                     }
+                    // Ask the supervisor to reopen the transport. Once per
+                    // episode is enough — the supervisor drains any duplicate
+                    // requests that pile up while it's reconnecting, so even
+                    // if several Disconnected events arrive (storm + host
+                    // Disconnect racing) we don't tear down the fresh link.
+                    if let Some(ref tx) = self.reconnect_request_tx {
+                        let _ = tx.send(());
+                    }
+                }
+                TransportEvent::Reconnecting { attempt } => {
+                    // Minimal handling for Task 3 (UI status lands in Task 5).
+                    self.status_msg = format!("reconnecting (attempt {attempt})");
                 }
                 TransportEvent::ClipboardFromHost(text) => {
                     self.clipboard_text = text;
