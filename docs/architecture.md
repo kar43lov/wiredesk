@@ -50,20 +50,28 @@ monitor.rs             — NSScreen FFI wrapper (objc2-app-kit) под cfg(macos
                           MonitorInfo { index, name, frame, size },
                           list_monitors(), resolve_target_monitor(preferred, &monitors)
                           (pure helper для fullscreen orchestration)
+link.rs                — LinkSupervisor: владеет парой reader/writer, respawn +
+                          reopen транспорта с backoff на disconnect/storm.
+                          LinkContext (shared-Arc'и, переживающие реконнект),
+                          spawn_link/spawn_supervisor, StormCounter-интеграция,
+                          link_up-гейт для IPC (true только после HelloAck)
 ```
 
 ---
 
 ## Threading (client)
 
-Клиент делит serial-порт на два независимых хэндла через `Transport::try_clone()`:
+Клиент делит serial-порт на два независимых хэндла через `Transport::try_clone()`. Пара reader/writer живёт под надзором **LinkSupervisor** (`link.rs`) и пересоздаётся при реконнекте:
 
-- **writer_thread** — единственный отправитель. Блокируется на `outgoing_rx.recv_timeout(2s)`. Пакет → отправляет немедленно. Таймаут → шлёт Heartbeat. UI кладёт пакеты в канал и не ждёт.
-- **reader_thread** — единственный получатель. recv() в цикле, диспатчит на `events_tx` для UI. Также держит `IncomingClipboard` для сборки входящих ClipChunks.
-- **clipboard poll thread** — раз в 500мс читает Mac clipboard, при изменении отправляет ClipOffer + ClipChunks через тот же `outgoing_tx`.
+- **writer_thread** (`link.rs`) — единственный отправитель. Блокируется на `outgoing_rx.recv_timeout(2s)`. Пакет → отправляет немедленно. Таймаут → шлёт Heartbeat. UI кладёт пакеты в канал и не ждёт. При выходе **возвращает `outgoing_rx`** через JoinHandle — канал переживает реконнект, клоны `outgoing_tx` у остальных потоков остаются валидными.
+- **reader_thread** (`link.rs`) — единственный получатель. recv() в цикле, диспатчит на `events_tx` для UI. Держит `IncomingClipboard`, `StormCounter` (детект frame-error storm: 10 подряд `Protocol`-ошибок) и liveness-budget (6s idle / 30s busy без единого пакета = тихая смерть host'а). Поднимает `link_up` на HelloAck, опускает на любом выходе.
+- **supervisor thread** (`link.rs::spawn_supervisor`) — слушает `reconnect_request_rx` (UI шлёт `()` на каждый Disconnected; стартовое подключение — первый же запрос из main). Teardown старой пары через shared shutdown-флаг (send/recv могут никогда не ошибиться — флаг обязателен), reopen транспорта с backoff 1s→2s→…→30s cap, respawn пары, новый Hello. Дубли запросов дренируются ДО спавна нового линка.
+- **clipboard poll thread** — раз в 500мс читает Mac clipboard, при изменении отправляет ClipOffer + ClipChunks через тот же `outgoing_tx`. Реконнект не переживать не нужно — поток не владеет транспортом.
 - **keyboard tap thread** (только macOS) — отдельный CFRunLoop, владеет CGEventTap. Подробнее в секции «Keyboard hijack».
 
 Латенси UI→провод ~µs (только время записи в UART, ~100µs).
+
+Host-сторона зеркально: `session_thread.rs` обёрнут в `'reopen` loop — storm или fatal `Transport`-ошибка разбирает Session (`into_injector`, внутри `release_all` против залипших клавиш), ждёт 500ms (Win COM close асинхронный) и переоткрывает порт с тем же backoff.
 
 ## Data flow
 
@@ -156,7 +164,7 @@ crates/wiredesk-transport/src/bluetooth/
 - **Image encode/decode:** `image 0.25` (`default-features=false, features=["png"]`), helpers `encode_rgba_to_png` / `decode_png_to_rgba` дублируются на обеих сторонах. Encode в poll thread (~50–150 ms). Decode имеет `Limits::max_alloc = 64 MB` + post-decode проверка `(w*h*4) ≤ 64 MB` (PNG-bomb защита: палеточный 8K×8K decode'ит в 256 MB RGBA).
 - **File commit pipeline (receive side).** `unpack_first_chunk(payload)` → `(name, content)` → `sanitize_basename(name)` strips path components, `..` segments, Windows drive letters, Windows-reserved chars (`<>:"|?*`) и NUL → `_`, prefixes NTFS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`) `_`. Empty → `clipboard.bin` fallback. Write в `dirs::cache_dir()/WireDesk` (Mac — `~/Library/Caches/WireDesk/`) или `%TEMP%\WireDesk\` (Win), затем `set_file_url`/`set_cf_hdrop` FFI на OS clipboard. **CRITICAL:** dedup-стамп (`set_file(hash)`/`LastKind::File(hash)`) применяется только если FFI succeeded — иначе bidirectional re-emit loop (OS clipboard not actually replaced). `in_flight_file_path` slot tracking + `reset()` cleanup на abort/disconnect — partial file не остаётся.
 - **Cache vacuum.** Startup hook `run_startup_vacuum(Duration::from_secs(24 * 3600))` (обе стороны) — вычищает файлы старше 24h из cache dir через `wiredesk_core::cache_vacuum::vacuum_cache_dir`. Non-fatal: missing dir → Ok(0); per-file errors → log warn + continue.
-- **Settings → Clipboard panel:** 5 независимых runtime-toggle через `Arc<AtomicBool>` — `send_images`, `receive_images`, `send_text`, `receive_text`, `receive_files`. Mac — без рестарта (Arc.store() прямо из egui checkbox). Win — Save+Restart pattern (Arc читается из HostConfig при boot; respawn нужен для apply). Полезно для apps вроде Whispr Flow / Maccy которые часто пишут в clipboard.
+- **Settings → Clipboard panel:** 6 независимых runtime-toggle через `Arc<AtomicBool>` — `send_images`, `receive_images`, `send_text`, `receive_text`, `receive_files`, `send_files` (последний — opt-in, default OFF). Mac — без рестарта (Arc.store() прямо из egui checkbox). Win — Save+Restart pattern (Arc читается из HostConfig при boot; respawn нужен для apply). Полезно для apps вроде Whispr Flow / Maccy которые часто пишут в clipboard.
 - **Status UI на Mac:** (1) `format_progress("Sending clipboard", cur, total)` или `format_progress("Sending file 'X.pdf'", cur, total)` (через `current_outgoing_label` Arc<Mutex<String>> slot) рендерится как `egui::ProgressBar` с inline текстом — в chrome panel И в capture banner (для fullscreen где menu bar скрыт macOS). (2) `NSStatusItem` справа от часов через `objc2-app-kit::NSStatusBar::systemStatusBar` + `dispatch_async_f` на main queue. Idle: «W», active: «↑43%» / «↓67%». Click handler — TODO (custom NSObject subclass через `objc2::declare_class!` нужен).
 - **Tray balloon notification (Win)** при oversize file/image: `SessionStatus::Notification(String)` slot в `StatusState` — отдельно от persistent `Connected/Waiting/Disconnected`, не overwrites tray icon color и settings status row. Surface через `nwg::TrayNotification::show(msg, title, WARNING_ICON|LARGE_ICON, None)`.
 - **Tray double-click → Settings (Win):** nwg 1.0.13 не имеет нативного double-click event для tray. Workaround: `OnMousePress(MousePressLeftUp)` + `Cell<Option<Instant>>` tracking previous up — два up в окне 500ms = double-click.
