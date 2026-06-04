@@ -35,6 +35,18 @@ impl std::fmt::Display for ConnectionState {
     }
 }
 
+/// State to show while the supervisor is (re)opening the transport: a cold
+/// start (no handshake ever completed) is a first connect — "Connecting…" —
+/// while any later cycle is a true "Reconnecting…". Pure helper so the
+/// wording rule is unit-testable.
+fn reconnect_state(ever_connected: bool) -> ConnectionState {
+    if ever_connected {
+        ConnectionState::Reconnecting
+    } else {
+        ConnectionState::Connecting
+    }
+}
+
 /// Messages from the transport thread to the UI.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -62,6 +74,9 @@ pub struct WireDeskApp {
     /// 1-based reopen attempt number, set from `TransportEvent::Reconnecting`.
     /// Only meaningful while `state == ConnectionState::Reconnecting`.
     reconnect_attempt: u32,
+    /// True once a handshake has ever completed in this process — picks
+    /// "Connecting…" vs "Reconnecting…" wording (cold start isn't a RE-connect).
+    ever_connected: bool,
     capturing: bool,
     fullscreen: bool,
     host_name: String,
@@ -376,6 +391,7 @@ impl WireDeskApp {
         Self {
             state: ConnectionState::Disconnected,
             reconnect_attempt: 0,
+            ever_connected: false,
             capturing: false,
             fullscreen: false,
             host_name: String::new(),
@@ -1428,6 +1444,7 @@ impl eframe::App for WireDeskApp {
             match event {
                 TransportEvent::Connected { host_name, screen_w, screen_h } => {
                     self.state = ConnectionState::Connected;
+                    self.ever_connected = true;
                     self.host_name = host_name;
                     self.screen_w = screen_w;
                     self.screen_h = screen_h;
@@ -1469,9 +1486,17 @@ impl eframe::App for WireDeskApp {
                     }
                 }
                 TransportEvent::Reconnecting { attempt } => {
-                    self.state = ConnectionState::Reconnecting;
+                    // Cold start (never connected yet) is a first connect, not
+                    // a RE-connect — show "Connecting…" instead of the
+                    // misleading "Reconnecting… (attempt 1)". This also keeps
+                    // the `Connecting` variant alive (review minor).
+                    self.state = reconnect_state(self.ever_connected);
                     self.reconnect_attempt = attempt;
-                    self.status_msg = format!("reconnecting (attempt {attempt})");
+                    self.status_msg = if self.ever_connected {
+                        format!("reconnecting (attempt {attempt})")
+                    } else {
+                        format!("connecting (attempt {attempt})")
+                    };
                 }
                 TransportEvent::ClipboardFromHost(text) => {
                     self.clipboard_text = text;
@@ -2098,6 +2123,11 @@ mod tests {
         app.state = ConnectionState::Reconnecting;
         app.reconnect_attempt = 3;
         assert_eq!(app.status_text(), "Reconnecting… (attempt 3)");
+
+        // Wording rule: cold start (never connected) shows Connecting,
+        // any later supervisor cycle is a true Reconnecting.
+        assert_eq!(reconnect_state(false), ConnectionState::Connecting);
+        assert_eq!(reconnect_state(true), ConnectionState::Reconnecting);
 
         // Connected — embeds host name and resolution.
         app.state = ConnectionState::Connected;
