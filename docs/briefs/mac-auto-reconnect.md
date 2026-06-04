@@ -1,6 +1,6 @@
 # Бриф: Mac client auto-reconnect после host disconnect
 
-**Status:** ready for /planning:make. Branch предложен: `feat/mac-auto-reconnect`.
+**Status:** SUPERSEDED 2026-06-04 → поглощён `docs/briefs/serial-error-storm-recovery.md` (Mac reconnect loop = компонент 2 объединённого scope; этот файл остаётся детальной спекой компонента — Вариант 1, AC, риски актуальны).
 
 ## Контекст
 
