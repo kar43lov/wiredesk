@@ -1357,7 +1357,13 @@ impl WireDeskApp {
         // Cap scrollback at ~64 KB to avoid unbounded growth.
         const MAX: usize = 64 * 1024;
         if self.shell_output.len() > MAX {
-            let excess = self.shell_output.len() - MAX;
+            let mut excess = self.shell_output.len() - MAX;
+            // `drain(..excess)` panics if `excess` lands inside a multi-byte
+            // UTF-8 sequence (e.g. Cyrillic / JSON output). Advance to the next
+            // char boundary so we always cut on a valid edge.
+            while excess < self.shell_output.len() && !self.shell_output.is_char_boundary(excess) {
+                excess += 1;
+            }
             self.shell_output.drain(..excess);
         }
     }
