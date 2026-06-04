@@ -68,11 +68,11 @@
 
 ### Task 5: Mac client — UI-статус Reconnecting
 
-- [ ] В `apps/wiredesk-client/src/app.rs`: добавить `ConnectionState::Reconnecting` (хранить `reconnect_attempt: u32` полем приложения); обработать `TransportEvent::Reconnecting { attempt }` → state + attempt; `TransportEvent::Connected` уже сбрасывает в Connected.
-- [ ] Обновить `status_text()` (app.rs:1333-1351): для Reconnecting вернуть `"Reconnecting… (attempt N)"`.
-- [ ] Capture-mode: в `render_capture_overlays` banner-текст при `state != Connected` показывать «● HOST LINK LOST — reconnecting…» (жёлтый tint вместо красного), чтобы юзер в fullscreen видел потерю канала.
-- [ ] Обновить тесты `status_text()` (есть существующие unit-тесты pure-хелпера) — добавить кейс Reconnecting.
-- [ ] Запустить `cargo test -p wiredesk-client` и `cargo clippy -p wiredesk-client -- -D warnings` — должны проходить.
+- [x] В `apps/wiredesk-client/src/app.rs`: добавить `ConnectionState::Reconnecting` (хранить `reconnect_attempt: u32` полем приложения); обработать `TransportEvent::Reconnecting { attempt }` → state + attempt; `TransportEvent::Connected` уже сбрасывает в Connected.
+- [x] Обновить `status_text()` (app.rs:1333-1351): для Reconnecting вернуть `"Reconnecting… (attempt N)"`.
+- [x] Capture-mode: в `render_capture_overlays` banner-текст при `state != Connected` показывать «● HOST LINK LOST — reconnecting…» (жёлтый tint вместо красного), чтобы юзер в fullscreen видел потерю канала.
+- [x] Обновить тесты `status_text()` (есть существующие unit-тесты pure-хелпера) — добавить кейс Reconnecting.
+- [x] Запустить `cargo test -p wiredesk-client` и `cargo clippy -p wiredesk-client -- -D warnings` — должны проходить.
 
 ### Task 6: Полная верификация + документация
 

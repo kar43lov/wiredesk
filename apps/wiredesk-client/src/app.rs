@@ -18,6 +18,10 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// Link supervisor is reopening the transport after a disconnect. The
+    /// 1-based attempt number is stored separately in `WireDeskApp`
+    /// (`reconnect_attempt`) so the enum stays `Copy`.
+    Reconnecting,
 }
 
 impl std::fmt::Display for ConnectionState {
@@ -26,6 +30,7 @@ impl std::fmt::Display for ConnectionState {
             ConnectionState::Disconnected => write!(f, "Not connected"),
             ConnectionState::Connecting => write!(f, "Connecting…"),
             ConnectionState::Connected => write!(f, "Connected"),
+            ConnectionState::Reconnecting => write!(f, "Reconnecting…"),
         }
     }
 }
@@ -54,6 +59,9 @@ pub enum TransportEvent {
 
 pub struct WireDeskApp {
     state: ConnectionState,
+    /// 1-based reopen attempt number, set from `TransportEvent::Reconnecting`.
+    /// Only meaningful while `state == ConnectionState::Reconnecting`.
+    reconnect_attempt: u32,
     capturing: bool,
     fullscreen: bool,
     host_name: String,
@@ -367,6 +375,7 @@ impl WireDeskApp {
         let initial_h = initial_config.height;
         Self {
             state: ConnectionState::Disconnected,
+            reconnect_attempt: 0,
             capturing: false,
             fullscreen: false,
             host_name: String::new(),
@@ -1198,7 +1207,21 @@ impl WireDeskApp {
     /// row is less click-critical than the top.
     fn render_capture_overlays(&self, ctx: &egui::Context) {
         let screen_rect = ctx.screen_rect();
-        let banner_fill = COLOR_CAPTURE_RED.linear_multiply(0.3);
+        // When the link is down the user is still in capture/fullscreen but
+        // input goes nowhere — surface that loudly with a yellow banner so the
+        // (now-frozen) Host view isn't mistaken for a live session.
+        let link_lost = self.state != ConnectionState::Connected;
+        let (banner_fill, banner_text) = if link_lost {
+            (
+                egui::Color32::from_rgb(180, 140, 0).linear_multiply(0.35),
+                "HOST LINK LOST — reconnecting…",
+            )
+        } else {
+            (
+                COLOR_CAPTURE_RED.linear_multiply(0.3),
+                "CAPTURING — Cmd+Esc to release",
+            )
+        };
 
         egui::Area::new(egui::Id::new("capture_banner_overlay"))
             .order(egui::Order::Foreground)
@@ -1213,7 +1236,7 @@ impl WireDeskApp {
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
                                 ui.label(
-                                    egui::RichText::new("CAPTURING — Cmd+Esc to release")
+                                    egui::RichText::new(banner_text)
                                         .size(BANNER_FONT_SIZE)
                                         .strong()
                                         .color(egui::Color32::WHITE),
@@ -1356,6 +1379,9 @@ impl WireDeskApp {
                 self.host_name, self.screen_w, self.screen_h
             ),
             ConnectionState::Connecting => "Connecting…".to_string(),
+            ConnectionState::Reconnecting => {
+                format!("Reconnecting… (attempt {})", self.reconnect_attempt)
+            }
             ConnectionState::Disconnected => {
                 // Echo the most recent status message when it carries a
                 // disconnect reason ("disconnected: …"). Otherwise fall
@@ -1443,7 +1469,8 @@ impl eframe::App for WireDeskApp {
                     }
                 }
                 TransportEvent::Reconnecting { attempt } => {
-                    // Minimal handling for Task 3 (UI status lands in Task 5).
+                    self.state = ConnectionState::Reconnecting;
+                    self.reconnect_attempt = attempt;
                     self.status_msg = format!("reconnecting (attempt {attempt})");
                 }
                 TransportEvent::ClipboardFromHost(text) => {
@@ -1563,6 +1590,7 @@ impl eframe::App for WireDeskApp {
             let status_color = match self.state {
                 ConnectionState::Connected => egui::Color32::GREEN,
                 ConnectionState::Connecting => egui::Color32::YELLOW,
+                ConnectionState::Reconnecting => egui::Color32::YELLOW,
                 ConnectionState::Disconnected => egui::Color32::RED,
             };
             let status_text = self.status_text();
@@ -2039,6 +2067,7 @@ mod tests {
             (ConnectionState::Disconnected, "Not connected"),
             (ConnectionState::Connecting, "Connecting…"),
             (ConnectionState::Connected, "Connected"),
+            (ConnectionState::Reconnecting, "Reconnecting…"),
         ];
         for (state, expected) in cases {
             assert_eq!(format!("{state}"), expected, "Display for {state:?}");
@@ -2064,6 +2093,11 @@ mod tests {
         // Connecting — current spec uses ellipsis (…).
         app.state = ConnectionState::Connecting;
         assert_eq!(app.status_text(), "Connecting…");
+
+        // Reconnecting — embeds the 1-based attempt counter.
+        app.state = ConnectionState::Reconnecting;
+        app.reconnect_attempt = 3;
+        assert_eq!(app.status_text(), "Reconnecting… (attempt 3)");
 
         // Connected — embeds host name and resolution.
         app.state = ConnectionState::Connected;
