@@ -25,6 +25,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,6 +79,7 @@ pub fn spawn_ipc_acceptor(
     outgoing_tx: mpsc::Sender<Packet>,
     exec_slot: ExecEventSlot,
     single_inflight: Arc<Mutex<()>>,
+    link_up: Arc<AtomicBool>,
 ) {
     // Stale socket from prior crash — `bind` fails with EADDRINUSE
     // unless we unlink first. Ignore not-found.
@@ -130,8 +132,9 @@ pub fn spawn_ipc_acceptor(
                     let outgoing_tx = outgoing_tx.clone();
                     let exec_slot = exec_slot.clone();
                     let single_inflight = single_inflight.clone();
+                    let link_up = link_up.clone();
                     thread::spawn(move || {
-                        handle_connection(stream, outgoing_tx, exec_slot, single_inflight);
+                        handle_connection(stream, outgoing_tx, exec_slot, single_inflight, link_up);
                     });
                 }
                 Err(e) => {
@@ -152,6 +155,7 @@ fn handle_connection(
     outgoing_tx: mpsc::Sender<Packet>,
     exec_slot: ExecEventSlot,
     single_inflight: Arc<Mutex<()>>,
+    link_up: Arc<AtomicBool>,
 ) {
     let req = match read_request(&mut stream) {
         Ok(r) => r,
@@ -166,6 +170,23 @@ fn handle_connection(
         req.ssh,
         req.timeout_secs
     );
+
+    // Serial link is mid-reconnect (supervisor cleared `link_up`): the
+    // writer thread is gone, so any ShellOpen/ShellInput we'd queue
+    // would block in the outgoing channel until a new link comes up,
+    // and the run would just time out on a dead wire. Bail out
+    // immediately with a distinct terminal frame so the term side can
+    // map it to exit 125 (transport class) instead of waiting. This
+    // check is BEFORE the keepalive and single_inflight acquire — no
+    // point queuing against a link that isn't there.
+    if !link_up.load(Ordering::Relaxed) {
+        log::info!("IPC handler: link down (reconnecting) — refusing run");
+        let _ = write_response(
+            &mut stream,
+            &IpcResponse::TransportUnavailable("transport reconnecting — retry shortly".into()),
+        );
+        return;
+    }
 
     // Keepalive BEFORE acquiring single_inflight. If a prior handler
     // is stuck in run_oneshot (e.g. `--ssh dev "exit 42"` exits the
@@ -440,8 +461,15 @@ mod tests {
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let link_up = Arc::new(AtomicBool::new(true));
 
-        spawn_ipc_acceptor(socket.clone(), outgoing_tx, exec_slot.clone(), inflight);
+        spawn_ipc_acceptor(
+            socket.clone(),
+            outgoing_tx,
+            exec_slot.clone(),
+            inflight,
+            link_up,
+        );
 
         // Give the acceptor a moment to bind before we connect.
         thread::sleep(Duration::from_millis(50));
@@ -503,6 +531,7 @@ mod tests {
                 IpcResponse::Stdout(b) => stdout_collected.extend_from_slice(&b),
                 IpcResponse::Exit(c) => break c,
                 IpcResponse::Error(m) => panic!("handler error: {m}"),
+                IpcResponse::TransportUnavailable(m) => panic!("unexpected unavailable: {m}"),
             }
         };
         stage_thread.join().expect("stage thread");
@@ -510,6 +539,54 @@ mod tests {
         assert_eq!(exit, 0);
         let s = String::from_utf8(stdout_collected).unwrap();
         assert!(s.contains("hi\n"), "stdout streamed: {s:?}");
+    }
+
+    /// When the serial link is mid-reconnect (`link_up == false`), the
+    /// handler must answer `TransportUnavailable` immediately and never
+    /// touch `outgoing_tx` (no ShellOpen queued against a dead wire).
+    #[test]
+    fn handler_link_down_returns_transport_unavailable() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let socket = tmp.path().join("wd-exec.sock");
+
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let link_up = Arc::new(AtomicBool::new(false)); // link DOWN
+
+        spawn_ipc_acceptor(
+            socket.clone(),
+            outgoing_tx,
+            exec_slot,
+            inflight,
+            link_up,
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        let req = IpcRequest {
+            cmd: "echo hi".into(),
+            ssh: None,
+            timeout_secs: 5,
+            compress: false,
+        };
+        write_request(&mut client, &req).unwrap();
+
+        match wiredesk_exec_core::ipc::read_response(&mut client).unwrap() {
+            IpcResponse::TransportUnavailable(msg) => {
+                assert!(msg.contains("reconnecting"), "msg: {msg}");
+            }
+            other => panic!("expected TransportUnavailable, got {other:?}"),
+        }
+
+        // Handler must NOT have queued any packet (no ShellOpen against
+        // a dead wire).
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "handler must not send any outgoing packet when link is down"
+        );
     }
 
     #[test]
@@ -527,9 +604,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Packet>();
         let slot: ExecEventSlot = Arc::new(Mutex::new(None));
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let link_up = Arc::new(AtomicBool::new(true));
 
         // Must not panic.
-        spawn_ipc_acceptor(socket, tx, slot, inflight);
+        spawn_ipc_acceptor(socket, tx, slot, inflight, link_up);
     }
 
     #[test]
@@ -544,7 +622,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Packet>();
         let slot: ExecEventSlot = Arc::new(Mutex::new(None));
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        spawn_ipc_acceptor(socket.clone(), tx, slot, inflight);
+        let link_up = Arc::new(AtomicBool::new(true));
+        spawn_ipc_acceptor(socket.clone(), tx, slot, inflight, link_up);
         thread::sleep(Duration::from_millis(50));
 
         // Now it should be a real socket — connect should succeed.

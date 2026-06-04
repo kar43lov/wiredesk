@@ -172,7 +172,14 @@ fn main() {
         let single_inflight: Arc<std::sync::Mutex<()>> =
             Arc::new(std::sync::Mutex::new(()));
         let socket_path = wiredesk_exec_core::default_socket_path();
-        ipc::spawn_ipc_acceptor(socket_path, ipc_outgoing_tx, ipc_slot, single_inflight);
+        let ipc_link_up = link_up.clone();
+        ipc::spawn_ipc_acceptor(
+            socket_path,
+            ipc_outgoing_tx,
+            ipc_slot,
+            single_inflight,
+            ipc_link_up,
+        );
     }
     #[cfg(not(target_os = "macos"))]
     {

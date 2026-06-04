@@ -351,12 +351,37 @@ fn try_socket_first(
             IpcResponse::Stdout(b) => {
                 let _ = out.write_all(&b);
             }
-            IpcResponse::Exit(code) => return Ok(Some(code)),
-            IpcResponse::Error(msg) => {
-                eprintln!("wd: host error: {msg}");
-                return Ok(Some(1));
+            terminal => {
+                // Stdout is the only non-terminal frame; everything else
+                // ends the run. classify_terminal_response is total over
+                // the terminal variants, so the expect never fires.
+                let (code, diag) = classify_terminal_response(&terminal)
+                    .expect("non-Stdout IpcResponse is terminal");
+                if let Some(d) = diag {
+                    eprintln!("{d}");
+                }
+                return Ok(Some(code));
             }
         }
+    }
+}
+
+/// Map a *terminal* `IpcResponse` to the exit code `wd` should return
+/// plus an optional stderr diagnostic line. Returns `None` for the
+/// non-terminal `Stdout` variant (the caller streams those to stdout
+/// instead).
+///
+/// `TransportUnavailable` maps to exit 125 (transport class — the GUI's
+/// serial link is mid-reconnect) to match the direct-open path's
+/// 125-on-transport-error convention, distinct from exit 1 for a host
+/// error. Kept pure so it's unit-testable without a live socket.
+#[cfg(target_os = "macos")]
+fn classify_terminal_response(resp: &IpcResponse) -> Option<(i32, Option<String>)> {
+    match resp {
+        IpcResponse::Stdout(_) => None,
+        IpcResponse::Exit(code) => Some((*code, None)),
+        IpcResponse::Error(msg) => Some((1, Some(format!("wd: host error: {msg}")))),
+        IpcResponse::TransportUnavailable(msg) => Some((125, Some(format!("wd: {msg}")))),
     }
 }
 
@@ -1266,6 +1291,7 @@ mod tests {
                 IpcResponse::Stdout(b) => collected.extend_from_slice(&b),
                 IpcResponse::Exit(c) => break c,
                 IpcResponse::Error(m) => panic!("error: {m}"),
+                IpcResponse::TransportUnavailable(m) => panic!("unavailable: {m}"),
             }
         };
         server.join().expect("server thread");
@@ -1278,6 +1304,39 @@ mod tests {
         // the optimiser strips other paths.
         let _: fn(&mut std::os::unix::net::UnixStream, &mut [u8]) -> std::io::Result<usize> =
             std::os::unix::net::UnixStream::read;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classify_terminal_response_transport_unavailable_is_125() {
+        use wiredesk_exec_core::ipc::IpcResponse;
+
+        // TransportUnavailable → exit 125 (transport class) with a
+        // `wd: <msg>` stderr diagnostic.
+        let (code, diag) = classify_terminal_response(&IpcResponse::TransportUnavailable(
+            "transport reconnecting — retry shortly".into(),
+        ))
+        .expect("terminal");
+        assert_eq!(code, 125);
+        assert_eq!(
+            diag.as_deref(),
+            Some("wd: transport reconnecting — retry shortly")
+        );
+
+        // Error → exit 1 (host class), distinct from 125.
+        let (code, diag) =
+            classify_terminal_response(&IpcResponse::Error("boom".into())).expect("terminal");
+        assert_eq!(code, 1);
+        assert_eq!(diag.as_deref(), Some("wd: host error: boom"));
+
+        // Exit passes the code through with no diagnostic.
+        let (code, diag) =
+            classify_terminal_response(&IpcResponse::Exit(42)).expect("terminal");
+        assert_eq!(code, 42);
+        assert!(diag.is_none());
+
+        // Stdout is non-terminal.
+        assert!(classify_terminal_response(&IpcResponse::Stdout(b"x".to_vec())).is_none());
     }
 
     #[test]

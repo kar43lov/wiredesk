@@ -60,11 +60,11 @@
 
 ### Task 4: Mac client — IPC во время reconnect
 
-- [ ] Добавить в enum `IpcResponse` (`crates/wiredesk-exec-core/src/ipc.rs`) НОВЫЙ вариант `TransportUnavailable(String)` — не перегружать существующий `Error` (правило расширения hand-rolled протоколов: новый opcode/вариант, не новая семантика старого). Оба конца IPC (`wiredesk-client` GUI и `wd`/`wiredesk-term`) собираются из одного workspace одной командой — lock-step совместимость обеспечена обычной пересборкой.
-- [ ] В `apps/wiredesk-client/src/ipc.rs`: пробросить `link_up: Arc<AtomicBool>` в IPC acceptor/handler. В начале обработки запроса (до захвата `single_inflight`/запуска runner'а): если `!link_up.load()` → немедленно ответить `IpcResponse::TransportUnavailable("transport reconnecting — retry shortly".into())` и закрыть соединение.
-- [ ] Term-side маппинг: ВАЖНО — сейчас `apps/wiredesk-term/src/main.rs:355-357` маппит любой `IpcResponse::Error` в exit 1; exit 125 (строки 471-479) живёт только на direct-open пути. Добавить arm для `IpcResponse::TransportUnavailable` → stderr `wd: transport reconnecting — retry shortly` + **exit 125** (transport-класс, AC3 брифа). Без этой правки AC3 не выполняется.
-- [ ] Написать тесты: (1) IPC handler с `link_up=false` возвращает `TransportUnavailable` без попытки писать в outgoing (mock/фейковый stream по образцу существующих ipc-тестов); (2) term-side: `TransportUnavailable` → exit 125 (unit на функцию маппинга, если она выделена; иначе выделить pure-хелпер).
-- [ ] Запустить `cargo test -p wiredesk-client -p wiredesk-exec-core` — должны проходить.
+- [x] Добавить в enum `IpcResponse` (`crates/wiredesk-exec-core/src/ipc.rs`) НОВЫЙ вариант `TransportUnavailable(String)` — не перегружать существующий `Error` (правило расширения hand-rolled протоколов: новый opcode/вариант, не новая семантика старого). Оба конца IPC (`wiredesk-client` GUI и `wd`/`wiredesk-term`) собираются из одного workspace одной командой — lock-step совместимость обеспечена обычной пересборкой.
+- [x] В `apps/wiredesk-client/src/ipc.rs`: пробросить `link_up: Arc<AtomicBool>` в IPC acceptor/handler. В начале обработки запроса (до захвата `single_inflight`/запуска runner'а): если `!link_up.load()` → немедленно ответить `IpcResponse::TransportUnavailable("transport reconnecting — retry shortly".into())` и закрыть соединение.
+- [x] Term-side маппинг: ВАЖНО — сейчас `apps/wiredesk-term/src/main.rs:355-357` маппит любой `IpcResponse::Error` в exit 1; exit 125 (строки 471-479) живёт только на direct-open пути. Добавить arm для `IpcResponse::TransportUnavailable` → stderr `wd: transport reconnecting — retry shortly` + **exit 125** (transport-класс, AC3 брифа). Без этой правки AC3 не выполняется. (Реализовано через pure-хелпер `classify_terminal_response`.)
+- [x] Написать тесты: (1) IPC handler с `link_up=false` возвращает `TransportUnavailable` без попытки писать в outgoing (mock/фейковый stream по образцу существующих ipc-тестов); (2) term-side: `TransportUnavailable` → exit 125 (unit на функцию маппинга, если она выделена; иначе выделить pure-хелпер).
+- [x] Запустить `cargo test -p wiredesk-client -p wiredesk-exec-core` — должны проходить.
 
 ### Task 5: Mac client — UI-статус Reconnecting
 

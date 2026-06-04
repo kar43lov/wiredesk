@@ -37,11 +37,22 @@ pub struct IpcRequest {
 /// exactly one terminal frame (`Exit` on success, `Error` on a failure
 /// the handler decided to surface to the caller — e.g. transport drop
 /// mid-run, runner returning Closed).
+///
+/// `TransportUnavailable` is a distinct terminal variant (not folded
+/// into `Error`) so the term side can map it to exit 125 (transport
+/// class) instead of exit 1 (host error). It's emitted immediately,
+/// before the run even starts, when the GUI's serial link is mid-reconnect
+/// (`link_up == false`): there's no point queuing a `wd --exec` against a
+/// dead wire. Adding a new variant (not overloading `Error`'s semantics)
+/// follows the hand-rolled-protocol extension rule. GUI and `wd` ship
+/// from the same workspace via lock-step rebuilds, so there's no
+/// version-mismatch window where one end lacks this variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IpcResponse {
     Stdout(Vec<u8>),
     Exit(i32),
     Error(String),
+    TransportUnavailable(String),
 }
 
 /// Defensive cap so a malformed peer can't trick us into allocating a
@@ -276,6 +287,7 @@ mod tests {
             IpcResponse::Exit(124),
             IpcResponse::Exit(-1),
             IpcResponse::Error("transport closed".into()),
+            IpcResponse::TransportUnavailable("transport reconnecting — retry shortly".into()),
         ] {
             let mut buf = Vec::new();
             write_response(&mut buf, &resp).unwrap();
