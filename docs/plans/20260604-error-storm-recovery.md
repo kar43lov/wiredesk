@@ -76,8 +76,8 @@
 
 ### Task 6: Полная верификация + документация
 
-- [ ] Прогнать все Validation Commands (build, full test suite с `--test-threads=1`, clippy workspace, оба cross-target clippy) — всё зелёное.
-- [ ] Обновить `CLAUDE.md`: краткий пункт про auto-recovery (storm-детект 10 подряд Protocol-ошибок → reopen на обеих сторонах; Mac reconnect loop с backoff 1s→30s; статус Reconnecting в UI) + актуализировать счётчик тестов в разбивке по крейтам (вырастут как минимум wiredesk-core за счёт нового `storm.rs`, client, host, exec-core/term).
-- [ ] Обновить `README.md`: user-facing описание (канал самовосстанавливается; ручной перезапуск больше не нужен).
-- [ ] В `docs/briefs/serial-error-storm-recovery.md` и `docs/briefs/mac-auto-reconnect.md` проставить SHIPPED-заголовки (по факту мержа — оставить TODO-маркер для post-merge).
-- [ ] Финальный smoke: `cargo build --release --workspace` собирается; убедиться, что число тестов выросло и все проходят.
+- [x] Прогнать все Validation Commands (build, full test suite с `--test-threads=1`, clippy workspace, оба cross-target clippy) — всё зелёное. (650 passing +5 ignored; clippy чистый workspace + оба win-gnu cross-target.)
+- [x] Обновить `CLAUDE.md`: краткий пункт про auto-recovery (storm-детект 10 подряд Protocol-ошибок → reopen на обеих сторонах; Mac reconnect loop с backoff 1s→30s; статус Reconnecting в UI) + актуализировать счётчик тестов в разбивке по крейтам (вырастут как минимум wiredesk-core за счёт нового `storm.rs`, client, host, exec-core/term). (239 client + 157 host + 84 exec-core + 88 protocol + 41 transport + 23 term + 18 core = 650.)
+- [x] Обновить `README.md`: user-facing описание (канал самовосстанавливается; ручной перезапуск больше не нужен).
+- [x] В `docs/briefs/serial-error-storm-recovery.md` и `docs/briefs/mac-auto-reconnect.md` проставить SHIPPED-заголовки (по факту мержа — оставить TODO-маркер для post-merge).
+- [x] Финальный smoke: `cargo build --release --workspace` собирается; убедиться, что число тестов выросло и все проходят. (release build OK за 36.9s; тесты 634→650.)

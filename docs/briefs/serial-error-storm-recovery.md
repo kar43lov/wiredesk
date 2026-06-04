@@ -1,5 +1,7 @@
 # Бриф: auto-recovery канала при frame-error storm + Mac auto-reconnect
 
+> **SHIPPED 2026-06-04** (branch `feature/error-storm-recovery`, реализован по плану `docs/plans/20260604-error-storm-recovery.md`). StormCounter (10 подряд Protocol-ошибок) на обеих сторонах + Win reopen-loop + Mac LinkSupervisor с backoff 1s→30s + IPC `TransportUnavailable`/exit 125 + UI Reconnecting. Все validation-команды зелёные, тесты 650 passing. TODO post-merge: проставить master-хэш/PR# после live-теста и мержа в master.
+
 **Status:** ready for /planning:make. Branch: `feat/error-storm-recovery`.
 
 **Поглощает** `docs/briefs/mac-auto-reconnect.md` (Mac reconnect loop — компонент 2 этого брифа; старый бриф остаётся как детальная спека компонента, помечен superseded).

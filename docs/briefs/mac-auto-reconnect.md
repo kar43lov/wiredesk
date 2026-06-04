@@ -1,6 +1,8 @@
 # Бриф: Mac client auto-reconnect после host disconnect
 
-**Status:** SUPERSEDED 2026-06-04 → поглощён `docs/briefs/serial-error-storm-recovery.md` (Mac reconnect loop = компонент 2 объединённого scope; этот файл остаётся детальной спекой компонента — Вариант 1, AC, риски актуальны).
+**Status:** SHIPPED 2026-06-04 → реализован как компонент 2 объединённого scope `docs/briefs/serial-error-storm-recovery.md` (план `docs/plans/20260604-error-storm-recovery.md`, branch `feature/error-storm-recovery`). Mac LinkSupervisor (`apps/wiredesk-client/src/link.rs`) делает полный in-process reconnect с backoff 1s→30s — закрывает все сценарии этого брифа (host quit, кабель, любой disconnect). Этот файл остаётся детальной спекой компонента (Вариант 1, AC, риски). TODO post-merge: master-хэш/PR# после live-теста.
+
+**Ранее:** SUPERSEDED 2026-06-04 → поглощён `docs/briefs/serial-error-storm-recovery.md` (Mac reconnect loop = компонент 2 объединённого scope; этот файл остаётся детальной спекой компонента — Вариант 1, AC, риски актуальны).
 
 ## Контекст
 
