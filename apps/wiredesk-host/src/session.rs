@@ -242,12 +242,15 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             Err(e) => return Err(e),
         };
 
-        self.handle_packet(packet)?;
-        // A real packet decoded → the channel is alive; clear the storm run.
-        // This is the SINGLE reset site: the other Ok-paths of tick()
-        // (heartbeat-timeout, recv-timeout) return without a decoded packet,
-        // and resetting there would break "timeouts don't participate".
+        // A real packet decoded → the channel is alive; clear the storm run
+        // BEFORE handling (Codex iter3 P3): a handler error (e.g. injector
+        // failure on a key event) returns early via `?`, and a decoded frame
+        // must still break the protocol-error streak — the wire is fine, the
+        // failure is local. This is the SINGLE reset site: the other Ok-paths
+        // of tick() (heartbeat-timeout, recv-timeout) return without a decoded
+        // packet, and resetting there would break "timeouts don't participate".
         self.storm.on_valid_packet();
+        self.handle_packet(packet)?;
         Ok(true)
     }
 
