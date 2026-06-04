@@ -203,6 +203,7 @@ fn main() {
         exec_slot: exec_slot.clone(),
         current_outgoing_label: current_outgoing_label.clone(),
         reader_outgoing_tx: outgoing_tx.clone(),
+        link_up: link_up.clone(),
     };
 
     // Spawn the link supervisor. It owns the reader/writer pair and reopens
@@ -213,7 +214,6 @@ fn main() {
     {
         let supervisor_transport_cfg = transport_cfg.clone();
         let supervisor_events_tx = events_tx.clone();
-        let supervisor_link_up = link_up.clone();
         let open_fn =
             move || wiredesk_transport::open_transport(&supervisor_transport_cfg);
         link::spawn_supervisor(
@@ -222,7 +222,6 @@ fn main() {
             outgoing_rx,
             supervisor_events_tx,
             reconnect_request_rx,
-            supervisor_link_up,
             link_ctx,
         );
     }

@@ -55,6 +55,13 @@ pub struct LinkContext {
     /// Reader's clone of `outgoing_tx` — used to send `ClipDecline` back to
     /// the host when an incoming offer is rejected.
     pub reader_outgoing_tx: Sender<Packet>,
+    /// True only while the handshake is complete AND the reader is alive —
+    /// the IPC gate keys off this (Codex iter4 P2: a freshly opened port is
+    /// not yet a usable link; flipping this at spawn would let `wd --exec`
+    /// queue onto a host that never sent HelloAck and hang to its timeout).
+    /// The reader stores `true` on HelloAck and `false` on every exit path;
+    /// the supervisor stores `false` at teardown (belt-and-braces).
+    pub link_up: Arc<AtomicBool>,
 }
 
 /// Join handles for one reader/writer pair. The writer's handle resolves to
@@ -120,14 +127,12 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 ///
 /// The first request — sent by `main` at startup — drives the initial open
 /// through the same path, so there's no duplicate open code.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_supervisor(
     mut open_fn: impl FnMut() -> Result<Box<dyn Transport>, WireDeskError> + Send + 'static,
     mut backoff_fn: impl FnMut(u32) -> Duration + Send + 'static,
     outgoing_rx: Receiver<Packet>,
     events_tx: Sender<TransportEvent>,
     reconnect_request_rx: Receiver<()>,
-    link_up: Arc<AtomicBool>,
     ctx: LinkContext,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -141,8 +146,11 @@ pub fn spawn_supervisor(
                 return;
             }
 
-            // Tear down the current link, if one is up.
-            link_up.store(false, Ordering::Release);
+            // Tear down the current link, if one is up. The reader also
+            // clears the flag on its own exit paths; this store covers the
+            // teardown-of-a-live-link case (storm: reader already gone, but
+            // we must gate IPC before joining the still-alive writer).
+            ctx.link_up.store(false, Ordering::Release);
             if let Some(h) = handles.take() {
                 // Raise the shared shutdown flag so BOTH threads exit even if
                 // their transport never errors on its own — the writer's
@@ -215,7 +223,9 @@ pub fn spawn_supervisor(
                 shutdown,
                 ctx.clone(),
             ));
-            link_up.store(true, Ordering::Release);
+            // NOTE: `link_up` is NOT raised here — an open port is not yet a
+            // usable link. The reader flips it true on HelloAck (handshake
+            // complete) and back to false on every exit path; see LinkContext.
         }
     })
 }
@@ -393,6 +403,7 @@ fn reader_thread(
     shutdown: Arc<AtomicBool>,
     ctx: LinkContext,
 ) {
+    let link_up = ctx.link_up.clone();
     reader_loop(
         transport,
         events_tx,
@@ -401,6 +412,9 @@ fn reader_thread(
         RECV_TIMEOUT_IDLE,
         RECV_TIMEOUT_BUSY,
     );
+    // Whatever path the loop exited through (storm, fatal, idle budget,
+    // host Disconnect, shutdown flag) — the link is no longer usable.
+    link_up.store(false, Ordering::Release);
 }
 
 /// Reader body with injectable liveness budgets so tests can drive the
@@ -481,6 +495,9 @@ fn reader_loop(
                     } => {
                         log::info!("connected to '{host_name}' ({screen_w}x{screen_h})");
                         reset_session_state(&mut incoming_clip);
+                        // Handshake complete — the link is now usable; open
+                        // the IPC gate (see LinkContext::link_up).
+                        ctx.link_up.store(true, Ordering::Release);
                         let _ = events_tx.send(TransportEvent::Connected {
                             host_name,
                             screen_w,
@@ -699,8 +716,23 @@ mod tests {
             exec_slot: Arc::new(std::sync::Mutex::new(None)),
             current_outgoing_label: Arc::new(std::sync::Mutex::new(String::new())),
             reader_outgoing_tx: tx,
+            link_up: Arc::new(AtomicBool::new(false)),
         };
         (ctx, rx)
+    }
+
+    /// A scripted HelloAck — drives the reader's handshake-complete path so
+    /// supervisor tests can observe `link_up` flipping true.
+    fn hello_ack() -> Packet {
+        Packet::new(
+            Message::HelloAck {
+                version: VERSION,
+                host_name: "test-host".into(),
+                screen_w: 100,
+                screen_h: 100,
+            },
+            0,
+        )
     }
 
     #[test]
@@ -985,31 +1017,31 @@ mod tests {
     #[test]
     fn supervisor_retries_then_links_up() {
         let (ctx, _reader_outgoing_rx) = test_ctx();
+        let link_up = ctx.link_up.clone();
         let (events_tx, events_rx) = mpsc::channel();
         let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let (request_tx, request_rx) = mpsc::channel::<()>();
-        let link_up = Arc::new(AtomicBool::new(false));
 
-        // open_fn fails twice, succeeds on the 3rd call with an idle
-        // transport.
+        // open_fn fails twice, succeeds on the 3rd call with a transport that
+        // immediately hands the reader a HelloAck (handshake completes →
+        // link_up flips true; an open port alone must NOT raise the flag).
         let mut calls = 0u32;
         let open_fn = move || -> Result<Box<dyn Transport>> {
             calls += 1;
             if calls < 3 {
                 Err(WireDeskError::Transport(format!("open fail {calls}")))
             } else {
-                Ok(Box::new(ScriptedTransport::new(vec![], true)) as Box<dyn Transport>)
+                Ok(Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true))
+                    as Box<dyn Transport>)
             }
         };
 
-        let link_up_c = link_up.clone();
         let _sup = spawn_supervisor(
             open_fn,
             |_| Duration::from_millis(5), // near-zero backoff for the test
             outgoing_rx,
             events_tx,
             request_rx,
-            link_up_c,
             ctx,
         );
 
@@ -1045,25 +1077,24 @@ mod tests {
         // writer `send()` still returns Ok (fd open, chip corrupting) — must
         // not block on `writer.join()`. Drives a full up → teardown → up cycle.
         let (ctx, _reader_outgoing_rx) = test_ctx();
+        let link_up = ctx.link_up.clone();
         let (events_tx, events_rx) = mpsc::channel();
         let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let (request_tx, request_rx) = mpsc::channel::<()>();
-        let link_up = Arc::new(AtomicBool::new(false));
 
-        // Every open succeeds with an idle, send-OK transport — models a fd
-        // that stays open across the storm.
+        // Every open succeeds with a send-OK transport that completes the
+        // handshake (HelloAck) — models a fd that stays open across the storm.
         let open_fn = move || -> Result<Box<dyn Transport>> {
-            Ok(Box::new(ScriptedTransport::new(vec![], true)) as Box<dyn Transport>)
+            Ok(Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true))
+                as Box<dyn Transport>)
         };
 
-        let link_up_c = link_up.clone();
         let _sup = spawn_supervisor(
             open_fn,
             |_| Duration::from_millis(5),
             outgoing_rx,
             events_tx,
             request_rx,
-            link_up_c,
             ctx,
         );
 
@@ -1089,11 +1120,23 @@ mod tests {
 
         // Tear down the live link and reopen. The second Reconnecting event is
         // emitted only AFTER `writer.join()` returns — if the writer can't be
-        // stopped, this recv times out (the regression).
+        // stopped, this recv times out (the regression). Skip interleaved
+        // events (the first link's Connected from its HelloAck).
         request_tx.send(()).unwrap();
-        match events_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(TransportEvent::Reconnecting { attempt }) => assert_eq!(attempt, 1),
-            other => panic!("expected second Reconnecting after teardown, got {other:?}"),
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "never saw the second Reconnecting after teardown"
+            );
+            match events_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(TransportEvent::Reconnecting { attempt }) => {
+                    assert_eq!(attempt, 1);
+                    break;
+                }
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("events channel died: {e}"),
+            }
         }
         wait_up();
 
@@ -1112,7 +1155,6 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel();
         let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let (request_tx, request_rx) = mpsc::channel::<()>();
-        let link_up = Arc::new(AtomicBool::new(false));
 
         // 1st open → send-broken transport (HELLO fails instantly, writer
         // exits with Disconnected). 2nd open → healthy idle transport.
@@ -1122,14 +1164,12 @@ mod tests {
             Ok(Box::new(ScriptedTransport::new(vec![], calls > 1)) as Box<dyn Transport>)
         };
 
-        let link_up_c = link_up.clone();
         let _sup = spawn_supervisor(
             open_fn,
             |_| Duration::from_millis(5),
             outgoing_rx,
             events_tx,
             request_rx,
-            link_up_c,
             ctx,
         );
 
@@ -1171,7 +1211,54 @@ mod tests {
         }
 
         drop(request_tx);
-        // Silence unused warning — the flag is intentionally not the signal.
-        let _ = link_up.load(Ordering::Acquire);
+    }
+
+    #[test]
+    fn link_up_requires_handshake_not_just_spawn() {
+        // Codex iter4 P2 regression: an open port alone must NOT open the IPC
+        // gate. link_up may flip true only on HelloAck, and must drop back to
+        // false when the reader exits.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let link_up = ctx.link_up.clone();
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Reader over an idle transport (no HelloAck): the flag must stay
+        // false no matter how long the link has been "spawned".
+        let transport = Box::new(ScriptedTransport::new(vec![], true));
+        let shutdown_c = shutdown.clone();
+        let ctx_c = ctx.clone();
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx_c));
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !link_up.load(Ordering::Acquire),
+            "link_up must not raise before the handshake completes"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+
+        // Reader that completes the handshake: flag raises on HelloAck...
+        let (events_tx, events_rx2) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let transport = Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true));
+        let shutdown_c = shutdown.clone();
+        let ctx_c = ctx.clone();
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx_c));
+        match events_rx2.recv_timeout(Duration::from_secs(2)) {
+            Ok(TransportEvent::Connected { .. }) => {}
+            other => panic!("expected Connected after HelloAck, got {other:?}"),
+        }
+        assert!(
+            link_up.load(Ordering::Acquire),
+            "link_up must raise on HelloAck"
+        );
+        // ...and drops back to false once the reader exits.
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+        assert!(
+            !link_up.load(Ordering::Acquire),
+            "link_up must clear when the reader exits"
+        );
+        drop(events_rx);
     }
 }
