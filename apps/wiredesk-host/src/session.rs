@@ -273,7 +273,16 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// the reopen loop: the injector is built once via a `FnOnce` and must
     /// survive across transport reopens, so the old session is dismantled
     /// and the injector migrates into the freshly-opened one.
-    pub fn into_injector(self) -> I {
+    ///
+    /// Releases all held input first (Codex iter5 P2): if the link died
+    /// mid-keypress / mid-drag, the heartbeat-timeout path would normally
+    /// `release_all` — but the reopen paths consume the session directly,
+    /// and without this Windows would keep the key/button stuck down across
+    /// the reconnect.
+    pub fn into_injector(mut self) -> I {
+        if let Err(e) = self.injector.release_all() {
+            log::warn!("release_all during session teardown failed: {e}");
+        }
         self.injector
     }
 

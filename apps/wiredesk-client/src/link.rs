@@ -259,6 +259,7 @@ fn writer_thread(
         0,
     )) {
         log::error!("failed to send HELLO: {e}");
+        ctx.link_up.store(false, Ordering::Release);
         let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
         return outgoing_rx;
     }
@@ -315,6 +316,11 @@ fn writer_thread(
                 }
                 if let Err(e) = transport.send(&packet) {
                     log::error!("send error: {e}");
+                    // Close the IPC gate immediately (Codex iter5 P2): the
+                    // reader may still be alive, and waiting for the UI →
+                    // supervisor teardown to clear the flag leaves a window
+                    // where wd --exec queues onto a dead writer's channel.
+                    ctx.link_up.store(false, Ordering::Release);
                     let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
                     return outgoing_rx;
                 }
@@ -355,6 +361,7 @@ fn writer_thread(
             // receiver back so the supervisor can reopen.
             if let Err(e) = transport.send(&Packet::new(Message::Heartbeat, 0)) {
                 log::error!("heartbeat send error: {e}");
+                ctx.link_up.store(false, Ordering::Release);
                 let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
                 return outgoing_rx;
             }
