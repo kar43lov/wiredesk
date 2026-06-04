@@ -331,10 +331,43 @@ fn writer_thread(
         }
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            let _ = transport.send(&Packet::new(Message::Heartbeat, 0));
+            // Treat a failed heartbeat write like any other send error. On an
+            // idle link the periodic heartbeat is the ONLY write, so swallowing
+            // its error would hide a dead local fd (cable yanked on our side)
+            // until the reader happens to notice. Emit Disconnected and hand the
+            // receiver back so the supervisor can reopen.
+            if let Err(e) = transport.send(&Packet::new(Message::Heartbeat, 0)) {
+                log::error!("heartbeat send error: {e}");
+                let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
+                return outgoing_rx;
+            }
             last_heartbeat = Instant::now();
         }
     }
+}
+
+/// Receive-side liveness budget while the link is idle. The host emits a
+/// heartbeat every 2 s; three missed in a row means the peer is gone — host
+/// quit / crash / cable yanked on the *remote* side leaves our local fd open,
+/// so `recv()` only ever times out (never a fatal error). Mirrors the host's
+/// `HEARTBEAT_TIMEOUT_IDLE` so neither side is more trigger-happy.
+const RECV_TIMEOUT_IDLE: Duration = Duration::from_secs(6);
+/// Receive-side budget while a transfer is in flight. A large clipboard push
+/// (Mac→Host) saturates the wire and the host's heartbeats queue behind our
+/// chunks, so the strict idle window would falsely fire. Mirrors the host's
+/// `HEARTBEAT_TIMEOUT_BUSY`.
+const RECV_TIMEOUT_BUSY: Duration = Duration::from_secs(30);
+
+/// True while a clipboard transfer is in flight (either direction) or a shell
+/// session is open — the wire is busy and the peer's heartbeats may be delayed,
+/// so the reader picks the looser [`RECV_TIMEOUT_BUSY`] budget.
+fn transfer_in_flight(ctx: &LinkContext) -> bool {
+    let outgoing =
+        ctx.outgoing_total.load(Ordering::Relaxed) > ctx.outgoing_progress.load(Ordering::Relaxed);
+    let incoming =
+        ctx.incoming_total.load(Ordering::Relaxed) > ctx.incoming_progress.load(Ordering::Relaxed);
+    let shell = ctx.exec_slot.lock().map(|g| g.is_some()).unwrap_or(false);
+    outgoing || incoming || shell
 }
 
 /// Sole reader of the serial port. Translates incoming packets to UI events.
@@ -348,10 +381,31 @@ fn writer_thread(
 /// `shutdown` is checked every iteration so the supervisor can stop us even
 /// on a silent transport (recv only ever timing out).
 fn reader_thread(
+    transport: Box<dyn Transport>,
+    events_tx: Sender<TransportEvent>,
+    shutdown: Arc<AtomicBool>,
+    ctx: LinkContext,
+) {
+    reader_loop(
+        transport,
+        events_tx,
+        shutdown,
+        ctx,
+        RECV_TIMEOUT_IDLE,
+        RECV_TIMEOUT_BUSY,
+    );
+}
+
+/// Reader body with injectable liveness budgets so tests can drive the
+/// idle-disconnect path without real-time waits. Production passes
+/// [`RECV_TIMEOUT_IDLE`]/[`RECV_TIMEOUT_BUSY`].
+fn reader_loop(
     mut transport: Box<dyn Transport>,
     events_tx: Sender<TransportEvent>,
     shutdown: Arc<AtomicBool>,
     ctx: LinkContext,
+    idle_timeout: Duration,
+    busy_timeout: Duration,
 ) {
     let outgoing_tx = ctx.reader_outgoing_tx.clone();
     let exec_slot = ctx.exec_slot.clone();
@@ -390,6 +444,12 @@ fn reader_thread(
     // Frame-error storm detector — see module + StormCounter docs.
     let mut storm = StormCounter::new(DEFAULT_STORM_THRESHOLD);
 
+    // Receive-liveness clock. Reset on every decoded packet (the host's 2 s
+    // heartbeat keeps it fresh on a live idle link). If it runs past the
+    // budget while `recv()` only times out, the peer is gone — see the
+    // timeout arm below.
+    let mut last_recv = Instant::now();
+
     // Cancel-batch state — same role as the writer-side counters: log a
     // single START and a single END line per cancel sweep instead of one
     // per dropped chunk.
@@ -402,8 +462,9 @@ fn reader_thread(
         match transport.recv() {
             Ok(p) => {
                 // A real packet decoded → the channel is alive; clear the
-                // storm run.
+                // storm run and refresh the liveness clock.
                 storm.on_valid_packet();
+                last_recv = Instant::now();
                 match p.message {
                     Message::HelloAck {
                         host_name,
@@ -496,7 +557,32 @@ fn reader_thread(
                     }
                 }
             }
-            Err(ref e) if e.to_string().contains("timeout") => continue,
+            Err(ref e) if e.to_string().contains("timeout") => {
+                // Silent disconnect: host quit / crash / cable yanked on the
+                // remote side leaves our local fd open, so `recv()` only ever
+                // times out (no fatal error) and the writer's heartbeats sink
+                // into a dead wire. Without this check the reader would loop
+                // forever, `link_up` would stay true, and the supervisor would
+                // never reopen. If no packet (incl. the host's 2 s heartbeat)
+                // arrived within the liveness budget, treat the link as gone.
+                let limit = if transfer_in_flight(&ctx) {
+                    busy_timeout
+                } else {
+                    idle_timeout
+                };
+                if last_recv.elapsed() >= limit {
+                    log::warn!(
+                        "host link lost — no packet for {:?} — reopening port",
+                        last_recv.elapsed()
+                    );
+                    reset_session_state(&mut incoming_clip);
+                    let _ = events_tx.send(TransportEvent::Disconnected(
+                        "host link lost — no heartbeat".into(),
+                    ));
+                    return;
+                }
+                continue;
+            }
             Err(WireDeskError::Protocol(ref msg)) => {
                 if storm.on_protocol_error() {
                     log::error!(
@@ -719,6 +805,96 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert!(events_rx.try_recv().is_err(), "unexpected event after reset");
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn transfer_in_flight_reflects_counters() {
+        let (ctx, _rx) = test_ctx();
+        // Fresh ctx, no shell → idle.
+        assert!(!transfer_in_flight(&ctx));
+        // Outgoing transfer started (total set, progress behind) → busy.
+        ctx.outgoing_total.store(100, Ordering::Relaxed);
+        ctx.outgoing_progress.store(10, Ordering::Relaxed);
+        assert!(transfer_in_flight(&ctx));
+        // Outgoing finished (progress caught up) → idle again.
+        ctx.outgoing_progress.store(100, Ordering::Relaxed);
+        assert!(!transfer_in_flight(&ctx));
+        // Incoming transfer in flight → busy.
+        ctx.incoming_total.store(50, Ordering::Relaxed);
+        ctx.incoming_progress.store(0, Ordering::Relaxed);
+        assert!(transfer_in_flight(&ctx));
+    }
+
+    #[test]
+    fn reader_idle_timeout_emits_disconnect() {
+        // Silent remote disconnect (host quit / crash / remote-side unplug):
+        // our local fd stays open so `recv()` only times out. The reader must
+        // notice the dead link via the receive-liveness budget and emit
+        // Disconnected so the supervisor reopens — otherwise link_up stays true
+        // forever (the AC1 gap this fix closes).
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Empty script → idle transport that only ever times out.
+        let transport = Box::new(ScriptedTransport::new(vec![], true));
+        let handle = thread::spawn(move || {
+            reader_loop(
+                transport,
+                events_tx,
+                shutdown,
+                ctx,
+                Duration::from_millis(40), // tiny idle budget for the test
+                Duration::from_secs(30),
+            )
+        });
+
+        let evt = events_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected a Disconnected after the idle budget elapsed");
+        match evt {
+            TransportEvent::Disconnected(reason) => {
+                assert!(reason.contains("host link lost"), "reason: {reason}");
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn reader_busy_budget_suppresses_idle_disconnect() {
+        // With a transfer in flight the reader uses the looser busy budget, so
+        // the strict idle window must NOT fire mid-transfer (false-positive
+        // guard). Idle budget tiny, busy budget large → no Disconnected while
+        // the outgoing counter says a push is in progress.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        ctx.outgoing_total.store(1000, Ordering::Relaxed);
+        ctx.outgoing_progress.store(1, Ordering::Relaxed);
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let transport = Box::new(ScriptedTransport::new(vec![], true));
+        let shutdown_c = shutdown.clone();
+        let handle = thread::spawn(move || {
+            reader_loop(
+                transport,
+                events_tx,
+                shutdown_c,
+                ctx,
+                Duration::from_millis(20),  // idle budget would fire fast...
+                Duration::from_secs(30),    // ...but busy budget keeps us alive
+            )
+        });
+
+        // Well past the idle budget but far under the busy budget → silence.
+        assert!(
+            events_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "unexpected Disconnected while a transfer was in flight"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
