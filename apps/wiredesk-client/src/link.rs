@@ -59,14 +59,20 @@ pub struct LinkContext {
 
 /// Join handles for one reader/writer pair. The writer's handle resolves to
 /// the `outgoing_rx` it owned so the supervisor can hand it to the next link.
+/// `shutdown` is shared by both threads; the supervisor raises it at teardown
+/// so neither thread can outlive the link (see [`spawn_supervisor`]).
 pub struct LinkHandles {
     pub writer: JoinHandle<Receiver<Packet>>,
     pub reader: JoinHandle<()>,
+    pub shutdown: Arc<AtomicBool>,
 }
 
-/// Spawn a reader/writer pair over the given transport handles. `shutdown`
-/// lets the supervisor stop the reader even when its `recv()` only ever times
-/// out (silent host quit / unplug) — without it `join()` would hang forever.
+/// Spawn a reader/writer pair over the given transport handles. `shutdown` is
+/// shared by both threads so the supervisor can stop either even when its
+/// transport never errors on its own: the reader's `recv()` only times out
+/// (silent host quit / unplug), and the writer's `send()` keeps returning
+/// `Ok` during a frame-error storm (the fd is alive, the chip just corrupts
+/// bytes on the wire). Without it `join()` would hang forever.
 pub fn spawn_link(
     reader_t: Box<dyn Transport>,
     writer_t: Box<dyn Transport>,
@@ -78,10 +84,18 @@ pub fn spawn_link(
     let writer = {
         let events_tx = events_tx.clone();
         let ctx = ctx.clone();
-        thread::spawn(move || writer_thread(writer_t, outgoing_rx, events_tx, ctx))
+        let shutdown = shutdown.clone();
+        thread::spawn(move || writer_thread(writer_t, outgoing_rx, events_tx, shutdown, ctx))
     };
-    let reader = thread::spawn(move || reader_thread(reader_t, events_tx, shutdown, ctx));
-    LinkHandles { writer, reader }
+    let reader = {
+        let shutdown = shutdown.clone();
+        thread::spawn(move || reader_thread(reader_t, events_tx, shutdown, ctx))
+    };
+    LinkHandles {
+        writer,
+        reader,
+        shutdown,
+    }
 }
 
 /// Exponential backoff capped at 30s: attempt 1→1s, 2→2s, 3→4s, 4→8s,
@@ -130,11 +144,12 @@ pub fn spawn_supervisor(
             // Tear down the current link, if one is up.
             link_up.store(false, Ordering::Release);
             if let Some(h) = handles.take() {
-                // Reader exits on the shutdown flag we raise here; writer
-                // exits when its transport handle fails (the old fd is dead)
-                // and returns the receiver we need for the next link.
-                // The shutdown flag belonged to the now-departing link; the
-                // next link gets a fresh one below.
+                // Raise the shared shutdown flag so BOTH threads exit even if
+                // their transport never errors on its own — the writer's
+                // `send()` keeps returning `Ok` during a frame-error storm, so
+                // without this flag `h.writer.join()` would block forever. The
+                // writer returns the receiver we need for the next link.
+                h.shutdown.store(true, Ordering::Release);
                 if let Ok(rx) = h.writer.join() {
                     outgoing_rx = Some(rx);
                 }
@@ -213,6 +228,7 @@ fn writer_thread(
     mut transport: Box<dyn Transport>,
     outgoing_rx: Receiver<Packet>,
     events_tx: Sender<TransportEvent>,
+    shutdown: Arc<AtomicBool>,
     ctx: LinkContext,
 ) -> Receiver<Packet> {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -238,6 +254,14 @@ fn writer_thread(
     let mut cancel_active = false;
 
     loop {
+        // Supervisor raised the teardown flag — return the receiver so the
+        // next link can reuse the channel. Checked here because `send()` keeps
+        // returning `Ok` during a frame-error storm, so the error-exit paths
+        // below never fire and `recv_timeout` would otherwise loop forever.
+        if shutdown.load(Ordering::Acquire) {
+            return outgoing_rx;
+        }
+
         let timeout = HEARTBEAT_INTERVAL
             .saturating_sub(last_heartbeat.elapsed())
             .max(Duration::from_millis(1));
@@ -509,7 +533,6 @@ mod tests {
     enum Step {
         Protocol,
         Valid(Packet),
-        #[allow(dead_code)]
         Fatal,
     }
 
@@ -618,20 +641,55 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // One short of threshold, then the script idles (timeouts). No
-        // Disconnected should arrive; we then shut the reader down.
-        let steps: Vec<Step> = (0..DEFAULT_STORM_THRESHOLD - 1)
+        // One short of threshold, then a valid Heartbeat. The reader must
+        // process every error WITHOUT firing a storm and then surface the
+        // Heartbeat — a storm would have returned before reaching it. The
+        // positive Heartbeat assertion proves the errors were drained (not
+        // merely "no event yet"), so the test can't pass on a slow runner
+        // that simply hasn't processed the errors in time.
+        let mut steps: Vec<Step> = (0..DEFAULT_STORM_THRESHOLD - 1)
             .map(|_| Step::Protocol)
             .collect();
+        steps.push(Step::Valid(Packet::new(Message::Heartbeat, 0)));
         let transport = Box::new(ScriptedTransport::new(steps, true));
         let shutdown_c = shutdown.clone();
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
 
-        // Give it time to chew through the errors and start idling.
-        thread::sleep(Duration::from_millis(100));
-        // No event should be queued.
-        assert!(events_rx.try_recv().is_err());
+        let evt = events_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected the heartbeat after threshold-1 errors");
+        assert!(
+            matches!(evt, TransportEvent::Heartbeat),
+            "expected Heartbeat (no storm), got {evt:?}"
+        );
+        // No Disconnected should follow.
+        assert!(events_rx.try_recv().is_err(), "unexpected event after heartbeat");
         shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn reader_fatal_error_emits_disconnect() {
+        // Plain-disconnect path (host quit / cable yank / send-recv fatal):
+        // a non-timeout, non-Protocol recv error must emit Disconnected and
+        // exit so the supervisor reopens. This is the second of the two
+        // recovery triggers named in the module docs.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let transport = Box::new(ScriptedTransport::new(vec![Step::Fatal], true));
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown, ctx));
+
+        let evt = events_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected a transport event");
+        match evt {
+            TransportEvent::Disconnected(reason) => {
+                assert!(reason.contains("scripted fatal"), "reason: {reason}");
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
         handle.join().unwrap();
     }
 
@@ -670,11 +728,13 @@ mod tests {
         let (ctx, _reader_outgoing_rx) = test_ctx();
         let (events_tx, _events_rx) = mpsc::channel();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // send_ok=false → the Hello send fails immediately and the writer
         // returns the receiver.
         let transport = Box::new(ScriptedTransport::new(vec![], false));
-        let handle = thread::spawn(move || writer_thread(transport, outgoing_rx, events_tx, ctx));
+        let handle =
+            thread::spawn(move || writer_thread(transport, outgoing_rx, events_tx, shutdown, ctx));
         let returned_rx = handle.join().unwrap();
 
         // The outgoing_tx clone is still valid; a packet sent now must be
@@ -686,6 +746,38 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("packet available on returned receiver");
         assert!(matches!(got.message, Message::Heartbeat));
+    }
+
+    #[test]
+    fn writer_exits_on_shutdown_flag_even_when_send_succeeds() {
+        // Regression: during a frame-error storm the serial fd stays open, so
+        // `send()` keeps returning Ok and the writer never reaches an
+        // error-exit. The supervisor must be able to stop it via the shutdown
+        // flag — otherwise `writer.join()` at teardown deadlocks and the port
+        // is never reopened (the exact scenario this feature exists to fix).
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (events_tx, _events_rx) = mpsc::channel();
+        let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // send_ok=true + empty script → Hello sends OK, then the writer loops
+        // on recv_timeout + periodic heartbeats, never erroring.
+        let transport = Box::new(ScriptedTransport::new(vec![], true));
+        let shutdown_c = shutdown.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let rx = writer_thread(transport, outgoing_rx, events_tx, shutdown_c, ctx);
+            let _ = done_tx.send(());
+            rx
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Release);
+        // Must exit within a heartbeat interval + slack once shutdown is set.
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("writer never exited on shutdown — would deadlock supervisor teardown");
+        handle.join().unwrap();
     }
 
     #[test]
@@ -761,6 +853,66 @@ mod tests {
 
         // Drop the request sender so the supervisor's next recv() returns Err
         // and the thread can wind down with the test.
+        drop(request_tx);
+    }
+
+    #[test]
+    fn supervisor_reconnects_live_link_without_deadlock() {
+        // Regression for the storm path: tearing down a LIVE link — one whose
+        // writer `send()` still returns Ok (fd open, chip corrupting) — must
+        // not block on `writer.join()`. Drives a full up → teardown → up cycle.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (events_tx, events_rx) = mpsc::channel();
+        let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let (request_tx, request_rx) = mpsc::channel::<()>();
+        let link_up = Arc::new(AtomicBool::new(false));
+
+        // Every open succeeds with an idle, send-OK transport — models a fd
+        // that stays open across the storm.
+        let open_fn = move || -> Result<Box<dyn Transport>> {
+            Ok(Box::new(ScriptedTransport::new(vec![], true)) as Box<dyn Transport>)
+        };
+
+        let link_up_c = link_up.clone();
+        let _sup = spawn_supervisor(
+            open_fn,
+            |_| Duration::from_millis(5),
+            outgoing_rx,
+            events_tx,
+            request_rx,
+            link_up_c,
+            ctx,
+        );
+
+        let wait_up = || {
+            let start = Instant::now();
+            while !link_up.load(Ordering::Acquire) {
+                assert!(start.elapsed() < Duration::from_secs(3), "link never came up");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // First open → link up.
+        request_tx.send(()).unwrap();
+        match events_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(TransportEvent::Reconnecting { attempt }) => assert_eq!(attempt, 1),
+            other => panic!("expected Reconnecting{{1}}, got {other:?}"),
+        }
+        wait_up();
+        // Let the post-spawn drain run so our next request triggers a real
+        // teardown instead of being swallowed by the drain loop.
+        thread::sleep(Duration::from_millis(20));
+
+        // Tear down the live link and reopen. The second Reconnecting event is
+        // emitted only AFTER `writer.join()` returns — if the writer can't be
+        // stopped, this recv times out (the regression).
+        request_tx.send(()).unwrap();
+        match events_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(TransportEvent::Reconnecting { attempt }) => assert_eq!(attempt, 1),
+            other => panic!("expected second Reconnecting after teardown, got {other:?}"),
+        }
+        wait_up();
+
         drop(request_tx);
     }
 }

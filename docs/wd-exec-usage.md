@@ -96,7 +96,7 @@ Decode error → exit 125 (transport-class) с диагностикой в stder
 | 0–253 | Реальный exit code команды (PS `$LASTEXITCODE` или bash `$?`) |
 | 1 | PS terminating error (catch'нулось через `try { } catch { }`) — например `Get-Item /nonexistent` |
 | 124 | Sentinel не пришёл за `--timeout` секунд (default 90). Convention `timeout(1)`. На stderr печатается `last bytes received: "..."` — last 256 байт wire-buffer'а для диагностики где залип (mid-MOTD vs после READY-marker vs mid-command output). |
-| 125 | Transport error (serial drop'нулся, host исчез) **или** `--compress` decode failure (host выдал невалидный gzip+base64 payload — на stderr печатается `--compress decode failed: <msg>`) |
+| 125 | Transport error (serial drop'нулся, host исчез) **или** GUI serial-link mid-reconnect (IPC mode: GUI чинит канал после frame-error storm / disconnect — на stderr `wd: transport reconnecting — retry shortly`, retry через пару секунд) **или** `--compress` decode failure (host выдал невалидный gzip+base64 payload — на stderr печатается `--compress decode failed: <msg>`) |
 | любой | **Ctrl+C / timeout на `wd --exec` через IPC mode**: term-процесс умирает мгновенно, но host-side команда продолжает выполняться до собственного завершения (не interrupt'им host shell mid-run — destructive operations safety). GUI handler ждёт sentinel/timeout, шлёт ShellClose, **drain'ит wire до idle** (PR #21) и потом освобождает single-inflight queue. Следующий `wd --exec` будет ждать пока wire не стихнет — для heavy-output cmd'а это до 30s. Acceptable trade-off для clean-state semantics. |
 | любой | Обычный shell exit propagation |
 

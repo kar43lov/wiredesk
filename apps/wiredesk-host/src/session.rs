@@ -66,48 +66,25 @@ pub struct Session<T: Transport, I: InputInjector> {
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
-    /// Convenience ctor with default (zero-init) progress counters.
-    /// Used by the `#[cfg(test)]` fixtures; production wiring goes
-    /// through `with_counters` so the overlay sees the same atomics.
+    /// Convenience ctor with default (zero-init) progress counters and a
+    /// default-on `receive_files` toggle. Used by the `#[cfg(test)]` fixtures;
+    /// production wiring goes through `with_counters_and_toggles` directly so
+    /// the overlay sees the same atomics.
     #[cfg(test)]
     pub fn new(transport: T, injector: I, host_name: String, screen_w: u16, screen_h: u16) -> Self {
-        Self::with_counters(
-            transport,
-            injector,
-            host_name,
-            screen_w,
-            screen_h,
-            ProgressCounters::default(),
-        )
-    }
-
-    /// Convenience shim with a default-on `receive_files` toggle. Task 8
-    /// moved the production `session_thread::spawn` path to
-    /// `with_counters_and_toggles`; `Session::new` (cfg(test)) still funnels
-    /// through here. `#[allow(dead_code)]` suppresses the workspace
-    /// `-D warnings` lint when the test cfg path is excluded.
-    #[allow(dead_code)]
-    pub fn with_counters(
-        transport: T,
-        injector: I,
-        host_name: String,
-        screen_w: u16,
-        screen_h: u16,
-        counters: ProgressCounters,
-    ) -> Self {
         Self::with_counters_and_toggles(
             transport,
             injector,
             host_name,
             screen_w,
             screen_h,
-            counters,
+            ProgressCounters::default(),
             Arc::new(AtomicBool::new(true)),
         )
     }
 
-    /// Same as `with_counters` plus a `receive_files` runtime toggle threaded
-    /// through to `ClipboardSync::with_counters_and_toggles`. Production
+    /// Full ctor: progress counters plus a `receive_files` runtime toggle
+    /// threaded through to `ClipboardSync::with_counters_and_toggles`. Production
     /// session-thread spawn wires the toggle from `HostConfig.receive_files`
     /// so a `false` in TOML disables incoming `FORMAT_FILE` offers at boot;
     /// the Settings UI's Save-and-Restart respawns the host process, so the

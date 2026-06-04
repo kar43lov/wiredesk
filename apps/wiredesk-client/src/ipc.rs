@@ -556,16 +556,27 @@ mod tests {
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let link_up = Arc::new(AtomicBool::new(false)); // link DOWN
 
+        // Hold single_inflight for the whole test. The link-down refusal must
+        // fire BEFORE the handler tries to acquire this lock — otherwise it
+        // would block here forever. Proves the ordering the handler documents,
+        // not just the "no packet queued" symptom.
+        let _held = inflight.lock().unwrap();
+
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
             exec_slot,
-            inflight,
+            inflight.clone(),
             link_up,
         );
         thread::sleep(Duration::from_millis(50));
 
         let mut client = UnixStream::connect(&socket).expect("connect");
+        // Bound the read so a regression (lock acquired before the link check)
+        // fails the test instead of hanging it.
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let req = IpcRequest {
             cmd: "echo hi".into(),
             ssh: None,
@@ -574,7 +585,9 @@ mod tests {
         };
         write_request(&mut client, &req).unwrap();
 
-        match wiredesk_exec_core::ipc::read_response(&mut client).unwrap() {
+        match wiredesk_exec_core::ipc::read_response(&mut client)
+            .expect("link-down refusal must arrive without acquiring single_inflight")
+        {
             IpcResponse::TransportUnavailable(msg) => {
                 assert!(msg.contains("reconnecting"), "msg: {msg}");
             }
