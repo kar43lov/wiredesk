@@ -29,11 +29,11 @@
 
 ### Task 1: StormCounter в wiredesk-core
 
-- [ ] Создать `crates/wiredesk-core/src/storm.rs`: `pub struct StormCounter { consecutive: u32, threshold: u32 }` с методами `new(threshold: u32)`, `on_protocol_error(&mut self) -> bool` (инкремент; возвращает `true` когда `consecutive >= threshold` — шторм), `on_valid_packet(&mut self)` (сброс в 0), `count(&self) -> u32`. Doc-комментарий: что считается штормом, почему timeout'ы не участвуют (см. Context).
-- [ ] Добавить `pub const DEFAULT_STORM_THRESHOLD: u32 = 10;` там же.
-- [ ] Подключить модуль в `crates/wiredesk-core/src/lib.rs` (`pub mod storm;`).
-- [ ] Написать тесты в `storm.rs`: (1) threshold-1 ошибок → false, threshold-я → true; (2) сброс на `on_valid_packet` посреди серии; (3) после срабатывания продолжает возвращать true на следующих ошибках; (4) threshold=1 edge case.
-- [ ] Запустить `cargo test -p wiredesk-core` и `cargo clippy -p wiredesk-core -- -D warnings` — должны проходить.
+- [x] Создать `crates/wiredesk-core/src/storm.rs`: `pub struct StormCounter { consecutive: u32, threshold: u32 }` с методами `new(threshold: u32)`, `on_protocol_error(&mut self) -> bool` (инкремент; возвращает `true` когда `consecutive >= threshold` — шторм), `on_valid_packet(&mut self)` (сброс в 0), `count(&self) -> u32`. Doc-комментарий: что считается штормом, почему timeout'ы не участвуют (см. Context).
+- [x] Добавить `pub const DEFAULT_STORM_THRESHOLD: u32 = 10;` там же.
+- [x] Подключить модуль в `crates/wiredesk-core/src/lib.rs` (`pub mod storm;`).
+- [x] Написать тесты в `storm.rs`: (1) threshold-1 ошибок → false, threshold-я → true; (2) сброс на `on_valid_packet` посреди серии; (3) после срабатывания продолжает возвращать true на следующих ошибках; (4) threshold=1 edge case.
+- [x] Запустить `cargo test -p wiredesk-core` и `cargo clippy -p wiredesk-core -- -D warnings` — должны проходить.
 
 ### Task 2: Win host — storm-детект в Session + reopen loop в session_thread
 
