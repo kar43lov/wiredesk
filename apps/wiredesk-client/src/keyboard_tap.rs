@@ -32,6 +32,7 @@ use crate::input::keymap::{
 /// Mac VK code constants used for hotkey detection.
 const CG_KEY_RETURN: u16 = 0x24;
 const CG_KEY_ESCAPE: u16 = 0x35;
+const CG_KEY_V: u16 = 0x09;
 
 /// Mask of all modifier bits we care about — used to reject combos with
 /// "extra" modifiers (e.g., Cmd+Shift+Enter shouldn't match Cmd+Enter).
@@ -62,6 +63,16 @@ fn matches_cmd_only(flags: u64, swap: bool) -> bool {
 /// `true` if the event matches Cmd+Enter exactly (no extra modifiers).
 fn is_cmd_enter(keycode: u16, flags: u64, swap: bool) -> bool {
     keycode == CG_KEY_RETURN && matches_cmd_only(flags, swap)
+}
+
+/// `true` if a synthetic KeyDown is a Cmd+V paste (Whispr Flow / TextExpander
+/// / AppleScript). Only a real paste should kick the clipboard poll thread out
+/// of its outbound-text debounce — kicking on *any* synthetic key would let an
+/// unrelated synthetic keystroke ship a half-formed copy-on-select fragment
+/// before it settles. Synthetic events carry the literal Cmd bit (Karabiner
+/// doesn't touch CGEventPost'ed events), so no swap handling is needed.
+fn is_synthetic_paste(keycode: u16, flags: u64) -> bool {
+    keycode == CG_KEY_V && (flags & CG_FLAG_COMMAND) != 0
 }
 
 /// `true` if the event matches Cmd+Esc — the release-capture combo.
@@ -503,7 +514,14 @@ mod macos {
                                         // Cmd+V, so kicking on KeyDown lets
                                         // the poll catch the new content
                                         // before the dispatcher's wait gate.
-                                        let _ = poll_kick_cb.send(());
+                                        // Only a real Cmd+V paste kicks: the
+                                        // kick also bypasses the outbound-text
+                                        // debounce, so an unrelated synthetic
+                                        // key must NOT trigger it (else a
+                                        // copy-on-select fragment ships early).
+                                        if super::is_synthetic_paste(kc, flags) {
+                                            let _ = poll_kick_cb.send(());
+                                        }
 
                                         let mut combo: super::SyntheticCombo =
                                             Vec::new();
@@ -728,6 +746,19 @@ mod tests {
     fn make_kick_tx() -> mpsc::Sender<()> {
         let (tx, _rx) = mpsc::channel();
         tx
+    }
+
+    #[test]
+    fn synthetic_paste_detects_cmd_v_only() {
+        // Cmd+V → paste.
+        assert!(is_synthetic_paste(CG_KEY_V, CG_FLAG_COMMAND));
+        // Cmd+V with extra modifiers still counts (paste apps vary).
+        assert!(is_synthetic_paste(CG_KEY_V, CG_FLAG_COMMAND | CG_FLAG_SHIFT));
+        // V without Cmd → not a paste.
+        assert!(!is_synthetic_paste(CG_KEY_V, 0));
+        assert!(!is_synthetic_paste(CG_KEY_V, CG_FLAG_CONTROL));
+        // Cmd + other key (e.g. Cmd+C, keycode 0x08) → not a paste.
+        assert!(!is_synthetic_paste(0x08, CG_FLAG_COMMAND));
     }
 
     #[test]

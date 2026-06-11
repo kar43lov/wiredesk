@@ -676,6 +676,71 @@ fn apply_outgoing_progress_inner(
     }
 }
 
+/// What the poll thread should do with a freshly-probed clipboard text value.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TextSendDecision {
+    /// Ship it now (stable across two ticks, or a synthetic-paste kick).
+    Send,
+    /// New/changing value — hold one tick and re-check next poll.
+    Hold,
+    /// Already the last value we sent — nothing to do.
+    Skip,
+}
+
+/// Decide whether outbound clipboard text should ship this tick.
+///
+/// `already_sent` — the value equals our last committed `LastSeen.text`.
+/// `pending` — the hash we held on the *previous* poll tick (debounce state).
+/// `kicked` — a synthetic Cmd+V (Whispr Flow) woke us this tick.
+///
+/// Debounce rationale: copy-on-select terminals (Ghostty
+/// `copy-on-select = clipboard`, iTerm) rewrite the pasteboard on every
+/// selection-extend while the user drags the mouse. Each intermediate
+/// fragment (`ping`, `-n`, …) has a distinct hash, so without a stability
+/// gate every fragment races onto the wire as its own clipboard sync and
+/// Host pastes whichever landed last. Requiring the value to survive two
+/// consecutive poll ticks drops the transient drag states and ships only the
+/// settled selection. Synthetic Cmd+V bypasses the gate: Whispr writes the
+/// clipboard exactly once and the paste dispatcher's wait-gate needs the
+/// value on the wire immediately, with no extra tick of latency.
+///
+/// Known limitation (accepted): the debounce opens a ~400 ms window where a
+/// freshly-copied value is held while a *physical* Cmd+V (which is forwarded
+/// to Host immediately, unlike synthetic paste, with no wait-gate) would land
+/// on Host's previous clipboard. In WireDesk's capture architecture this is
+/// practically unreachable: forwarding a physical Cmd+V to Host requires
+/// capture-mode, but producing a new Mac clipboard value (mouse-select in
+/// Ghostty / Cmd+C) requires being OUT of capture — the two states are
+/// mutually exclusive and switching between them takes far longer than the
+/// window. Gating physical paste like synthetic paste would add latency to
+/// every Ctrl+V on Host, which isn't worth closing an unreachable gap.
+///
+/// Known limitation #2 (accepted): for a single clipboard item that carries
+/// BOTH text and an image/file (rich browser/Word selection), the held text
+/// ships one tick AFTER the image/file branches, and since Host commits each
+/// format with `EmptyClipboard` (single-format clipboard), the late text
+/// overwrites the binary content — Host ends up with text instead of the
+/// image. Pure-text (terminal copy-on-select) and pure-image (screenshot)
+/// clipboards are unaffected; only mixed items regress, which is rare in the
+/// terminal-centric workflow. A full fix needs NSPasteboard type-probing to
+/// detect mixed items and skip the debounce for them — disproportionate here.
+///
+/// Pure so it's unit-testable without spinning the poll thread.
+pub(crate) fn decide_text_send(
+    hash: u64,
+    already_sent: bool,
+    pending: Option<u64>,
+    kicked: bool,
+) -> TextSendDecision {
+    if already_sent {
+        TextSendDecision::Skip
+    } else if kicked || pending == Some(hash) {
+        TextSendDecision::Send
+    } else {
+        TextSendDecision::Hold
+    }
+}
+
 /// Spawn a background thread that polls the local clipboard and pushes
 /// ClipOffer + ClipChunks onto `outgoing_tx` whenever the content changes
 /// (and isn't something we just wrote ourselves).
@@ -789,6 +854,11 @@ pub fn spawn_poll_thread(
             }
         }
 
+        // Debounce state for outbound text: the hash we saw last tick but did
+        // not yet ship (waiting to confirm it's stable, not a copy-on-select
+        // drag fragment). See `decide_text_send`.
+        let mut pending_text_hash: Option<u64> = None;
+
         loop {
             // Sleep up to CLIP_POLL_INTERVAL, but wake immediately if the
             // keyboard tap signals that a synthetic Cmd+V just fired —
@@ -796,8 +866,19 @@ pub fn spawn_poll_thread(
             // dispatcher's wait-on-in-flight gate has a chance to rely
             // on stale state. Drain any extra kicks queued during the
             // active poll cycle so we don't poll twice in a row.
-            let _ = poll_kick_rx.recv_timeout(CLIP_POLL_INTERVAL);
-            while poll_kick_rx.try_recv().is_ok() {}
+            // `paste_kicked` means a synthetic Cmd+V paste (Whispr Flow) woke
+            // us — the kick is sent ONLY for real paste events
+            // (`is_synthetic_paste` in keyboard_tap), and it bypasses the text
+            // debounce so the freshly written value reaches the wire this tick
+            // before the paste dispatcher's wait-gate checks it.
+            // A kick that lands between `recv_timeout` returning Timeout and
+            // the drain below must still count — otherwise the drain swallows
+            // it with the flag left false and the Whispr text is held one tick
+            // instead of shipped immediately.
+            let mut paste_kicked = poll_kick_rx.recv_timeout(CLIP_POLL_INTERVAL).is_ok();
+            while poll_kick_rx.try_recv().is_ok() {
+                paste_kicked = true;
+            }
 
             // Clear the in-flight flag at the start of each tick. By now
             // the previous text-send (if any) has been drained from
@@ -813,33 +894,64 @@ pub fn spawn_poll_thread(
             // standing screenshot) doesn't loop. Runtime toggle gates
             // the path entirely.
             if send_text.load(Ordering::Relaxed) {
-                if let Ok(text) = clip.get_text() {
-                    if !text.is_empty() {
+                // Probe text. A non-empty value runs the debounce; anything
+                // else (empty clipboard, or an image/file-only clipboard where
+                // `get_text` errs) must DROP any pending debounce hash —
+                // otherwise a stale pending survives the non-text interlude
+                // and a later re-copy of the same text would match it and ship
+                // on its first sighting, skipping the stability gate.
+                match clip.get_text() {
+                    Ok(text) if !text.is_empty() => {
                         let hash = hash_text(&text);
-                        if !state.get().matches_text_hash(hash) {
-                            state.set_text(hash);
-                            let bytes = text.as_bytes();
-                            if bytes.len() > MAX_CLIPBOARD_BYTES {
-                                log::warn!(
-                                    "clipboard: skipping push — {} bytes exceeds limit",
-                                    bytes.len()
-                                );
-                            } else {
-                                log::debug!(
-                                    "clipboard: pushing {} bytes to host",
-                                    bytes.len()
-                                );
-                                outgoing_text_in_flight
-                                    .store(true, Ordering::Release);
-                                emit_offer_and_chunks(
-                                    &outgoing_tx,
-                                    FORMAT_TEXT_UTF8,
-                                    bytes,
-                                );
+                        let already_sent = state.get().matches_text_hash(hash);
+                        match decide_text_send(
+                            hash,
+                            already_sent,
+                            pending_text_hash,
+                            paste_kicked,
+                        ) {
+                            TextSendDecision::Skip => {
+                                pending_text_hash = None;
+                            }
+                            TextSendDecision::Hold => {
+                                // copy-on-select drag fragment (or any value
+                                // not yet stable for two ticks) — hold and
+                                // re-check next poll instead of shipping it.
+                                pending_text_hash = Some(hash);
+                            }
+                            TextSendDecision::Send => {
+                                pending_text_hash = None;
+                                state.set_text(hash);
+                                let bytes = text.as_bytes();
+                                if bytes.len() > MAX_CLIPBOARD_BYTES {
+                                    log::warn!(
+                                        "clipboard: skipping push — {} bytes exceeds limit",
+                                        bytes.len()
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "clipboard: pushing {} bytes to host",
+                                        bytes.len()
+                                    );
+                                    outgoing_text_in_flight
+                                        .store(true, Ordering::Release);
+                                    emit_offer_and_chunks(
+                                        &outgoing_tx,
+                                        FORMAT_TEXT_UTF8,
+                                        bytes,
+                                    );
+                                }
                             }
                         }
                     }
+                    _ => {
+                        pending_text_hash = None;
+                    }
                 }
+            } else {
+                // Text sending disabled — drop pending so re-enabling later
+                // doesn't treat a value held before the toggle as "stable".
+                pending_text_hash = None;
             }
 
             // 2) Probe image. Independent dedup slot. Runtime toggle gates.
@@ -1603,6 +1715,65 @@ pub fn run_startup_vacuum(older_than: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- decide_text_send (copy-on-select debounce) ---
+
+    #[test]
+    fn debounce_holds_new_value_then_sends_when_stable() {
+        // Tick 1: brand-new value, nothing pending → hold.
+        assert_eq!(
+            decide_text_send(0xAAAA, false, None, false),
+            TextSendDecision::Hold
+        );
+        // Tick 2: same value pending → confirmed stable → send.
+        assert_eq!(
+            decide_text_send(0xAAAA, false, Some(0xAAAA), false),
+            TextSendDecision::Send
+        );
+    }
+
+    #[test]
+    fn debounce_keeps_holding_while_value_keeps_changing() {
+        // Drag fragment A pending, now clipboard shows fragment B → still hold
+        // (B is new this tick). This is the copy-on-select drag: every tick a
+        // different hash, so nothing ever ships until the drag settles.
+        assert_eq!(
+            decide_text_send(0xBBBB, false, Some(0xAAAA), false),
+            TextSendDecision::Hold
+        );
+    }
+
+    #[test]
+    fn already_sent_value_is_skipped_regardless_of_pending() {
+        assert_eq!(
+            decide_text_send(0xAAAA, true, None, false),
+            TextSendDecision::Skip
+        );
+        assert_eq!(
+            decide_text_send(0xAAAA, true, Some(0xAAAA), false),
+            TextSendDecision::Skip
+        );
+    }
+
+    #[test]
+    fn synthetic_kick_bypasses_debounce() {
+        // Whispr Flow synthetic Cmd+V: new value, nothing pending, but kicked
+        // → send immediately (no extra tick of latency for dictation paste).
+        assert_eq!(
+            decide_text_send(0xCCCC, false, None, true),
+            TextSendDecision::Send
+        );
+    }
+
+    #[test]
+    fn kick_on_already_sent_value_still_skips() {
+        // A kick must not re-send a value we already committed (would loop on
+        // Whispr's own paste of unchanged clipboard).
+        assert_eq!(
+            decide_text_send(0xCCCC, true, None, true),
+            TextSendDecision::Skip
+        );
+    }
 
     /// Build a synthetic 4×4 RGBA buffer with deterministic content.
     fn synthetic_rgba_4x4() -> arboard::ImageData<'static> {
