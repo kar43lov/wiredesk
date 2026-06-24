@@ -54,14 +54,23 @@ impl SessionStatus {
 ///
 /// `counters` is shared with the always-on-top transfer overlay (Task 1).
 /// The session thread is the sole writer; the overlay thread only reads.
+///
+/// `receive_files` is shared with the Settings UI thread: it owns the Arc,
+/// the session thread reads it on every clipboard offer, and `Save` calls
+/// `store` on it — so the "Receive files" toggle applies live without a
+/// process restart. The Arc survives reopen-cycles (it's passed into each
+/// fresh `Session`).
 #[cfg(target_os = "windows")]
 pub fn spawn(
     config: HostConfig,
     status_tx: mpsc::Sender<SessionStatus>,
     counters: ProgressCounters,
+    receive_files: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     use crate::injector::WindowsInjector;
-    spawn_with_injector(config, status_tx, counters, |_| WindowsInjector::new())
+    spawn_with_injector(config, status_tx, counters, receive_files, |_| {
+        WindowsInjector::new()
+    })
 }
 
 /// Non-Windows fallback for development on macOS / Linux: uses the mock
@@ -71,9 +80,10 @@ pub fn spawn(
     config: HostConfig,
     status_tx: mpsc::Sender<SessionStatus>,
     counters: ProgressCounters,
+    receive_files: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     use crate::injector::MockInjector;
-    spawn_with_injector(config, status_tx, counters, |_| {
+    spawn_with_injector(config, status_tx, counters, receive_files, |_| {
         Ok::<_, WireDeskError>(MockInjector::default())
     })
 }
@@ -82,6 +92,7 @@ fn spawn_with_injector<I, F>(
     config: HostConfig,
     status_tx: mpsc::Sender<SessionStatus>,
     counters: ProgressCounters,
+    receive_files: Arc<AtomicBool>,
     make_injector: F,
 ) -> JoinHandle<()>
 where
@@ -104,13 +115,11 @@ where
             }
         };
 
-        // `receive_files` toggle: Settings UI persists `HostConfig.receive_files`
-        // and Save-and-Restart respawns the whole host process, so this Arc
-        // is effectively read-once at boot. Wrapping in an Arc keeps the
-        // signature aligned with `with_counters_and_toggles` (which also
-        // serves Mac-style live mutation; we just never call `store` on the
-        // host side).
-        let receive_files = Arc::new(AtomicBool::new(config.receive_files));
+        // `receive_files` toggle: owned by the Settings UI thread and shared
+        // in. We read it on every clipboard offer; `Save` stores into it, so
+        // the "Receive files" toggle applies live (no process restart). The
+        // Arc is re-cloned into each fresh `Session` below, so it survives
+        // reopen-cycles.
 
         // Backoff attempt counter for consecutive open failures; reset to 0
         // on every successful open.

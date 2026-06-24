@@ -2416,6 +2416,39 @@ mod tests {
     }
 
     #[test]
+    fn host_receive_files_toggle_is_live_across_offers() {
+        // Task 8 live-toggle guarantee: `on_offer` must re-read the
+        // `receive_files` flag on EVERY call, not cache it at construction.
+        // This is the property that lets the Settings UI store into the
+        // shared Arc and have the running session honor it without a restart.
+        // We flip the flag between offers on the SAME instance and assert the
+        // accept/decline policy follows each store.
+        let mut sync = ClipboardSync::new_for_test();
+        let flag = sync.receive_files.clone(); // external handle, as main.rs holds
+
+        // Start ON → file offer accepted.
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            sync.on_offer(FORMAT_FILE, 4096).is_none(),
+            "flag ON → offer accepted"
+        );
+
+        // Flip OFF via the external handle → next offer declined live.
+        flag.store(false, Ordering::Relaxed);
+        match sync.on_offer(FORMAT_FILE, 4096) {
+            Some(Message::ClipDecline { format }) => assert_eq!(format, FORMAT_FILE),
+            other => panic!("flag OFF → expected ClipDecline, got {other:?}"),
+        }
+
+        // Flip back ON → accepted again, no restart in between.
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            sync.on_offer(FORMAT_FILE, 4096).is_none(),
+            "flag back ON → offer accepted again"
+        );
+    }
+
+    #[test]
     fn host_incoming_file_oversize_offer_dropped_no_decline() {
         // Even with receive_files=true, an offer past MAX_FILE_BYTES + name
         // headroom is dropped silently (no ClipDecline — that's reserved for

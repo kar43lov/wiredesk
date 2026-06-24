@@ -86,11 +86,11 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// Full ctor: progress counters plus a `receive_files` runtime toggle
     /// threaded through to `ClipboardSync::with_counters_and_toggles`. Production
     /// session-thread spawn wires the toggle from `HostConfig.receive_files`
-    /// so a `false` in TOML disables incoming `FORMAT_FILE` offers at boot;
-    /// the Settings UI's Save-and-Restart respawns the host process, so the
-    /// flag isn't live-mutable from outside the session loop (matches the
-    /// existing send_images/receive_images pattern on the Mac side, which
-    /// uses Arc only because the Mac UI has live config without restart).
+    /// (a `false` in TOML disables incoming `FORMAT_FILE` offers at boot). The
+    /// Arc is owned by `main` and shared with the Settings UI, which `store`s
+    /// into it on Save — so the flag IS live-mutable from outside the session
+    /// loop: the toggle applies without a process restart (matches the Mac
+    /// side's live `send_images`/`receive_images` toggles).
     pub fn with_counters_and_toggles(
         transport: T,
         injector: I,

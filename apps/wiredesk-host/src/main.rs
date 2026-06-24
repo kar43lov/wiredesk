@@ -141,16 +141,26 @@ fn main() {
     // (Windows) reads. Default-initialised so dev loop on macOS still gets
     // a valid bundle (no overlay there, but Session needs the structure).
     let counters = ProgressCounters::default();
-    let _session = session_thread::spawn(cfg.clone(), status_tx, counters.clone());
+    // `receive_files` is owned here and shared with both the session thread
+    // (reads it on every clipboard offer) and the Settings UI (`Save` stores
+    // into it) — so the "Receive files" toggle applies live without a restart.
+    let receive_files = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_files));
+    let _session = session_thread::spawn(
+        cfg.clone(),
+        status_tx,
+        counters.clone(),
+        receive_files.clone(),
+    );
 
     let last_status = Arc::new(Mutex::new(ui::status_bridge::StatusState::default()));
 
     #[cfg(windows)]
-    run_windows(cfg, status_rx, last_status, counters);
+    run_windows(cfg, status_rx, last_status, counters, receive_files);
 
     #[cfg(not(windows))]
     {
         let _ = counters; // unused in dev loop, keep clone for symmetry
+        let _ = receive_files; // ditto — no Settings UI in dev loop
         run_dev_loop(status_rx, last_status);
     }
 }
@@ -179,6 +189,7 @@ fn run_windows(
     status_rx: mpsc::Receiver<SessionStatus>,
     last: Arc<Mutex<ui::status_bridge::StatusState>>,
     counters: ProgressCounters,
+    receive_files: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use native_windows_gui as nwg;
 
@@ -444,6 +455,9 @@ fn run_windows(
     // call that pumps messages.
     let settings_clone2 = settings.clone();
     let cfg_holder = Arc::new(Mutex::new(cfg.clone()));
+    // Moved into the event closure so `handle_save` can store the live
+    // `receive_files` flag the session thread reads.
+    let receive_files_for_save = receive_files.clone();
     let settings_event_handler =
         nwg::full_bind_event_handler(&settings_handle, move |evt, _evt_data, handle| {
             use nwg::Event as E;
@@ -480,7 +494,7 @@ fn run_windows(
             match evt {
                 E::OnButtonClick => {
                     if is_save {
-                        handle_save(&settings_clone2, &cfg_holder);
+                        handle_save(&settings_clone2, &cfg_holder, &receive_files_for_save);
                     } else if is_copy_mac {
                         handle_copy_mac(&settings_clone2, &cfg_holder);
                     } else if is_restart {
@@ -540,6 +554,7 @@ fn run_windows(
 fn handle_save(
     settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
     cfg_holder: &Arc<Mutex<HostConfig>>,
+    receive_files: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     let base = cfg_holder
         .lock()
@@ -553,6 +568,11 @@ fn handle_save(
                 s.set_message(&format!("Save failed: {e}"));
                 return;
             }
+            // The "Receive files" toggle applies live: the session thread
+            // reads this same Arc on every clipboard offer, so storing here
+            // takes effect immediately — no restart needed for this field.
+            // (port / baud / size / transport still require a restart.)
+            receive_files.store(new_cfg.receive_files, std::sync::atomic::Ordering::Relaxed);
             // Sync autostart with the checkbox.
             let r = if new_cfg.run_on_startup {
                 ui::autostart::enable()
@@ -562,7 +582,7 @@ fn handle_save(
             if let Err(e) = r {
                 s.set_message(&format!("Saved, but autostart toggle failed: {e}"));
             } else {
-                s.set_message("Saved. Restart WireDesk Host to apply.");
+                s.set_message("Saved. File receive applied; restart to apply other changes.");
             }
             if let Ok(mut g) = cfg_holder.lock() {
                 *g = new_cfg;
