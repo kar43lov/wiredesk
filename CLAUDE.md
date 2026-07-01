@@ -120,17 +120,18 @@ open target/release/WireDesk.app
 
 ## Architecture
 
-Rust workspace с 6 crate:
+Rust workspace с 7 crate:
 
 ```
 crates/
   wiredesk-core       — WireDeskError, типы (Resolution, MouseButton, Modifiers)
-  wiredesk-protocol   — бинарный протокол: Packet, Message (20 типов), COBS framing, CRC-16
+  wiredesk-protocol   — бинарный протокол: Packet, Message (21 тип), COBS framing, CRC-16
   wiredesk-transport  — trait Transport, SerialTransport, MockTransport
+  wiredesk-exec-core  — shared sentinel-runner для `wd --exec` (streaming через FnMut(&[u8]) callback) + `ExecTransport` trait; общий между term и client
 apps/
   wiredesk-host       — Windows tray agent: Session + InputInjector + ShellProcess + ClipboardSync + nwg UI (settings + tray + autostart)
-  wiredesk-client     — macOS egui app: capture-окно + InputMapper + clipboard poll thread + settings panel
-  wiredesk-term       — macOS CLI: raw-mode terminal bridge для Ghostty/iTerm (только shell)
+  wiredesk-client     — macOS egui app: capture-окно + InputMapper + clipboard poll thread + settings panel; хостит `IpcExecTransport` для параллельного `wd --exec` через GUI
+  wiredesk-term       — macOS CLI: raw-mode terminal bridge для Ghostty/iTerm (shell) + `wd --exec` non-interactive mode
 ```
 
 Полный архитектурный разбор (module maps Host + Client, threading, data flow, protocol details, clipboard sync, keyboard hijack, shell-over-serial, key design decisions) — в [`docs/architecture.md`](docs/architecture.md). Ключевые точки ниже:
