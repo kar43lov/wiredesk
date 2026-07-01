@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wiredesk_protocol::clip_file::{
     MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
@@ -741,6 +741,78 @@ pub(crate) fn decide_text_send(
     }
 }
 
+/// How long we keep suppressing a just-sent file's name if it later shows
+/// up as plain text (Finder's lazily-resolved filename-as-text — see
+/// `recent_file_names_contains`). Generous margin over the observed
+/// 200ms-9s delay range between the file-url and text representations
+/// landing on the pasteboard (two live tests of the same 1.3 MB file).
+const SENT_FILE_NAME_WINDOW: Duration = Duration::from_secs(30);
+
+/// How many recently-sent file names to remember. Mirrors `TEXT_HISTORY`'s
+/// rationale — more than one file can be in flight or recently sent (e.g.
+/// a second file copied while the first is still transmitting), so a
+/// single-slot guard would lose track of the earlier one.
+const SENT_FILE_NAME_CAPACITY: usize = 4;
+
+/// Record `name` as a just-sent file, evicting the oldest entry beyond
+/// `SENT_FILE_NAME_CAPACITY`. Pure so tests can drive it without spawning
+/// the poll thread or sleeping.
+pub(crate) fn push_sent_file_name(
+    entries: &mut std::collections::VecDeque<(String, Instant)>,
+    name: String,
+    now: Instant,
+) {
+    entries.push_front((name, now));
+    entries.truncate(SENT_FILE_NAME_CAPACITY);
+}
+
+/// True when `text` exactly matches the name of a recently-sent file —
+/// almost certainly Finder's lazily-resolved filename-as-text for that
+/// same Cmd+C, not a genuine independent text copy. See the file/text race
+/// guard in `spawn_poll_thread`.
+///
+/// On a match, the entry's timestamp is refreshed to `now` (Codex review,
+/// third pass): the poll thread calls this every ~200ms tick, and Finder
+/// doesn't retract the lazy text once it resolves — it just sits on the
+/// pasteboard, unchanged, for as long as the user doesn't copy anything
+/// else. A fixed window measured from the original file-send would expire
+/// out from under a slow paste (copy file, wait >30s, then paste — still a
+/// completely ordinary use case) and let the stale filename text through
+/// to overwrite the file on Host. Refreshing on every observed match makes
+/// the window slide forward as long as the SAME text keeps reappearing; it
+/// only starts counting down once the clipboard actually moves on.
+///
+/// Deliberately NOT keyed off `current_outgoing_label`: that field is
+/// cleared by the writer thread the moment the file's own bytes finish
+/// hitting the wire, purely to reset the UI status line — a fast/small
+/// file, or a second file queued while the first is still transmitting,
+/// can easily outlive that clear (Codex review, first pass, caught this).
+/// Tracking a short recent history here, entirely inside the poll thread,
+/// sidesteps that race.
+///
+/// Known accepted trade-off: still a content match, not a causal one —
+/// literal text identical to a just-sent file's name is treated as the
+/// same race for as long as it keeps reappearing (plus `SENT_FILE_NAME_WINDOW`
+/// after it last did), even if unrelated. Narrow enough (exact match) that
+/// full NSPasteboard type-probing isn't worth it — matches the existing
+/// accepted-limitation pattern for mixed-format clipboard items in this file.
+pub(crate) fn recent_file_names_contains(
+    entries: &mut std::collections::VecDeque<(String, Instant)>,
+    text: &str,
+    now: Instant,
+) -> bool {
+    match entries
+        .iter_mut()
+        .find(|(name, at)| name == text && now.duration_since(*at) <= SENT_FILE_NAME_WINDOW)
+    {
+        Some(entry) => {
+            entry.1 = now;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Spawn a background thread that polls the local clipboard and pushes
 /// ClipOffer + ClipChunks onto `outgoing_tx` whenever the content changes
 /// (and isn't something we just wrote ourselves).
@@ -859,6 +931,12 @@ pub fn spawn_poll_thread(
         // drag fragment). See `decide_text_send`.
         let mut pending_text_hash: Option<u64> = None;
 
+        // Recently-sent file names with timestamps, owned solely by this
+        // thread — see `recent_file_names_contains` for why this can't just
+        // reuse `current_outgoing_label`.
+        let mut sent_file_names: std::collections::VecDeque<(String, Instant)> =
+            std::collections::VecDeque::new();
+
         loop {
             // Sleep up to CLIP_POLL_INTERVAL, but wake immediately if the
             // keyboard tap signals that a synthetic Cmd+V just fired —
@@ -905,10 +983,14 @@ pub fn spawn_poll_thread(
             // <len(filename utf8)>`, then Explorer paste yields the
             // filename string instead of the file). Since the delay isn't
             // bounded to "this tick" or even "a couple of ticks", the text
-            // branch below instead compares the candidate text against
-            // `current_outgoing_label` — which holds the just-sent file's
-            // name for the file's entire on-wire lifetime — and skips any
-            // text that matches it, regardless of which tick it surfaces on.
+            // branch below instead checks the candidate text against
+            // `sent_file_names` — a short recent-history ring (NOT
+            // `current_outgoing_label`, which the writer thread clears the
+            // moment the file's own bytes finish hitting the wire, for an
+            // unrelated UI-status-line purpose; a fast/small file or a
+            // second file queued mid-transfer can easily outlive that clear
+            // — see `recent_file_names_contains`) — and skips any text that
+            // matches, regardless of which tick or how long after it surfaces.
             'file: {
                 // Always poll so `file_change_count` tracks the pasteboard
                 // even while the opt-in is OFF. If we skipped the probe when
@@ -963,6 +1045,12 @@ pub fn spawn_poll_thread(
                         if let Ok(mut g) = current_outgoing_label.lock() {
                             *g = name.clone();
                         }
+                        // Separately, remember this name for the file/text
+                        // race guard below (see `recent_file_names_contains`
+                        // — intentionally independent of the UI label above,
+                        // which clears on wire-completion and can't be
+                        // reused for this).
+                        push_sent_file_name(&mut sent_file_names, name.clone(), Instant::now());
                         emit_offer_and_chunks(&outgoing_tx, FORMAT_FILE, &packed);
                     }
                     FilePollOutcome::Oversize { path_hash, err } => {
@@ -1004,18 +1092,28 @@ pub fn spawn_poll_thread(
                     Ok(text) if !text.is_empty() => {
                         let hash = hash_text(&text);
                         // Race guard (see comment above the file probe): a
-                        // candidate text value that exactly matches the name
-                        // of a file transfer still on the wire is Finder's
+                        // candidate text value that exactly matches a
+                        // recently-sent file's name is Finder's
                         // lazily-resolved filename-as-text for the SAME
-                        // Cmd+C, not a genuine independent text copy. Stamp
-                        // it as already-sent (without shipping) so it never
-                        // reaches the wire and overwrites the file on Host.
-                        let is_pending_file_name = current_outgoing_label
-                            .lock()
-                            .map(|g| !g.is_empty() && *g == text)
-                            .unwrap_or(false);
+                        // Cmd+C, not a genuine independent text copy. Skip
+                        // it (without shipping) so it never reaches the
+                        // wire and overwrites the file on Host.
+                        //
+                        // Deliberately do NOT `state.set_text(hash)` here
+                        // (Codex review, second pass): stamping it into the
+                        // normal sent-text dedup history would make a LATER
+                        // legitimate copy of that exact string look
+                        // "already sent" and get silently skipped, for as
+                        // long as it survives the 4-entry LRU — well past
+                        // this guard's own 30s window. Leaving the dedup
+                        // state untouched means a genuine future copy of
+                        // that text is unaffected; if the same lazy text is
+                        // still sitting unchanged once the window lapses,
+                        // it's shipped normally like any other text (the
+                        // race has long since resolved by then).
+                        let is_pending_file_name =
+                            recent_file_names_contains(&mut sent_file_names, &text, Instant::now());
                         if is_pending_file_name {
-                            state.set_text(hash);
                             pending_text_hash = None;
                         } else {
                             let already_sent = state.get().matches_text_hash(hash);
@@ -1804,6 +1902,158 @@ mod tests {
             decide_text_send(0xCCCC, true, None, true),
             TextSendDecision::Skip
         );
+    }
+
+    // --- push_sent_file_name / recent_file_names_contains (file/text race guard) ---
+
+    #[test]
+    fn recent_file_name_exact_match_within_window_is_detected() {
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        push_sent_file_name(&mut entries, "Справочник 12.02.26.xls".to_string(), now);
+        // "Arrives" 5s later — well within the 30s window observed live.
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "Справочник 12.02.26.xls",
+            now + Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn recent_file_name_expires_after_window_if_never_rematched() {
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        push_sent_file_name(&mut entries, "report.xlsx".to_string(), now);
+        // 31s later, with no intervening match to refresh it — just past
+        // the 30s window — must NOT match, so a genuinely unrelated later
+        // text copy isn't suppressed forever.
+        assert!(!recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(31)
+        ));
+    }
+
+    #[test]
+    fn recent_file_name_refreshes_on_repeated_match_while_unchanged() {
+        // Codex review (third pass): Finder's lazy filename-text sits on
+        // the pasteboard unchanged for as long as the user doesn't copy
+        // anything else, and the poll thread re-observes it every ~200ms
+        // tick. A slow paste (copy file, wait well over 30s, then paste)
+        // must not let the stale filename text slip through just because
+        // the window was measured from the original file-send.
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        push_sent_file_name(&mut entries, "report.xlsx".to_string(), now);
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(10)
+        ));
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(20)
+        ));
+        // 35s after the ORIGINAL push (would've expired under a fixed
+        // window), but only 15s after the last match — still suppressed.
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(35)
+        ));
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn recent_file_name_stops_refreshing_once_untouched_and_then_expires() {
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        push_sent_file_name(&mut entries, "report.xlsx".to_string(), now);
+        // One match at t=5 refreshes the entry to t=5.
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(5)
+        ));
+        // No further matches (clipboard moved on) — 31s after that LAST
+        // refresh (t=5+31=36) it must finally expire.
+        assert!(!recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            now + Duration::from_secs(36)
+        ));
+    }
+
+    #[test]
+    fn recent_file_name_empty_history_never_matches() {
+        let mut entries = std::collections::VecDeque::new();
+        assert!(!recent_file_names_contains(
+            &mut entries,
+            "report.xlsx",
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn recent_file_name_different_text_does_not_match() {
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        push_sent_file_name(&mut entries, "report.xlsx".to_string(), now);
+        assert!(!recent_file_names_contains(
+            &mut entries,
+            "something else entirely",
+            now
+        ));
+    }
+
+    #[test]
+    fn recent_file_name_survives_a_second_file_queued_on_top() {
+        // Codex review finding (first pass): a second file copied while the
+        // first is still on the wire must not evict the first file's name
+        // from the guard — its lazily-resolved filename-text can still
+        // arrive after the second file was queued (this is exactly why the
+        // guard can't reuse `current_outgoing_label`, a single slot the
+        // writer thread overwrites/clears per transfer).
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        push_sent_file_name(&mut entries, "first.xlsx".to_string(), now);
+        push_sent_file_name(
+            &mut entries,
+            "second.xlsx".to_string(),
+            now + Duration::from_secs(1),
+        );
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "first.xlsx",
+            now + Duration::from_secs(2)
+        ));
+        assert!(recent_file_names_contains(
+            &mut entries,
+            "second.xlsx",
+            now + Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn push_sent_file_name_evicts_beyond_capacity() {
+        let mut entries = std::collections::VecDeque::new();
+        let now = Instant::now();
+        for i in 0..(SENT_FILE_NAME_CAPACITY + 2) {
+            push_sent_file_name(&mut entries, format!("file{i}.xlsx"), now);
+        }
+        assert_eq!(entries.len(), SENT_FILE_NAME_CAPACITY);
+        // Oldest entries evicted; most recently pushed survives.
+        assert!(!recent_file_names_contains(&mut entries, "file0.xlsx", now));
+        assert!(recent_file_names_contains(
+            &mut entries,
+            &format!("file{}.xlsx", SENT_FILE_NAME_CAPACITY + 1),
+            now
+        ));
     }
 
     /// Build a synthetic 4×4 RGBA buffer with deterministic content.
