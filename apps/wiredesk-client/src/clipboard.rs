@@ -889,137 +889,26 @@ pub fn spawn_poll_thread(
             // Whispr-Flow's Cmd+V until the new clipboard reaches Host.
             outgoing_text_in_flight.store(false, Ordering::Release);
 
-            // 1) Probe text. Independent dedup slot (`LastSeen.text`) so
-            // an alternating text/image clipboard (Whispr Flow + a
-            // standing screenshot) doesn't loop. Runtime toggle gates
-            // the path entirely.
-            if send_text.load(Ordering::Relaxed) {
-                // Probe text. A non-empty value runs the debounce; anything
-                // else (empty clipboard, or an image/file-only clipboard where
-                // `get_text` errs) must DROP any pending debounce hash —
-                // otherwise a stale pending survives the non-text interlude
-                // and a later re-copy of the same text would match it and ship
-                // on its first sighting, skipping the stability gate.
-                match clip.get_text() {
-                    Ok(text) if !text.is_empty() => {
-                        let hash = hash_text(&text);
-                        let already_sent = state.get().matches_text_hash(hash);
-                        match decide_text_send(
-                            hash,
-                            already_sent,
-                            pending_text_hash,
-                            paste_kicked,
-                        ) {
-                            TextSendDecision::Skip => {
-                                pending_text_hash = None;
-                            }
-                            TextSendDecision::Hold => {
-                                // copy-on-select drag fragment (or any value
-                                // not yet stable for two ticks) — hold and
-                                // re-check next poll instead of shipping it.
-                                pending_text_hash = Some(hash);
-                            }
-                            TextSendDecision::Send => {
-                                pending_text_hash = None;
-                                state.set_text(hash);
-                                let bytes = text.as_bytes();
-                                if bytes.len() > MAX_CLIPBOARD_BYTES {
-                                    log::warn!(
-                                        "clipboard: skipping push — {} bytes exceeds limit",
-                                        bytes.len()
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "clipboard: pushing {} bytes to host",
-                                        bytes.len()
-                                    );
-                                    outgoing_text_in_flight
-                                        .store(true, Ordering::Release);
-                                    emit_offer_and_chunks(
-                                        &outgoing_tx,
-                                        FORMAT_TEXT_UTF8,
-                                        bytes,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        pending_text_hash = None;
-                    }
-                }
-            } else {
-                // Text sending disabled — drop pending so re-enabling later
-                // doesn't treat a value held before the toggle as "stable".
-                pending_text_hash = None;
-            }
-
-            // 2) Probe image. Independent dedup slot. Runtime toggle gates.
-            // Note: probing both text AND image in the same tick (instead
-            // of falling through only on text-empty) is intentional — the
-            // OS clipboard can hold both. This closes the codex C3 gap.
-            //
-            // The image branch is wrapped in a labeled inner block so each
-            // early-exit (cap rejection, encode failure, etc.) falls through
-            // to the file branch below instead of skipping the whole tick.
-            // The OS clipboard can carry text + image + file URLs from the
-            // same Cmd+C; we don't want a stale image to suppress file sync.
-            'image: {
-                if !send_images.load(Ordering::Relaxed) {
-                    break 'image;
-                }
-                let img = match clip.get_image() {
-                    Ok(i) => i,
-                    Err(_) => break 'image, // not an image
-                };
-
-                let hash = hash_bytes(&img.bytes);
-                // Short-circuit BEFORE the expensive RGBA→PNG encode for both:
-                // - already-sent images (LastSeen.image),
-                // - already-rejected oversized images (LastSeen.oversize_image).
-                // Otherwise every 500 ms tick re-encodes (~30-150 ms CPU) and
-                // re-emits the toast for the SAME oversize buffer.
-                if state.get().matches_image_hash(hash) {
-                    break 'image;
-                }
-
-                let png = match encode_rgba_to_png(&img) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::warn!("clipboard: PNG encode failed: {e}");
-                        break 'image;
-                    }
-                };
-
-                if let Err(e) = check_image_size(png.len(), MAX_IMAGE_BYTES) {
-                    log::warn!(
-                        "clipboard: image too large ({} bytes, limit {}), skipping",
-                        e.png_len,
-                        MAX_IMAGE_BYTES
-                    );
-                    let _ = events_tx.send(TransportEvent::Toast(format_oversize_toast(&e)));
-                    // Stamp the RGBA hash so the next 500 ms tick short-circuits
-                    // for the same image. A new RGBA (user re-copied) gives a new
-                    // hash and re-tries the encode path.
-                    state.set_oversize_image(hash);
-                    break 'image;
-                }
-
-                // Codex iter3 E2 (acceptable): sender dedup is set on enqueue,
-                // not on successful send. If transport fails mid-transfer, retry
-                // happens only when clipboard content changes again. Acceptable:
-                // heartbeat covers disconnect within 6s, app restart clears state.
-                state.set_image(hash);
-
-                log::debug!("clipboard: pushing image to host ({} encoded bytes)", png.len());
-                emit_offer_and_chunks(&outgoing_tx, FORMAT_PNG_IMAGE, &png);
-            }
-
-            // 3) Probe file. Independent dedup slot. Same shape as image:
-            // wrapped in a labeled block so failures don't stop other branches
-            // (text already ran above). File sync is always-on at outbound —
-            // the runtime toggle for files lives on the receive side
-            // (`receive_files`), wired up in Task 7a.
+            // 1) Probe file FIRST, before text. Finder's Cmd+C on a file
+            // eventually exposes the filename as plain text on the same
+            // pasteboard item, ALONGSIDE the `public.file-url` entry — but
+            // Finder resolves that text representation lazily (observed
+            // delay ranges from ~200ms to ~9s after the file-url appears,
+            // presumably a promise/lazy-provider resolving on its own
+            // schedule). Once it lands, the text debounce ships it, it
+            // queues behind the (possibly still-in-flight) file transfer on
+            // the wire, and Host commits each format via its own
+            // `EmptyClipboard` — so the filename-text silently overwrites
+            // the file we just delivered (100% repro on every single-file
+            // Finder copy, confirmed via host.log: `clipboard.recv DONE
+            // <file>` immediately followed by `clipboard.recv DONE
+            // <len(filename utf8)>`, then Explorer paste yields the
+            // filename string instead of the file). Since the delay isn't
+            // bounded to "this tick" or even "a couple of ticks", the text
+            // branch below instead compares the candidate text against
+            // `current_outgoing_label` — which holds the just-sent file's
+            // name for the file's entire on-wire lifetime — and skips any
+            // text that matches it, regardless of which tick it surfaces on.
             'file: {
                 // Always poll so `file_change_count` tracks the pasteboard
                 // even while the opt-in is OFF. If we skipped the probe when
@@ -1098,6 +987,148 @@ pub fn spawn_poll_thread(
                         log::debug!("clipboard: file poll skipped — {reason}");
                     }
                 }
+            }
+
+            // 2) Probe text. Independent dedup slot (`LastSeen.text`) so
+            // an alternating text/image clipboard (Whispr Flow + a
+            // standing screenshot) doesn't loop. Runtime toggle gates
+            // the path entirely.
+            if send_text.load(Ordering::Relaxed) {
+                // Probe text. A non-empty value runs the debounce; anything
+                // else (empty clipboard, or an image/file-only clipboard where
+                // `get_text` errs) must DROP any pending debounce hash —
+                // otherwise a stale pending survives the non-text interlude
+                // and a later re-copy of the same text would match it and ship
+                // on its first sighting, skipping the stability gate.
+                match clip.get_text() {
+                    Ok(text) if !text.is_empty() => {
+                        let hash = hash_text(&text);
+                        // Race guard (see comment above the file probe): a
+                        // candidate text value that exactly matches the name
+                        // of a file transfer still on the wire is Finder's
+                        // lazily-resolved filename-as-text for the SAME
+                        // Cmd+C, not a genuine independent text copy. Stamp
+                        // it as already-sent (without shipping) so it never
+                        // reaches the wire and overwrites the file on Host.
+                        let is_pending_file_name = current_outgoing_label
+                            .lock()
+                            .map(|g| !g.is_empty() && *g == text)
+                            .unwrap_or(false);
+                        if is_pending_file_name {
+                            state.set_text(hash);
+                            pending_text_hash = None;
+                        } else {
+                            let already_sent = state.get().matches_text_hash(hash);
+                            match decide_text_send(
+                                hash,
+                                already_sent,
+                                pending_text_hash,
+                                paste_kicked,
+                            ) {
+                                TextSendDecision::Skip => {
+                                    pending_text_hash = None;
+                                }
+                                TextSendDecision::Hold => {
+                                    // copy-on-select drag fragment (or any value
+                                    // not yet stable for two ticks) — hold and
+                                    // re-check next poll instead of shipping it.
+                                    pending_text_hash = Some(hash);
+                                }
+                                TextSendDecision::Send => {
+                                    pending_text_hash = None;
+                                    state.set_text(hash);
+                                    let bytes = text.as_bytes();
+                                    if bytes.len() > MAX_CLIPBOARD_BYTES {
+                                        log::warn!(
+                                            "clipboard: skipping push — {} bytes exceeds limit",
+                                            bytes.len()
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "clipboard: pushing {} bytes to host",
+                                            bytes.len()
+                                        );
+                                        outgoing_text_in_flight
+                                            .store(true, Ordering::Release);
+                                        emit_offer_and_chunks(
+                                            &outgoing_tx,
+                                            FORMAT_TEXT_UTF8,
+                                            bytes,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        pending_text_hash = None;
+                    }
+                }
+            } else {
+                // Text sending disabled — drop pending so re-enabling later
+                // doesn't treat a value held before the toggle as "stable".
+                pending_text_hash = None;
+            }
+
+            // 3) Probe image. Independent dedup slot. Runtime toggle gates.
+            // Note: probing both text AND image in the same tick (instead
+            // of falling through only on text-empty) is intentional — the
+            // OS clipboard can hold both. This closes the codex C3 gap.
+            //
+            // The image branch is wrapped in a labeled inner block so each
+            // early-exit (cap rejection, encode failure, etc.) falls through
+            // to the end of the tick instead of skipping the whole tick.
+            // The OS clipboard can carry text + image + file URLs from the
+            // same Cmd+C; we don't want a stale image to suppress file sync.
+            'image: {
+                if !send_images.load(Ordering::Relaxed) {
+                    break 'image;
+                }
+                let img = match clip.get_image() {
+                    Ok(i) => i,
+                    Err(_) => break 'image, // not an image
+                };
+
+                let hash = hash_bytes(&img.bytes);
+                // Short-circuit BEFORE the expensive RGBA→PNG encode for both:
+                // - already-sent images (LastSeen.image),
+                // - already-rejected oversized images (LastSeen.oversize_image).
+                // Otherwise every 500 ms tick re-encodes (~30-150 ms CPU) and
+                // re-emits the toast for the SAME oversize buffer.
+                if state.get().matches_image_hash(hash) {
+                    break 'image;
+                }
+
+                let png = match encode_rgba_to_png(&img) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!("clipboard: PNG encode failed: {e}");
+                        break 'image;
+                    }
+                };
+
+                if let Err(e) = check_image_size(png.len(), MAX_IMAGE_BYTES) {
+                    log::warn!(
+                        "clipboard: image too large ({} bytes, limit {}), skipping",
+                        e.png_len,
+                        MAX_IMAGE_BYTES
+                    );
+                    let _ = events_tx.send(TransportEvent::Toast(format_oversize_toast(&e)));
+                    // Stamp the RGBA hash so the next 500 ms tick short-circuits
+                    // for the same image. A new RGBA (user re-copied) gives a new
+                    // hash and re-tries the encode path.
+                    state.set_oversize_image(hash);
+                    break 'image;
+                }
+
+                // Codex iter3 E2 (acceptable): sender dedup is set on enqueue,
+                // not on successful send. If transport fails mid-transfer, retry
+                // happens only when clipboard content changes again. Acceptable:
+                // heartbeat covers disconnect within 6s, app restart clears state.
+                state.set_image(hash);
+
+                log::debug!("clipboard: pushing image to host ({} encoded bytes)", png.len());
+                emit_offer_and_chunks(&outgoing_tx, FORMAT_PNG_IMAGE, &png);
             }
         }
     });
