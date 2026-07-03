@@ -284,24 +284,24 @@ carries those `Packet`s:
 **Files:**
 - Modify: `apps/wiredesk-client/src/ipc.rs`
 
-- [ ] implement `#[allow(dead_code)] fn handle_interactive_connection(stream, outgoing_tx,
+- [x] implement `#[allow(dead_code)] fn handle_interactive_connection(stream, outgoing_tx,
       exec_slot, shell_owner, host_info, link_up)`:
       `try_acquire(Interactive)` (busy → write terminal "shell busy" frame + close); refuse if
       `link_up == false` OR `host_info` empty; install `ExecSlotGuard`; originate the single
       `ShellOpenPty { shell, cols, rows }` to `outgoing_tx`.
-- [ ] implement the two pumps: socket→wire (`Hello`→synth `HelloAck` from `host_info`, NOT
+- [x] implement the two pumps: socket→wire (`Hello`→synth `HelloAck` from `host_info`, NOT
       forwarded; `Heartbeat`→drop; `ShellInput`/`PtyResize`/`ShellClose`/`Disconnect`→`outgoing_tx`)
       and slot→socket (`ShellOutput`/`ShellExit`/`HostError`→`Packet`→socket). Poll `link_up` each
       cycle; on `false` write synth `Disconnect` + close socket (AC6). Teardown: `ShellClose`,
       drop guard, close.
-- [ ] write tests (call the fn directly with a `UnixStream::pair` + mock `outgoing_tx`/`exec_slot`):
+- [x] write tests (call the fn directly with a `UnixStream::pair` + mock `outgoing_tx`/`exec_slot`):
       `Hello`→synth `HelloAck` and NOT forwarded to wire; `Heartbeat` dropped; `ShellInput`/
       `PtyResize` forwarded; staged `ShellOutput`/`ShellExit` reach the socket.
-- [ ] write tests: `link_up == false` OR empty `host_info` → refused, no packet queued
+- [x] write tests: `link_up == false` OR empty `host_info` → refused, no packet queued
       (mirror `handler_link_down_returns_transport_unavailable`).
-- [ ] write tests: owner already `Interactive`/`Exec` → "shell busy", no `ShellOpenPty` queued.
-- [ ] write tests: mid-session `link_up`→false → synth `Disconnect` written, socket closed (AC6).
-- [ ] run tests - must pass before next task.
+- [x] write tests: owner already `Interactive`/`Exec` → "shell busy", no `ShellOpenPty` queued.
+- [x] write tests: mid-session `link_up`→false → synth `Disconnect` written, socket closed (AC6).
+- [x] run tests - must pass before next task.
 
 ### Task 7: Atomic `IpcConnect` cutover — acceptor dispatch + exec handler + exec client together
 

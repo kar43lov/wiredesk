@@ -32,13 +32,18 @@ use std::thread;
 use std::time::Duration;
 
 use wiredesk_exec_core::{
-    ipc::{read_request, write_response, IpcResponse},
+    ipc::{
+        read_packet_frame, read_request, write_packet_frame, write_response, IpcInteractiveOpen,
+        IpcResponse,
+    },
     ExecError, ExecEvent, ExecTransport,
 };
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
 use crate::exec_bridge::{ExecEventSlot, ExecSlotGuard};
+use crate::link::SharedHostInfo;
+use crate::shell_channel::{try_acquire, SharedShellOwner, ShellOwner};
 
 /// `ExecTransport` impl that bridges the runner to the GUI's existing
 /// outgoing-packet channel and the IPC handler's mpsc. `send_input`
@@ -412,6 +417,257 @@ fn handle_connection(
     }
 }
 
+/// Protocol version echoed in the synthesised `HelloAck`. The term ignores
+/// the version field on receive (`link.rs` HelloAck arm binds `..`), so this
+/// is informational — kept at 1 to match the host's real handshake.
+const SYNTH_HELLO_ACK_VERSION: u8 = 1;
+
+/// Error code carried by the terminal frames the interactive relay writes when
+/// it refuses a connection (channel busy / link not ready). The term maps the
+/// closed socket to a transport-class exit; the message is for the user's eyes.
+const RELAY_REFUSE_CODE: u16 = 125;
+
+/// Build the `Error` packet the relay writes to the socket when it refuses an
+/// interactive connect (owner already held, or link/host not ready).
+fn relay_error_packet(msg: &str) -> Packet {
+    Packet::new(
+        Message::Error {
+            code: RELAY_REFUSE_CODE,
+            msg: msg.to_string(),
+        },
+        0,
+    )
+}
+
+/// Synthesize a `HelloAck` from the cached host-info. The term connects to the
+/// socket *after* the GUI already handshook with the host, so its `Hello` is
+/// answered from this cache instead of being forwarded to the wire. Falls back
+/// to empty host_name / zero geometry if the cache somehow drained between the
+/// caller's readiness check and this call (the term tolerates it — geometry is
+/// re-derived from its own `terminal::size()`).
+fn synth_hello_ack(host_info: &SharedHostInfo) -> Packet {
+    let (host_name, screen_w, screen_h) = host_info
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(|hi| (hi.host_name, hi.screen_w as u16, hi.screen_h as u16))
+        .unwrap_or_else(|| (String::new(), 0, 0));
+    Packet::new(
+        Message::HelloAck {
+            version: SYNTH_HELLO_ACK_VERSION,
+            host_name,
+            screen_w,
+            screen_h,
+        },
+        0,
+    )
+}
+
+/// Per-connection handler for an **interactive** `wd` session (streaming PTY
+/// over the socket). Unlike the one-shot exec handler, both directions carry
+/// raw `Packet`s after the `IpcConnect::Interactive` frame the acceptor already
+/// consumed. This function:
+///
+///   1. claims the shell channel as `Interactive` (cross-kind fail-fast — a
+///      busy channel gets a terminal "shell busy" frame and the socket closes);
+///   2. refuses if the serial link is down or the host-info cache is empty
+///      (not yet handshook — AC6), writing a terminal frame + closing;
+///   3. installs an `ExecSlotGuard` so `reader_thread` fans host shell-events
+///      into our private mpsc;
+///   4. **originates the single `ShellOpenPty { shell, cols, rows }`** — the
+///      term does NOT send its own (plan-review Important #2);
+///   5. runs two pumps until socket EOF / `ShellExit` / term `ShellClose` /
+///      link-down:
+///        * socket → wire (reader thread): `Hello` → synth `HelloAck` from the
+///          cache (NOT forwarded); `Heartbeat` → dropped; `ShellInput` /
+///          `PtyResize` → `outgoing_tx`; `ShellClose` / `Disconnect` → stop
+///          (teardown sends the single host-side `ShellClose`);
+///        * slot → socket (this thread): `ShellOutput` / `ShellExit` /
+///          `HostError` → `Packet` → socket. Polls `link_up` each cycle; on
+///          `false` writes a synth `Disconnect` and closes the socket so the
+///          term's reader sees EOF and exits cleanly (AC6).
+///
+/// On teardown: send `ShellClose` to the host, drop the owner + slot guards
+/// (channel → `Idle`, slot → `None`), close the socket. All guards are RAII so
+/// a panic in either pump still releases the channel.
+///
+/// `dead_code` allowed until Task 7 dispatches it from the acceptor.
+#[allow(dead_code)]
+fn handle_interactive_connection(
+    stream: UnixStream,
+    open: IpcInteractiveOpen,
+    outgoing_tx: mpsc::Sender<Packet>,
+    exec_slot: ExecEventSlot,
+    shell_owner: SharedShellOwner,
+    host_info: SharedHostInfo,
+    link_up: Arc<AtomicBool>,
+) {
+    // 1. Claim the host's single shell slot exclusively. Busy (exec or another
+    //    interactive session in flight) → fail-fast terminal frame + close. No
+    //    queuing: a minutes-long interactive session must never block Claude.
+    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Interactive) {
+        Some(g) => g,
+        None => {
+            log::info!("IPC interactive: shell channel busy — refusing");
+            let mut s = stream;
+            let _ = write_packet_frame(&mut s, &relay_error_packet("shell busy"));
+            return;
+        }
+    };
+
+    // 2. Refuse if the link is mid-reconnect or we never handshook (empty
+    //    host-info cache): we can't synth an accurate HelloAck and any
+    //    ShellOpenPty we'd queue would block against a dead wire.
+    let host_info_ready = host_info.lock().map(|g| g.is_some()).unwrap_or(false);
+    if !link_up.load(Ordering::Relaxed) || !host_info_ready {
+        log::info!("IPC interactive: link down or host-info empty — refusing");
+        let mut s = stream;
+        let _ = write_packet_frame(&mut s, &relay_error_packet("host link not ready"));
+        return;
+    }
+
+    // 3. Private mpsc for the duration of the session; reader_thread fans host
+    //    ShellOutput / ShellExit / HostError into it via the slot guard.
+    let (event_tx, event_rx) = mpsc::channel::<ExecEvent>();
+    let _slot_guard = ExecSlotGuard::install(&exec_slot, event_tx);
+
+    // 4. Originate the single ShellOpenPty (the term does NOT send its own on
+    //    the IPC path — plan-review Important #2). cols/rows come from the
+    //    term's terminal::size() at connect time.
+    if let Err(e) = outgoing_tx.send(Packet::new(
+        Message::ShellOpenPty {
+            shell: open.shell.clone(),
+            cols: open.cols,
+            rows: open.rows,
+        },
+        0,
+    )) {
+        log::warn!("IPC interactive: ShellOpenPty send failed: {e}; aborting");
+        return;
+    }
+
+    // 5. Split the socket: the original fd reads (blocking); a clone behind a
+    //    mutex serialises writes from both pumps (reader-thread synth HelloAck
+    //    vs this thread's ShellOutput frames — concurrent write_all would
+    //    interleave frame bytes otherwise).
+    let read_stream = stream;
+    let write_stream = match read_stream.try_clone() {
+        Ok(s) => Arc::new(Mutex::new(s)),
+        Err(e) => {
+            log::warn!("IPC interactive: stream try_clone failed: {e}; aborting");
+            return;
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Reader thread: socket → wire. Blocks on read_packet_frame; the teardown
+    // below shuts the socket down to unblock it (avoids a mid-frame read-timeout
+    // desync). It NEVER forwards ShellClose/Disconnect to the wire — teardown
+    // emits the single host-side ShellClose.
+    let reader = {
+        let r_stop = stop.clone();
+        let r_write = write_stream.clone();
+        let r_outgoing = outgoing_tx.clone();
+        let r_host_info = host_info.clone();
+        let mut rs = read_stream;
+        thread::spawn(move || {
+            while !r_stop.load(Ordering::Relaxed) {
+                match read_packet_frame(&mut rs) {
+                    Ok(pkt) => match pkt.message {
+                        Message::Hello { .. } => {
+                            // Answer from the cache; never forward to the wire —
+                            // the GUI already handshook with the host.
+                            let ack = synth_hello_ack(&r_host_info);
+                            if let Ok(mut w) = r_write.lock() {
+                                let _ = write_packet_frame(&mut *w, &ack);
+                            }
+                        }
+                        // GUI writer owns heartbeat on the real wire; drop the
+                        // term's so we don't double it.
+                        Message::Heartbeat => {}
+                        Message::ShellClose | Message::Disconnect => {
+                            r_stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Message::ShellInput { .. } | Message::PtyResize { .. } => {
+                            if r_outgoing.send(pkt).is_err() {
+                                r_stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        // Any other message type from the term is unexpected on
+                        // the interactive path — ignore rather than forward.
+                        _ => {}
+                    },
+                    // EOF / socket shutdown / decode error — term is gone.
+                    Err(_) => {
+                        r_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        })
+    };
+
+    // Main pump: slot → socket, plus link_up watchdog.
+    loop {
+        if !link_up.load(Ordering::Relaxed) {
+            // Link went down mid-session (supervisor cleared it). Tell the term
+            // with a synth Disconnect so its reader exits cleanly instead of
+            // hanging on a wire that will never answer (AC6).
+            log::info!("IPC interactive: link down mid-session — sending synth Disconnect");
+            if let Ok(mut w) = write_stream.lock() {
+                let _ = write_packet_frame(&mut *w, &Packet::new(Message::Disconnect, 0));
+            }
+            break;
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(ExecEvent::ShellOutput(data)) => {
+                if let Ok(mut w) = write_stream.lock() {
+                    if write_packet_frame(&mut *w, &Packet::new(Message::ShellOutput { data }, 0))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            Ok(ExecEvent::ShellExit(code)) => {
+                if let Ok(mut w) = write_stream.lock() {
+                    let _ = write_packet_frame(&mut *w, &Packet::new(Message::ShellExit { code }, 0));
+                }
+                break;
+            }
+            Ok(ExecEvent::HostError(msg)) => {
+                if let Ok(mut w) = write_stream.lock() {
+                    let _ = write_packet_frame(
+                        &mut *w,
+                        &Packet::new(Message::Error { code: 0, msg }, 0),
+                    );
+                }
+            }
+            Ok(ExecEvent::Idle) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Teardown. Signal + shut the socket down to unblock the blocking reader,
+    // join it, then close the host shell so the next session can ShellOpen.
+    stop.store(true, Ordering::Relaxed);
+    if let Ok(w) = write_stream.lock() {
+        let _ = w.shutdown(std::net::Shutdown::Both);
+    }
+    let _ = reader.join();
+    if let Err(e) = outgoing_tx.send(Packet::new(Message::ShellClose, 0)) {
+        log::warn!("IPC interactive: ShellClose send failed on teardown: {e}");
+    }
+    // `_owner_guard` (→ Idle) and `_slot_guard` (→ None) drop here.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +934,317 @@ mod tests {
         let decoded = read_request(&mut r).unwrap();
         assert!(decoded.compress, "handler-side decode preserves compress flag");
         assert_eq!(decoded.cmd, "echo hi");
+    }
+
+    // ---- Interactive relay (Task 6) -------------------------------------
+
+    use crate::link::{HostInfo, SharedHostInfo};
+    use crate::shell_channel::new_shared_owner;
+
+    fn populated_host_info() -> SharedHostInfo {
+        Arc::new(Mutex::new(Some(HostInfo {
+            host_name: "win-host".into(),
+            screen_w: 2560,
+            screen_h: 1440,
+        })))
+    }
+
+    /// Spin until the interactive handler has installed its exec slot (it does
+    /// so before originating ShellOpenPty, but the handler runs on its own
+    /// thread so we poll to avoid a race in the staging tests).
+    fn wait_slot_installed(slot: &ExecEventSlot) {
+        for _ in 0..400 {
+            if slot.lock().unwrap().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("exec slot never installed by interactive handler");
+    }
+
+    fn stage_event(slot: &ExecEventSlot, ev: ExecEvent) {
+        let guard = slot.lock().unwrap();
+        let tx = guard.as_ref().expect("slot must be installed before staging");
+        tx.send(ev).expect("stage into installed slot");
+    }
+
+    #[test]
+    fn interactive_hello_synth_ack_and_forwards_input() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        let open = IpcInteractiveOpen {
+            shell: "pwsh".into(),
+            cols: 100,
+            rows: 30,
+        };
+        let (h_slot, h_owner, h_hi, h_link) =
+            (exec_slot.clone(), owner.clone(), host_info.clone(), link_up.clone());
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(server, open, outgoing_tx, h_slot, h_owner, h_hi, h_link);
+        });
+
+        // (4) The relay originates the single ShellOpenPty — the term sends none.
+        let first = outgoing_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay must originate ShellOpenPty");
+        match first.message {
+            Message::ShellOpenPty { shell, cols, rows } => {
+                assert_eq!(shell, "pwsh");
+                assert_eq!(cols, 100);
+                assert_eq!(rows, 30);
+            }
+            other => panic!("expected ShellOpenPty first, got {other:?}"),
+        }
+        assert_eq!(*owner.lock().unwrap(), ShellOwner::Interactive);
+
+        // Hello → synth HelloAck from the cache, NOT forwarded to the wire.
+        write_packet_frame(
+            &mut client,
+            &Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "mac-term".into(),
+                },
+                0,
+            ),
+        )
+        .unwrap();
+        match read_packet_frame(&mut client).expect("HelloAck").message {
+            Message::HelloAck {
+                host_name,
+                screen_w,
+                screen_h,
+                ..
+            } => {
+                assert_eq!(host_name, "win-host");
+                assert_eq!(screen_w, 2560);
+                assert_eq!(screen_h, 1440);
+            }
+            other => panic!("expected synth HelloAck, got {other:?}"),
+        }
+
+        // Heartbeat dropped; ShellInput + PtyResize forwarded to the wire.
+        write_packet_frame(&mut client, &Packet::new(Message::Heartbeat, 0)).unwrap();
+        write_packet_frame(
+            &mut client,
+            &Packet::new(Message::ShellInput { data: b"ls\r".to_vec() }, 0),
+        )
+        .unwrap();
+        write_packet_frame(
+            &mut client,
+            &Packet::new(Message::PtyResize { cols: 80, rows: 24 }, 0),
+        )
+        .unwrap();
+
+        // Next wire packet is ShellInput — Hello + Heartbeat were NOT forwarded.
+        match outgoing_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("forwarded ShellInput")
+            .message
+        {
+            Message::ShellInput { data } => assert_eq!(data, b"ls\r"),
+            other => panic!("expected forwarded ShellInput, got {other:?}"),
+        }
+        assert!(matches!(
+            outgoing_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("forwarded PtyResize")
+                .message,
+            Message::PtyResize { cols: 80, rows: 24 }
+        ));
+
+        // Staged host ShellOutput / ShellExit reach the socket.
+        wait_slot_installed(&exec_slot);
+        stage_event(&exec_slot, ExecEvent::ShellOutput(b"hi\n".to_vec()));
+        match read_packet_frame(&mut client).expect("ShellOutput").message {
+            Message::ShellOutput { data } => assert_eq!(data, b"hi\n"),
+            other => panic!("expected ShellOutput, got {other:?}"),
+        }
+        stage_event(&exec_slot, ExecEvent::ShellExit(0));
+        assert!(matches!(
+            read_packet_frame(&mut client).expect("ShellExit").message,
+            Message::ShellExit { code: 0 }
+        ));
+
+        handler.join().expect("handler thread");
+        // Teardown: single host-side ShellClose + owner released.
+        assert!(matches!(
+            outgoing_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("teardown ShellClose")
+                .message,
+            Message::ShellClose
+        ));
+        assert_eq!(*owner.lock().unwrap(), ShellOwner::Idle);
+    }
+
+    #[test]
+    fn interactive_refused_when_link_down() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(false)); // link DOWN
+
+        let open = IpcInteractiveOpen {
+            shell: String::new(),
+            cols: 80,
+            rows: 24,
+        };
+        let owner_probe = owner.clone();
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(
+                server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
+            );
+        });
+
+        match read_packet_frame(&mut client).expect("refuse frame").message {
+            Message::Error { code, .. } => assert_eq!(code, RELAY_REFUSE_CODE),
+            other => panic!("expected Error refuse frame, got {other:?}"),
+        }
+        handler.join().unwrap();
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "no ShellOpenPty may be queued when the link is down"
+        );
+        assert_eq!(
+            *owner_probe.lock().unwrap(),
+            ShellOwner::Idle,
+            "refused connect must release the channel"
+        );
+    }
+
+    #[test]
+    fn interactive_refused_when_host_info_empty() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        let host_info: SharedHostInfo = Arc::new(Mutex::new(None)); // never handshook
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        let open = IpcInteractiveOpen {
+            shell: String::new(),
+            cols: 80,
+            rows: 24,
+        };
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(
+                server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
+            );
+        });
+
+        assert!(matches!(
+            read_packet_frame(&mut client).expect("refuse frame").message,
+            Message::Error { .. }
+        ));
+        handler.join().unwrap();
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "no ShellOpenPty may be queued before the first HelloAck"
+        );
+    }
+
+    #[test]
+    fn interactive_refused_when_channel_busy() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        // Pre-claim as Exec — a competing interactive connect must fail fast.
+        let _held = try_acquire(&owner, ShellOwner::Exec).expect("pre-claim Exec");
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        let open = IpcInteractiveOpen {
+            shell: "pwsh".into(),
+            cols: 80,
+            rows: 24,
+        };
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(
+                server,
+                open,
+                outgoing_tx,
+                exec_slot,
+                owner.clone(),
+                host_info,
+                link_up,
+            );
+        });
+
+        match read_packet_frame(&mut client).expect("busy frame").message {
+            Message::Error { msg, .. } => assert!(msg.contains("busy"), "msg: {msg}"),
+            other => panic!("expected 'shell busy' Error, got {other:?}"),
+        }
+        handler.join().unwrap();
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "no ShellOpenPty may be queued when the channel is busy"
+        );
+    }
+
+    #[test]
+    fn interactive_link_down_midsession_sends_disconnect() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        let open = IpcInteractiveOpen {
+            shell: "pwsh".into(),
+            cols: 80,
+            rows: 24,
+        };
+        let link_probe = link_up.clone();
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(
+                server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
+            );
+        });
+
+        // Session established: the relay originated ShellOpenPty.
+        assert!(matches!(
+            outgoing_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ShellOpenPty")
+                .message,
+            Message::ShellOpenPty { .. }
+        ));
+
+        // Link drops mid-session → the relay must synth a Disconnect so the
+        // term's reader sees a clean end instead of hanging (AC6).
+        link_probe.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            read_packet_frame(&mut client)
+                .expect("synth Disconnect on link-down")
+                .message,
+            Message::Disconnect
+        ));
+        handler.join().unwrap();
     }
 }
