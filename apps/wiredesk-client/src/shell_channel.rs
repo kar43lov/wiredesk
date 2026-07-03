@@ -19,8 +19,7 @@
 //!     `single_inflight: Arc<Mutex<()>>`, nested *under* the `Exec` owner
 //!     state — the exec handler first `try_acquire(Exec)` (cross-kind
 //!     fail-fast), then blocks on `single_inflight` to serialise
-//!     exec-vs-exec as today. That mutex lives in the IPC acceptor; the
-//!     wiring lands in Task 7.
+//!     exec-vs-exec as today. That mutex lives in the IPC acceptor.
 //!
 //! `try_acquire` returns `None` when the channel is not `Idle`, so the
 //! caller can emit a "shell busy" frame and bail. On success it returns a
@@ -30,12 +29,7 @@
 use std::sync::{Arc, Mutex};
 
 /// Who currently owns the host's single shell slot.
-///
-/// `dead_code` allowed on the busy variants: they're constructed only by
-/// `try_acquire` callers, which land in Task 7 — until then only the
-/// module's tests exercise them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ShellOwner {
     /// No shell session in flight — the channel is free to claim.
     Idle,
@@ -50,12 +44,8 @@ pub enum ShellOwner {
 /// interactive handlers) and reset via the RAII guard on teardown.
 pub type SharedShellOwner = Arc<Mutex<ShellOwner>>;
 
-/// Construct a fresh, `Idle` shared owner.
-///
-/// `dead_code` allowed until Task 7 threads this into `spawn_ipc_acceptor`;
-/// the lifecycle is exercised by this module's tests, and `main.rs`
-/// constructs one to reserve the wiring point.
-#[allow(dead_code)]
+/// Construct a fresh, `Idle` shared owner. `main.rs` builds one and threads
+/// it into `spawn_ipc_acceptor`, shared by the exec + interactive handlers.
 pub fn new_shared_owner() -> SharedShellOwner {
     Arc::new(Mutex::new(ShellOwner::Idle))
 }
@@ -63,10 +53,6 @@ pub fn new_shared_owner() -> SharedShellOwner {
 /// RAII guard: while held, the channel owner is set to the acquired
 /// kind. On drop it resets the owner to `Idle` — including during a
 /// panic unwind, so a panicking handler thread never strands the lock.
-///
-/// `dead_code` allowed until Task 7 wires the acquire calls into the
-/// IPC acceptor; the lifecycle is already covered by this module's tests.
-#[allow(dead_code)]
 pub struct ShellChannelGuard {
     owner: SharedShellOwner,
 }
@@ -86,7 +72,6 @@ impl Drop for ShellChannelGuard {
 /// the channel is currently `Idle`; otherwise `None` (busy — cross-kind
 /// or same-kind, both fail-fast at this layer). exec-vs-exec FIFO is
 /// handled one level up by `single_inflight`, not here.
-#[allow(dead_code)]
 pub fn try_acquire(owner: &SharedShellOwner, kind: ShellOwner) -> Option<ShellChannelGuard> {
     debug_assert_ne!(
         kind,

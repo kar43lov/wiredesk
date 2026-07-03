@@ -631,7 +631,17 @@ fn handle_interactive_connection(
     //    interleave frame bytes otherwise).
     let read_stream = stream;
     let write_stream = match read_stream.try_clone() {
-        Ok(s) => Arc::new(Mutex::new(s)),
+        Ok(s) => {
+            // Bound socket writes so a wedged term (SIGSTOP'd `wd`, hung
+            // terminal that stops draining) can't fill the kernel send buffer
+            // and block the pump forever mid-`write_all` while holding the
+            // owner guard — that would poison the shell channel (every later
+            // `wd` refused "shell busy") and grow `event_rx` unbounded. On a
+            // write timeout the pump returns Err, breaks, and teardown frees
+            // the channel. 15s is far above any healthy local-socket write.
+            let _ = s.set_write_timeout(Some(Duration::from_secs(15)));
+            Arc::new(Mutex::new(s))
+        }
         Err(e) => {
             log::warn!("IPC interactive: stream try_clone failed: {e}; aborting");
             return;
@@ -1007,10 +1017,10 @@ mod tests {
 
     #[test]
     fn ipc_handler_extracts_compress_field() {
-        // Smoke: an IpcRequest with compress=true round-trips through
-        // bincode and is readable on the handler side. The actual
-        // forwarding to run_oneshot is direct field access (req.compress),
-        // verified by compilation; this guards the wire-level path.
+        // Codec smoke only: an IpcRequest with compress=true survives a
+        // bincode write/read round-trip. This does NOT drive the handler or
+        // assert the flag reaches run_oneshot — that forwarding is direct
+        // field access (req.compress), enforced by compilation.
         use std::io::Cursor;
 
         let req = IpcRequest {
@@ -1235,6 +1245,7 @@ mod tests {
             cols: 80,
             rows: 24,
         };
+        let owner_probe = owner.clone();
         let handler = thread::spawn(move || {
             handle_interactive_connection(
                 server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
@@ -1249,6 +1260,13 @@ mod tests {
         assert!(
             outgoing_rx.try_recv().is_err(),
             "no ShellOpenPty may be queued before the first HelloAck"
+        );
+        // This branch acquires the owner guard *before* the host-info check, so
+        // a guard leak here would strand the channel — assert it released.
+        assert_eq!(
+            *owner_probe.lock().unwrap(),
+            ShellOwner::Idle,
+            "refused connect must release the channel"
         );
     }
 
