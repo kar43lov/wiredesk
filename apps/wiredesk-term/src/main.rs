@@ -228,7 +228,13 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
     // In --exec mode keep the banner + cheatsheet quiet — that
     // output is for interactive users, not for AI agents reading
     // stderr.
-    handshake(&writer, &mut reader, &args.name, args.exec)?;
+    if handshake(&writer, &mut reader, &args.name, args.exec)?.is_none() {
+        // Direct serial: no HelloAck in time is fatal (no socket to fall back
+        // to — we already own the port exclusively).
+        return Err(WireDeskError::Transport(
+            "handshake: no HelloAck within 5 seconds".into(),
+        ));
+    }
 
     // Open shell on Host. Pipe-mode for `--exec` (PR #9 sentinel
     // detection requires clean stdout, no PSReadLine/ANSI). PTY-mode
@@ -507,7 +513,21 @@ fn try_interactive_socket_at(path: &Path, shell: &str, client_name: &str) -> Res
 
     // Hello/HelloAck over the socket. `quiet=false` so the connected banner +
     // cheatsheet print exactly as on the direct-serial path.
-    handshake(&writer, &mut reader, client_name, false)?;
+    //
+    // `Ok(None)` = the GUI accepted the connection but never sent a HelloAck
+    // within the deadline (relay wedged / stale socket). Mirror
+    // `try_socket_first`'s first-frame-timeout fallback: return `Ok(None)` so
+    // `run()` falls through to the direct-serial bridge instead of failing the
+    // whole command. A relay *refusal* ("shell busy" / "host link not ready")
+    // arrives as a `Message::Error` → `Err` here, which is correct: the
+    // direct-serial path would fail too (the GUI holds the port), so we surface
+    // it rather than silently retrying.
+    if handshake(&writer, &mut reader, client_name, false)?.is_none() {
+        eprintln!(
+            "wiredesk-term: GUI IPC unresponsive (no HelloAck in 5s), falling back to direct serial"
+        );
+        return Ok(None);
+    }
 
     // NO ShellOpenPty here — the GUI relay already originated it (see above).
 
@@ -658,12 +678,25 @@ fn run_exec_oneshot(
 /// taken `&mut` because `recv()` needs `&mut self` to update its frame
 /// buffer; the caller keeps ownership and hands the reader off to
 /// `bridge_loop` afterward.
+///
+/// Return contract distinguishes the two non-fatal outcomes so callers
+/// can decide policy:
+/// - `Ok(Some(()))` — HelloAck received, connected.
+/// - `Ok(None)` — **no first frame within the 5 s deadline** (peer accepted
+///   the connection but never answered). The interactive-IPC path treats this
+///   as "GUI socket present but unresponsive" and falls back to direct serial,
+///   mirroring `try_socket_first`'s first-frame-timeout fallback; the
+///   direct-serial path turns it into a hard error (there's nothing to fall
+///   back to).
+/// - `Err(_)` — a host/relay `Message::Error` (e.g. "shell busy") or a real
+///   transport failure. Terminal for every caller: falling back to serial
+///   would just fail too (the GUI holds the port), so the error is surfaced.
 fn handshake(
     writer: &Arc<Mutex<Box<dyn Transport>>>,
     reader: &mut Box<dyn Transport>,
     client_name: &str,
     quiet: bool,
-) -> Result<()> {
+) -> Result<Option<()>> {
     {
         let mut t = writer
             .lock()
@@ -680,9 +713,8 @@ fn handshake(
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if std::time::Instant::now() >= deadline {
-            return Err(WireDeskError::Transport(
-                "handshake: no HelloAck within 5 seconds".into(),
-            ));
+            // No first frame in time — let the caller choose fallback vs error.
+            return Ok(None);
         }
         match reader.recv() {
             Ok(p) => match p.message {
@@ -691,7 +723,7 @@ fn handshake(
                         eprintln!("{}", format_connected_banner(&host_name, screen_w, screen_h));
                         eprint!("{}", format_hotkey_cheatsheet());
                     }
-                    return Ok(());
+                    return Ok(Some(()));
                 }
                 Message::Error { code, msg } => {
                     return Err(WireDeskError::Transport(format!(
@@ -754,8 +786,42 @@ fn bridge_loop(
         resize_poll_thread(resize_writer, resize_stop);
     });
 
-    // Main thread: read stdin and forward bytes as ShellInput, byte-
-    // for-byte. ConPTY echoes/edits/colors output; we are a dumb pipe.
+    // Stdin pump: read stdin and forward bytes as ShellInput, byte-for-byte.
+    // Runs on its **own** thread (not the main thread) and is deliberately
+    // NOT joined: a blocking `stdin.read()` can't be interrupted portably, so
+    // if we ran it inline the loop below would stay parked inside `read()`
+    // after the reader thread flags a host disconnect — the terminal would sit
+    // in raw mode until the user happened to press a key (AC6 "no hang" miss).
+    // Detaching it lets teardown proceed the moment `stop` is set; the parked
+    // thread dies with the process on exit.
+    let stdin_stop = stop.clone();
+    let stdin_writer = writer.clone();
+    thread::spawn(move || {
+        stdin_pump(stdin_writer, stdin_stop);
+    });
+
+    // Wait for any thread (stdin pump on Ctrl+]/EOF, reader thread on host
+    // Disconnect/EOF) to raise `stop`, checking often enough that teardown is
+    // prompt but without busy-spinning.
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Signal reader, heartbeat and resize threads to stop, then join them.
+    // The stdin pump is intentionally left detached (it may be parked in
+    // `read()`); the caller restores the terminal and the process exits.
+    let _ = reader_handle.join();
+    let _ = heartbeat.join();
+    let _ = resize_handle.join();
+    Ok(())
+}
+
+/// Stdin → `ShellInput` forwarder. Byte-for-byte: ConPTY echoes/edits/colors
+/// output, so we are a dumb pipe with no local echo or line discipline. The
+/// only keystroke intercepted is Ctrl+] (`ESCAPE_BYTE`), the local quit hotkey.
+/// Runs on its own thread; sets `stop` on quit hotkey, stdin EOF, or a send
+/// failure so the `bridge_loop` supervisor tears the session down.
+fn stdin_pump(writer: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<AtomicBool>) {
     let stdin = io::stdin();
     let mut stdin_lock = stdin.lock();
     let mut buf = [0u8; 256];
@@ -790,13 +856,7 @@ fn bridge_loop(
             }
         }
     }
-
-    // Signal reader, heartbeat and resize threads to stop, then join.
     stop.store(true, Ordering::Relaxed);
-    let _ = reader_handle.join();
-    let _ = heartbeat.join();
-    let _ = resize_handle.join();
-    Ok(())
 }
 
 /// Poll the local terminal size every 500 ms; forward `PtyResize`
@@ -1545,6 +1605,48 @@ mod tests {
             res.is_none(),
             "absent socket must yield Ok(None) for serial fallback"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn try_interactive_socket_unresponsive_gui_falls_back() {
+        // Socket is present (GUI-like listener bound) but the peer never sends a
+        // HelloAck — a wedged/stale relay. handshake hits its deadline and
+        // returns Ok(None), so try_interactive_socket_at must fall back
+        // (Ok(None)) rather than propagate an error and abort the command.
+        // Mirrors try_socket_first's first-frame-timeout fallback.
+        use std::os::unix::net::UnixListener;
+
+        // Short path: Unix socket paths are capped at SUN_LEN (~104 bytes on
+        // macOS), and the usual long /var/folders temp dir + a full UUID blows
+        // past it for a real `bind`.
+        let path = std::path::PathBuf::from("/tmp").join(format!(
+            "wd-si-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind silent listener");
+        // Accept + drain the term's frames but deliberately answer nothing.
+        let accept = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut sink = [0u8; 1024];
+                // Read until the term closes its half (after its handshake
+                // deadline), then drop. Never write a HelloAck.
+                while let Ok(n) = sock.read(&mut sink) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let res = try_interactive_socket_at(&path, "", "wiredesk-term").expect("no hard error");
+        assert!(
+            res.is_none(),
+            "present-but-silent GUI socket must yield Ok(None) for serial fallback"
+        );
+        drop(accept);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(target_os = "macos")]

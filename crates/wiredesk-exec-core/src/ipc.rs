@@ -88,7 +88,12 @@ pub enum IpcResponse {
 /// 4 GB buffer on a single bad u32 length-prefix. 16 MB is generous
 /// even for the largest realistic stdout chunk (typical `wd --exec`
 /// docker-logs output is ~200 KB).
-const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+///
+/// Public so the term's `IpcStreamTransport` (which frames the same way
+/// but reads through a *stateful* partial-frame accumulator to survive
+/// mid-frame read timeouts) enforces the identical cap rather than
+/// duplicating the constant.
+pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
 /// Write a length-prefixed frame: u32 BE byte count, then `payload`.
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {

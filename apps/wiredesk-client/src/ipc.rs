@@ -731,12 +731,20 @@ fn handle_interactive_connection(
                 break;
             }
             Ok(ExecEvent::HostError(msg)) => {
+                // A host shell error on the interactive path is terminal: the
+                // only `Message::Error`s the reader fans in here are shell-open
+                // failures ("shell already open" from a stale host slot after a
+                // crashed prior session, or a spawn error), and no `ShellExit`
+                // follows them. Forward the error to the term, then break so
+                // teardown runs — otherwise the owner guard stays held and the
+                // channel is stuck "shell busy" until the user manually Ctrl+]s.
                 if let Ok(mut w) = write_stream.lock() {
                     let _ = write_packet_frame(
                         &mut *w,
                         &Packet::new(Message::Error { code: 0, msg }, 0),
                     );
                 }
+                break;
             }
             Ok(ExecEvent::Idle) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1355,6 +1363,70 @@ mod tests {
             Message::Disconnect
         ));
         handler.join().unwrap();
+    }
+
+    #[test]
+    fn interactive_host_shell_error_tears_down_and_releases_owner() {
+        // A host shell-open error (e.g. "shell already open" from a stale host
+        // slot after a crashed prior session) arrives as ExecEvent::HostError
+        // with no ShellExit to follow. The relay must forward it to the term,
+        // then break so teardown runs — otherwise the owner guard stays held and
+        // every later `wd` is refused "shell busy" indefinitely.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        let open = IpcInteractiveOpen {
+            shell: "pwsh".into(),
+            cols: 80,
+            rows: 24,
+        };
+        let (h_slot, h_owner, h_hi, h_link) =
+            (exec_slot.clone(), owner.clone(), host_info.clone(), link_up.clone());
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(server, open, outgoing_tx, h_slot, h_owner, h_hi, h_link);
+        });
+
+        // Session established: the relay originated ShellOpenPty and holds the
+        // channel.
+        assert!(matches!(
+            outgoing_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ShellOpenPty")
+                .message,
+            Message::ShellOpenPty { .. }
+        ));
+        assert_eq!(*owner.lock().unwrap(), ShellOwner::Interactive);
+
+        // Host rejects the open — HostError with no ShellExit to follow.
+        wait_slot_installed(&exec_slot);
+        stage_event(&exec_slot, ExecEvent::HostError("shell already open".into()));
+
+        // The error is forwarded to the term...
+        match read_packet_frame(&mut client).expect("forwarded host error").message {
+            Message::Error { msg, .. } => assert!(msg.contains("shell"), "msg: {msg}"),
+            other => panic!("expected forwarded Message::Error, got {other:?}"),
+        }
+        // ...and the relay tears down: single host-side ShellClose + owner freed.
+        assert!(matches!(
+            outgoing_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("teardown ShellClose after host error")
+                .message,
+            Message::ShellClose
+        ));
+        handler.join().expect("handler thread must return after host error");
+        assert_eq!(
+            *owner.lock().unwrap(),
+            ShellOwner::Idle,
+            "host shell error must release the channel"
+        );
     }
 
     // ---- Atomic IpcConnect cutover (Task 7) -----------------------------
