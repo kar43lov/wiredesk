@@ -1,6 +1,6 @@
 # Бриф: интерактивный `wd` через GUI IPC — PTY-стрим параллельно с открытым GUI
 
-**Status:** brainstorm закончен 2026-07-03, готов к `/planning:make`. Расширяет `wd-exec-via-gui-ipc.md` (SHIPPED) на **interactive**-кейс, который тот бриф явно вывел из scope. Закрывает последний путь в WireDesk, требующий терминирования GUI.
+**Status:** ✅ SHIPPED 2026-07-03 (ветка `feat/interactive-wd-via-gui-ipc`, план `docs/plans/completed/20260703-interactive-wd-via-gui-ipc.md`, 723 теста зелёные, AC1–AC7 verified). Расширяет `wd-exec-via-gui-ipc.md` (SHIPPED) на **interactive**-кейс, который тот бриф явно вывел из scope. Закрыл последний путь в WireDesk, требующий терминирования GUI. Реализовано ровно по Approach A ниже; host не менялся. Осталась ручная live-приёмка на FT232H @ 3 Mbaud (AC1/AC5 — см. Post-Completion плана).
 
 ## Цель
 

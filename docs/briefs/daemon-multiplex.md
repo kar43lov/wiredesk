@@ -2,7 +2,9 @@
 
 **Status:** ⚠️ **SUPERSEDED** by [`wd-exec-via-gui-ipc.md`](./wd-exec-via-gui-ipc.md) (брейншторм 2026-05-04).
 
-Брейншторм зафиксировал, что full-daemon extraction (~2–3 нед) — overkill: interactive `wd` параллельно не требуется (только `wd --exec` от Claude в чате параллельно с GUI clipboard sync). Меньший shape — embedded IPC поверх GUI (~5–7 дней) — покрывает реальный workflow. Текущий бриф оставлен для контекста; новый бриф — primary spec.
+Брейншторм зафиксировал, что full-daemon extraction (~2–3 нед) — overkill: меньший shape — embedded IPC поверх GUI (~5–7 дней) — покрывает реальный workflow. Текущий бриф оставлен для контекста; новый бриф — primary spec.
+
+**Апдейт 2026-07-03:** оговорка «interactive `wd` параллельно не требуется» больше не держится — interactive-кейс всё-таки понадобился. Он зашипан **без** full-daemon: тот же embedded-IPC-мост расширили на bidirectional PTY-стрим (`IpcStreamTransport` в term + streaming-релей в GUI), см. [`interactive-wd-via-gui-ipc.md`](./interactive-wd-via-gui-ipc.md) (SHIPPED). Full-daemon так и остаётся не нужен.
 
 ---
 

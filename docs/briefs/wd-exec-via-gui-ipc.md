@@ -1,6 +1,6 @@
 # Бриф: `wd --exec` через GUI IPC — параллельная работа без терминирования GUI
 
-**Status:** brainstorm закончен 2026-05-04, готово к `/planning:make`. Заменяет более широкий `daemon-multiplex.md` (тот scope не нужен — interactive `wd` параллельно не требуется).
+**Status:** ✅ SHIPPED. Заменяет более широкий `daemon-multiplex.md`. Оговорка «interactive `wd` параллельно не требуется» **устарела** — interactive-кейс всё-таки понадобился и зашипан отдельно: тот же IPC-мост расширен на bidirectional PTY-стрим, см. [`interactive-wd-via-gui-ipc.md`](./interactive-wd-via-gui-ipc.md) (SHIPPED 2026-07-03). После него единственный direct-serial-путь в WireDesk устранён.
 
 ## Цель
 

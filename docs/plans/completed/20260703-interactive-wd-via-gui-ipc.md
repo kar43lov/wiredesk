@@ -421,12 +421,21 @@ carries those `Packet`s:
 - Modify: `docs/briefs/interactive-wd-via-gui-ipc.md` (mark SHIPPED after live test)
 - Modify: `docs/briefs/wd-exec-via-gui-ipc.md`, `docs/briefs/daemon-multiplex.md` (cross-link)
 
-- [ ] CLAUDE.md: document interactive-`wd`-over-IPC (parallel with GUI + capture), the
-      fail-fast shell-owner policy, GUI-panel removal, updated test count.
-- [ ] README.md: matching feature note + updated crate/test counts.
-- [ ] update memory pointers (`feedback_wd_interactive_session.md`,
-      `feedback_serial_terminal_bridge.md` — single-port ownership no longer applies to WireDesk).
-- [ ] move this plan to `docs/plans/completed/` (create dir if needed).
+- [x] CLAUDE.md: document interactive-`wd`-over-IPC (parallel with GUI + capture), the
+      fail-fast shell-owner policy, GUI-panel removal, updated test count (687→723). Also updated
+      the ConPTY/Shell-over-serial/known-limitation lines, crate description, the "mutually
+      exclusive" note, and the Plan section (interactive brief + SUPERSEDED daemon-multiplex +
+      obsolete gui-shell-pty-emulator).
+- [x] README.md: matching feature note (terminal-only "runs alongside the GUI" para +
+      `--exec` cross-link + Status paragraph) + updated crate/test counts (687→723). Rewrote the
+      "mutually exclusive" note to "coexist via IPC relay, host single shell slot fails fast".
+- [x] update memory pointers (`feedback_wd_interactive_session.md` — "busy from GUI" resolved,
+      "shell busy" exit 125; `feedback_serial_terminal_bridge.md` §5 — single-port ownership no
+      longer applies; new `project_interactive_wd_via_gui_ipc.md`; MEMORY.md index +
+      `project_wiredesk.md` test count).
+      Also cross-linked the two brief headers (`wd-exec-via-gui-ipc.md`, `daemon-multiplex.md`) and
+      marked `interactive-wd-via-gui-ipc.md` SHIPPED.
+- [x] move this plan to `docs/plans/completed/`.
 
 ## Post-Completion
 *Manual / external — no checkboxes.*
