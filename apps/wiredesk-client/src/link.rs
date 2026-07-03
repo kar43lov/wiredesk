@@ -33,6 +33,25 @@ use wiredesk_transport::transport::Transport;
 use crate::app::TransportEvent;
 use crate::{clipboard, exec_bridge};
 
+/// Host identity + geometry learned from the `HelloAck` handshake. The
+/// interactive-`wd`-over-IPC relay (Task 6/7) needs these to synthesise an
+/// accurate `HelloAck` for a term that connects *after* the GUI already
+/// handshook — the term never touches the wire, so the GUI answers its
+/// `Hello` from this cache instead of forwarding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostInfo {
+    pub host_name: String,
+    pub screen_w: u32,
+    pub screen_h: u32,
+}
+
+/// Shared host-info cache. `None` until the first `HelloAck`; set back to
+/// `None` on every link-down. Populated by the reader thread (sole writer)
+/// and read by the IPC acceptor's interactive relay (Task 7). The acceptor
+/// thread has no access to `App`, so this `Arc<Mutex<..>>` is how the
+/// handshake result crosses into it.
+pub type SharedHostInfo = Arc<std::sync::Mutex<Option<HostInfo>>>;
+
 /// All shared state that outlives a reconnect and is needed by the
 /// reader/writer threads. Every field is an `Arc`/`Sender`/`String`, so the
 /// container is cheaply `Clone` — each fresh link gets its own clone. This
@@ -62,6 +81,11 @@ pub struct LinkContext {
     /// The reader stores `true` on HelloAck and `false` on every exit path;
     /// the supervisor stores `false` at teardown (belt-and-braces).
     pub link_up: Arc<AtomicBool>,
+    /// Host identity/geometry from the last `HelloAck` (see [`HostInfo`]).
+    /// The reader populates it on HelloAck alongside `link_up=true` and
+    /// clears it (`None`) on every exit path; the supervisor also clears it
+    /// at teardown. The interactive relay reads it to synth a `HelloAck`.
+    pub host_info: SharedHostInfo,
 }
 
 /// Join handles for one reader/writer pair. The writer's handle resolves to
@@ -151,6 +175,9 @@ pub fn spawn_supervisor(
             // teardown-of-a-live-link case (storm: reader already gone, but
             // we must gate IPC before joining the still-alive writer).
             ctx.link_up.store(false, Ordering::Release);
+            if let Ok(mut hi) = ctx.host_info.lock() {
+                *hi = None;
+            }
             if let Some(h) = handles.take() {
                 // Raise the shared shutdown flag so BOTH threads exit even if
                 // their transport never errors on its own — the writer's
@@ -411,6 +438,7 @@ fn reader_thread(
     ctx: LinkContext,
 ) {
     let link_up = ctx.link_up.clone();
+    let host_info = ctx.host_info.clone();
     reader_loop(
         transport,
         events_tx,
@@ -421,6 +449,13 @@ fn reader_thread(
     );
     // Whatever path the loop exited through (storm, fatal, idle budget,
     // host Disconnect, shutdown flag) — the link is no longer usable.
+    // Clear the host-info cache in lock-step with link_up so the relay never
+    // synths a `HelloAck` for a host we're no longer connected to. Cleared
+    // before the final `link_up` store so the lock temporary drops well
+    // before `host_info` does (borrow-checker: keeps it off the fn tail).
+    if let Ok(mut hi) = host_info.lock() {
+        *hi = None;
+    }
     link_up.store(false, Ordering::Release);
 }
 
@@ -502,6 +537,17 @@ fn reader_loop(
                     } => {
                         log::info!("connected to '{host_name}' ({screen_w}x{screen_h})");
                         reset_session_state(&mut incoming_clip);
+                        // Cache host identity/geometry for the interactive
+                        // relay's synth `HelloAck` (see LinkContext::host_info).
+                        // Populated BEFORE link_up flips true so a relay that
+                        // observes link_up==true always sees a matching cache.
+                        if let Ok(mut hi) = ctx.host_info.lock() {
+                            *hi = Some(HostInfo {
+                                host_name: host_name.clone(),
+                                screen_w: screen_w.into(),
+                                screen_h: screen_h.into(),
+                            });
+                        }
                         // Handshake complete — the link is now usable; open
                         // the IPC gate (see LinkContext::link_up).
                         ctx.link_up.store(true, Ordering::Release);
@@ -724,6 +770,7 @@ mod tests {
             current_outgoing_label: Arc::new(std::sync::Mutex::new(String::new())),
             reader_outgoing_tx: tx,
             link_up: Arc::new(AtomicBool::new(false)),
+            host_info: Arc::new(Mutex::new(None)),
         };
         (ctx, rx)
     }
@@ -1267,5 +1314,70 @@ mod tests {
             "link_up must clear when the reader exits"
         );
         drop(events_rx);
+    }
+
+    #[test]
+    fn reader_caches_host_info_on_hello_ack() {
+        // The interactive relay synths its `HelloAck` from this cache, so the
+        // reader must populate it (host_name/geometry from the handshake) the
+        // moment HelloAck arrives — and while the link stays up.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let host_info = ctx.host_info.clone();
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // HelloAck then an idle link (keeps the reader alive so we can observe
+        // the populated cache before the exit path would clear it).
+        let transport = Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true));
+        let shutdown_c = shutdown.clone();
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
+
+        // Wait for the Connected event so we know HelloAck was processed.
+        match events_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(TransportEvent::Connected { .. }) => {}
+            other => panic!("expected Connected after HelloAck, got {other:?}"),
+        }
+        assert_eq!(
+            *host_info.lock().unwrap(),
+            Some(HostInfo {
+                host_name: "test-host".into(),
+                screen_w: 100,
+                screen_h: 100,
+            }),
+            "host_info must be cached from the HelloAck"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn reader_clears_host_info_on_disconnect() {
+        // On any link-down the cache must be cleared so the relay never synths
+        // a `HelloAck` for a host we're no longer connected to. Drive HelloAck
+        // (populate) → host Disconnect (reader exits, must clear).
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let host_info = ctx.host_info.clone();
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let transport = Box::new(ScriptedTransport::new(
+            vec![
+                Step::Valid(hello_ack()),
+                Step::Valid(Packet::new(Message::Disconnect, 0)),
+            ],
+            true,
+        ));
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown, ctx));
+
+        // Reader exits on the Disconnect packet; join, then assert cleared.
+        handle.join().unwrap();
+        assert_eq!(
+            *host_info.lock().unwrap(),
+            None,
+            "host_info must be cleared when the reader exits on disconnect"
+        );
+        // Drain the events so the channel isn't dropped mid-send in the reader.
+        while events_rx.try_recv().is_ok() {}
     }
 }

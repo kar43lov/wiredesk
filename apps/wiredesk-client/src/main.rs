@@ -162,6 +162,12 @@ fn main() {
     // every reader spawned across reconnects via LinkContext.
     let exec_slot: exec_bridge::ExecEventSlot = Arc::new(std::sync::Mutex::new(None));
 
+    // Shared host-info cache: populated by the reader on `HelloAck`, cleared
+    // on link-down. The interactive-`wd`-over-IPC relay (Task 6/7) reads it to
+    // synth an accurate `HelloAck` for a term that connects after the GUI
+    // already handshook. Cloned into the IPC acceptor in Task 7.
+    let host_info: link::SharedHostInfo = Arc::new(std::sync::Mutex::new(None));
+
     // Spawn the IPC acceptor so `wd --exec` can run in parallel with an
     // active GUI (Mac-only — non-Mac builds are unsupported by design, but the
     // cfg keeps cross-compilation working). Bind failure is non-fatal: GUI
@@ -209,6 +215,7 @@ fn main() {
         current_outgoing_label: current_outgoing_label.clone(),
         reader_outgoing_tx: outgoing_tx.clone(),
         link_up: link_up.clone(),
+        host_info: host_info.clone(),
     };
 
     // Spawn the link supervisor. It owns the reader/writer pair and reopens

@@ -272,12 +272,12 @@ carries those `Packet`s:
 - Modify: `apps/wiredesk-client/src/link.rs` (populate at `HelloAck` arm; clear on link-down)
 - Modify: `apps/wiredesk-client/src/main.rs` (construct `SharedHostInfo`, thread into `LinkContext`)
 
-- [ ] add `HostInfo { host_name: String, screen_w: u32, screen_h: u32 }` and
+- [x] add `HostInfo { host_name: String, screen_w: u32, screen_h: u32 }` and
       `SharedHostInfo = Arc<Mutex<Option<HostInfo>>>`; add the field to `LinkContext`.
-- [ ] populate it in the reader's `HelloAck` arm (`link.rs:497-513`) alongside the existing
+- [x] populate it in the reader's `HelloAck` arm (`link.rs:497-513`) alongside the existing
       `link_up=true`; set it back to `None` on every link-down (where `link_up` goes false).
-- [ ] write tests: reader loop / helper stores `HostInfo` on `HelloAck`; clears on disconnect.
-- [ ] run tests - must pass before next task.
+- [x] write tests: reader loop / helper stores `HostInfo` on `HelloAck`; clears on disconnect.
+- [x] run tests - must pass before next task.
 
 ### Task 6: GUI interactive relay handler (standalone, not yet dispatched)
 
