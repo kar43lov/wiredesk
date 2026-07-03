@@ -254,17 +254,17 @@ carries those `Packet`s:
 - Create: `apps/wiredesk-client/src/shell_channel.rs`
 - Modify: `apps/wiredesk-client/src/main.rs` (module decl + construct the shared owner)
 
-- [ ] implement `enum ShellOwner { Idle, Exec, Interactive }`, `type SharedShellOwner =
+- [x] implement `enum ShellOwner { Idle, Exec, Interactive }`, `type SharedShellOwner =
       Arc<Mutex<ShellOwner>>`, `try_acquire(&SharedShellOwner, kind) -> Option<ShellChannelGuard>`
       (returns `None` when not `Idle`), RAII `ShellChannelGuard` resetting to `Idle` on drop.
-- [ ] document the composition: exec handler `try_acquire(Exec)` (cross-kind fail-fast) THEN the
+- [x] document the composition: exec handler `try_acquire(Exec)` (cross-kind fail-fast) THEN the
       retained `single_inflight` mutex for exec-vs-exec FIFO; interactive `try_acquire(Interactive)`
       only (no queue). (Actual wiring in Task 7.)
-- [ ] write tests: `Idle`→`Interactive` ok; second acquire (`Exec` or `Interactive`) → `None`;
+- [x] write tests: `Idle`→`Interactive` ok; second acquire (`Exec` or `Interactive`) → `None`;
       drop guard → next acquire ok.
-- [ ] write tests: guard resets to `Idle` even on holder-thread panic (mirror
+- [x] write tests: guard resets to `Idle` even on holder-thread panic (mirror
       `panic_in_holder_thread_still_releases_slot`).
-- [ ] run tests - must pass before next task.
+- [x] run tests - must pass before next task.
 
 ### Task 5: Shared host-info cache for synth `HelloAck`
 

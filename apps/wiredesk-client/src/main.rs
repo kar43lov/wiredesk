@@ -11,6 +11,7 @@ mod link;
 mod logging;
 mod monitor;
 mod restart;
+mod shell_channel;
 mod status_bar;
 
 use std::sync::Arc;
@@ -169,6 +170,10 @@ fn main() {
     {
         let ipc_outgoing_tx = outgoing_tx.clone();
         let ipc_slot = exec_slot.clone();
+        // Shared single-owner lock for the host's one shell slot. Reserved
+        // here; Task 7 threads it into `spawn_ipc_acceptor` so the exec and
+        // interactive handlers can fail-fast cross-kind (see shell_channel).
+        let _shell_owner = shell_channel::new_shared_owner();
         let single_inflight: Arc<std::sync::Mutex<()>> =
             Arc::new(std::sync::Mutex::new(()));
         let socket_path = wiredesk_exec_core::default_socket_path();
