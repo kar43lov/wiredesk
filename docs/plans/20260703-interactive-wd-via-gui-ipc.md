@@ -215,14 +215,14 @@ carries those `Packet`s:
 - Modify: `crates/wiredesk-exec-core/src/ipc.rs`
 - Modify: `crates/wiredesk-exec-core/Cargo.toml` (add `wiredesk-protocol` dep if absent)
 
-- [ ] add **free functions** `write_packet_frame`/`read_packet_frame` wrapping the
+- [x] add **free functions** `write_packet_frame`/`read_packet_frame` wrapping the
       `wiredesk-protocol` `Packet` wire encode/decode in the length-prefix framing; enforce
       `MAX_FRAME_BYTES`. (Match existing `write_frame`/`read_frame` style — no struct.)
-- [ ] write tests: round-trip every interactive `Message` type used
+- [x] write tests: round-trip every interactive `Message` type used
       (`Hello`/`HelloAck`/`ShellOpenPty`/`ShellInput`/`PtyResize`/`ShellOutput`/`ShellExit`/
       `ShellClose`/`Disconnect`/`Heartbeat`) through `UnixStream::pair()`.
-- [ ] write tests: truncated/oversize frame → `Err`, not panic.
-- [ ] run tests - must pass before next task.
+- [x] write tests: truncated/oversize frame → `Err`, not panic.
+- [x] run tests - must pass before next task.
 
 ### Task 3: `IpcStreamTransport: Transport` in `wiredesk-term`
 

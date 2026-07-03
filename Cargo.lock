@@ -5474,6 +5474,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "uuid",
+ "wiredesk-protocol",
 ]
 
 [[package]]

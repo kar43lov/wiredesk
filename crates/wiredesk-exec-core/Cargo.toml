@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+wiredesk-protocol.workspace = true
 thiserror.workspace = true
 log.workspace = true
 uuid.workspace = true

@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use wiredesk_protocol::packet::Packet;
 
 /// One client → server message: the command to run + its parameters.
 /// One per connection — the IPC handler enforces a single-in-flight
@@ -146,6 +147,31 @@ pub fn write_connect<W: Write>(w: &mut W, conn: &IpcConnect) -> io::Result<()> {
 pub fn read_connect<R: Read>(r: &mut R) -> io::Result<IpcConnect> {
     let bytes = read_frame(r)?;
     bincode::deserialize(&bytes).map_err(bincode_to_io)
+}
+
+/// Encode + frame a `Packet` for the interactive stream. After the
+/// `IpcConnect::Interactive` handshake both directions carry `Packet`s;
+/// we reuse the exact serial wire codec (`Packet::to_bytes` — header +
+/// payload + CRC, **without** COBS since the Unix socket is already a
+/// reliable byte-stream) wrapped in the same length-prefix framing as
+/// every other IPC frame. A packet whose payload exceeds `MAX_PAYLOAD`
+/// is rejected by `to_bytes`; the encoded frame is additionally capped
+/// by `write_frame`/`read_frame`'s `MAX_FRAME_BYTES`.
+pub fn write_packet_frame<W: Write>(w: &mut W, packet: &Packet) -> io::Result<()> {
+    let bytes = packet
+        .to_bytes()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("packet encode: {e}")))?;
+    write_frame(w, &bytes)
+}
+
+/// Decode a framed `Packet` from the interactive stream. Oversize length
+/// prefixes are rejected by `read_frame` before allocation; a malformed
+/// packet body (bad magic / CRC / truncated payload) surfaces as an
+/// `InvalidData` error rather than a panic.
+pub fn read_packet_frame<R: Read>(r: &mut R) -> io::Result<Packet> {
+    let bytes = read_frame(r)?;
+    Packet::from_bytes(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("packet decode: {e}")))
 }
 
 /// Encode + frame an `IpcResponse`.
@@ -428,6 +454,96 @@ mod tests {
             result.is_err(),
             "legacy bare IpcRequest frame must fail to decode as IpcConnect (lock-step cutover contract)"
         );
+    }
+
+    fn interactive_message_corpus() -> Vec<wiredesk_protocol::message::Message> {
+        use wiredesk_protocol::message::Message;
+        vec![
+            Message::Hello { version: 1, client_name: "mac-term".into() },
+            Message::HelloAck {
+                version: 1,
+                host_name: "win-host".into(),
+                screen_w: 2560,
+                screen_h: 1440,
+            },
+            Message::ShellOpenPty { shell: "powershell.exe".into(), cols: 120, rows: 40 },
+            Message::ShellInput { data: b"Get-Process\r".to_vec() },
+            Message::PtyResize { cols: 100, rows: 30 },
+            // ShellOutput may carry arbitrary bytes incl. NUL.
+            Message::ShellOutput { data: vec![0, 1, 0xFF, b'o', b'k', 0x1B, b'[', b'0', b'm'] },
+            Message::ShellExit { code: 0 },
+            Message::ShellClose,
+            Message::Disconnect,
+            Message::Heartbeat,
+        ]
+    }
+
+    #[test]
+    fn packet_frame_round_trip_cursor() {
+        for msg in interactive_message_corpus() {
+            let packet = Packet::new(msg.clone(), 7);
+            let mut buf = Vec::new();
+            write_packet_frame(&mut buf, &packet).unwrap();
+            let mut r = Cursor::new(buf);
+            let decoded = read_packet_frame(&mut r).unwrap();
+            assert_eq!(decoded.seq, 7, "seq preserved for {msg:?}");
+            assert_eq!(decoded.message, msg, "message round-trips");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packet_frame_round_trip_via_unix_pair() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let corpus = interactive_message_corpus();
+        let (mut a, mut b) = UnixStream::pair().expect("UnixStream::pair");
+        let sent = corpus.clone();
+        let writer = thread::spawn(move || {
+            for (i, msg) in sent.into_iter().enumerate() {
+                write_packet_frame(&mut a, &Packet::new(msg, i as u16)).unwrap();
+            }
+        });
+        for (i, msg) in corpus.into_iter().enumerate() {
+            let decoded = read_packet_frame(&mut b).unwrap();
+            assert_eq!(decoded.seq, i as u16);
+            assert_eq!(decoded.message, msg);
+        }
+        writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn packet_frame_rejects_oversize_length_prefix() {
+        // Same 16 MB cap applies to the packet frame decode — a forged
+        // length prefix must be refused before allocation, not panic.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&(MAX_FRAME_BYTES + 1).to_be_bytes());
+        let mut r = Cursor::new(bad);
+        let err = read_packet_frame(&mut r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn packet_frame_rejects_truncated_body() {
+        // A frame whose length prefix is valid but body is a truncated /
+        // corrupt packet (bad magic) must surface as InvalidData, not panic.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        let mut r = Cursor::new(buf);
+        let err = read_packet_frame(&mut r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn packet_frame_rejects_short_read() {
+        // Length prefix promises 8 bytes but the stream ends early —
+        // read_frame's read_exact returns UnexpectedEof, propagated as Err.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&8u32.to_be_bytes());
+        bad.extend_from_slice(&[0x57, 0x44]); // only 2 of 8 promised bytes
+        let mut r = Cursor::new(bad);
+        assert!(read_packet_frame(&mut r).is_err());
     }
 
     #[test]
