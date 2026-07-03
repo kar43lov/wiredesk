@@ -697,7 +697,17 @@ fn handshake(
     client_name: &str,
     quiet: bool,
 ) -> Result<Option<()>> {
-    {
+    // Send Hello. Capture the result instead of `?`-ing it: on the IPC path a
+    // write failure can be the relay's *fail-fast refusal* — it wrote a
+    // `Message::Error` ("shell busy" / "host link not ready") and closed the
+    // socket before our Hello landed, which on a Unix socket surfaces as
+    // BrokenPipe. The refusal Error is still buffered on the reader fd, so
+    // instead of bailing with a generic broken-pipe we fall through to the read
+    // loop and surface the real refusal message. Only IPC-transport write errors
+    // (prefix "ipc write", produced solely by `IpcStreamTransport::send`) get
+    // this treatment; a serial-path (or any other) write error returns
+    // immediately, preserving the direct-serial handshake behaviour byte-for-byte.
+    let hello_send = {
         let mut t = writer
             .lock()
             .map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
@@ -707,14 +717,31 @@ fn handshake(
                 client_name: client_name.into(),
             },
             0,
-        ))?;
-    }
+        ))
+    };
+    let hello_err: Option<WireDeskError> = match hello_send {
+        Ok(()) => None,
+        Err(e) => {
+            let is_ipc_write =
+                matches!(&e, WireDeskError::Transport(m) if m.contains("ipc write"));
+            if is_ipc_write {
+                Some(e) // fall through to read the buffered refusal Error
+            } else {
+                return Err(e); // serial / other — fail immediately, as before
+            }
+        }
+    };
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if std::time::Instant::now() >= deadline {
-            // No first frame in time — let the caller choose fallback vs error.
-            return Ok(None);
+            // No first frame in time. If our Hello write had failed (IPC
+            // BrokenPipe), surface that write error — nothing was buffered.
+            // Otherwise let the caller choose fallback vs error.
+            return match hello_err {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
         }
         match reader.recv() {
             Ok(p) => match p.message {
@@ -733,7 +760,15 @@ fn handshake(
                 _ => continue,
             },
             Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => continue,
-            Err(e) => return Err(e),
+            // Reader closed/failed. If our Hello write also failed (the relay
+            // refused + closed before we could read a buffered Error), the write
+            // error is the more informative root cause — prefer it.
+            Err(e) => {
+                return match hello_err {
+                    Some(we) => Err(we),
+                    None => Err(e),
+                };
+            }
         }
     }
 }
@@ -980,6 +1015,135 @@ fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
 mod tests {
     use super::*;
     use wiredesk_transport::mock::MockTransport;
+
+    /// Writer double whose `send` fails like `IpcStreamTransport::send` does when
+    /// the relay closed the socket first (BrokenPipe → "ipc write: ..."). Its
+    /// `recv` only ever times out (writers aren't read from in handshake).
+    struct IpcBrokenPipeWriter;
+    impl Transport for IpcBrokenPipeWriter {
+        fn send(&mut self, _p: &Packet) -> Result<()> {
+            Err(WireDeskError::Transport("ipc write: Broken pipe (os error 32)".into()))
+        }
+        fn recv(&mut self) -> Result<Packet> {
+            Err(WireDeskError::Transport("recv timeout".into()))
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "mock-ipc-broken-writer"
+        }
+        fn try_clone(&self) -> Result<Box<dyn Transport>> {
+            Ok(Box::new(IpcBrokenPipeWriter))
+        }
+    }
+
+    /// Writer double whose `send` fails like a serial-port write error (no
+    /// "ipc write" prefix) — handshake must surface this immediately.
+    struct SerialFailWriter;
+    impl Transport for SerialFailWriter {
+        fn send(&mut self, _p: &Packet) -> Result<()> {
+            Err(WireDeskError::Transport("serial send: device not configured".into()))
+        }
+        fn recv(&mut self) -> Result<Packet> {
+            Err(WireDeskError::Transport("recv timeout".into()))
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "mock-serial-fail-writer"
+        }
+        fn try_clone(&self) -> Result<Box<dyn Transport>> {
+            Ok(Box::new(SerialFailWriter))
+        }
+    }
+
+    /// Reader double that yields one queued packet then times out forever.
+    struct QueuedReader {
+        queued: Option<Packet>,
+    }
+    impl Transport for QueuedReader {
+        fn send(&mut self, _p: &Packet) -> Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Packet> {
+            match self.queued.take() {
+                Some(p) => Ok(p),
+                None => Err(WireDeskError::Transport("recv timeout".into())),
+            }
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "mock-queued-reader"
+        }
+        fn try_clone(&self) -> Result<Box<dyn Transport>> {
+            Ok(Box::new(QueuedReader { queued: None }))
+        }
+    }
+
+    #[test]
+    fn handshake_surfaces_ipc_refusal_despite_broken_pipe_write() {
+        // Codex P2: the GUI relay writes a `Message::Error` refusal then closes
+        // the socket before the term's Hello lands (BrokenPipe). handshake must
+        // still surface the buffered refusal ("shell busy"), not a generic
+        // broken-pipe write error.
+        let writer: Arc<Mutex<Box<dyn Transport>>> =
+            Arc::new(Mutex::new(Box::new(IpcBrokenPipeWriter)));
+        let mut reader: Box<dyn Transport> = Box::new(QueuedReader {
+            queued: Some(Packet::new(
+                Message::Error {
+                    code: 125,
+                    msg: "shell busy — interactive wd session active".into(),
+                },
+                0,
+            )),
+        });
+        let err = handshake(&writer, &mut reader, "mac-term", true).unwrap_err();
+        match err {
+            WireDeskError::Transport(m) => {
+                assert!(
+                    m.contains("shell busy"),
+                    "must surface the relay refusal message, got: {m}"
+                );
+                assert!(
+                    !m.contains("Broken pipe"),
+                    "must not leak the generic write error: {m}"
+                );
+            }
+            other => panic!("expected Transport(refusal), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_serial_write_error_fails_immediately() {
+        // A non-IPC (serial) write error must NOT fall through to the read loop —
+        // it returns immediately, preserving the direct-serial handshake path.
+        // The reader is staged with a HelloAck it must never reach.
+        let writer: Arc<Mutex<Box<dyn Transport>>> =
+            Arc::new(Mutex::new(Box::new(SerialFailWriter)));
+        let mut reader: Box<dyn Transport> = Box::new(QueuedReader {
+            queued: Some(Packet::new(
+                Message::HelloAck {
+                    version: 1,
+                    host_name: "HOST".into(),
+                    screen_w: 2560,
+                    screen_h: 1440,
+                },
+                0,
+            )),
+        });
+        let err = handshake(&writer, &mut reader, "mac-term", true).unwrap_err();
+        match err {
+            WireDeskError::Transport(m) => assert!(
+                m.contains("serial send"),
+                "serial write error must surface immediately, got: {m}"
+            ),
+            other => panic!("expected Transport(serial), got {other:?}"),
+        }
+    }
 
     #[test]
     fn heartbeat_thread_sends_at_least_one_heartbeat() {
