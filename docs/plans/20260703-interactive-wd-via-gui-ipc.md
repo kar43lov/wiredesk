@@ -357,14 +357,19 @@ carries those `Packet`s:
 **Files:**
 - Create: `apps/wiredesk-client/tests/interactive_ipc.rs` (or a `#[cfg(test)]` integ module)
 
-- [ ] fake-GUI: bind a temp socket, run the interactive relay against mock `outgoing_tx`
+- [x] fake-GUI: bind a temp socket, run the interactive relay against mock `outgoing_tx`
       (capturing forwarded packets) + a drivable `exec_slot` + a populated `host_info`.
-- [ ] in-process client: connect via `IpcStreamTransport`, drive
+      (Via the real `spawn_ipc_acceptor` + `dispatch_connection` path, not a direct handler call —
+      covers `IpcConnect::Interactive` framing + acceptor routing. Binary-only crate has no lib
+      target, so the suite is a `#[cfg(all(test, target_os = "macos"))]` in-tree module
+      (`src/interactive_ipc_e2e.rs`), the plan-sanctioned alternative to `tests/`.)
+- [x] in-process client: connect via the socket, drive
       `IpcConnect::Interactive` → `Hello`/synth-`HelloAck` → staged `ShellOutput` echo → `ShellExit`.
-- [ ] assert: synth `HelloAck` received; the single `ShellOpenPty` is originated by the relay;
+- [x] assert: synth `HelloAck` received; the single `ShellOpenPty` is originated by the relay;
       forwarded `ShellInput`/`PtyResize` match; teardown sends `ShellClose`; owner returns to `Idle`.
-- [ ] assert: a second concurrent interactive connect during the first → "shell busy".
-- [ ] run tests - must pass before next task.
+- [x] assert: a second concurrent interactive connect during the first → "shell busy" (+ a
+      channel-reuse-after-teardown test guarding the owner guard doesn't leak on the acceptor path).
+- [x] run tests - must pass before next task.
 
 ### Task 10: Remove the dead GUI shell-panel
 

@@ -5,6 +5,10 @@ mod config;
 mod exec_bridge;
 #[cfg(target_os = "macos")]
 mod ipc;
+/// End-to-end interactive-IPC round-trip test (Task 9). Test-only — the crate
+/// is binary-only, so this integ suite lives in-tree instead of `tests/`.
+#[cfg(all(test, target_os = "macos"))]
+mod interactive_ipc_e2e;
 mod input;
 mod keyboard_tap;
 mod link;
