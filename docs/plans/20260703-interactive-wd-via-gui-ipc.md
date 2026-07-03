@@ -393,14 +393,26 @@ carries those `Packet`s:
 
 ### Task 11: Verify acceptance criteria
 
-- [ ] AC1–AC7 walk-through against the brief; confirm each has a covering test or a documented
-      manual step (AC1/AC5 are live-only — note in Post-Completion).
-- [ ] verify edge cases: GUI mid-reconnect during session (AC6), fallback with GUI closed (AC3),
-      concurrent exec-vs-interactive both directions (AC2), exec-vs-exec still FIFO.
-- [ ] run full suite: `cargo test --workspace -- --test-threads=1`.
-- [ ] `cargo clippy --workspace -- -D warnings` and `cargo build --release --workspace` clean.
-- [ ] verify test coverage: new modules (ipc codec, IpcStreamTransport, shell_channel, host-info
-      cache, relay) each have success + error tests.
+- [x] AC1–AC7 walk-through against the brief; confirm each has a covering test or a documented
+      manual step (AC1/AC5 are live-only — note in Post-Completion). AC2 → `exec_refused_when_interactive_holds_channel`
+      + `interactive_refused_when_channel_busy` + `e2e_second_interactive_connect_is_busy` (both directions);
+      AC3 → `connect_at_nonexistent_path_returns_none` + unchanged `bridge_loop`; AC4 →
+      clippy clean + `app_constructs_without_shell_panel_state`; AC5 → `interactive_hello_synth_ack_and_forwards_input`
+      (PtyResize forward, live repaint manual); AC6 → `interactive_link_down_midsession_sends_disconnect`
+      + `interactive_refused_when_link_down` + `handler_link_down_returns_transport_unavailable`; AC7 → 723 passing.
+- [x] verify edge cases: GUI mid-reconnect during session (AC6 — `interactive_link_down_midsession_sends_disconnect`),
+      fallback with GUI closed (AC3 — `connect_at_nonexistent_path_returns_none`),
+      concurrent exec-vs-interactive both directions (AC2, covered above), exec-vs-exec still FIFO
+      (`concurrent_exec_fifo_no_false_busy`).
+- [x] run full suite: `cargo test --workspace -- --test-threads=1` → 723 passed, 0 failed, 5 ignored
+      (client 279, host 148, exec-core 94, protocol 88, transport 51, term 45, core 18).
+- [x] `cargo clippy --workspace -- -D warnings` and `cargo build --release --workspace` clean.
+- [x] verify test coverage: new modules each have success + error tests — ipc codec
+      (`connect_frame_*` + `packet_frame_round_trip_*` / `packet_frame_rejects_*`), IpcStreamTransport
+      (`send_heartbeat_writes_nothing_to_peer`, recv-timeout, `connect_at_nonexistent_path_returns_none`,
+      `recv_after_peer_close_reports_disconnect`), shell_channel (`idle_acquire_*` / `second_acquire_*_fails_fast`
+      / `drop_guard_releases_channel` + panic-release), host-info cache (`synth_hello_ack`, `populated_host_info`,
+      link.rs arm), relay (`interactive_hello_synth_ack_and_forwards_input` + `interactive_refused_when_*`).
 
 ### Task 12: Update documentation
 
