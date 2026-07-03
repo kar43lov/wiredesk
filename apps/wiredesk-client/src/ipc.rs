@@ -554,15 +554,19 @@ fn synth_hello_ack(host_info: &SharedHostInfo) -> Packet {
 ///   2. refuses if the serial link is down or the host-info cache is empty
 ///      (not yet handshook — AC6), writing a terminal frame + closing;
 ///   3. installs an `ExecSlotGuard` so `reader_thread` fans host shell-events
-///      into our private mpsc;
-///   4. **originates the single `ShellOpenPty { shell, cols, rows }`** — the
-///      term does NOT send its own (plan-review Important #2);
-///   5. runs two pumps until socket EOF / `ShellExit` / term `ShellClose` /
+///      into our private mpsc (before the PTY opens, so no output is missed);
+///   4. **handshakes synchronously**: reads the term's `Hello` and answers with a
+///      synth `HelloAck` from the cached host-info (NOT forwarded to the wire —
+///      the GUI already handshook), under a bounded read timeout;
+///   5. **only then originates the single `ShellOpenPty { shell, cols, rows }`**
+///      (the term sends none — plan-review Important #2). Opening after the
+///      HelloAck guarantees host startup output can't race ahead of it and be
+///      dropped by the term's handshake loop (Codex P2);
+///   6. runs two pumps until socket EOF / `ShellExit` / term `ShellClose` /
 ///      link-down:
-///        * socket → wire (reader thread): `Hello` → synth `HelloAck` from the
-///          cache (NOT forwarded); `Heartbeat` → dropped; `ShellInput` /
-///          `PtyResize` → `outgoing_tx`; `ShellClose` / `Disconnect` → stop
-///          (teardown sends the single host-side `ShellClose`);
+///        * socket → wire (reader thread): `Hello` (stray) / `Heartbeat` →
+///          dropped; `ShellInput` / `PtyResize` → `outgoing_tx`; `ShellClose` /
+///          `Disconnect` → stop (teardown sends the single host-side `ShellClose`);
 ///        * slot → socket (this thread): `ShellOutput` / `ShellExit` /
 ///          `HostError` → `Packet` → socket. Polls `link_up` each cycle; on
 ///          `false` writes a synth `Disconnect` and closes the socket so the
@@ -575,7 +579,7 @@ fn synth_hello_ack(host_info: &SharedHostInfo) -> Packet {
 /// Dispatched from `dispatch_connection` on an `IpcConnect::Interactive` frame.
 #[allow(clippy::too_many_arguments)]
 fn handle_interactive_connection(
-    stream: UnixStream,
+    mut stream: UnixStream,
     open: IpcInteractiveOpen,
     outgoing_tx: mpsc::Sender<Packet>,
     exec_slot: ExecEventSlot,
@@ -608,13 +612,50 @@ fn handle_interactive_connection(
     }
 
     // 3. Private mpsc for the duration of the session; reader_thread fans host
-    //    ShellOutput / ShellExit / HostError into it via the slot guard.
+    //    ShellOutput / ShellExit / HostError into it via the slot guard. Installed
+    //    before the PTY opens so no host startup output is missed.
     let (event_tx, event_rx) = mpsc::channel::<ExecEvent>();
     let _slot_guard = ExecSlotGuard::install(&exec_slot, event_tx);
 
-    // 4. Originate the single ShellOpenPty (the term does NOT send its own on
-    //    the IPC path — plan-review Important #2). cols/rows come from the
-    //    term's terminal::size() at connect time.
+    // 4. Synchronous handshake BEFORE opening the PTY (Codex P2): read the term's
+    //    Hello and answer with a synth HelloAck from the cached host-info. Opening
+    //    the PTY only *after* the HelloAck is on the wire guarantees host startup
+    //    output (PowerShell banner/prompt) can never race ahead of the HelloAck
+    //    and get discarded by the term's handshake loop (which ignores
+    //    non-HelloAck frames). A bounded read timeout keeps a silent/crashed
+    //    client from stranding the owner guard; on any failure we bail and
+    //    teardown frees the channel.
+    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+        log::warn!("IPC interactive: handshake set_read_timeout failed: {e}; aborting");
+        return;
+    }
+    match read_packet_frame(&mut stream) {
+        Ok(pkt) if matches!(pkt.message, Message::Hello { .. }) => {
+            let ack = synth_hello_ack(&host_info);
+            if let Err(e) = write_packet_frame(&mut stream, &ack) {
+                log::warn!("IPC interactive: HelloAck write failed: {e}; aborting");
+                return;
+            }
+        }
+        Ok(other) => {
+            log::warn!(
+                "IPC interactive: expected Hello first, got {:?}; aborting",
+                other.message
+            );
+            return;
+        }
+        Err(e) => {
+            log::info!("IPC interactive: no Hello within handshake window: {e}; aborting");
+            return;
+        }
+    }
+    // Restore blocking reads for the async reader thread below (teardown unblocks
+    // it via socket shutdown, not a timeout).
+    let _ = stream.set_read_timeout(None);
+
+    // 5. NOW originate the single ShellOpenPty — any host output arrives strictly
+    //    after the HelloAck (the term does NOT send its own; plan-review
+    //    Important #2). cols/rows come from the term's terminal::size().
     if let Err(e) = outgoing_tx.send(Packet::new(
         Message::ShellOpenPty {
             shell: open.shell.clone(),
@@ -627,10 +668,11 @@ fn handle_interactive_connection(
         return;
     }
 
-    // 5. Split the socket: the original fd reads (blocking); a clone behind a
-    //    mutex serialises writes from both pumps (reader-thread synth HelloAck
-    //    vs this thread's ShellOutput frames — concurrent write_all would
-    //    interleave frame bytes otherwise).
+    // 6. Split the socket: the original fd is read (blocking) by the reader
+    //    thread; a write clone is used by this thread's main pump. The Hello
+    //    handshake above already ran synchronously on `stream`, so the reader no
+    //    longer writes to the socket — only the main pump does; the Mutex wrapper
+    //    is retained as a simple owned write handle.
     let read_stream = stream;
     let write_stream = match read_stream.try_clone() {
         Ok(s) => {
@@ -658,25 +700,15 @@ fn handle_interactive_connection(
     // emits the single host-side ShellClose.
     let reader = {
         let r_stop = stop.clone();
-        let r_write = write_stream.clone();
         let r_outgoing = outgoing_tx.clone();
-        let r_host_info = host_info.clone();
         let mut rs = read_stream;
         thread::spawn(move || {
             while !r_stop.load(Ordering::Relaxed) {
                 match read_packet_frame(&mut rs) {
                     Ok(pkt) => match pkt.message {
-                        Message::Hello { .. } => {
-                            // Answer from the cache; never forward to the wire —
-                            // the GUI already handshook with the host.
-                            let ack = synth_hello_ack(&r_host_info);
-                            if let Ok(mut w) = r_write.lock() {
-                                let _ = write_packet_frame(&mut *w, &ack);
-                            }
-                        }
-                        // GUI writer owns heartbeat on the real wire; drop the
-                        // term's so we don't double it.
-                        Message::Heartbeat => {}
+                        // Hello was already answered synchronously before the PTY
+                        // opened; GUI owns heartbeat — drop both.
+                        Message::Hello { .. } | Message::Heartbeat => {}
                         Message::ShellClose | Message::Disconnect => {
                             r_stop.store(true, Ordering::Relaxed);
                             break;
@@ -1087,6 +1119,25 @@ mod tests {
         tx.send(ev).expect("stage into installed slot");
     }
 
+    /// Client-side interactive handshake: send `Hello`, read + return the relay's
+    /// synth `HelloAck`. The relay answers `Hello` BEFORE originating
+    /// `ShellOpenPty` (Codex P2 ordering), so tests must handshake before
+    /// expecting the PTY-open on the wire.
+    fn client_handshake(client: &mut UnixStream) -> Message {
+        write_packet_frame(
+            client,
+            &Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "mac-term".into(),
+                },
+                0,
+            ),
+        )
+        .unwrap();
+        read_packet_frame(client).expect("HelloAck").message
+    }
+
     #[test]
     fn interactive_hello_synth_ack_and_forwards_input() {
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -1111,33 +1162,10 @@ mod tests {
             handle_interactive_connection(server, open, outgoing_tx, h_slot, h_owner, h_hi, h_link);
         });
 
-        // (4) The relay originates the single ShellOpenPty — the term sends none.
-        let first = outgoing_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("relay must originate ShellOpenPty");
-        match first.message {
-            Message::ShellOpenPty { shell, cols, rows } => {
-                assert_eq!(shell, "pwsh");
-                assert_eq!(cols, 100);
-                assert_eq!(rows, 30);
-            }
-            other => panic!("expected ShellOpenPty first, got {other:?}"),
-        }
-        assert_eq!(current_owner(&owner), ShellOwner::Interactive);
-
-        // Hello → synth HelloAck from the cache, NOT forwarded to the wire.
-        write_packet_frame(
-            &mut client,
-            &Packet::new(
-                Message::Hello {
-                    version: 1,
-                    client_name: "mac-term".into(),
-                },
-                0,
-            ),
-        )
-        .unwrap();
-        match read_packet_frame(&mut client).expect("HelloAck").message {
+        // New ordering (Codex P2): the relay reads Hello and answers the synth
+        // HelloAck (from the cache, NOT forwarded to the wire) BEFORE originating
+        // ShellOpenPty. Handshake first.
+        match client_handshake(&mut client) {
             Message::HelloAck {
                 host_name,
                 screen_w,
@@ -1150,6 +1178,21 @@ mod tests {
             }
             other => panic!("expected synth HelloAck, got {other:?}"),
         }
+
+        // Only after the HelloAck does the relay originate the single ShellOpenPty
+        // — the term sends none.
+        let first = outgoing_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay must originate ShellOpenPty after handshake");
+        match first.message {
+            Message::ShellOpenPty { shell, cols, rows } => {
+                assert_eq!(shell, "pwsh");
+                assert_eq!(cols, 100);
+                assert_eq!(rows, 30);
+            }
+            other => panic!("expected ShellOpenPty after handshake, got {other:?}"),
+        }
+        assert_eq!(current_owner(&owner), ShellOwner::Interactive);
 
         // Heartbeat dropped; ShellInput + PtyResize forwarded to the wire.
         write_packet_frame(&mut client, &Packet::new(Message::Heartbeat, 0)).unwrap();
@@ -1354,7 +1397,8 @@ mod tests {
             );
         });
 
-        // Session established: the relay originated ShellOpenPty.
+        // Handshake first, then the relay originates ShellOpenPty.
+        let _ = client_handshake(&mut client);
         assert!(matches!(
             outgoing_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -1403,8 +1447,9 @@ mod tests {
             handle_interactive_connection(server, open, outgoing_tx, h_slot, h_owner, h_hi, h_link);
         });
 
-        // Session established: the relay originated ShellOpenPty and holds the
+        // Handshake first, then the relay originates ShellOpenPty and holds the
         // channel.
+        let _ = client_handshake(&mut client);
         assert!(matches!(
             outgoing_rx
                 .recv_timeout(Duration::from_secs(2))
