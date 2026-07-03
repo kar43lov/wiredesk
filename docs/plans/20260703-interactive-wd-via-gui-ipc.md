@@ -333,20 +333,24 @@ carries those `Packet`s:
 **Files:**
 - Modify: `apps/wiredesk-term/src/main.rs`
 
-- [ ] add `#[cfg(target_os = "macos")] fn try_interactive_socket_at(path, args, …) ->
+- [x] add `#[cfg(target_os = "macos")] fn try_interactive_socket_at(path, args, …) ->
       Result<Option<i32>>` (path-parameterized): `IpcStreamTransport::connect_at` → `Ok(None)` on
       no socket; send `IpcConnect::Interactive { shell, cols, rows }` (cols/rows from
       `terminal::size()`); perform the `Hello`/`HelloAck` handshake **over the socket**; build the
       `IpcStreamTransport` writer + `try_clone` reader and run the existing `bridge_loop`.
-- [ ] **do NOT send the `run()` `ShellOpenPty` block (`main.rs:221-225`) on the IPC path** — the
-      GUI relay originates the single `ShellOpenPty` (plan-review Important #2). Guard that block so
-      it runs only on the direct-serial path.
-- [ ] call `try_interactive_socket` in `run()` on the interactive branch **before**
-      `SerialTransport::open` (`main.rs:192`); `Ok(None)` falls through to direct-serial unchanged.
-- [ ] print the source in the startup banner ("interactive via GUI IPC" vs "interactive via direct
+      (Dispatch frame sent via new `IpcStreamTransport::send_connect`; keeps `connect_at` a live
+      non-test caller so the module's `#[allow(dead_code)]` could be removed.)
+- [x] **do NOT send the `run()` `ShellOpenPty` block on the IPC path** — the GUI relay originates
+      the single `ShellOpenPty` (plan-review Important #2). Satisfied structurally: the IPC path is
+      self-contained in `try_interactive_socket_at` and `return`s before the shared `ShellOpenPty`
+      send, so that block runs only on the direct-serial path (documented inline).
+- [x] call `try_interactive_socket` in `run()` on the interactive branch **before**
+      `SerialTransport::open`; `Ok(None)` falls through to direct-serial unchanged.
+- [x] print the source in the startup banner ("interactive via GUI IPC" vs "interactive via direct
       serial"), consistent with the resolve banner style.
-- [ ] write tests: `try_interactive_socket_at` with no socket present → `Ok(None)` (fallback).
-- [ ] run tests - must pass before next task.
+- [x] write tests: `try_interactive_socket_at` with no socket present → `Ok(None)` (fallback);
+      plus `send_connect` dispatch-frame-then-packets round-trip in `ipc_transport.rs`.
+- [x] run tests - must pass before next task.
 
 ### Task 9: End-to-end interactive round-trip integration test
 

@@ -18,8 +18,11 @@ use crossterm::terminal;
 use wiredesk_core::error::{Result, WireDeskError};
 use wiredesk_exec_core::format_timeout_diagnostic;
 #[cfg(target_os = "macos")]
+use std::path::Path;
+#[cfg(target_os = "macos")]
 use wiredesk_exec_core::ipc::{
-    default_socket_path, read_response, write_connect, IpcConnect, IpcRequest, IpcResponse,
+    default_socket_path, read_response, write_connect, IpcConnect, IpcInteractiveOpen, IpcRequest,
+    IpcResponse,
 };
 use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
@@ -31,10 +34,8 @@ use resolve::ValueSource;
 
 // Interactive `wd` over the GUI's Unix socket. Mac-only (the GUI + its
 // `wd-exec.sock` live on macOS), mirroring the cfg-gated exec IPC above.
-// `#[allow(dead_code)]` until Task 8 wires `try_interactive_socket` — the
-// transport is fully tested in isolation before it's plumbed into `run()`.
+// Wired into `run()` via `try_interactive_socket` (Task 8).
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 mod ipc_transport;
 
 const ESCAPE_BYTE: u8 = 0x1D; // Ctrl+]
@@ -180,6 +181,20 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
         // Else: fall through to direct serial.
     }
 
+    // Mac-only: interactive `wd` tries the GUI IPC socket first too, so a
+    // streaming PTY can run in parallel with a live WireDesk.app (even during
+    // active capture) instead of contending for the serial port. Mirrors the
+    // `--exec` fallback shape: `Ok(None)` (no socket / GUI closed) falls
+    // through to the direct-serial path below — backward-compatible. On the
+    // IPC path the GUI relay originates the single `ShellOpenPty`, so this
+    // returns before the shared `ShellOpenPty` send below ever runs.
+    #[cfg(target_os = "macos")]
+    if !args.exec {
+        if let Some(code) = try_interactive_socket(&args.shell, &args.name)? {
+            return Ok(code);
+        }
+    }
+
     if !args.exec {
         // Only call out where port/baud came from when at least one wasn't
         // explicit on the command line — if the user typed both flags
@@ -191,6 +206,7 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
                 baud_source.label()
             );
         }
+        eprintln!("wiredesk-term: interactive via direct serial");
         eprintln!(
             "wiredesk-term: connecting to {} @ {} baud (Ctrl+] to quit)",
             args.port, args.baud
@@ -432,6 +448,89 @@ fn classify_terminal_response(resp: &IpcResponse) -> Option<(i32, Option<String>
         IpcResponse::Error(msg) => Some((1, Some(format!("wd: host error: {msg}")))),
         IpcResponse::TransportUnavailable(msg) => Some((125, Some(format!("wd: {msg}")))),
     }
+}
+
+/// Try the GUI's IPC socket for an **interactive** `wd` session (streaming
+/// PTY over the socket). Returns `Ok(Some(code))` when the session ran over
+/// the socket (caller exits with that code), `Ok(None)` when the socket is
+/// absent/refused (caller falls back to direct serial — backward-compatible).
+/// Path-parameterised for testability; the thin `try_interactive_socket`
+/// wrapper pins `default_socket_path()`. Mac-only.
+///
+/// Unlike the exec path, the term originates **no** `ShellOpenPty` here — the
+/// GUI relay does that from the `IpcConnect::Interactive` payload we send below
+/// (plan-review Important #2). The term only handshakes (answered by the relay's
+/// synth `HelloAck` from its cached host-info) and runs the standard
+/// `bridge_loop` over the socket transport. A relay refusal (shell busy / link
+/// not ready) arrives as a `Message::Error`, which `handshake` surfaces as an
+/// `Err` — correct, since the direct-serial path would fail too (the GUI holds
+/// the port).
+#[cfg(target_os = "macos")]
+fn try_interactive_socket_at(path: &Path, shell: &str, client_name: &str) -> Result<Option<i32>> {
+    use ipc_transport::IpcStreamTransport;
+
+    // Connect: `Ok(None)` on ENOENT/ECONNREFUSED → fall back to direct serial.
+    let mut transport = match IpcStreamTransport::connect_at(path)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // Initial PTY size from the local terminal. Default 100×40 matches the
+    // direct-serial path if `size()` fails (no tty / pre-raw-mode quirk).
+    let (cols, rows) = terminal::size().unwrap_or((100, 40));
+
+    // First frame: the IpcConnect dispatch discriminator. The GUI relay reads
+    // it, claims the shell channel, and originates the single ShellOpenPty to
+    // the host — the term sends none of its own. A write failure here means the
+    // socket died between connect and now; fall back to serial.
+    if transport
+        .send_connect(&IpcConnect::Interactive(IpcInteractiveOpen {
+            shell: shell.into(),
+            cols,
+            rows,
+        }))
+        .is_err()
+    {
+        return Ok(None);
+    }
+
+    eprintln!("wiredesk-term: interactive via GUI IPC (Ctrl+] to quit)");
+
+    // Split the socket into independent reader/writer halves so `bridge_loop`
+    // runs byte-for-byte unchanged (mirrors the serial split). `try_clone`
+    // dups the fd; both halves carry their own read timeout.
+    let reader: Box<dyn Transport> = transport
+        .try_clone()
+        .map_err(|e| WireDeskError::Transport(format!("ipc split: {e}")))?;
+    let writer: Arc<Mutex<Box<dyn Transport>>> = Arc::new(Mutex::new(Box::new(transport)));
+    let mut reader = reader;
+
+    // Hello/HelloAck over the socket. `quiet=false` so the connected banner +
+    // cheatsheet print exactly as on the direct-serial path.
+    handshake(&writer, &mut reader, client_name, false)?;
+
+    // NO ShellOpenPty here — the GUI relay already originated it (see above).
+
+    // Switch local terminal to raw mode and run the standard interactive bridge.
+    terminal::enable_raw_mode().map_err(|e| WireDeskError::Input(format!("raw mode: {e}")))?;
+    let r = bridge_loop(writer.clone(), reader).map(|_| 0);
+    let _ = terminal::disable_raw_mode();
+    eprintln!("\nwiredesk-term: disconnected");
+
+    // Best-effort teardown: ShellClose frees the host slot, Disconnect makes
+    // the GUI relay tear down promptly (same as the direct-serial path).
+    if let Ok(mut t) = writer.lock() {
+        let _ = t.send(&Packet::new(Message::ShellClose, 0));
+        let _ = t.send(&Packet::new(Message::Disconnect, 0));
+    }
+
+    r.map(Some)
+}
+
+/// Thin wrapper pinning `default_socket_path()`. See `try_interactive_socket_at`.
+#[cfg(target_os = "macos")]
+fn try_interactive_socket(shell: &str, client_name: &str) -> Result<Option<i32>> {
+    try_interactive_socket_at(&default_socket_path(), shell, client_name)
 }
 
 /// `ExecTransport` impl that bridges the shared crate's runner to the
@@ -1412,6 +1511,24 @@ mod tests {
         assert!(
             decoded.compress,
             "compress flag must round-trip through bincode wire format"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn try_interactive_socket_missing_socket_returns_none() {
+        // No listener at the path → connect fails → `Ok(None)` so the caller
+        // falls back to the direct-serial interactive bridge. No handshake,
+        // no raw-mode toggle, no banner side effects.
+        let bogus = std::env::temp_dir().join(format!(
+            "wd-interactive-missing-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&bogus);
+        let res = try_interactive_socket_at(&bogus, "", "wiredesk-term").expect("no hard error");
+        assert!(
+            res.is_none(),
+            "absent socket must yield Ok(None) for serial fallback"
         );
     }
 

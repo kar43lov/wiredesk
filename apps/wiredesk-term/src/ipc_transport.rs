@@ -28,7 +28,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use wiredesk_core::error::{Result, WireDeskError};
-use wiredesk_exec_core::ipc::{read_packet_frame, write_packet_frame};
+use wiredesk_exec_core::ipc::{read_packet_frame, write_connect, write_packet_frame, IpcConnect};
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
@@ -71,6 +71,16 @@ impl IpcStreamTransport {
             // there's no GUI IPC to ride — signal fallback, not a hard error.
             Err(_) => Ok(None),
         }
+    }
+
+    /// Write the `IpcConnect` dispatch frame — the mandatory first frame of a
+    /// connection, sent before any `Packet`s. Kept a distinct method (not
+    /// `send`) because the dispatch frame is a bincode `IpcConnect`, not a wire
+    /// `Packet`; `send` only ever carries `Packet`s after this frame. Used by
+    /// the term's `try_interactive_socket_at` to announce `Interactive` mode.
+    pub fn send_connect(&mut self, conn: &IpcConnect) -> Result<()> {
+        write_connect(&mut self.stream, conn)
+            .map_err(|e| WireDeskError::Transport(format!("ipc connect frame: {e}")))
     }
 }
 
@@ -268,6 +278,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let result = IpcStreamTransport::connect_at(&path).unwrap();
         assert!(result.is_none(), "expected Ok(None) for absent socket");
+    }
+
+    #[test]
+    fn send_connect_writes_dispatch_frame_then_packets() {
+        use wiredesk_exec_core::ipc::{read_connect, IpcInteractiveOpen};
+
+        let (a, b) = UnixStream::pair().expect("pair");
+        let mut tx = IpcStreamTransport::from_stream(a).unwrap();
+        let mut rx_raw = b; // peer reads the raw dispatch frame first
+
+        // First frame: the IpcConnect dispatch discriminator.
+        tx.send_connect(&IpcConnect::Interactive(IpcInteractiveOpen {
+            shell: "powershell.exe".into(),
+            cols: 120,
+            rows: 40,
+        }))
+        .unwrap();
+        // Subsequent frames: plain Packets (Hello handshake).
+        tx.send(&Packet::new(
+            Message::Hello {
+                version: 1,
+                client_name: "mac-term".into(),
+            },
+            0,
+        ))
+        .unwrap();
+
+        // Peer decodes the dispatch frame, then the packet frame — in order.
+        match read_connect(&mut rx_raw).expect("read_connect") {
+            IpcConnect::Interactive(open) => {
+                assert_eq!(open.shell, "powershell.exe");
+                assert_eq!(open.cols, 120);
+                assert_eq!(open.rows, 40);
+            }
+            IpcConnect::Exec(req) => panic!("expected Interactive, got Exec: {req:?}"),
+        }
+        let pkt = read_packet_frame(&mut rx_raw).expect("packet after dispatch");
+        assert!(matches!(pkt.message, Message::Hello { .. }));
     }
 
     #[test]
