@@ -59,9 +59,6 @@ pub enum TransportEvent {
     Reconnecting { attempt: u32 },
     ClipboardFromHost(String),
     Heartbeat,
-    ShellOutput(Vec<u8>),
-    ShellExit(i32),
-    ShellError(String),
     /// Transient user-facing notification — surfaced as an inline toast in the
     /// chrome panel for ~3 seconds. Used by the clipboard poll thread when an
     /// oversize image is dropped (so the user knows their copy didn't make it
@@ -94,11 +91,6 @@ pub struct WireDeskApp {
     // Permission state
     permission_granted: bool,
     last_perm_check: Instant,
-    // Terminal-over-serial state
-    shell_open: bool,
-    shell_output: String,
-    shell_input: String,
-    shell_kind: String, // "" (default), "powershell", "cmd"
     // Settings panel state — TOML-backed configuration the user is editing.
     pending_config: ClientConfig,
     config_dirty: bool,
@@ -185,11 +177,6 @@ pub struct WireDeskApp {
     /// with the keyboard tap thread; flipping the Settings checkbox takes
     /// effect on the next FlagsChanged / KeyDown the tap sees.
     swap_option_command: Arc<AtomicBool>,
-    /// One-shot flag set when the Terminal panel transitions to open.
-    /// Consumed by the next render frame to give the shell input field
-    /// focus without the user having to click into it. Without this the
-    /// user has to click before typing the first command.
-    shell_just_opened: bool,
     /// User-pressed Cancel for the outgoing transfer. Shared with the
     /// writer thread, which drops queued ClipOffer/ClipChunk packets while
     /// the flag is set and re-arms it once the stale batch drains.
@@ -408,11 +395,6 @@ impl WireDeskApp {
             seq: 0,
             permission_granted: keyboard_tap::is_permission_granted(),
             last_perm_check: Instant::now(),
-            shell_open: false,
-            shell_output: String::new(),
-            shell_input: String::new(),
-            shell_kind: String::new(),
-            shell_just_opened: false,
             pending_config: initial_config,
             config_dirty: false,
             save_toast: None,
@@ -1105,41 +1087,8 @@ impl WireDeskApp {
         }
     }
 
-    fn shell_send(&mut self, msg: Message) {
-        let seq = self.next_seq();
-        let _ = self.outgoing_tx.send(Packet::new(msg, seq));
-    }
-
-    fn shell_open_request(&mut self) {
-        if self.shell_open {
-            return;
-        }
-        let kind = self.shell_kind.clone();
-        self.shell_send(Message::ShellOpen { shell: kind });
-        self.shell_open = true;
-        self.shell_output.clear();
-        // Tell the next render frame to grab keyboard focus for the
-        // shell input — otherwise the user has to click into the field
-        // before typing their first command.
-        self.shell_just_opened = true;
-    }
-
-    fn shell_close_request(&mut self) {
-        if !self.shell_open {
-            return;
-        }
-        self.shell_send(Message::ShellClose);
-    }
-
-    fn shell_send_input(&mut self, text: &str) {
-        // Append a newline so the line gets executed by the shell.
-        let mut data = text.as_bytes().to_vec();
-        data.push(b'\n');
-        self.shell_send(Message::ShellInput { data });
-    }
-
     /// True when WireDesk should render the full chrome (status, buttons,
-    /// shell panel). False in capture or fullscreen mode — when the user is
+    /// settings panel). False in capture or fullscreen mode — when the user is
     /// "in" Windows via the HDMI capture monitor and a stray click on a
     /// WireDesk button would be disruptive.
     fn should_show_chrome(&self) -> bool {
@@ -1411,23 +1360,6 @@ impl WireDeskApp {
         }
     }
 
-    fn shell_append_output(&mut self, bytes: &[u8]) {
-        // Lossy UTF-8 — shell output may contain mixed encodings or partial sequences.
-        let s = String::from_utf8_lossy(bytes);
-        self.shell_output.push_str(&s);
-        // Cap scrollback at ~64 KB to avoid unbounded growth.
-        const MAX: usize = 64 * 1024;
-        if self.shell_output.len() > MAX {
-            let mut excess = self.shell_output.len() - MAX;
-            // `drain(..excess)` panics if `excess` lands inside a multi-byte
-            // UTF-8 sequence (e.g. Cyrillic / JSON output). Advance to the next
-            // char boundary so we always cut on a valid edge.
-            while excess < self.shell_output.len() && !self.shell_output.is_char_boundary(excess) {
-                excess += 1;
-            }
-            self.shell_output.drain(..excess);
-        }
-    }
 }
 
 impl eframe::App for WireDeskApp {
@@ -1502,19 +1434,6 @@ impl eframe::App for WireDeskApp {
                     self.clipboard_text = text;
                 }
                 TransportEvent::Heartbeat => {}
-                TransportEvent::ShellOutput(data) => {
-                    self.shell_append_output(&data);
-                }
-                TransportEvent::ShellExit(code) => {
-                    self.shell_open = false;
-                    self.shell_append_output(
-                        format!("\n[shell exited with code {code}]\n").as_bytes(),
-                    );
-                }
-                TransportEvent::ShellError(msg) => {
-                    self.shell_open = false;
-                    self.shell_append_output(format!("\n[shell error: {msg}]\n").as_bytes());
-                }
                 TransportEvent::Toast(msg) => {
                     self.transient_toast = Some((msg, Instant::now()));
                 }
@@ -1790,101 +1709,6 @@ impl eframe::App for WireDeskApp {
             }
 
             ui.separator();
-
-            // Terminal-over-serial
-            let mut want_open = false;
-            let mut want_close = false;
-            let mut want_send = false;
-            ui.collapsing("Terminal (serial shell)", |ui| {
-                if self.state != ConnectionState::Connected {
-                    ui.label("Connect first to use the shell.");
-                    return;
-                }
-
-                ui.horizontal(|ui| {
-                    if !self.shell_open {
-                        ui.label("Shell:");
-                        egui::ComboBox::from_id_salt("shell_kind")
-                            .selected_text(if self.shell_kind.is_empty() {
-                                "default".into()
-                            } else {
-                                self.shell_kind.clone()
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.shell_kind, String::new(), "default");
-                                ui.selectable_value(&mut self.shell_kind, "powershell".into(), "powershell");
-                                ui.selectable_value(&mut self.shell_kind, "cmd".into(), "cmd");
-                            });
-                        if ui.button("Open").clicked() {
-                            want_open = true;
-                        }
-                    } else {
-                        ui.label("shell open");
-                        if ui.button("Close").clicked() {
-                            want_close = true;
-                        }
-                        if ui.button("Clear output").clicked() {
-                            self.shell_output.clear();
-                        }
-                    }
-                });
-
-                // Output area — read-only, scrollable, monospace
-                egui::ScrollArea::vertical()
-                    .id_salt("shell_output_scroll")
-                    .stick_to_bottom(true)
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.shell_output.as_str())
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(10)
-                                .interactive(false),
-                        );
-                    });
-
-                if self.shell_open {
-                    ui.horizontal(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.shell_input)
-                                .id_salt("shell_input")
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("type a command, Enter to send"),
-                        );
-                        let enter_pressed = resp.lost_focus()
-                            && ui.input(|i: &egui::InputState| i.key_pressed(egui::Key::Enter));
-                        if enter_pressed && !self.shell_input.is_empty() {
-                            want_send = true;
-                            // Pressing Enter takes focus away from a
-                            // singleline TextEdit. Reclaim it now so the
-                            // next command can be typed without clicking
-                            // back into the field.
-                            resp.request_focus();
-                        }
-                        if self.shell_just_opened {
-                            resp.request_focus();
-                            self.shell_just_opened = false;
-                        }
-                    });
-                }
-            });
-
-            if want_open {
-                self.shell_open_request();
-            }
-            if want_close {
-                self.shell_close_request();
-            }
-            if want_send {
-                let line = std::mem::take(&mut self.shell_input);
-                // Echo into local scrollback so user sees what was sent.
-                self.shell_append_output(format!("> {line}\n").as_bytes());
-                self.shell_send_input(&line);
-            }
-
-            ui.separator();
             self.render_settings_panel(ui);
 
             ui.separator();
@@ -2045,34 +1869,21 @@ mod tests {
     }
 
     #[test]
+    fn app_constructs_without_shell_panel_state() {
+        // The GUI shell-panel was removed (interactive `wd` now runs over the
+        // socket relay). This guards that the app still constructs and renders
+        // its chrome without any shell-panel fields — the update loop no longer
+        // references shell_open/shell_output/shell_input/shell_kind, and the
+        // reduced `TransportEvent` set (no Shell* variants) compiles.
+        let app = make_app();
+        assert!(app.should_show_chrome());
+    }
+
+    #[test]
     fn fullscreen_hides_chrome() {
         let mut app = make_app();
         app.fullscreen = true;
         assert!(!app.should_show_chrome());
-    }
-
-    #[test]
-    fn shell_open_sets_just_opened_flag() {
-        let mut app = make_app();
-        assert!(!app.shell_open);
-        assert!(!app.shell_just_opened);
-
-        app.shell_open_request();
-        assert!(app.shell_open, "shell_open should flip to true");
-        assert!(
-            app.shell_just_opened,
-            "shell_just_opened should be set so the next render frame can grab focus"
-        );
-
-        // Idempotency: calling open again while already open must not
-        // re-arm the flag (otherwise focus would jump on every redraw
-        // that happens to call shell_open_request a second time).
-        app.shell_just_opened = false;
-        app.shell_open_request();
-        assert!(
-            !app.shell_just_opened,
-            "second shell_open_request while open must NOT re-arm the flag"
-        );
     }
 
     #[test]

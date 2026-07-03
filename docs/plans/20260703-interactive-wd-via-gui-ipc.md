@@ -378,16 +378,18 @@ carries those `Packet`s:
 - Modify: `apps/wiredesk-client/src/link.rs` (only if the shell `events_tx` fan-out becomes
   fully unused after panel removal)
 
-- [ ] remove shell-panel state (`shell_open`/`shell_output`/`shell_input`/`shell_kind`),
-      the UI panel block, and the `shell_open_request`/`shell_send_input`/`shell_close_request`
-      handlers.
-- [ ] remove the `TransportEvent::ShellOutput/ShellExit/ShellError` consumption in `app.rs`;
-      if that leaves the reader's `events_tx` shell arms with no consumer, drop those arms
-      (keep `exec_slot` fan-out — the interactive/exec path needs it). Document what stays.
-- [ ] update any tests referencing the removed panel; add/adjust a test asserting the app
-      builds its update loop without shell-panel state.
-- [ ] `cargo clippy --workspace -- -D warnings` clean (no dead-code/unused).
-- [ ] run tests - must pass before next task.
+- [x] remove shell-panel state (`shell_open`/`shell_output`/`shell_input`/`shell_kind`,
+      plus `shell_just_opened`), the UI panel block, and the `shell_open_request`/
+      `shell_send_input`/`shell_close_request`/`shell_send`/`shell_append_output` handlers.
+- [x] remove the `TransportEvent::ShellOutput/ShellExit/ShellError` consumption in `app.rs`
+      (variants dropped from the enum). Reader's `events_tx` shell arms in `link.rs` had no
+      consumer left → dropped those `send()`s, kept the `exec_slot` `broadcast_exec_event`
+      fan-out (interactive/exec path needs it) with a doc comment on what stays.
+- [x] removed the `shell_open_sets_just_opened_flag` test; added
+      `app_constructs_without_shell_panel_state` asserting the app still builds its update loop
+      and renders chrome without shell-panel state.
+- [x] `cargo clippy --workspace -- -D warnings` clean (no dead-code/unused).
+- [x] run tests - must pass before next task.
 
 ### Task 11: Verify acceptance criteria
 

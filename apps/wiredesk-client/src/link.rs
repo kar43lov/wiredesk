@@ -598,28 +598,30 @@ fn reader_loop(
                         }
                         incoming_clip.on_chunk(index, data);
                     }
+                    // Shell output/exit/errors are consumed only by the exec &
+                    // interactive-IPC paths via the `exec_slot` fan-out. The GUI
+                    // shell-panel was removed (interactive `wd` runs over the
+                    // socket relay), so there is no `TransportEvent::Shell*`
+                    // consumer left — we broadcast to the slot and stop there.
                     Message::ShellOutput { data } => {
                         exec_bridge::broadcast_exec_event(
                             &exec_slot,
-                            wiredesk_exec_core::ExecEvent::ShellOutput(data.clone()),
+                            wiredesk_exec_core::ExecEvent::ShellOutput(data),
                         );
-                        let _ = events_tx.send(TransportEvent::ShellOutput(data));
                     }
                     Message::ShellExit { code } => {
                         exec_bridge::broadcast_exec_event(
                             &exec_slot,
                             wiredesk_exec_core::ExecEvent::ShellExit(code),
                         );
-                        let _ = events_tx.send(TransportEvent::ShellExit(code));
                     }
                     Message::Error { code, msg } => {
                         log::warn!("error from host: code={code} msg={msg}");
                         if msg.contains("shell") {
                             exec_bridge::broadcast_exec_event(
                                 &exec_slot,
-                                wiredesk_exec_core::ExecEvent::HostError(msg.clone()),
+                                wiredesk_exec_core::ExecEvent::HostError(msg),
                             );
-                            let _ = events_tx.send(TransportEvent::ShellError(msg));
                         }
                     }
                     Message::Disconnect => {
