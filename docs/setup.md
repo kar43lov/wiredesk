@@ -216,7 +216,7 @@ cd ~/Data/prjcts/wiredesk
 
 ## Шаг 9. Терминал в Ghostty/iTerm
 
-Закрой `wiredesk-client` (он держит порт). В Ghostty:
+**Полностью закрой** `wiredesk-client` / `WireDesk.app` (Cmd+Q) — он держит порт, интерактивный `wd` и GUI взаимоисключающие. ⚠️ Отпустить **Capture Input** («Input: released») **недостаточно** — release отпускает только клавиатуру/мышь, serial-порт держится всё время, пока жив процесс `.app`. Признак «GUI держит порт» — зелёный кружок «Connected to wiredesk-host» + `serial open …: Device or resource busy` при запуске `wd`. Проверить держащий процесс: `lsof /dev/cu.usbserial-XXX`. Если закрывать GUI не хочешь — используй `wd --exec "..."` (ходит через IPC-мост параллельно с GUI, порт не занимает). В Ghostty:
 
 ```bash
 cd ~/Data/prjcts/wiredesk
@@ -225,7 +225,9 @@ cd ~/Data/prjcts/wiredesk
 
 (baud — такой же как у host'а, см. шаг 6).
 
-Появится приглашение PowerShell. **Ctrl+]** — выход с восстановлением локального терминала.
+**Флаги опциональны.** `wiredesk-term` (`wd`) при старте сам подхватывает port/baud: сначала пробует авто-детект единственного подключённого WCH/FTDI-адаптера по USB VID, иначе читает `port`/`baud` из того же `config.toml`, что и GUI. Так что после первичной настройки достаточно голого `wd` — а `--port`/`--baud` нужны только чтобы переопределить вручную. Стартовый баннер печатает, откуда взято значение (`port via auto-detected adapter, baud via config.toml`).
+
+Появится приглашение PowerShell. **Ctrl+]** — выход с восстановлением локального терминала. ⚠️ `Ctrl+]` даёт нужный байт `0x1D` **только на английской раскладке** — на русской та же клавиша это «ъ», выход не сработает; переключи раскладку на ABC/US. `Ctrl+C` и `Ctrl+D` из `wd` **не** выходят — они форвардятся на хост (SIGINT / EOF). Если застрял — закрой вкладку терминала (Cmd+W).
 
 Interactive `wd` теперь использует настоящий PTY на host'е (ConPTY) — vim/htop/nano, ssh без `-tt`, PSReadLine с history через стрелки и Tab autocomplete работают как в нативном терминале. Окно Ghostty можно ресайзить — vim/htop reflow'ят корректно. Ограничение: для `wd --exec` (non-interactive single-shot mode) специально используется pipe-канал — sudo с паролем и интерактивные prompt'ы там работать не будут (по дизайну, для clean stdout sentinel detection).
 
