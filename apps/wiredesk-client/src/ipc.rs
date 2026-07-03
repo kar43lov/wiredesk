@@ -755,7 +755,15 @@ fn handle_interactive_connection(
     // Teardown. Signal + shut the socket down to unblock the blocking reader,
     // join it, then close the host shell so the next session can ShellOpen.
     stop.store(true, Ordering::Relaxed);
-    if let Ok(w) = write_stream.lock() {
+    // Recover on poison: if a pump panicked while holding the write lock the
+    // guard is poisoned, but we still MUST shut the socket down — it's the only
+    // thing that unblocks the timeout-less reader below (see the reader comment
+    // above). Silently skipping the shutdown on `Err` would hang reader.join()
+    // forever, so `_owner_guard` never drops and every later `wd` is refused
+    // "shell busy" until the GUI restarts. Matches the poison recovery used for
+    // `single_inflight` in handle_connection.
+    {
+        let w = write_stream.lock().unwrap_or_else(|p| p.into_inner());
         let _ = w.shutdown(std::net::Shutdown::Both);
     }
     let _ = reader.join();
