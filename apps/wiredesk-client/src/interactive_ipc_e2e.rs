@@ -132,9 +132,27 @@ fn wait_owner_idle(owner: &SharedShellOwner) {
     );
 }
 
+/// Client-side interactive handshake: send `Hello`, read + return the relay's
+/// synth `HelloAck` message. The relay answers `Hello` BEFORE originating
+/// `ShellOpenPty` (Codex P2 ordering), so the client handshakes first.
+fn client_handshake(client: &mut UnixStream) -> Message {
+    write_packet_frame(
+        client,
+        &Packet::new(
+            Message::Hello {
+                version: 1,
+                client_name: "mac-term".into(),
+            },
+            0,
+        ),
+    )
+    .unwrap();
+    read_packet_frame(client).expect("HelloAck").message
+}
+
 /// Full happy-path round-trip through the acceptor:
-/// `IpcConnect::Interactive` → relay originates the single `ShellOpenPty` →
-/// `Hello`/synth-`HelloAck` → forwarded `ShellInput`/`PtyResize` → staged
+/// `IpcConnect::Interactive` → `Hello`/synth-`HelloAck` → relay originates the
+/// single `ShellOpenPty` → forwarded `ShellInput`/`PtyResize` → staged
 /// `ShellOutput` echo → `ShellExit` → teardown `ShellClose` → owner `Idle`.
 #[test]
 fn e2e_interactive_round_trip_through_acceptor() {
@@ -152,31 +170,9 @@ fn e2e_interactive_round_trip_through_acceptor() {
     )
     .unwrap();
 
-    // The relay originates the ONE ShellOpenPty (the term sends none) with the
-    // geometry from the dispatch frame.
-    match gui.recv_wire() {
-        Message::ShellOpenPty { shell, cols, rows } => {
-            assert_eq!(shell, "pwsh");
-            assert_eq!(cols, 120);
-            assert_eq!(rows, 40);
-        }
-        other => panic!("expected ShellOpenPty first, got {other:?}"),
-    }
-    assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
-
-    // Hello → synth HelloAck from the cache (NOT forwarded to the wire).
-    write_packet_frame(
-        &mut client,
-        &Packet::new(
-            Message::Hello {
-                version: 1,
-                client_name: "mac-term".into(),
-            },
-            0,
-        ),
-    )
-    .unwrap();
-    match read_packet_frame(&mut client).expect("HelloAck").message {
+    // Hello → synth HelloAck from the cache (NOT forwarded to the wire), BEFORE
+    // the relay originates ShellOpenPty.
+    match client_handshake(&mut client) {
         Message::HelloAck {
             host_name,
             screen_w,
@@ -189,6 +185,18 @@ fn e2e_interactive_round_trip_through_acceptor() {
         }
         other => panic!("expected synth HelloAck, got {other:?}"),
     }
+
+    // Only after the HelloAck does the relay originate the ONE ShellOpenPty (the
+    // term sends none) with the geometry from the dispatch frame.
+    match gui.recv_wire() {
+        Message::ShellOpenPty { shell, cols, rows } => {
+            assert_eq!(shell, "pwsh");
+            assert_eq!(cols, 120);
+            assert_eq!(rows, 40);
+        }
+        other => panic!("expected ShellOpenPty after handshake, got {other:?}"),
+    }
+    assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
 
     // Heartbeat dropped; ShellInput + PtyResize forwarded to the wire.
     write_packet_frame(&mut client, &Packet::new(Message::Heartbeat, 0)).unwrap();
@@ -254,7 +262,8 @@ fn e2e_second_interactive_connect_is_busy() {
         }),
     )
     .unwrap();
-    // Confirm session 1 acquired the channel (ShellOpenPty originated).
+    // Confirm session 1 acquired the channel: handshake, then ShellOpenPty.
+    let _ = client_handshake(&mut c1);
     assert!(matches!(gui.recv_wire(), Message::ShellOpenPty { .. }));
     assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
 
@@ -305,6 +314,7 @@ fn e2e_channel_reusable_after_teardown() {
         }),
     )
     .unwrap();
+    let _ = client_handshake(&mut c1);
     assert!(matches!(gui.recv_wire(), Message::ShellOpenPty { .. }));
     wait_slot_installed(&gui.exec_slot);
     stage_event(&gui.exec_slot, ExecEvent::ShellExit(0));
@@ -327,6 +337,7 @@ fn e2e_channel_reusable_after_teardown() {
         }),
     )
     .unwrap();
+    let _ = client_handshake(&mut c2);
     assert!(matches!(gui.recv_wire(), Message::ShellOpenPty { .. }));
     assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
 
