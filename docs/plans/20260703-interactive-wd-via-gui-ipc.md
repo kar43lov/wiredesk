@@ -232,21 +232,21 @@ carries those `Packet`s:
 - Modify: `apps/wiredesk-term/Cargo.toml` (ensure `wiredesk-exec-core`, `wiredesk-protocol`,
   `wiredesk-transport` deps available)
 
-- [ ] implement `IpcStreamTransport` over `UnixStream`: `send`/`recv` via the Task 2 codec,
+- [x] implement `IpcStreamTransport` over `UnixStream`: `send`/`recv` via the Task 2 codec,
       `try_clone` via `UnixStream::try_clone`, `is_connected`, `name = "ipc-stream"`.
-- [ ] **`recv` sets `set_read_timeout(Some(~100ms))`** and maps `WouldBlock`/`TimedOut` →
+- [x] **`recv` sets `set_read_timeout(Some(~100ms))`** and maps `WouldBlock`/`TimedOut` →
       `Err(WireDeskError::Transport("recv timeout".into()))` so `bridge_loop`'s reader wakes to
       check `stop` (Ctrl+] exits cleanly — plan-review Important #3).
-- [ ] **`send` drops `Message::Heartbeat`** (returns `Ok(())` without writing) — GUI owns
+- [x] **`send` drops `Message::Heartbeat`** (returns `Ok(())` without writing) — GUI owns
       heartbeat; keeps `bridge_loop` unchanged, no double heartbeat.
-- [ ] add `connect_at(socket_path) -> Result<Option<Self>>` returning `Ok(None)` on
+- [x] add `connect_at(socket_path) -> Result<Option<Self>>` returning `Ok(None)` on
       `ENOENT`/`ECONNREFUSED` (path-parameterized for testability — plan-review Minor #2).
-- [ ] write tests: `send(Packet)` on one paired stream == `recv()` on the other (all shell types);
+- [x] write tests: `send(Packet)` on one paired stream == `recv()` on the other (all shell types);
       `send(Heartbeat)` writes nothing to the peer.
-- [ ] write tests: `recv` on an idle socket returns the "recv timeout" `Err` within ~timeout
+- [x] write tests: `recv` on an idle socket returns the "recv timeout" `Err` within ~timeout
       (not a hang); `try_clone` yields an independent-decoder handle.
-- [ ] write tests: `connect_at` to a nonexistent path → `Ok(None)` (fallback signal).
-- [ ] run tests - must pass before next task.
+- [x] write tests: `connect_at` to a nonexistent path → `Ok(None)` (fallback signal).
+- [x] run tests - must pass before next task.
 
 ### Task 4: `ShellChannelOwner` — cross-kind fail-fast, exec-vs-exec FIFO retained
 

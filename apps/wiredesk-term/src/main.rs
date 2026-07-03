@@ -29,6 +29,14 @@ use wiredesk_transport::transport::Transport;
 mod resolve;
 use resolve::ValueSource;
 
+// Interactive `wd` over the GUI's Unix socket. Mac-only (the GUI + its
+// `wd-exec.sock` live on macOS), mirroring the cfg-gated exec IPC above.
+// `#[allow(dead_code)]` until Task 8 wires `try_interactive_socket` — the
+// transport is fully tested in isolation before it's plumbed into `run()`.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+mod ipc_transport;
+
 const ESCAPE_BYTE: u8 = 0x1D; // Ctrl+]
 /// Send Heartbeat once every two seconds while connected so the host
 /// session loop's idle-timeout (6 s, see Session::HEARTBEAT_TIMEOUT_IDLE)
