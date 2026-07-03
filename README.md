@@ -86,7 +86,7 @@ cargo test --workspace
 
 > First time? Read **[docs/setup.md](docs/setup.md)** — covers wiring, port discovery, Rust install on Windows (incl. how to do it under "Continent" lockdown), and handshake troubleshooting.
 
-Defaults are baked in for a single-user setup (`COM3`, `/dev/cu.usbserial-120`, 115200 baud, 2560×1440). Override with flags or via the settings UI / `config.toml`.
+Hardcoded fallback defaults are baked in for a bare CH340 cable (`COM3`, `/dev/cu.usbserial-120`, 115200 baud, 2560×1440) — override with flags, `config.toml`, or (Mac CLI only) let `wd` auto-detect the serial adapter by USB VID. See [wd port/baud auto-resolve](#wd-portbaud-auto-resolve) below.
 
 ### Configuration
 
@@ -149,6 +149,15 @@ wiredesk-term
 # Optional: pick a specific shell
 wiredesk-term --shell powershell
 wiredesk-term --shell cmd
+```
+
+#### `wd` port/baud auto-resolve
+
+Run with no flags and `wd` picks port and baud in this order: explicit `--port`/`--baud` on the command line → a single unambiguous WCH/FTDI USB-serial adapter detected on the system right now → `port`/`baud` from `config.toml` (the same file the GUI's Settings panel writes) → hardcoded fallback. Auto-detection survives moving the cable to a different physical USB port — macOS reassigns `/dev/cu.usbserial-NNN` by port location, so a config-only lookup would go stale the moment you replug. When resolution didn't come purely from the CLI, `wd` prints where each value came from:
+
+```
+wiredesk-term: port via auto-detected adapter, baud via config.toml
+wiredesk-term: connecting to /dev/cu.usbserial-140 @ 3000000 baud (Ctrl+] to quit)
 ```
 
 On launch you'll see a banner with the host name and screen size plus a hotkey cheatsheet:
@@ -233,7 +242,7 @@ Default baud rate 115200 (~11 KB/s on CH340) — rock-solid for mouse+keyboard (
 crates/
   wiredesk-core        — error types, shared types
   wiredesk-protocol    — packet format, messages, COBS, CRC-16
-  wiredesk-transport   — Transport trait, SerialTransport, MockTransport
+  wiredesk-transport   — Transport trait, SerialTransport, MockTransport, detect (USB VID classification, shared by host's Detect button and `wd`'s auto-resolve)
   wiredesk-exec-core   — shared sentinel-runner + ExecTransport trait for `wd --exec` (used by term and client)
 apps/
   wiredesk-host        — Windows agent (Session + InputInjector + shell subprocess)
@@ -243,7 +252,7 @@ apps/
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded + single files up to 20 MB via NSPasteboard `file URL` / CF_HDROP, cached under `~/Library/Caches/WireDesk/` and `%TEMP%\WireDesk\` with 24 h vacuum on startup; receive-side sanitize against path traversal and NTFS reserved names; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode pass-through bridge in Ghostty/iTerm against a real PTY on the host — vim/htop/ssh without `-tt`/PSReadLine arrow-up + Tab autocomplete work natively; window resize reflows the host's `htop`/`vim` within 500 ms; hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately; `wd --exec` non-interactive mode and the GUI shell-panel keep using the legacy pipe path with zero regressions). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → System (Karabiner swap, Save & Restart) and Clipboard (6 toggles: send/receive × text/image plus receive-files and send-files; Mac→Host file send is opt-in, default off). Win host: tray agent (nwg) with **labeled serial-port dropdown + auto-detect** recognizing both CH340 (VID 0x1A86) and FTDI FT232H/R/2232/4232 (VID 0x0403), **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), **Receive files** checkbox in the Clipboard group, Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. 261 client + 158 host + 84 exec-core + 88 protocol + 41 transport + 23 term + 18 wiredesk-core = 673 tests passing (+5 ignored; use `cargo test --workspace -- --test-threads=1` on macOS — host-side parallel runner has a pre-existing flake).
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded + single files up to 20 MB via NSPasteboard `file URL` / CF_HDROP, cached under `~/Library/Caches/WireDesk/` and `%TEMP%\WireDesk\` with 24 h vacuum on startup; receive-side sanitize against path traversal and NTFS reserved names; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode pass-through bridge in Ghostty/iTerm against a real PTY on the host — vim/htop/ssh without `-tt`/PSReadLine arrow-up + Tab autocomplete work natively; window resize reflows the host's `htop`/`vim` within 500 ms; hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately; `wd --exec` non-interactive mode and the GUI shell-panel keep using the legacy pipe path with zero regressions). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (W / ↑% / ↓%), Settings → System (Karabiner swap, Save & Restart) and Clipboard (6 toggles: send/receive × text/image plus receive-files and send-files; Mac→Host file send is opt-in, default off). Win host: tray agent (nwg) with **labeled serial-port dropdown + auto-detect** recognizing both CH340 (VID 0x1A86) and FTDI FT232H/R/2232/4232 (VID 0x0403), **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), **Receive files** checkbox in the Clipboard group, Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. 261 client + 148 host + 84 exec-core + 88 protocol + 51 transport + 37 term + 18 wiredesk-core = 687 tests passing (+5 ignored; use `cargo test --workspace -- --test-threads=1` on macOS — host-side parallel runner has a pre-existing flake).
 
 ## License
 

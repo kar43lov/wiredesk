@@ -21,10 +21,12 @@ session_thread.rs      — spawn() generic over injector cfg, SessionStatus enum
 ui/
   mod.rs               — module routing, dead_code allows for non-Windows
   format.rs            — pure validators (validate_baud/port/dimension),
-                          format_mac_launch_command, status_color,
-                          classify_ports → Vec<DetectedPort> (AdapterKind:
-                          CH34x VID 0x1A86 / FTDI VID 0x0403 / OtherUsb /
-                          NonUsb, chip-labeled) + target_indices + enumerate_ports_now
+                          format_mac_launch_command, status_color;
+                          re-exports port classification (classify_ports →
+                          Vec<DetectedPort>, AdapterKind CH34x VID 0x1A86 /
+                          FTDI VID 0x0403 / OtherUsb / NonUsb, target_indices,
+                          enumerate_ports_now) from wiredesk-transport::detect
+                          — shared with wiredesk-term's startup port auto-detect
   icons.rs             — shared embedded PNG bytes (ICON_GREEN/YELLOW/GRAY_BYTES)
                           + app-icon.ico bytes — used by tray + settings status
   settings_window.rs   — #[cfg(windows)] nwg builder UI grouped into Frame
