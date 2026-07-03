@@ -32,7 +32,7 @@ use wiredesk_protocol::packet::Packet;
 use crate::exec_bridge::ExecEventSlot;
 use crate::ipc::spawn_ipc_acceptor;
 use crate::link::{HostInfo, SharedHostInfo};
-use crate::shell_channel::{new_shared_owner, try_acquire, SharedShellOwner, ShellOwner};
+use crate::shell_channel::{current_owner, new_shared_owner, try_acquire, SharedShellOwner, ShellOwner};
 
 /// Shared wiring for a fake-GUI: the acceptor's dependencies plus the mock
 /// `outgoing_rx` (captures packets the relay forwards to the "wire") and the
@@ -121,14 +121,14 @@ fn stage_event(slot: &ExecEventSlot, ev: ExecEvent) {
 /// handler thread, which we can't join through the detached acceptor).
 fn wait_owner_idle(owner: &SharedShellOwner) {
     for _ in 0..600 {
-        if *owner.lock().unwrap() == ShellOwner::Idle {
+        if current_owner(owner) == ShellOwner::Idle {
             return;
         }
         thread::sleep(Duration::from_millis(5));
     }
     panic!(
         "channel never returned to Idle (owner still {:?})",
-        *owner.lock().unwrap()
+        current_owner(owner)
     );
 }
 
@@ -162,7 +162,7 @@ fn e2e_interactive_round_trip_through_acceptor() {
         }
         other => panic!("expected ShellOpenPty first, got {other:?}"),
     }
-    assert_eq!(*gui.owner.lock().unwrap(), ShellOwner::Interactive);
+    assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
 
     // Hello → synth HelloAck from the cache (NOT forwarded to the wire).
     write_packet_frame(
@@ -256,7 +256,7 @@ fn e2e_second_interactive_connect_is_busy() {
     .unwrap();
     // Confirm session 1 acquired the channel (ShellOpenPty originated).
     assert!(matches!(gui.recv_wire(), Message::ShellOpenPty { .. }));
-    assert_eq!(*gui.owner.lock().unwrap(), ShellOwner::Interactive);
+    assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
 
     // Session 2: connect while session 1 holds the channel → "shell busy".
     let mut c2 = gui.connect();
@@ -328,7 +328,7 @@ fn e2e_channel_reusable_after_teardown() {
     )
     .unwrap();
     assert!(matches!(gui.recv_wire(), Message::ShellOpenPty { .. }));
-    assert_eq!(*gui.owner.lock().unwrap(), ShellOwner::Interactive);
+    assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
 
     // Sanity: the second session really owns it — a competing acquire fails.
     assert!(

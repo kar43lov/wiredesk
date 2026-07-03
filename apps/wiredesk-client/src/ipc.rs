@@ -250,6 +250,30 @@ fn handle_connection(
         return;
     }
 
+    // Claim the shell channel as `Exec` BEFORE queuing on `single_inflight`
+    // (Codex P2). Exec claims stack (ref-counted), so a queued exec is counted
+    // as "exec present" for the whole time it waits — an interactive session
+    // can't slip into the A→B handoff window and force a false "shell busy" on
+    // the already-queued exec. Fails fast only if an interactive `wd` session
+    // holds the channel (term maps the transport-class frame → exit 125).
+    // Declared BEFORE `_inflight_guard` so on return the inflight mutex releases
+    // first (waking the next queued exec, which already holds its own Exec ref)
+    // and only then does this exec's ref drop — the count never dips to 0 across
+    // the handoff.
+    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Exec) {
+        Some(g) => g,
+        None => {
+            log::info!("IPC handler: shell channel held by interactive session — refusing exec");
+            let _ = write_response(
+                &mut stream,
+                &IpcResponse::TransportUnavailable(
+                    "shell busy — interactive wd session active".into(),
+                ),
+            );
+            return;
+        }
+    };
+
     // Keepalive BEFORE acquiring single_inflight. If a prior handler
     // is stuck in run_oneshot (e.g. `--ssh dev "exit 42"` exits the
     // remote bash, ssh tunnel closes, host PS stays alive, sentinel
@@ -299,28 +323,6 @@ fn handle_connection(
         );
         return;
     }
-
-    // Claim the shell channel as `Exec`. `single_inflight` (held above) already
-    // serialises exec-vs-exec FIFO, so by the time we reach here the owner is
-    // `Idle` UNLESS an interactive `wd` session holds the channel — in which
-    // case we fail fast with a transport-class frame (term maps → exit 125)
-    // instead of queuing behind a minutes-long PTY session. Declared *after*
-    // `_inflight_guard` so on return the owner resets to `Idle` before the
-    // inflight mutex releases, keeping the next queued exec's `try_acquire`
-    // clean.
-    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Exec) {
-        Some(g) => g,
-        None => {
-            log::info!("IPC handler: shell channel held by interactive session — refusing exec");
-            let _ = write_response(
-                &mut stream,
-                &IpcResponse::TransportUnavailable(
-                    "shell busy — interactive wd session active".into(),
-                ),
-            );
-            return;
-        }
-    };
 
     // Private mpsc for the duration of this run. Reader thread fans
     // ShellOutput / ShellExit / shell-Error into here via the slot
@@ -1056,7 +1058,7 @@ mod tests {
     // ---- Interactive relay (Task 6) -------------------------------------
 
     use crate::link::{HostInfo, SharedHostInfo};
-    use crate::shell_channel::new_shared_owner;
+    use crate::shell_channel::{current_owner, new_shared_owner};
 
     fn populated_host_info() -> SharedHostInfo {
         Arc::new(Mutex::new(Some(HostInfo {
@@ -1121,7 +1123,7 @@ mod tests {
             }
             other => panic!("expected ShellOpenPty first, got {other:?}"),
         }
-        assert_eq!(*owner.lock().unwrap(), ShellOwner::Interactive);
+        assert_eq!(current_owner(&owner), ShellOwner::Interactive);
 
         // Hello → synth HelloAck from the cache, NOT forwarded to the wire.
         write_packet_frame(
@@ -1201,7 +1203,7 @@ mod tests {
                 .message,
             Message::ShellClose
         ));
-        assert_eq!(*owner.lock().unwrap(), ShellOwner::Idle);
+        assert_eq!(current_owner(&owner), ShellOwner::Idle);
     }
 
     #[test]
@@ -1238,7 +1240,7 @@ mod tests {
             "no ShellOpenPty may be queued when the link is down"
         );
         assert_eq!(
-            *owner_probe.lock().unwrap(),
+            current_owner(&owner_probe),
             ShellOwner::Idle,
             "refused connect must release the channel"
         );
@@ -1280,7 +1282,7 @@ mod tests {
         // This branch acquires the owner guard *before* the host-info check, so
         // a guard leak here would strand the channel — assert it released.
         assert_eq!(
-            *owner_probe.lock().unwrap(),
+            current_owner(&owner_probe),
             ShellOwner::Idle,
             "refused connect must release the channel"
         );
@@ -1410,7 +1412,7 @@ mod tests {
                 .message,
             Message::ShellOpenPty { .. }
         ));
-        assert_eq!(*owner.lock().unwrap(), ShellOwner::Interactive);
+        assert_eq!(current_owner(&owner), ShellOwner::Interactive);
 
         // Host rejects the open — HostError with no ShellExit to follow.
         wait_slot_installed(&exec_slot);
@@ -1431,7 +1433,7 @@ mod tests {
         ));
         handler.join().expect("handler thread must return after host error");
         assert_eq!(
-            *owner.lock().unwrap(),
+            current_owner(&owner),
             ShellOwner::Idle,
             "host shell error must release the channel"
         );
@@ -1504,7 +1506,7 @@ mod tests {
             "no outgoing packet may be queued when interactive holds the channel"
         );
         assert_eq!(
-            *owner.lock().unwrap(),
+            current_owner(&owner),
             ShellOwner::Interactive,
             "the refused exec must NOT disturb the interactive owner state"
         );
@@ -1630,7 +1632,7 @@ mod tests {
         // rather than asserting immediately.
         let mut released = false;
         for _ in 0..600 {
-            if *owner.lock().unwrap() == ShellOwner::Idle {
+            if current_owner(&owner) == ShellOwner::Idle {
                 released = true;
                 break;
             }
@@ -1639,7 +1641,7 @@ mod tests {
         assert!(
             released,
             "channel must return to Idle after both exec runs (owner still {:?})",
-            *owner.lock().unwrap()
+            current_owner(&owner)
         );
     }
 }
