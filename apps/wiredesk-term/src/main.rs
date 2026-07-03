@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use crossterm::terminal;
 use wiredesk_core::error::{Result, WireDeskError};
 use wiredesk_exec_core::format_timeout_diagnostic;
@@ -25,6 +25,9 @@ use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::serial::SerialTransport;
 use wiredesk_transport::transport::Transport;
+
+mod resolve;
+use resolve::ValueSource;
 
 const ESCAPE_BYTE: u8 = 0x1D; // Ctrl+]
 /// Send Heartbeat once every two seconds while connected so the host
@@ -95,11 +98,35 @@ struct Args {
     command: Option<String>,
 }
 
+/// `--port`/`--baud` count as "from the user" only when they came from the
+/// command line or an env var — clap's own default value is a `ValueSource`
+/// too (`DefaultValue`), and we don't want that to shadow auto-detection or
+/// config.toml (see `resolve` module docs for the full priority order).
+fn from_user(src: Option<clap::parser::ValueSource>) -> bool {
+    matches!(
+        src,
+        Some(clap::parser::ValueSource::CommandLine) | Some(clap::parser::ValueSource::EnvVariable)
+    )
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let args = Args::parse();
 
-    match run(&args) {
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+    let cli_port = from_user(matches.value_source("port")).then(|| args.port.clone());
+    let cli_baud = from_user(matches.value_source("baud")).then_some(args.baud);
+
+    let (toml_port, toml_baud) = resolve::load_toml_port_baud(&resolve::config_path());
+    let detected = resolve::detect_target_ports();
+
+    let (port, port_source) = resolve::resolve_port(cli_port, &detected, toml_port, &args.port);
+    let (baud, baud_source) = resolve::resolve_baud(cli_baud, toml_baud, args.baud);
+    args.port = port;
+    args.baud = baud;
+
+    match run(&args, port_source, baud_source) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             // Make sure we always restore the terminal before printing the error.
@@ -110,7 +137,7 @@ fn main() {
     }
 }
 
-fn run(args: &Args) -> Result<i32> {
+fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Result<i32> {
     // Validate --exec / COMMAND coupling before opening serial — fast
     // fail with a clear message, no half-opened state.
     if args.exec && args.command.is_none() {
@@ -146,6 +173,16 @@ fn run(args: &Args) -> Result<i32> {
     }
 
     if !args.exec {
+        // Only call out where port/baud came from when at least one wasn't
+        // explicit on the command line — if the user typed both flags
+        // there's nothing to explain.
+        if port_source != ValueSource::Cli || baud_source != ValueSource::Cli {
+            eprintln!(
+                "wiredesk-term: port via {}, baud via {}",
+                port_source.label(),
+                baud_source.label()
+            );
+        }
         eprintln!(
             "wiredesk-term: connecting to {} @ {} baud (Ctrl+] to quit)",
             args.port, args.baud

@@ -5522,9 +5522,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "dirs",
  "env_logger",
  "log",
+ "serde",
  "thiserror 2.0.18",
+ "toml 0.8.23",
  "uuid",
  "wiredesk-core",
  "wiredesk-exec-core",
