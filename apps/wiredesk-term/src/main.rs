@@ -894,6 +894,21 @@ fn reader_thread(mut transport: Box<dyn Transport>, stop: Arc<AtomicBool>) {
             },
             Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => continue,
             Err(_) => {
+                // A transport that reports itself disconnected will never
+                // recover — the GUI process quit mid-session and its socket
+                // EOF'd (`IpcStreamTransport::recv` sets `connected=false`).
+                // Tear the session down with feedback instead of spinning
+                // forever on the 50 ms backoff. `SerialTransport::is_connected`
+                // is a constant `true`, so the direct-serial path keeps its
+                // transient-error backoff unchanged and only ends on a real
+                // `Message::Disconnect`.
+                if !transport.is_connected() {
+                    let mut out = stdout.lock();
+                    let _ = writeln!(out, "\r\n[host disconnected]\r");
+                    let _ = out.flush();
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
                 // Brief backoff to avoid tight loop on persistent failure.
                 thread::sleep(Duration::from_millis(50));
             }
