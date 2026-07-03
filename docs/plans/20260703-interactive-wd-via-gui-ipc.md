@@ -310,20 +310,23 @@ carries those `Packet`s:
 - Modify: `apps/wiredesk-client/src/main.rs` (callsite: pass `SharedShellOwner` + `SharedHostInfo`)
 - Modify: `apps/wiredesk-term/src/main.rs` (`try_socket_first` sends `IpcConnect::Exec`)
 
-- [ ] acceptor: read `IpcConnect` first; dispatch `Exec`→existing handler, `Interactive`→Task 6
+- [x] acceptor: read `IpcConnect` first; dispatch `Exec`→existing handler, `Interactive`→Task 6
       handler (remove its `#[allow(dead_code)]`).
-- [ ] exec handler: replace `single_inflight`-first with `try_acquire(Exec)` (busy-by-Interactive →
-      `IpcResponse::TransportUnavailable("shell busy")` → term exit 125), THEN keep `single_inflight`
-      for exec-vs-exec FIFO (unchanged behaviour).
-- [ ] `spawn_ipc_acceptor` signature + `main.rs` callsite: pass `SharedShellOwner` + `SharedHostInfo`
+- [x] exec handler: single_inflight-first, THEN `try_acquire(Exec)` (busy-by-Interactive →
+      `IpcResponse::TransportUnavailable("shell busy")` → term exit 125), keeping `single_inflight`
+      for exec-vs-exec FIFO (owner guard declared after inflight so it resets to `Idle` first on
+      return — plan prose said "try_acquire first" but the Idle-only `try_acquire` from Task 4
+      requires inflight-first to preserve FIFO; documented inline).
+- [x] `spawn_ipc_acceptor` signature + `main.rs` callsite: pass `SharedShellOwner` + `SharedHostInfo`
       (keep `single_inflight` as before, now nested under `Exec`).
-- [ ] `apps/wiredesk-term/src/main.rs`: `try_socket_first` writes `IpcConnect::Exec(req)` via
-      `write_connect` instead of bare `write_request` (`main.rs:354`). **This is the edit the
+- [x] `apps/wiredesk-term/src/main.rs`: `try_socket_first` writes `IpcConnect::Exec(req)` via
+      `write_connect` instead of bare `write_request`. **This is the edit the
       cutover cannot omit** (plan-review Critical #1).
-- [ ] write/​update tests: exec regression — `handler_round_trip_via_unix_socket` updated to send
-      `IpcConnect::Exec` and still passes end-to-end; interactive-owner-held → exec gets 125-class
-      frame, no `ShellOpen` queued; two concurrent exec still FIFO-serialise (no false "busy").
-- [ ] run tests - must pass before next task.
+- [x] write/​update tests: exec regression — `handler_round_trip_via_unix_socket` +
+      term `try_socket_first_walks_request_response_stream` updated to send `IpcConnect::Exec` and
+      still pass end-to-end; `exec_refused_when_interactive_holds_channel` → 125-class frame, no
+      `ShellOpen` queued; `concurrent_exec_fifo_no_false_busy` → two concurrent exec both exit 0.
+- [x] run tests - must pass before next task.
 
 ### Task 8: term `try_interactive_socket` + serial fallback
 

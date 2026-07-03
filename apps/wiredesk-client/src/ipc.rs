@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use wiredesk_exec_core::{
     ipc::{
-        read_packet_frame, read_request, write_packet_frame, write_response, IpcInteractiveOpen,
-        IpcResponse,
+        read_connect, read_packet_frame, write_packet_frame, write_response, IpcConnect,
+        IpcInteractiveOpen, IpcRequest, IpcResponse,
     },
     ExecError, ExecEvent, ExecTransport,
 };
@@ -79,11 +79,14 @@ impl ExecTransport for IpcExecTransport {
 /// (missing parent dir, EADDRINUSE race, permission denied) logs a
 /// warning and returns — GUI continues without IPC, term's
 /// `try_socket_first` will fall back to direct serial.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_ipc_acceptor(
     socket_path: PathBuf,
     outgoing_tx: mpsc::Sender<Packet>,
     exec_slot: ExecEventSlot,
+    shell_owner: SharedShellOwner,
     single_inflight: Arc<Mutex<()>>,
+    host_info: SharedHostInfo,
     link_up: Arc<AtomicBool>,
 ) {
     // Stale socket from prior crash — `bind` fails with EADDRINUSE
@@ -136,10 +139,20 @@ pub fn spawn_ipc_acceptor(
                     log::info!("IPC connection accepted");
                     let outgoing_tx = outgoing_tx.clone();
                     let exec_slot = exec_slot.clone();
+                    let shell_owner = shell_owner.clone();
                     let single_inflight = single_inflight.clone();
+                    let host_info = host_info.clone();
                     let link_up = link_up.clone();
                     thread::spawn(move || {
-                        handle_connection(stream, outgoing_tx, exec_slot, single_inflight, link_up);
+                        dispatch_connection(
+                            stream,
+                            outgoing_tx,
+                            exec_slot,
+                            shell_owner,
+                            single_inflight,
+                            host_info,
+                            link_up,
+                        );
                     });
                 }
                 Err(e) => {
@@ -150,25 +163,69 @@ pub fn spawn_ipc_acceptor(
     });
 }
 
-/// Per-connection handler. Holds `single_inflight` for the entire run
-/// (so concurrent connections queue), installs the `ExecSlotGuard` so
-/// `reader_thread` fans shell events into our private mpsc, runs the
-/// shared runner, ships the result back over the socket. Both guards
-/// are RAII — panic in any branch still releases them.
-fn handle_connection(
+/// Read the `IpcConnect` dispatch frame (first frame of every connection)
+/// and route to the matching handler. `Exec` → the one-shot exec handler
+/// (`handle_connection`); `Interactive` → the streaming PTY relay
+/// (`handle_interactive_connection`). A malformed / legacy-bare-request
+/// first frame fails to decode here and the connection is dropped — the
+/// intended fail-closed behaviour of the lock-step cutover (Task 7).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_connection(
     mut stream: UnixStream,
     outgoing_tx: mpsc::Sender<Packet>,
     exec_slot: ExecEventSlot,
+    shell_owner: SharedShellOwner,
     single_inflight: Arc<Mutex<()>>,
+    host_info: SharedHostInfo,
     link_up: Arc<AtomicBool>,
 ) {
-    let req = match read_request(&mut stream) {
-        Ok(r) => r,
+    let conn = match read_connect(&mut stream) {
+        Ok(c) => c,
         Err(e) => {
-            log::warn!("IPC: read_request failed: {e}; dropping connection");
+            log::warn!("IPC: read_connect failed: {e}; dropping connection");
             return;
         }
     };
+    match conn {
+        IpcConnect::Exec(req) => handle_connection(
+            stream,
+            req,
+            outgoing_tx,
+            exec_slot,
+            shell_owner,
+            single_inflight,
+            link_up,
+        ),
+        IpcConnect::Interactive(open) => handle_interactive_connection(
+            stream,
+            open,
+            outgoing_tx,
+            exec_slot,
+            shell_owner,
+            host_info,
+            link_up,
+        ),
+    }
+}
+
+/// Per-connection handler for one-shot `wd --exec`. The `IpcConnect::Exec(req)`
+/// frame was already decoded by `dispatch_connection`, so we take `req` by
+/// value. Holds `single_inflight` for the entire run (so concurrent exec
+/// connections queue FIFO), claims the shell channel as `Exec` (fail-fast if
+/// an interactive session holds it), installs the `ExecSlotGuard` so
+/// `reader_thread` fans shell events into our private mpsc, runs the shared
+/// runner, ships the result back over the socket. All guards are RAII — panic
+/// in any branch still releases them.
+#[allow(clippy::too_many_arguments)]
+fn handle_connection(
+    mut stream: UnixStream,
+    req: IpcRequest,
+    outgoing_tx: mpsc::Sender<Packet>,
+    exec_slot: ExecEventSlot,
+    shell_owner: SharedShellOwner,
+    single_inflight: Arc<Mutex<()>>,
+    link_up: Arc<AtomicBool>,
+) {
     log::info!(
         "IPC handler: cmd={:?} ssh={:?} timeout={}s",
         req.cmd,
@@ -242,6 +299,28 @@ fn handle_connection(
         );
         return;
     }
+
+    // Claim the shell channel as `Exec`. `single_inflight` (held above) already
+    // serialises exec-vs-exec FIFO, so by the time we reach here the owner is
+    // `Idle` UNLESS an interactive `wd` session holds the channel — in which
+    // case we fail fast with a transport-class frame (term maps → exit 125)
+    // instead of queuing behind a minutes-long PTY session. Declared *after*
+    // `_inflight_guard` so on return the owner resets to `Idle` before the
+    // inflight mutex releases, keeping the next queued exec's `try_acquire`
+    // clean.
+    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Exec) {
+        Some(g) => g,
+        None => {
+            log::info!("IPC handler: shell channel held by interactive session — refusing exec");
+            let _ = write_response(
+                &mut stream,
+                &IpcResponse::TransportUnavailable(
+                    "shell busy — interactive wd session active".into(),
+                ),
+            );
+            return;
+        }
+    };
 
     // Private mpsc for the duration of this run. Reader thread fans
     // ShellOutput / ShellExit / shell-Error into here via the slot
@@ -491,8 +570,8 @@ fn synth_hello_ack(host_info: &SharedHostInfo) -> Packet {
 /// (channel → `Idle`, slot → `None`), close the socket. All guards are RAII so
 /// a panic in either pump still releases the channel.
 ///
-/// `dead_code` allowed until Task 7 dispatches it from the acceptor.
-#[allow(dead_code)]
+/// Dispatched from `dispatch_connection` on an `IpcConnect::Interactive` frame.
+#[allow(clippy::too_many_arguments)]
 fn handle_interactive_connection(
     stream: UnixStream,
     open: IpcInteractiveOpen,
@@ -672,7 +751,7 @@ fn handle_interactive_connection(
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-    use wiredesk_exec_core::ipc::{write_request, IpcRequest};
+    use wiredesk_exec_core::ipc::{read_request, write_connect, write_request, IpcRequest};
 
     #[test]
     fn ipc_exec_transport_send_input_pushes_packet() {
@@ -730,14 +809,18 @@ mod tests {
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(true));
 
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
             exec_slot.clone(),
+            owner,
             inflight,
+            host_info,
             link_up,
         );
 
@@ -792,7 +875,7 @@ mod tests {
             timeout_secs: 5,
             compress: false,
         };
-        write_request(&mut client, &req).unwrap();
+        write_connect(&mut client, &IpcConnect::Exec(req)).unwrap();
 
         // Pull responses until Exit.
         let mut stdout_collected = Vec::new();
@@ -823,7 +906,9 @@ mod tests {
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(false)); // link DOWN
 
         // Hold single_inflight for the whole test. The link-down refusal must
@@ -836,7 +921,9 @@ mod tests {
             socket.clone(),
             outgoing_tx,
             exec_slot,
+            owner,
             inflight.clone(),
+            host_info,
             link_up,
         );
         thread::sleep(Duration::from_millis(50));
@@ -853,7 +940,7 @@ mod tests {
             timeout_secs: 5,
             compress: false,
         };
-        write_request(&mut client, &req).unwrap();
+        write_connect(&mut client, &IpcConnect::Exec(req)).unwrap();
 
         match wiredesk_exec_core::ipc::read_response(&mut client)
             .expect("link-down refusal must arrive without acquiring single_inflight")
@@ -886,11 +973,13 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Packet>();
         let slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let host_info: SharedHostInfo = Arc::new(Mutex::new(None));
         let link_up = Arc::new(AtomicBool::new(true));
 
         // Must not panic.
-        spawn_ipc_acceptor(socket, tx, slot, inflight, link_up);
+        spawn_ipc_acceptor(socket, tx, slot, owner, inflight, host_info, link_up);
     }
 
     #[test]
@@ -904,9 +993,11 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Packet>();
         let slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let host_info: SharedHostInfo = Arc::new(Mutex::new(None));
         let link_up = Arc::new(AtomicBool::new(true));
-        spawn_ipc_acceptor(socket.clone(), tx, slot, inflight, link_up);
+        spawn_ipc_acceptor(socket.clone(), tx, slot, owner, inflight, host_info, link_up);
         thread::sleep(Duration::from_millis(50));
 
         // Now it should be a real socket — connect should succeed.
@@ -1246,5 +1337,211 @@ mod tests {
             Message::Disconnect
         ));
         handler.join().unwrap();
+    }
+
+    // ---- Atomic IpcConnect cutover (Task 7) -----------------------------
+
+    /// While an interactive `wd` session holds the shell channel, an incoming
+    /// `wd --exec` must fail fast with a transport-class frame (term → exit 125)
+    /// and never queue a `ShellOpen` behind the minutes-long PTY session.
+    #[test]
+    fn exec_refused_when_interactive_holds_channel() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let socket = tmp.path().join("wd-exec.sock");
+
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        // Pre-claim the channel as Interactive — mirrors a live PTY session.
+        let _held = try_acquire(&owner, ShellOwner::Interactive).expect("pre-claim Interactive");
+        let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        spawn_ipc_acceptor(
+            socket.clone(),
+            outgoing_tx,
+            exec_slot,
+            owner.clone(),
+            inflight,
+            host_info,
+            link_up,
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let req = IpcRequest {
+            cmd: "echo hi".into(),
+            ssh: None,
+            timeout_secs: 5,
+            compress: false,
+        };
+        write_connect(&mut client, &IpcConnect::Exec(req)).unwrap();
+
+        // The handler emits an empty keepalive Stdout before acquiring the slot;
+        // then the owner-held refusal arrives as TransportUnavailable.
+        let terminal = loop {
+            match wiredesk_exec_core::ipc::read_response(&mut client)
+                .expect("owner-held refusal must arrive without hanging")
+            {
+                IpcResponse::Stdout(_) => continue, // keepalive
+                other => break other,
+            }
+        };
+        match terminal {
+            IpcResponse::TransportUnavailable(msg) => {
+                assert!(msg.contains("busy"), "msg: {msg}");
+            }
+            other => panic!("expected TransportUnavailable (shell busy), got {other:?}"),
+        }
+
+        // No ShellOpen may be queued against a channel the interactive session owns.
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "no outgoing packet may be queued when interactive holds the channel"
+        );
+        assert_eq!(
+            *owner.lock().unwrap(),
+            ShellOwner::Interactive,
+            "the refused exec must NOT disturb the interactive owner state"
+        );
+    }
+
+    /// Two `wd --exec` calls racing into one acceptor must both complete (exit 0)
+    /// — the `Exec` owner claim is nested UNDER `single_inflight`, so the second
+    /// exec blocks on the FIFO mutex rather than seeing a false "shell busy". A
+    /// regression that acquired the owner *before* `single_inflight` would make
+    /// the second concurrent exec fail fast; this guards that ordering.
+    #[test]
+    fn concurrent_exec_fifo_no_false_busy() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let socket = tmp.path().join("wd-exec.sock");
+
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let owner = new_shared_owner();
+        let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let host_info = populated_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        spawn_ipc_acceptor(
+            socket.clone(),
+            outgoing_tx,
+            exec_slot.clone(),
+            owner.clone(),
+            inflight,
+            host_info,
+            link_up,
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        // Staging thread: handlers serialise via single_inflight, so sentinels
+        // appear one run at a time. For each of the two runs, drain outgoing
+        // until the ShellInput carrying the sentinel, extract its uuid, then
+        // stage prompt → output → sentinel into whichever slot is installed.
+        let stage_slot = exec_slot.clone();
+        let stage_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let payload = loop {
+                    let pkt = match outgoing_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    if let Message::ShellInput { data } = pkt.message {
+                        let s = String::from_utf8_lossy(&data).to_string();
+                        if s.contains("__WD_DONE_") {
+                            break s;
+                        }
+                    }
+                };
+                let marker = "__WD_DONE_";
+                let start = payload.find(marker).expect("uuid") + marker.len();
+                let after = &payload[start..];
+                let end = after.find("__").unwrap();
+                let uuid = after[..end].to_string();
+
+                // The slot is reinstalled by each handler; wait for it.
+                let mut installed = false;
+                for _ in 0..400 {
+                    if stage_slot.lock().unwrap().is_some() {
+                        installed = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if !installed {
+                    return;
+                }
+                let stage = |ev: ExecEvent| {
+                    if let Some(tx) = stage_slot.lock().unwrap().as_ref() {
+                        let _ = tx.send(ev);
+                    }
+                };
+                stage(ExecEvent::ShellOutput(b"PS C:\\>\n".to_vec()));
+                stage(ExecEvent::ShellOutput(b"hi\n".to_vec()));
+                stage(ExecEvent::ShellOutput(
+                    format!("__WD_DONE_{uuid}__0\n").into_bytes(),
+                ));
+            }
+        });
+
+        // Two concurrent exec clients.
+        let run_client = |socket: PathBuf| {
+            let mut client = UnixStream::connect(&socket).expect("connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let req = IpcRequest {
+                cmd: "echo hi".into(),
+                ssh: None,
+                timeout_secs: 10,
+                compress: false,
+            };
+            write_connect(&mut client, &IpcConnect::Exec(req)).unwrap();
+            loop {
+                match wiredesk_exec_core::ipc::read_response(&mut client).unwrap() {
+                    IpcResponse::Stdout(_) => {}
+                    IpcResponse::Exit(c) => break c,
+                    IpcResponse::TransportUnavailable(m) => {
+                        panic!("concurrent exec falsely reported busy: {m}")
+                    }
+                    IpcResponse::Error(m) => panic!("handler error: {m}"),
+                }
+            }
+        };
+        let s1 = socket.clone();
+        let s2 = socket.clone();
+        let c1 = thread::spawn(move || run_client(s1));
+        let c2 = thread::spawn(move || run_client(s2));
+
+        let e1 = c1.join().expect("client 1");
+        let e2 = c2.join().expect("client 2");
+        stage_thread.join().expect("stage thread");
+        assert_eq!(e1, 0, "first exec exit code");
+        assert_eq!(e2, 0, "second exec exit code");
+
+        // The handler holds the owner guard through its post-run drain (a couple
+        // seconds after the client already saw Exit), so poll for the reset
+        // rather than asserting immediately.
+        let mut released = false;
+        for _ in 0..600 {
+            if *owner.lock().unwrap() == ShellOwner::Idle {
+                released = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            released,
+            "channel must return to Idle after both exec runs (owner still {:?})",
+            *owner.lock().unwrap()
+        );
     }
 }

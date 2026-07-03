@@ -176,19 +176,22 @@ fn main() {
     {
         let ipc_outgoing_tx = outgoing_tx.clone();
         let ipc_slot = exec_slot.clone();
-        // Shared single-owner lock for the host's one shell slot. Reserved
-        // here; Task 7 threads it into `spawn_ipc_acceptor` so the exec and
-        // interactive handlers can fail-fast cross-kind (see shell_channel).
-        let _shell_owner = shell_channel::new_shared_owner();
+        // Shared single-owner lock for the host's one shell slot. The exec and
+        // interactive handlers fail-fast cross-kind against it (see
+        // shell_channel); exec-vs-exec FIFO stays nested under `single_inflight`.
+        let shell_owner = shell_channel::new_shared_owner();
         let single_inflight: Arc<std::sync::Mutex<()>> =
             Arc::new(std::sync::Mutex::new(()));
+        let ipc_host_info = host_info.clone();
         let socket_path = wiredesk_exec_core::default_socket_path();
         let ipc_link_up = link_up.clone();
         ipc::spawn_ipc_acceptor(
             socket_path,
             ipc_outgoing_tx,
             ipc_slot,
+            shell_owner,
             single_inflight,
+            ipc_host_info,
             ipc_link_up,
         );
     }

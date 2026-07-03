@@ -19,7 +19,7 @@ use wiredesk_core::error::{Result, WireDeskError};
 use wiredesk_exec_core::format_timeout_diagnostic;
 #[cfg(target_os = "macos")]
 use wiredesk_exec_core::ipc::{
-    default_socket_path, read_response, write_request, IpcRequest, IpcResponse,
+    default_socket_path, read_response, write_connect, IpcConnect, IpcRequest, IpcResponse,
 };
 use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
@@ -359,7 +359,11 @@ fn try_socket_first(
         timeout_secs,
         compress,
     };
-    if write_request(&mut stream, &req).is_err() {
+    // First frame is the `IpcConnect` dispatch discriminator (lock-step cutover
+    // with the GUI acceptor + interactive path — plan Task 7 Critical #1). The
+    // exec path wraps the request as `IpcConnect::Exec`; the GUI reads a bare
+    // `IpcRequest` no longer.
+    if write_connect(&mut stream, &IpcConnect::Exec(req)).is_err() {
         return Ok(None);
     }
 
@@ -1284,7 +1288,7 @@ mod tests {
     fn try_socket_first_walks_request_response_stream() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
-        use wiredesk_exec_core::ipc::{read_request, write_response, IpcResponse};
+        use wiredesk_exec_core::ipc::{read_connect, write_response, IpcConnect, IpcResponse};
 
         let socket_path = std::env::temp_dir()
             .join(format!("wd-exec-test-{}.sock", uuid::Uuid::new_v4()));
@@ -1297,7 +1301,12 @@ mod tests {
         let server_path = socket_path.clone();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let req = read_request(&mut stream).expect("read_request");
+            // Acceptor now reads an `IpcConnect` dispatch frame; the exec path
+            // arrives wrapped as `IpcConnect::Exec`.
+            let req = match read_connect(&mut stream).expect("read_connect") {
+                IpcConnect::Exec(req) => req,
+                IpcConnect::Interactive(open) => panic!("expected Exec, got Interactive: {open:?}"),
+            };
             assert_eq!(req.cmd, "echo hi");
             assert_eq!(req.ssh, None);
             assert_eq!(req.timeout_secs, 5);
@@ -1319,14 +1328,14 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        wiredesk_exec_core::ipc::write_request(
+        write_connect(
             &mut stream,
-            &wiredesk_exec_core::ipc::IpcRequest {
+            &IpcConnect::Exec(wiredesk_exec_core::ipc::IpcRequest {
                 cmd: "echo hi".into(),
                 ssh: None,
                 timeout_secs: 5,
                 compress: false,
-            },
+            }),
         )
         .unwrap();
 
