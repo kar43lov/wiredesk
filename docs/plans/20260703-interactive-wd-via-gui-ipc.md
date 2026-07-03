@@ -200,14 +200,14 @@ carries those `Packet`s:
 **Files:**
 - Modify: `crates/wiredesk-exec-core/src/ipc.rs`
 
-- [ ] add `IpcInteractiveOpen { shell: String, cols: u16, rows: u16 }` (Serialize/Deserialize).
-- [ ] add `enum IpcConnect { Exec(IpcRequest), Interactive(IpcInteractiveOpen) }` + framed
+- [x] add `IpcInteractiveOpen { shell: String, cols: u16, rows: u16 }` (Serialize/Deserialize).
+- [x] add `enum IpcConnect { Exec(IpcRequest), Interactive(IpcInteractiveOpen) }` + framed
       `write_connect`/`read_connect` free functions reusing `write_frame`/`read_frame`.
-- [ ] write tests: `IpcConnect::Exec` and `::Interactive` round-trip via `UnixStream::pair()`
+- [x] write tests: `IpcConnect::Exec` and `::Interactive` round-trip via `UnixStream::pair()`
       and `Cursor`; oversize-length rejection still applies.
-- [ ] write tests: decoding a legacy bare-`IpcRequest` frame as `IpcConnect` fails cleanly
+- [x] write tests: decoding a legacy bare-`IpcRequest` frame as `IpcConnect` fails cleanly
       (documents the lock-step contract, mirrors `ipc_request_old_payload_compatibility`).
-- [ ] run tests - must pass before next task.
+- [x] run tests - must pass before next task.
 
 ### Task 2: Interactive `Packet` frame codec over the socket
 

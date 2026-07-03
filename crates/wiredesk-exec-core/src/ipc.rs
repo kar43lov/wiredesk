@@ -33,6 +33,34 @@ pub struct IpcRequest {
     pub compress: bool,
 }
 
+/// Interactive-open payload: the client requests a streaming PTY shell
+/// (interactive `wd`) rather than a one-shot `--exec`. Carries the shell
+/// to launch and the initial terminal geometry so the GUI relay can
+/// originate the single `ShellOpenPty { shell, cols, rows }` to the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcInteractiveOpen {
+    pub shell: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// First frame of every IPC connection: the connection-kind discriminator.
+/// `Exec` is the existing one-shot `wd --exec` path (now wrapped instead of
+/// sending a bare `IpcRequest`); `Interactive` opens a bidirectional PTY
+/// stream that carries `Packet`s after the handshake.
+///
+/// All three read/write sites (term exec client, term interactive client,
+/// GUI acceptor) change together in one lock-step rebuild — an old client
+/// that sends a bare `IpcRequest` frame will fail to decode here, which is
+/// the intended fail-closed behaviour (see `connect_frame_rejects_legacy_bare_request`).
+/// Adding a new wrapper enum (not overloading `IpcRequest`) follows the
+/// hand-rolled-protocol extension rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IpcConnect {
+    Exec(IpcRequest),
+    Interactive(IpcInteractiveOpen),
+}
+
 /// Server → client stream: zero or more `Stdout` frames followed by
 /// exactly one terminal frame (`Exit` on success, `Error` on a failure
 /// the handler decided to surface to the caller — e.g. transport drop
@@ -103,6 +131,19 @@ pub fn write_request<W: Write>(w: &mut W, req: &IpcRequest) -> io::Result<()> {
 
 /// Decode a framed `IpcRequest` from the stream.
 pub fn read_request<R: Read>(r: &mut R) -> io::Result<IpcRequest> {
+    let bytes = read_frame(r)?;
+    bincode::deserialize(&bytes).map_err(bincode_to_io)
+}
+
+/// Encode + frame an `IpcConnect` dispatch frame (the first frame of
+/// every connection).
+pub fn write_connect<W: Write>(w: &mut W, conn: &IpcConnect) -> io::Result<()> {
+    let bytes = bincode::serialize(conn).map_err(bincode_to_io)?;
+    write_frame(w, &bytes)
+}
+
+/// Decode the framed `IpcConnect` dispatch frame from the stream.
+pub fn read_connect<R: Read>(r: &mut R) -> io::Result<IpcConnect> {
     let bytes = read_frame(r)?;
     bincode::deserialize(&bytes).map_err(bincode_to_io)
 }
@@ -295,6 +336,98 @@ mod tests {
             let decoded = read_response(&mut r).unwrap();
             assert_eq!(decoded, resp);
         }
+    }
+
+    #[test]
+    fn connect_frame_exec_round_trip() {
+        let conn = IpcConnect::Exec(IpcRequest {
+            cmd: "docker ps".into(),
+            ssh: Some("prod-mup".into()),
+            timeout_secs: 90,
+            compress: true,
+        });
+        let mut buf = Vec::new();
+        write_connect(&mut buf, &conn).unwrap();
+        let mut r = Cursor::new(buf);
+        let decoded = read_connect(&mut r).unwrap();
+        assert_eq!(decoded, conn);
+    }
+
+    #[test]
+    fn connect_frame_interactive_round_trip() {
+        let conn = IpcConnect::Interactive(IpcInteractiveOpen {
+            shell: "powershell.exe".into(),
+            cols: 120,
+            rows: 40,
+        });
+        let mut buf = Vec::new();
+        write_connect(&mut buf, &conn).unwrap();
+        let mut r = Cursor::new(buf);
+        let decoded = read_connect(&mut r).unwrap();
+        assert_eq!(decoded, conn);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_frame_interactive_round_trip_via_unix_pair() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut a, mut b) = UnixStream::pair().expect("UnixStream::pair");
+        let writer = thread::spawn(move || {
+            write_connect(
+                &mut a,
+                &IpcConnect::Interactive(IpcInteractiveOpen {
+                    shell: "pwsh".into(),
+                    cols: 80,
+                    rows: 24,
+                }),
+            )
+            .unwrap();
+        });
+        match read_connect(&mut b).unwrap() {
+            IpcConnect::Interactive(open) => {
+                assert_eq!(open.shell, "pwsh");
+                assert_eq!(open.cols, 80);
+                assert_eq!(open.rows, 24);
+            }
+            other => panic!("expected Interactive, got {other:?}"),
+        }
+        writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn connect_frame_rejects_oversize_length_prefix() {
+        // Same defensive cap applies to the dispatch frame decode.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&(MAX_FRAME_BYTES + 1).to_be_bytes());
+        let mut r = Cursor::new(bad);
+        let err = read_connect(&mut r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn connect_frame_rejects_legacy_bare_request() {
+        // Lock-step cutover contract: a legacy client that writes a bare
+        // `IpcRequest` frame (pre-IpcConnect wire format) must NOT decode
+        // as an `IpcConnect`. bincode is positional — the enum prepends a
+        // u32 variant tag, so the legacy fields shift and deserialisation
+        // fails cleanly instead of silently mis-parsing. Documents that
+        // the three cutover sites (Task 7) must land together.
+        let legacy = IpcRequest {
+            cmd: "ls".into(),
+            ssh: None,
+            timeout_secs: 5,
+            compress: false,
+        };
+        let mut buf = Vec::new();
+        write_request(&mut buf, &legacy).unwrap();
+        let mut r = Cursor::new(buf);
+        let result = read_connect(&mut r);
+        assert!(
+            result.is_err(),
+            "legacy bare IpcRequest frame must fail to decode as IpcConnect (lock-step cutover contract)"
+        );
     }
 
     #[test]
