@@ -134,12 +134,22 @@ impl SettingsWindow {
                     .build(window_icon)
                     .expect("malformed bundled app-icon.ico — rebuild assets");
                 let icon_ref = Some(&*window_icon);
+                // MAIN_WINDOW (not WINDOW) so the frame carries WS_THICKFRAME +
+                // maximize/minimize boxes — the window is resizable. The plain
+                // WINDOW flag gave only WS_CAPTION|WS_SYSMENU (fixed border), so
+                // on a monitor with a different DPI/scale the right column of
+                // the layout got clipped with no way to widen the window. nwg's
+                // GridLayout listens on WM_SIZE and reflows on resize/maximize,
+                // and the outer grid's min_size keeps it from shrinking below
+                // legibility. `center(true)` places it on the active monitor
+                // (overriding the fixed position) so it can't spawn off-screen.
                 nwg::Window::builder()
-                    .size((460, 560))
+                    .size((520, 600))
                     .position((300, 300))
+                    .center(true)
                     .title("WireDesk Host Settings")
                     .icon(icon_ref)
-                    .flags(nwg::WindowFlags::WINDOW)
+                    .flags(nwg::WindowFlags::MAIN_WINDOW)
                     .build(window)?;
             }
 
