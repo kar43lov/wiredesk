@@ -261,3 +261,33 @@ crates/wiredesk-transport/src/bluetooth/
 - **`Message::ClipDecline { format }` (proto type 0x23)** — receiver просит sender'а abandon transfer. `IncomingClipboard::on_offer` возвращает `Some(Message::ClipDecline)` когда rejectит из-за settings toggle (`receive_text=false` / `receive_images=false`); reader thread форвардит decline через outgoing_tx. Sender (host: `ClipboardSync::cancel_outgoing()` дренит `pending_outbox`; client: set `outgoing_cancel: AtomicBool` который writer thread наблюдает) — drop'ает все pending chunks. Без этого toggle-off вызывал ~75 sec wire-saturation на 1 MB image (host всё равно шлёт chunks), что starved'ил TX (mouse / heartbeats) → false-positive heartbeat timeout disconnect.
 - **CREATE_NO_WINDOW для shell child** в `apps/wiredesk-host/src/shell.rs`. Win-host с `windows_subsystem = "windows"` — без console; default child создаёт свою console window. Flag (0x0800_0000) на `Command::creation_flags` подавляет это так что ShellOpen не показывает PowerShell window на host'ской HDMI-capture.
 - **Embed app icon в .exe** через `winresource` build-dependency. `apps/wiredesk-host/build.rs` gating через `HOST` env triple (only Windows host has `rc.exe`/`windres`) — Mac dev cross-checks compile clean но без icon resource section. Производственная сборка на Win показывает WireDesk-иконку в taskbar/Alt+Tab/Explorer.
+
+
+---
+
+## Вынесено из CLAUDE.md 11.08.2026 (рез раздутого контекста)
+
+## Architecture
+
+Rust workspace с 7 crate:
+
+```
+crates/
+  wiredesk-core       — WireDeskError, типы (Resolution, MouseButton, Modifiers)
+  wiredesk-protocol   — бинарный протокол: Packet, Message (21 тип), COBS framing, CRC-16
+  wiredesk-transport  — trait Transport, SerialTransport, MockTransport, detect (VID-классификация serial-портов: CH34x/FTDI, shared между host Detect-кнопкой и `wd` auto-detect)
+  wiredesk-exec-core  — shared sentinel-runner для `wd --exec` (streaming через FnMut(&[u8]) callback) + `ExecTransport` trait; общий между term и client
+apps/
+  wiredesk-host       — Windows tray agent: Session + InputInjector + ShellProcess + ClipboardSync + nwg UI (settings + tray + autostart)
+  wiredesk-client     — macOS egui app: capture-окно + InputMapper + clipboard poll thread + settings panel; IPC-acceptor для параллельного `wd --exec` (exec-хэндлер) и interactive `wd` (streaming-релей) через GUI; `shell_channel.rs` owner-lock, `SharedHostInfo`-кэш для synth HelloAck
+  wiredesk-term       — macOS CLI: raw-mode terminal bridge для Ghostty/iTerm (shell) + `wd --exec` non-interactive mode
+```
+
+Полный архитектурный разбор (module maps Host + Client, threading, data flow, protocol details, clipboard sync, keyboard hijack, shell-over-serial, key design decisions) — в [`docs/architecture.md`](docs/architecture.md). Ключевые точки ниже:
+
+- **Threading клиента:** writer / reader / clipboard poll / keyboard tap (CFRunLoop) — serial-порт расщеплён через `Transport::try_clone()`. Латенси UI→провод ~µs.
+- **Протокол:** binary, COBS-framed, CRC-16 packet-level. Header `[magic][type][flags][seq:u16][len:u16]`. **MAX_PAYLOAD = 4096** + matched `MAX_FRAME_SIZE = 8192` в SerialTransport.
+- **Heartbeat:** 2 сек, idle timeout 6с / busy 30с. Adaptive когда `clipboard.transfer_in_flight()` **или** `self.shell.is_some()` (PR #20). Без расширения на shell-busy heavy-output cmd'ы (`Get-EventLog`, ES `_search`) saturate'или wire → Mac heartbeat-sender falls behind → host disconnect через 6s.
+- **IPC post-run drain** (`apps/wiredesk-client/src/ipc.rs`, PR #21): после ShellClose handler ждёт пока wire не стихнет (2s idle deadline, ShellExit short-circuit, 30s hard cap) **прежде чем** освободить `single_inflight`. Без этого host продолжал шипить tail предыдущей cmd-output (~30s) и next request попадал на dirty wire → cascade timeouts. Trade-off: +2s overhead на каждый `wd --exec` (даже Ok).
+- **Shell-over-serial:** per-session opcode-discriminator (`ShellOpen=0x40` pipe vs `ShellOpenPty=0x45` PTY + `PtyResize=0x46`). Pipe-mode для `wd --exec`; PTY-mode для interactive `wd` (Win11 only через `portable-pty`). Interactive `wd` теперь ходит либо direct-serial, либо через GUI IPC-релей (см. выше) — в обоих случаях тот же `ShellOpenPty`-путь.
+- **Loop avoidance в clipboard:** `LastSeen` с раздельными slots per-format + LRU text history (4 entries) против Whispr-style inject pattern. Hash от RGBA bytes (PNG round-trip нестабилен на macOS).

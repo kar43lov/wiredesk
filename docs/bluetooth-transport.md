@@ -191,3 +191,14 @@ If a BT mouse / keyboard pairs and works, BT-radio path is open.
 - `docs/briefs/ft232h-upgrade.md` — Plan A (parallel option).
 - `docs/briefs/mac-auto-reconnect.md` — orthogonal process-level
   reconnect.
+
+
+---
+
+## Вынесено из CLAUDE.md 11.08.2026 (рез раздутого контекста)
+
+## Channel speed upgrade
+
+**SHIPPED & VERIFIED LIVE 2026-05-28.** Замена CH340 → **FT232H** на обеих сторонах null-modem'а подняла стабильный baud `115200 → 3_000_000` (×26), clipboard 1MB ~90 сек → ~3 сек. Никаких изменений в коде — только `baud = 3000000` в обоих `config.toml`. Hardware: два CJMCU-FT232H breakout (genuine FTDI, VID 0x0403 PID 0x6014), null-modem `AD0(TX) ↔ AD1(RX)` cross + GND, VCC изолированы. Windows требует **FTDI CDM driver** (https://ftdichip.com/drivers/vcp-drivers/) — без него COM-port не появляется в Ports (COM & LPT); macOS VCP встроен. Полный разбор + закрытые тупики (TCP/UDP режутся WFP-фильтрами Континента; Thunderbolt без TB-header'а на B760M не работает) + lessons learned — в `docs/briefs/ft232h-upgrade.md`. Plan B (Pi Zero 2W WinUSB bridge) остаётся как резерв на будущее **видео** по тому же каналу (USB 2.0 bulk ~30-40 MB/s).
+
+**Деградация платы FT232H (эпизод 2026-06-16).** Если канал «отпадывает» постоянными штормами — частая первопричина не софт, а **деградировавшая плата** (TX-тракт одной из двух CJMCU-FT232H). Диагностика по сигнатуре в `client.log`: `COBS`/`CRC`/`bad magic` = порча битов (сигнал/baud на грани, лечится понижением baud); `Broken pipe`+`No such file` = USB-отвал (питание/контакт; `No such file` для `cu.usbserial-NNN` локализует именно Mac-сторону); `host link lost` при идущих `clipboard.send DONE` = асимметрия, бьётся TX одной стороны/жила провода/GND. Решающий тест «плата vs провод/окружение» — **swap двух плат местами**: если глюк переехал на другую сторону, виновата плата (в эпизоде swap вылечил канал даже на 3 Mbaud). **Рецидив 2026-07-20** (643 `host link lost` + 2066 `dropping bad frame` за день, детерминированный `COBS ... position 11` = систематический clock-skew, не шум): swap снова вылечил, но пользователь **переткнул контакты И swap'нул платы разом** → root-cause не изолирован (плохой контакт vs деградация платы — разные диагнозы). **Урок: при рецидиве менять по ОДНОМУ** (сначала только переткнуть контакт, при повторе — только swap плат), иначе не узнать виновника. И: 3 Mbaud по DuPont-проводам без экрана/согласования — эксплуатация «на грани», нулевой запас по сигналу; надёжный ход «чтобы не всплывало» — понизить baud до 1_000_000 (всё равно ×8–9 к CH340, но запас по джиттеру огромный). Триаж лога — `/pg.wd-log` (личный slash-command).
