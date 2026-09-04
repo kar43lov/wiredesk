@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # macOS builds the whole workspace: the client is objc2/CoreFoundation-bound
+  # and the host compiles here too (MockInjector stands in for SendInput).
+  macos:
+    name: Test & clippy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        # Single-threaded on purpose: the host package SIGABRTs on roughly
+        # half the parallel runs on macOS. Pre-existing, reproduces on a
+        # clean main — see docs/known-limitations.md.
+        run: cargo test --workspace -- --test-threads=1
+
+  # The Windows-only paths (WindowsInjector, nwg UI, ConPTY, BLE GATT server)
+  # are invisible to a macOS clippy run — cfg-gated code is not even parsed
+  # for lints there. This job is the only thing that lints them.
+  windows:
+    name: Test & clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (host + shared crates)
+        run: cargo clippy -p wiredesk-host -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core --all-targets -- -D warnings
+      - name: Test (host + shared crates)
+        run: cargo test -p wiredesk-host -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -93,9 +93,16 @@ pub fn spawn_ipc_acceptor(
     // unless we unlink first. Ignore not-found.
     let _ = std::fs::remove_file(&socket_path);
 
-    // Ensure parent dir exists. If it doesn't, create it (with default
-    // perms — config.toml save creates it on first run, but a fresh
-    // install hitting IPC before settings save would see ENOENT).
+    // Ensure parent dir exists. If it doesn't, create it (config.toml
+    // save creates it on first run, but a fresh install hitting IPC
+    // before settings save would see ENOENT).
+    //
+    // The dir is then narrowed to 0700. This is what actually closes the
+    // window between `bind` below and the `chmod 0600` after it: for the
+    // few microseconds the socket exists with umask-derived perms, the
+    // directory above it already denies traversal to everyone else. Doing
+    // it with umask instead would need a libc dependency and would race
+    // against other threads, since umask is process-global.
     if let Some(parent) = socket_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             log::warn!(
@@ -103,6 +110,18 @@ pub fn spawn_ipc_acceptor(
                 parent.display()
             );
             return;
+        }
+        // Best-effort: an existing dir with wider perms gets narrowed, but
+        // a failure here is not fatal — the 0600 on the socket still
+        // applies a moment later.
+        if let Ok(meta) = std::fs::metadata(parent) {
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o077 != 0 {
+                perms.set_mode(0o700);
+                if let Err(e) = std::fs::set_permissions(parent, perms) {
+                    log::warn!("IPC acceptor: chmod 0700 on {} failed: {e}", parent.display());
+                }
+            }
         }
     }
 
@@ -858,6 +877,33 @@ mod tests {
     /// Bind succeeds, accept loop is alive, client connects + writes
     /// a Request + reads back a Stdout + Exit. We can't drive the
     /// runner end-to-end (it'd want a real serial transport), so we
+    /// The socket dir is narrowed to 0700 before binding, so the brief
+    /// window where the socket itself still carries umask-derived perms
+    /// is not reachable by another local user.
+    #[test]
+    fn acceptor_narrows_socket_dir_permissions() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("WireDesk");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        spawn_ipc_acceptor(
+            dir.join("wd-exec.sock"),
+            mpsc::channel::<Packet>().0,
+            Arc::new(Mutex::new(None)),
+            new_shared_owner(),
+            Arc::new(Mutex::new(())),
+            populated_host_info(),
+            Arc::new(AtomicBool::new(true)),
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "socket dir should be owner-only, got {:o}", mode & 0o777);
+    }
+
     /// stage events directly into `exec_slot` and let the handler's
     /// runner consume them.
     #[test]
