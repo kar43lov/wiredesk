@@ -1,6 +1,13 @@
-// Generate three 16×16 tray icons (green / yellow / gray "W") for the
-// Windows host tray. Run via `swift scripts/generate-tray-icons.swift` —
-// outputs assets/tray-{green,yellow,gray}.png.
+// Generate three 16×16 tray icons (green / yellow / gray) for the Windows
+// host tray. Run via `swift scripts/generate-tray-icons.swift` — outputs
+// assets/tray-{green,yellow,gray}.png.
+//
+// The glyph is the same monitor silhouette as the app icon
+// (scripts/generate-icon.swift), knocked out of a solid status-coloured
+// square. It used to be a white "W", which read as Microsoft Word.
+// Deliberately *not* the full app icon scaled down: at 16 px the cursor
+// arrow and the monitor outline turn to mush, so the tray gets a simplified
+// filled screen instead. Colour, not shape, carries the state here.
 
 import AppKit
 import CoreGraphics
@@ -44,18 +51,16 @@ for v in variants {
     v.color.setFill()
     NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
 
-    // White "W" — bold, fits 16×16 tightly.
-    let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: 13, weight: .black),
-        .foregroundColor: NSColor.white,
-    ]
-    let text = "W" as NSString
-    let textSize = text.size(withAttributes: attrs)
-    let origin = NSPoint(
-        x: (size.width - textSize.width) / 2,
-        y: (size.height - textSize.height) / 2 - 1
-    )
-    text.draw(at: origin, withAttributes: attrs)
+    // White monitor silhouette: screen body, neck, foot. Coordinates are
+    // whole pixels — a half-pixel edge at this size renders as grey mush.
+    NSColor.white.setFill()
+    NSBezierPath(roundedRect: NSRect(x: 2, y: 6, width: 12, height: 8),
+                 xRadius: 1.5, yRadius: 1.5).fill()
+    NSBezierPath(rect: NSRect(x: 7, y: 4, width: 2, height: 2)).fill()
+    NSBezierPath(rect: NSRect(x: 4, y: 3, width: 8, height: 1)).fill()
+    // Punch the screen out so the shape doesn't read as a solid blob.
+    v.color.setFill()
+    NSBezierPath(rect: NSRect(x: 4, y: 8, width: 8, height: 4)).fill()
 
     NSGraphicsContext.restoreGraphicsState()
 

@@ -331,6 +331,18 @@ fn main() {
         incoming_total: incoming_total.clone(),
     };
 
+    // Restore where the window was last closed. Without an explicit
+    // position AppKit places the window on whichever display it feels like
+    // — on a multi-monitor desk that's a different screen almost every
+    // launch. `restored_geometry` is None on first run and whenever the
+    // persisted rect fails the sanity filter; then we fall back to the
+    // default size and let the window manager choose a spot.
+    let restored_geometry = config::restore_window_geometry(&cfg);
+    match restored_geometry {
+        Some((x, y, w, h)) => log::info!("window: restoring {w}x{h} at {x},{y}"),
+        None => log::info!("window: no saved geometry, using default size"),
+    }
+
     let mut app = WireDeskApp::new(
         cfg,
         events_rx,
@@ -354,11 +366,21 @@ fn main() {
     );
     // Let the UI ask the supervisor to reconnect on each Disconnected event.
     app.set_reconnect_request_tx(reconnect_request_tx);
+    // Seed the geometry tracker with what we just asked winit for, so the
+    // first sampled rect doesn't look like a move and rewrite an identical
+    // config.
+    app.set_restored_geometry(restored_geometry);
 
+    let (default_w, default_h) = config::DEFAULT_WINDOW_SIZE;
+    let viewport = {
+        let vb = egui::ViewportBuilder::default().with_title("WireDesk");
+        match restored_geometry {
+            Some((x, y, w, h)) => vb.with_inner_size([w, h]).with_position([x, y]),
+            None => vb.with_inner_size([default_w, default_h]),
+        }
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 760.0])
-            .with_title("WireDesk"),
+        viewport,
         ..Default::default()
     };
 

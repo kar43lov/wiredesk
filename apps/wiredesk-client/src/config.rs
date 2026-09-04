@@ -93,6 +93,30 @@ pub struct ClientConfig {
     #[serde(default)]
     pub swap_option_command: bool,
 
+    /// Persisted geometry of the small (non-fullscreen) window: outer
+    /// position + inner size in logical points, winit/egui coordinates
+    /// (top-left origin, y down — same system as [`crate::monitor`]).
+    ///
+    /// Without this the window has no start position at all and AppKit
+    /// places it wherever it likes — on a multi-display desk that means a
+    /// different monitor on almost every launch. All four are written
+    /// together by [`save_window_geometry`] once the window has been still
+    /// for a moment; a partial set (any field `None`) is ignored on load,
+    /// so a hand-edited or truncated TOML falls back to the default size
+    /// instead of restoring half a rectangle.
+    ///
+    /// Fullscreen is deliberately never sampled — in fullscreen the outer
+    /// rect is the whole screen, and restoring *that* would reopen a
+    /// screen-sized window on the next cold start.
+    #[serde(default)]
+    pub window_x: Option<i32>,
+    #[serde(default)]
+    pub window_y: Option<i32>,
+    #[serde(default)]
+    pub window_w: Option<i32>,
+    #[serde(default)]
+    pub window_h: Option<i32>,
+
     /// Which transport to open on startup. `"serial"` (default) uses the
     /// existing USB-Serial path. `"bluetooth"` opens the BLE Central and
     /// scans for a peer matching `bluetooth.peer_name` / `bluetooth.service_uuid`.
@@ -165,6 +189,10 @@ impl Default for ClientConfig {
             receive_files: true,
             send_files: false,
             swap_option_command: false,
+            window_x: None,
+            window_y: None,
+            window_w: None,
+            window_h: None,
             transport: default_transport(),
             transport_fallback: None,
             bluetooth: BluetoothConfig::default(),
@@ -214,6 +242,87 @@ impl ClientConfig {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(path, s)
     }
+}
+
+/// Default inner size of the chrome window, used on first run and whenever
+/// the persisted geometry fails [`sane_window_geometry`].
+pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (520.0, 760.0);
+
+/// Reject a persisted geometry that would open the window somewhere the
+/// user can't reach it — NaN/infinite coordinates from a corrupt TOML, a
+/// degenerate size, or a position thousands of points off any plausible
+/// desktop (a config carried over from a machine with a very different
+/// display layout).
+///
+/// Returns the geometry unchanged when it passes. This is a coarse filter,
+/// not a monitor-bounds check: the display list isn't necessarily settled
+/// this early in startup, so the "did it land off-screen?" check runs later
+/// against live monitors (see `WireDeskApp::rescue_offscreen_window`).
+pub fn sane_window_geometry(x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+    // A window narrower/shorter than this can't show the chrome at all, and
+    // one larger than any real display is a sign of a garbled value.
+    const MIN_W: f32 = 320.0;
+    const MIN_H: f32 = 240.0;
+    const MAX_SIDE: f32 = 20_000.0;
+    // Generous enough for a tall multi-display wall, tight enough to catch
+    // a coordinate that has clearly gone wrong.
+    const MAX_ORIGIN: f32 = 30_000.0;
+
+    if ![x, y, w, h].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    if !(MIN_W..=MAX_SIDE).contains(&w) || !(MIN_H..=MAX_SIDE).contains(&h) {
+        return None;
+    }
+    if x.abs() > MAX_ORIGIN || y.abs() > MAX_ORIGIN {
+        return None;
+    }
+    Some((x, y, w, h))
+}
+
+/// Geometry to open the window with: the persisted rectangle when all four
+/// fields are present and sane, otherwise `None` (caller uses
+/// [`DEFAULT_WINDOW_SIZE`] and lets the window manager pick a position).
+pub fn restore_window_geometry(cfg: &ClientConfig) -> Option<(f32, f32, f32, f32)> {
+    let (x, y, w, h) = (cfg.window_x?, cfg.window_y?, cfg.window_w?, cfg.window_h?);
+    sane_window_geometry(x as f32, y as f32, w as f32, h as f32)
+}
+
+/// Persist just the four geometry fields, re-reading the on-disk config
+/// first.
+///
+/// Deliberately does **not** write the app's in-memory `ClientConfig`: the
+/// Settings panel edits an unsaved buffer (`pending_config`) that only the
+/// Save button is allowed to commit. Serialising the live struct here would
+/// silently publish those pending edits the moment the user nudged the
+/// window. Re-loading from disk and patching four fields keeps the two
+/// write paths independent — the cost is one small read per debounced move.
+pub fn save_window_geometry(x: f32, y: f32, w: f32, h: f32) -> io::Result<()> {
+    save_window_geometry_to(&ClientConfig::config_path(), x, y, w, h)
+}
+
+/// Round a logical-point coordinate to the whole point stored in the TOML.
+/// `f32 as i32` truncates toward zero, which would drift a window one point
+/// left/up on every save at negative coordinates.
+fn round_point(v: f32) -> i32 {
+    v.round() as i32
+}
+
+/// Path-parameterised form of [`save_window_geometry`] so the read-modify-write
+/// behaviour is testable against a temp file.
+pub fn save_window_geometry_to(
+    path: &Path,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> io::Result<()> {
+    let mut cfg = ClientConfig::load_from(path);
+    cfg.window_x = Some(round_point(x));
+    cfg.window_y = Some(round_point(y));
+    cfg.window_w = Some(round_point(w));
+    cfg.window_h = Some(round_point(h));
+    cfg.save_to(path)
 }
 
 /// Merge `ClientConfig` (from TOML / defaults) with parsed CLI args.
@@ -311,6 +420,10 @@ mod tests {
             receive_files: true,
             send_files: true,
             swap_option_command: false,
+            window_x: None,
+            window_y: None,
+            window_w: None,
+            window_h: None,
             transport: "serial".to_string(),
             transport_fallback: None,
             bluetooth: BluetoothConfig::default(),
@@ -471,6 +584,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sane_geometry_accepts_ordinary_window() {
+        assert_eq!(
+            sane_window_geometry(1200.0, 240.0, 520.0, 760.0),
+            Some((1200.0, 240.0, 520.0, 760.0))
+        );
+    }
+
+    #[test]
+    fn sane_geometry_accepts_negative_origin() {
+        // A display to the left of / above the primary one has negative
+        // winit coordinates — perfectly valid, must round-trip.
+        assert!(sane_window_geometry(-2560.0, -300.0, 520.0, 760.0).is_some());
+    }
+
+    #[test]
+    fn sane_geometry_rejects_nan_and_infinite() {
+        assert!(sane_window_geometry(f32::NAN, 0.0, 520.0, 760.0).is_none());
+        assert!(sane_window_geometry(0.0, f32::INFINITY, 520.0, 760.0).is_none());
+        assert!(sane_window_geometry(0.0, 0.0, f32::NAN, 760.0).is_none());
+    }
+
+    #[test]
+    fn sane_geometry_rejects_degenerate_size() {
+        assert!(sane_window_geometry(0.0, 0.0, 0.0, 0.0).is_none());
+        assert!(sane_window_geometry(0.0, 0.0, 100.0, 760.0).is_none());
+        assert!(sane_window_geometry(0.0, 0.0, 520.0, 50.0).is_none());
+    }
+
+    #[test]
+    fn sane_geometry_rejects_absurd_origin() {
+        assert!(sane_window_geometry(500_000.0, 0.0, 520.0, 760.0).is_none());
+    }
+
+    #[test]
+    fn restore_geometry_needs_all_four_fields() {
+        // A half-written config (or one hand-edited to drop a field) must
+        // fall back to the default size rather than restore a partial rect.
+        let mut cfg = ClientConfig {
+            window_x: Some(100),
+            window_y: Some(100),
+            window_w: Some(520),
+            ..Default::default()
+        };
+        assert!(restore_window_geometry(&cfg).is_none());
+        cfg.window_h = Some(760);
+        assert_eq!(restore_window_geometry(&cfg), Some((100.0, 100.0, 520.0, 760.0)));
+    }
+
+    #[test]
+    fn save_window_geometry_preserves_other_fields() {
+        // The geometry writer must not clobber settings the user saved
+        // through the Settings panel — it re-reads the file, patches four
+        // fields and writes back.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = ClientConfig {
+            port: "/dev/cu.usbserial-999".to_string(),
+            baud: 3_000_000,
+            send_files: true,
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        save_window_geometry_to(&path, 12.0, 34.0, 520.0, 760.0).unwrap();
+
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(loaded.port, "/dev/cu.usbserial-999");
+        assert_eq!(loaded.baud, 3_000_000);
+        assert!(loaded.send_files);
+        assert_eq!(
+            restore_window_geometry(&loaded),
+            Some((12.0, 34.0, 520.0, 760.0))
+        );
+    }
+
+    #[test]
+    fn save_window_geometry_creates_config_when_missing() {
+        // First run: no config.toml yet. The write must still land, so the
+        // very first "close where I left it" is honoured on the next launch.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        save_window_geometry_to(&path, -100.0, 50.0, 600.0, 800.0).unwrap();
+        let loaded = ClientConfig::load_from(&path);
+        assert_eq!(
+            restore_window_geometry(&loaded),
+            Some((-100.0, 50.0, 600.0, 800.0))
+        );
+    }
+
+    #[test]
+    fn config_without_window_fields_loads_as_none() {
+        // Every config written before this feature lacks the four fields —
+        // they must deserialize as None instead of failing the whole parse
+        // (which would reset port/baud/toggles to defaults).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "port = \"/dev/cu.usbserial-120\"\nbaud = 3000000\nwidth = 2560\nheight = 1440\nclient_name = \"wiredesk-client\"\n",
+        )
+        .unwrap();
+        let cfg = ClientConfig::load_from(&path);
+        assert_eq!(cfg.baud, 3_000_000);
+        assert!(restore_window_geometry(&cfg).is_none());
+    }
+
     fn toml_cfg() -> ClientConfig {
         ClientConfig {
             port: "/dev/cu.from-toml".to_string(),
@@ -486,6 +706,10 @@ mod tests {
             receive_files: true,
             send_files: false,
             swap_option_command: false,
+            window_x: None,
+            window_y: None,
+            window_w: None,
+            window_h: None,
             transport: "serial".to_string(),
             transport_fallback: None,
             bluetooth: BluetoothConfig::default(),

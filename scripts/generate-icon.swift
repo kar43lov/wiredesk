@@ -1,6 +1,12 @@
-// Generate a 1024×1024 PNG icon for WireDesk: white "W" on a deep-blue
-// rounded-square background. Run via `swift scripts/generate-icon.swift`
-// — outputs `assets/icon-source.png` next to the script's repo root.
+// Generate a 1024×1024 PNG icon for WireDesk: a monitor outline with a
+// pointer arrow on it — "I'm driving someone else's screen" — on a dark
+// rounded square. Run via `swift scripts/generate-icon.swift`; writes
+// `assets/icon-source.png`, which feeds both the macOS AppIcon.icns
+// (scripts/build-mac-app.sh) and the Windows .ico (scripts/icogen).
+//
+// The earlier icon was a white "W" on deep blue and was routinely mistaken
+// for Microsoft Word — hence a pictogram rather than a letter, and a colour
+// scheme nothing else on the desktop uses.
 
 import AppKit
 import CoreGraphics
@@ -23,29 +29,73 @@ else { fatalError("cannot create CGContext") }
 NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
 
-// Background — deep blue with subtle gradient.
-let bg = NSBezierPath(
-    roundedRect: NSRect(origin: .zero, size: size),
-    xRadius: 180,
-    yRadius: 180
-)
-let top = NSColor(srgbRed: 0.10, green: 0.20, blue: 0.55, alpha: 1.0)
-let bot = NSColor(srgbRed: 0.05, green: 0.10, blue: 0.30, alpha: 1.0)
-let grad = NSGradient(colors: [top, bot])!
-grad.draw(in: bg, angle: 270)
+func rgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
+    NSColor(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: 1)
+}
 
-// White "W" centered.
-let attrs: [NSAttributedString.Key: Any] = [
-    .font: NSFont.systemFont(ofSize: 720, weight: .heavy),
-    .foregroundColor: NSColor.white,
-]
-let text = "W" as NSString
-let textSize = text.size(withAttributes: attrs)
-let origin = NSPoint(
-    x: (size.width - textSize.width) / 2,
-    y: (size.height - textSize.height) / 2 - 30
+// Background plate. Inset from the full canvas so the icon matches the
+// optical size of system icons in the Dock — a shape drawn edge-to-edge
+// reads noticeably larger than its neighbours.
+let inset: CGFloat = 82
+let plateRect = NSRect(
+    x: inset,
+    y: inset,
+    width: size.width - inset * 2,
+    height: size.height - inset * 2
 )
-text.draw(at: origin, withAttributes: attrs)
+let plate = NSBezierPath(roundedRect: plateRect, xRadius: 196, yRadius: 196)
+NSGradient(colors: [rgb(38, 48, 44), rgb(14, 20, 18)])!.draw(in: plate, angle: 270)
+
+let accent = rgb(126, 231, 135)
+
+// Monitor: rounded outline + neck + foot. Stroke weights are heavy on
+// purpose — at 16 px the whole thing collapses to a silhouette, and a thin
+// outline would disappear entirely.
+let body = NSRect(x: 236, y: 330, width: 552, height: 400)
+let bodyPath = NSBezierPath(roundedRect: body, xRadius: 56, yRadius: 56)
+bodyPath.lineWidth = 62
+accent.setStroke()
+bodyPath.stroke()
+
+accent.setFill()
+NSBezierPath(
+    roundedRect: NSRect(x: 452, y: 226, width: 120, height: 120),
+    xRadius: 26,
+    yRadius: 26
+).fill()
+NSBezierPath(
+    roundedRect: NSRect(x: 340, y: 214, width: 344, height: 62),
+    xRadius: 31,
+    yRadius: 31
+).fill()
+
+// Pointer arrow sitting on the screen. Offsets are relative to the tip so
+// the shape stays a classic cursor (tip, left edge, notch, tail) rather
+// than the play-triangle a bare three-point path produces.
+let tip = NSPoint(x: 424, y: 664)
+let outline: [(CGFloat, CGFloat)] = [
+    (0, 0),
+    (0, -272),
+    (78, -198),
+    (126, -302),
+    (186, -274),
+    (138, -172),
+    (212, -172),
+]
+let cursor = NSBezierPath()
+for (i, d) in outline.enumerated() {
+    let p = NSPoint(x: tip.x + d.0, y: tip.y + d.1)
+    if i == 0 { cursor.move(to: p) } else { cursor.line(to: p) }
+}
+cursor.close()
+NSColor.white.setFill()
+cursor.fill()
+// Stroke as well as fill: rounds the corners so the arrow doesn't look
+// razor-sharp next to the rounded monitor, and thickens it for small sizes.
+cursor.lineWidth = 34
+cursor.lineJoinStyle = .round
+NSColor.white.setStroke()
+cursor.stroke()
 
 NSGraphicsContext.restoreGraphicsState()
 

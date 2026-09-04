@@ -66,6 +66,103 @@ pub enum TransportEvent {
     Toast(String),
 }
 
+/// How long to wait after a fullscreen exit before trying to put the window
+/// back. macOS animates the Spaces transition for roughly half a second and
+/// drops position commands issued during it.
+const FULLSCREEN_SETTLE: Duration = Duration::from_millis(600);
+
+/// Gap between restore attempts once the first one has fired.
+const RESTORE_RETRY: Duration = Duration::from_millis(300);
+
+/// Give up after this many attempts (~2 s of trying) and fall back to the
+/// off-screen rescue, so a window that refuses to move is at least reachable.
+const RESTORE_MAX_ATTEMPTS: u8 = 6;
+
+/// How close the window has to land to count as restored. AppKit clamps
+/// positions against the menu bar and Dock, so an exact match is not
+/// guaranteed even on success.
+const RESTORE_TOLERANCE: f32 = 24.0;
+
+/// If winit hasn't confirmed a `Fullscreen` command we issued within this
+/// long, stop treating the mismatch as ours and believe the reported state.
+const FULLSCREEN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A queued attempt to put the window back where it was before fullscreen.
+#[derive(Debug, Clone, Copy)]
+struct PendingRestore {
+    pos: egui::Pos2,
+    size: egui::Vec2,
+    /// Earliest instant the next attempt may fire.
+    next_at: Instant,
+    attempts: u8,
+}
+
+/// True when the window's outer origin is close enough to `target` to call
+/// the restore done.
+fn restore_landed(actual: egui::Pos2, target: egui::Pos2) -> bool {
+    (actual.x - target.x).abs() <= RESTORE_TOLERANCE
+        && (actual.y - target.y).abs() <= RESTORE_TOLERANCE
+}
+
+/// How long the window has to stay still before its geometry is written to
+/// the config. Long enough that a drag or a resize produces a single write,
+/// short enough that a quick move-then-quit still gets persisted by the
+/// `update()` path before `on_exit` has to catch it.
+const GEOMETRY_SETTLE: Duration = Duration::from_millis(800);
+
+/// Ignore sub-pixel jitter: AppKit reports fractional points on scaled
+/// displays and we don't want a rewrite for a 0.5pt drift.
+const GEOMETRY_EPSILON: f32 = 1.0;
+
+/// State of the one-shot "did the restored position land off-screen?" check.
+///
+/// The restored rectangle can point at a display that has since been
+/// unplugged (closed the window on the external monitor, came back with just
+/// the laptop). macOS does not reliably pull such a window back, so we look
+/// once — after giving winit a beat to actually place the window — and move
+/// it onto the primary display if nothing is visible.
+#[derive(Debug, Clone, Copy)]
+enum OffscreenCheck {
+    /// Waiting out the settle delay that started at this instant.
+    Armed(Instant),
+}
+
+/// Smallest visible sliver that still counts as "the user can grab this
+/// window". Roughly a title-bar-sized corner.
+const MIN_VISIBLE: egui::Vec2 = egui::vec2(120.0, 40.0);
+
+/// True when `rect` overlaps no monitor by at least [`MIN_VISIBLE`].
+///
+/// An empty monitor list means we couldn't enumerate displays (non-macOS
+/// build, or the call came too early) — report "on screen" rather than
+/// teleporting a window based on no information.
+fn window_is_offscreen(rect: egui::Rect, monitors: &[monitor::MonitorInfo]) -> bool {
+    if monitors.is_empty() {
+        return false;
+    }
+    !monitors.iter().any(|m| {
+        let overlap = m.frame.intersect(rect);
+        overlap.width() >= MIN_VISIBLE.x && overlap.height() >= MIN_VISIBLE.y
+    })
+}
+
+/// True when `sampled` is far enough from what's on disk to be worth a
+/// write. `None` on disk (nothing persisted yet) always counts as changed.
+fn geometry_changed(
+    persisted: Option<(f32, f32, f32, f32)>,
+    sampled: (f32, f32, f32, f32),
+) -> bool {
+    match persisted {
+        None => true,
+        Some(prev) => {
+            (prev.0 - sampled.0).abs() > GEOMETRY_EPSILON
+                || (prev.1 - sampled.1).abs() > GEOMETRY_EPSILON
+                || (prev.2 - sampled.2).abs() > GEOMETRY_EPSILON
+                || (prev.3 - sampled.3).abs() > GEOMETRY_EPSILON
+        }
+    }
+}
+
 pub struct WireDeskApp {
     state: ConnectionState,
     /// 1-based reopen attempt number, set from `TransportEvent::Reconnecting`.
@@ -108,13 +205,14 @@ pub struct WireDeskApp {
     // live display. Carries its own TTL so it doesn't clobber `status_msg`
     // when a real disconnect message wants the same slot.
     monitor_fallback_msg: Option<(String, Instant)>,
-    /// Queued `OuterPosition` to restore after fullscreen exit. macOS
-    /// Spaces transitions take ~500ms and a position command sent during
-    /// the transition lands the window off-screen on a Space that the
-    /// user's display no longer shows. Holding the position here and
-    /// applying it from `update()` after the timer ensures macOS has
-    /// finished the transition before we move the window.
-    pending_position_restore: Option<(egui::Pos2, Instant)>,
+    /// Queued window restore after leaving fullscreen. macOS Spaces
+    /// transitions take ~500 ms and a position command sent during one is
+    /// dropped, so the move waits out a settle delay and is then **retried
+    /// until the window actually lands** — a single fire-and-forget command
+    /// is silently lost whenever the transition runs long, and the window
+    /// stays on the fullscreen display instead of going back where the user
+    /// opened it.
+    pending_position_restore: Option<PendingRestore>,
     /// Last time we re-applied the bundle's Dock icon. winit/eframe's
     /// NSApp init can overwrite the icon ~1s after creator runs, so we
     /// re-apply periodically until macOS settles on our icon. Three or
@@ -123,12 +221,32 @@ pub struct WireDeskApp {
     last_dock_icon_apply: Option<Instant>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     dock_icon_apply_count: u8,
-    // Saved outer position before entering fullscreen on a non-active monitor.
-    // Restored on fullscreen exit so the chrome window returns to where the
-    // user originally had it. None when fullscreen wasn't entered via an
-    // explicit `OuterPosition` move (e.g. preferred_monitor=None or stale
-    // name falling back to "fullscreen on current display").
-    original_position: Option<egui::Pos2>,
+    // Outer position + inner size captured just before entering fullscreen,
+    // restored on the way out so the chrome window returns to the display
+    // the user opened it on — fullscreen targets `preferred_monitor`, which
+    // is usually a *different* screen, and macOS un-fullscreens onto the
+    // screen it was on, not the one it came from. Recorded on every entry,
+    // including the "fullscreen on current display" fallback: the window
+    // still has to come back to its own spot afterwards.
+    pre_fullscreen_geometry: Option<(egui::Pos2, egui::Vec2)>,
+    /// Set when *we* issue a `Fullscreen` command, so `sync_fullscreen_state`
+    /// doesn't mistake the frame or two before winit catches up for the user
+    /// having toggled fullscreen behind our back.
+    fullscreen_cmd_at: Option<Instant>,
+    /// Window geometry (outer position + inner size, logical points) as it
+    /// currently stands on disk. Seeded from the restored config at startup
+    /// so the first sampled frame doesn't look like a move; updated after
+    /// every successful write. `None` until the first save.
+    persisted_geometry: Option<(f32, f32, f32, f32)>,
+    /// Geometry seen in the latest frame plus when it last changed. A drag
+    /// emits a fresh rect every frame, so writes wait until the window has
+    /// been still for `GEOMETRY_SETTLE` — the TOML gets one write per move,
+    /// not sixty per second.
+    pending_geometry: Option<((f32, f32, f32, f32), Instant)>,
+    /// One-shot guard for the off-screen rescue: it runs once, shortly
+    /// after launch, when the restored position may point at a display that
+    /// is no longer connected.
+    offscreen_check: Option<OffscreenCheck>,
     // Snapshot of `preferred_monitor` taken once at startup. Used by
     // `toggle_fullscreen` so unsaved edits in the Settings panel don't
     // change live runtime behaviour — that contradicts the documented
@@ -402,7 +520,11 @@ impl WireDeskApp {
             cached_monitors: Vec::new(),
             cached_monitors_at: None,
             monitor_fallback_msg: None,
-            original_position: None,
+            pre_fullscreen_geometry: None,
+            fullscreen_cmd_at: None,
+            persisted_geometry: None,
+            pending_geometry: None,
+            offscreen_check: Some(OffscreenCheck::Armed(Instant::now())),
             pending_position_restore: None,
             last_dock_icon_apply: None,
             dock_icon_apply_count: 0,
@@ -432,6 +554,13 @@ impl WireDeskApp {
     /// the app without a live supervisor.
     pub fn set_reconnect_request_tx(&mut self, tx: mpsc::Sender<()>) {
         self.reconnect_request_tx = Some(tx);
+    }
+
+    /// Seed the geometry tracker with the rectangle `main()` handed to
+    /// winit. Without it the first frame's sample differs from `None` and
+    /// we'd rewrite a byte-identical config on every launch.
+    pub fn set_restored_geometry(&mut self, geometry: Option<(f32, f32, f32, f32)>) {
+        self.persisted_geometry = geometry;
     }
 
     fn refresh_available_ports(&mut self) {
@@ -976,14 +1105,18 @@ impl WireDeskApp {
     /// If no position was saved, leave the window where the OS placed it.
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.fullscreen = !self.fullscreen;
+        self.fullscreen_cmd_at = Some(Instant::now());
         if self.fullscreen {
+            // Record where we are *before* anything moves. Unconditional:
+            // the old code only did this on the `Some(m)` branch, so any
+            // fullscreen that fell back to "current display" came back with
+            // nothing to restore and the window stayed wherever macOS left it.
+            self.remember_pre_fullscreen_geometry(ctx);
             let monitors = monitor::list_monitors();
             let preferred = self.runtime_preferred_monitor.as_deref();
             let target = monitor::resolve_target_monitor(preferred, &monitors);
             match target {
                 Some(m) => {
-                    self.original_position = ctx
-                        .input(|i| i.viewport().outer_rect.map(|r| r.min));
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                         m.frame.min,
                     ));
@@ -1024,15 +1157,91 @@ impl WireDeskApp {
                 self.toggle_capture();
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            if let Some(pos) = self.original_position.take() {
-                // Defer OuterPosition until macOS finishes the Spaces
-                // transition (~500ms). Sending it inline puts the window
-                // on a Space that's already disappearing → user can't find
-                // it without Mission Control. The pending state is drained
-                // in update() once the timer elapses.
-                self.pending_position_restore = Some((pos, Instant::now()));
-                ctx.request_repaint_after(Duration::from_millis(700));
+            self.queue_position_restore(ctx);
+        }
+    }
+
+    /// Snapshot the current outer position + inner size as the place to
+    /// return to after fullscreen. No-op while the reported rects are still
+    /// missing (first frames) so we never store a bogus origin.
+    fn remember_pre_fullscreen_geometry(&mut self, ctx: &egui::Context) {
+        let snapshot = ctx.input(|i| {
+            let vp = i.viewport();
+            match (vp.outer_rect, vp.inner_rect) {
+                (Some(outer), Some(inner)) => Some((outer.min, inner.size())),
+                _ => None,
             }
+        });
+        if let Some(g) = snapshot {
+            log::debug!("fullscreen: remembering window at {:?} size {:?}", g.0, g.1);
+            self.pre_fullscreen_geometry = Some(g);
+        }
+    }
+
+    /// Queue the move back to the pre-fullscreen spot.
+    ///
+    /// Falls back to the geometry persisted in `config.toml` when there's no
+    /// in-process snapshot — that covers leaving a fullscreen the app never
+    /// saw begin (the green button or ⌃⌘F while we weren't looking).
+    fn queue_position_restore(&mut self, ctx: &egui::Context) {
+        let target = self.pre_fullscreen_geometry.take().or_else(|| {
+            self.persisted_geometry
+                .map(|(x, y, w, h)| (egui::pos2(x, y), egui::vec2(w, h)))
+        });
+        let Some((pos, size)) = target else {
+            log::warn!(
+                "leaving fullscreen with no saved geometry — window stays where macOS puts it"
+            );
+            return;
+        };
+        log::info!("fullscreen exit: restoring window to {pos:?} size {size:?}");
+        self.pending_position_restore = Some(PendingRestore {
+            pos,
+            size,
+            // Wait out the Spaces animation before the first attempt —
+            // commands sent mid-transition are dropped on the floor.
+            next_at: Instant::now() + FULLSCREEN_SETTLE,
+            attempts: 0,
+        });
+        ctx.request_repaint_after(FULLSCREEN_SETTLE);
+    }
+
+    /// Follow fullscreen changes the app didn't make: the green traffic-light
+    /// button, ⌃⌘F, and Mission Control all leave `self.fullscreen` stale.
+    /// Without this the exit path never runs at all and the window is simply
+    /// abandoned on whichever display the fullscreen was on.
+    fn sync_fullscreen_state(&mut self, ctx: &egui::Context) {
+        let Some(actual) = ctx.input(|i| i.viewport().fullscreen) else {
+            return;
+        };
+        if actual == self.fullscreen {
+            // Our own command has been confirmed — stop suppressing.
+            self.fullscreen_cmd_at = None;
+            return;
+        }
+        // A command of ours may still be in flight; winit reports the old
+        // state for a frame or two. Only believe a lasting mismatch.
+        if let Some(sent) = self.fullscreen_cmd_at {
+            if sent.elapsed() < FULLSCREEN_CONFIRM_TIMEOUT {
+                return;
+            }
+            log::warn!("fullscreen command not confirmed in time; following reported state");
+            self.fullscreen_cmd_at = None;
+        }
+        log::info!("fullscreen changed outside the app: {} -> {actual}", self.fullscreen);
+        self.fullscreen = actual;
+        if actual {
+            // Entered fullscreen without us: the outer rect is already the
+            // whole screen, so the in-process snapshot would be useless.
+            // `queue_position_restore` falls back to the persisted geometry,
+            // which `track_window_geometry` kept current until this moment.
+            self.pre_fullscreen_geometry = None;
+        } else {
+            // Mirror the exit half of `toggle_fullscreen`.
+            if self.capturing {
+                self.toggle_capture();
+            }
+            self.queue_position_restore(ctx);
         }
     }
 
@@ -1070,21 +1279,208 @@ impl WireDeskApp {
     #[cfg(not(target_os = "macos"))]
     fn reapply_dock_icon_if_needed(&mut self) {}
 
-    /// Drain the pending `OuterPosition` after fullscreen exit if its
-    /// settle timer has elapsed. Called from `update()`.
-    fn drain_pending_position_restore(&mut self, ctx: &egui::Context) {
-        let Some((pos, when)) = self.pending_position_restore else {
+    /// Sample the window rectangle and persist it once it settles.
+    ///
+    /// Fixes "the window reopens on a random display": with no saved
+    /// position, AppKit places the window wherever it likes on every launch.
+    ///
+    /// Skipped while fullscreen — there the outer rect *is* the screen, and
+    /// persisting it would restore a screen-sized window on the next cold
+    /// start. The same reason keeps this out of the fullscreen-exit path:
+    /// `drain_pending_position_restore` is still moving the window then, and
+    /// sampling mid-transition would capture the intermediate spot.
+    fn track_window_geometry(&mut self, ctx: &egui::Context) {
+        if self.fullscreen || self.pending_position_restore.is_some() {
+            return;
+        }
+        let Some(sampled) = self.sample_window_geometry(ctx) else {
             return;
         };
-        if when.elapsed() >= Duration::from_millis(600) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-            self.pending_position_restore = None;
-        } else {
-            // Wake again at the deadline so we don't miss the window.
-            ctx.request_repaint_after(
-                Duration::from_millis(600).saturating_sub(when.elapsed()),
-            );
+        if !geometry_changed(self.persisted_geometry, sampled) {
+            // Back where it started (or never moved) — drop any armed write
+            // so a nudge-and-undo doesn't touch the config at all.
+            self.pending_geometry = None;
+            return;
         }
+        match self.pending_geometry {
+            Some((prev, _)) if !geometry_changed(Some(prev), sampled) => {
+                // Still in the same place — check whether it has been there
+                // long enough to commit.
+                if let Some((geom, since)) = self.pending_geometry {
+                    if since.elapsed() >= GEOMETRY_SETTLE {
+                        self.write_window_geometry(geom);
+                        self.pending_geometry = None;
+                    } else {
+                        ctx.request_repaint_after(
+                            GEOMETRY_SETTLE.saturating_sub(since.elapsed()),
+                        );
+                    }
+                }
+            }
+            _ => {
+                // Moved (or first sample of this move) — restart the timer.
+                self.pending_geometry = Some((sampled, Instant::now()));
+                ctx.request_repaint_after(GEOMETRY_SETTLE);
+            }
+        }
+    }
+
+    /// Read the current outer position + inner size in logical points, or
+    /// `None` when the backend hasn't reported both rects yet (first frames)
+    /// or the values fail the sanity filter.
+    fn sample_window_geometry(&self, ctx: &egui::Context) -> Option<(f32, f32, f32, f32)> {
+        let (outer, inner) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.outer_rect, vp.inner_rect)
+        });
+        let (outer, inner) = (outer?, inner?);
+        // `with_position` takes the outer origin and `with_inner_size` the
+        // inner extent, so persist exactly that pair — mixing the two would
+        // walk the window down by the title-bar height on every restart.
+        crate::config::sane_window_geometry(
+            outer.min.x,
+            outer.min.y,
+            inner.width(),
+            inner.height(),
+        )
+    }
+
+    /// Write geometry to the config, keeping `persisted_geometry` in sync.
+    /// A failed write is logged once and the in-memory value left alone, so
+    /// the next settle retries rather than assuming the save landed.
+    fn write_window_geometry(&mut self, geom: (f32, f32, f32, f32)) {
+        let (x, y, w, h) = geom;
+        match crate::config::save_window_geometry(x, y, w, h) {
+            Ok(()) => {
+                self.persisted_geometry = Some(geom);
+                log::debug!("window geometry saved: {w}x{h} at {x},{y}");
+            }
+            Err(e) => log::warn!("could not save window geometry: {e}"),
+        }
+    }
+
+    /// Commit any geometry still waiting out its settle timer. Called from
+    /// `on_exit` so a move immediately followed by Cmd+Q isn't lost.
+    fn flush_window_geometry(&mut self) {
+        if let Some((geom, _)) = self.pending_geometry.take() {
+            if geometry_changed(self.persisted_geometry, geom) {
+                self.write_window_geometry(geom);
+            }
+        }
+    }
+
+    /// One-shot rescue for a restored position pointing at a display that is
+    /// no longer connected: if no part of the window overlaps a live monitor,
+    /// move it to the primary display's top-left corner.
+    ///
+    /// Runs once, `GEOMETRY_SETTLE` after launch — early enough that the user
+    /// doesn't sit staring at an empty desktop, late enough that winit has
+    /// actually placed the window and the display list has settled.
+    fn rescue_offscreen_window(&mut self, ctx: &egui::Context) {
+        let Some(OffscreenCheck::Armed(since)) = self.offscreen_check else {
+            return;
+        };
+        if since.elapsed() < GEOMETRY_SETTLE {
+            ctx.request_repaint_after(GEOMETRY_SETTLE.saturating_sub(since.elapsed()));
+            return;
+        }
+        self.offscreen_check = None;
+        self.move_onto_primary_if_offscreen(ctx);
+    }
+
+    /// Move the window onto the primary display if it currently overlaps no
+    /// connected one. Returns true when a move was issued.
+    ///
+    /// Shared by the startup check and the fullscreen-restore fallback: both
+    /// can leave the window on coordinates belonging to a display that isn't
+    /// there any more.
+    fn move_onto_primary_if_offscreen(&mut self, ctx: &egui::Context) -> bool {
+        if self.fullscreen {
+            return false;
+        }
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+            return false;
+        };
+        let monitors = monitor::list_monitors();
+        if !window_is_offscreen(outer, &monitors) {
+            return false;
+        }
+        let Some(primary) = monitors.first() else {
+            return false;
+        };
+        // Inset from the very corner so the window doesn't hide under the
+        // menu bar on the primary display.
+        let target = primary.frame.min + egui::vec2(80.0, 80.0);
+        log::warn!(
+            "window position {:?} is off every connected display; \
+             moving to primary at {:?}",
+            outer.min,
+            target
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        true
+    }
+
+    /// Drive the queued fullscreen-exit restore: wait out the settle delay,
+    /// move the window, then **verify it landed** and retry if it didn't.
+    ///
+    /// The verify-and-retry loop is the whole point. A single `OuterPosition`
+    /// after a fixed delay is silently dropped whenever the Spaces transition
+    /// runs longer than the delay, and the symptom is the window staying on
+    /// the fullscreen display instead of returning to the one it was opened
+    /// on. Retrying until the reported origin matches (or the attempts run
+    /// out) makes the restore independent of how long macOS takes.
+    fn drain_pending_position_restore(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.pending_position_restore else {
+            return;
+        };
+        let now = Instant::now();
+        if now < pending.next_at {
+            ctx.request_repaint_after(pending.next_at - now);
+            return;
+        }
+
+        // Did the previous attempt take effect?
+        if pending.attempts > 0 {
+            if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                if restore_landed(outer.min, pending.pos) {
+                    log::info!(
+                        "fullscreen exit: window restored to {:?} after {} attempt(s)",
+                        outer.min,
+                        pending.attempts
+                    );
+                    self.pending_position_restore = None;
+                    return;
+                }
+            }
+        }
+
+        if pending.attempts >= RESTORE_MAX_ATTEMPTS {
+            log::warn!(
+                "fullscreen exit: window did not move to {:?} after {} attempts; \
+                 leaving it in place",
+                pending.pos,
+                pending.attempts
+            );
+            self.pending_position_restore = None;
+            // Last resort: if it also ended up on no display at all, at least
+            // make it reachable.
+            self.move_onto_primary_if_offscreen(ctx);
+            return;
+        }
+
+        pending.attempts += 1;
+        pending.next_at = now + RESTORE_RETRY;
+        self.pending_position_restore = Some(pending);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pending.pos));
+        // Fullscreen resizes the window; without this it comes back
+        // screen-sized on the target display.
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(pending.size));
+        // Raise it — after a Spaces transition the window can end up behind
+        // whatever else is on the destination display.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint_after(RESTORE_RETRY);
     }
 
     /// True when WireDesk should render the full chrome (status, buttons,
@@ -1454,8 +1850,11 @@ impl eframe::App for WireDeskApp {
         // the tap so Mac shortcuts (Cmd+V to paste etc.) work normally on
         // the Mac side. Resumes when window gets focus back.
         self.sync_tap_to_focus(ctx);
+        self.sync_fullscreen_state(ctx);
         self.drain_pending_position_restore(ctx);
         self.reapply_dock_icon_if_needed();
+        self.rescue_offscreen_window(ctx);
+        self.track_window_geometry(ctx);
 
         // Drain TapEvents from the keyboard tap thread.
         let mut pending_tap_events: Vec<TapEvent> = Vec::new();
@@ -1803,6 +2202,13 @@ impl eframe::App for WireDeskApp {
         // Request repaint to keep event loop alive
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
+
+    /// Last chance to persist the window rectangle: a move followed straight
+    /// away by Cmd+Q quits before the settle timer fires, and without this
+    /// the next launch would restore the *previous* position.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_window_geometry();
+    }
 }
 
 #[cfg(test)]
@@ -1951,6 +2357,117 @@ mod tests {
     #[test]
     fn permission_steps_has_four_steps() {
         assert_eq!(permission_steps().len(), 4);
+    }
+
+    fn mon(x: f32, y: f32, w: f32, h: f32) -> monitor::MonitorInfo {
+        monitor::MonitorInfo {
+            index: 0,
+            name: "Test".to_string(),
+            frame: egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+        }
+    }
+
+    #[test]
+    fn restore_landed_accepts_exact_match() {
+        assert!(restore_landed(egui::pos2(1375.0, 823.0), egui::pos2(1375.0, 823.0)));
+    }
+
+    #[test]
+    fn restore_landed_tolerates_appkit_clamping() {
+        // AppKit nudges windows out from under the menu bar, so the origin
+        // we asked for and the one we get back differ by a few points on a
+        // perfectly successful restore.
+        assert!(restore_landed(egui::pos2(1375.0, 838.0), egui::pos2(1375.0, 823.0)));
+    }
+
+    #[test]
+    fn restore_landed_rejects_wrong_display() {
+        // The bug this guards: the window comes back on the fullscreen
+        // display instead of the one it was opened on. Thousands of points
+        // away must never read as "landed".
+        assert!(!restore_landed(egui::pos2(2560.0, 146.0), egui::pos2(1375.0, 823.0)));
+    }
+
+    #[test]
+    fn restore_landed_rejects_vertical_miss() {
+        assert!(!restore_landed(egui::pos2(1375.0, 1200.0), egui::pos2(1375.0, 823.0)));
+    }
+
+    #[test]
+    fn geometry_changed_treats_missing_as_changed() {
+        assert!(geometry_changed(None, (0.0, 0.0, 520.0, 760.0)));
+    }
+
+    #[test]
+    fn geometry_changed_ignores_subpixel_jitter() {
+        // AppKit reports fractional points on scaled displays; a 0.4pt
+        // drift must not trigger a config write.
+        let prev = Some((100.0, 200.0, 520.0, 760.0));
+        assert!(!geometry_changed(prev, (100.4, 199.7, 520.0, 760.2)));
+    }
+
+    #[test]
+    fn geometry_changed_detects_real_move() {
+        let prev = Some((100.0, 200.0, 520.0, 760.0));
+        assert!(geometry_changed(prev, (900.0, 200.0, 520.0, 760.0)));
+    }
+
+    #[test]
+    fn geometry_changed_detects_resize() {
+        let prev = Some((100.0, 200.0, 520.0, 760.0));
+        assert!(geometry_changed(prev, (100.0, 200.0, 680.0, 760.0)));
+    }
+
+    #[test]
+    fn window_on_a_monitor_is_not_offscreen() {
+        let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
+        let rect = egui::Rect::from_min_size(egui::pos2(200.0, 100.0), egui::vec2(520.0, 760.0));
+        assert!(!window_is_offscreen(rect, &monitors));
+    }
+
+    #[test]
+    fn window_on_unplugged_second_monitor_is_offscreen() {
+        // Closed on a display at x=1920; came back with only the built-in.
+        let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(2400.0, 300.0), egui::vec2(520.0, 760.0));
+        assert!(window_is_offscreen(rect, &monitors));
+    }
+
+    #[test]
+    fn window_mostly_off_but_grabbable_is_not_offscreen() {
+        // A window hanging off the right edge with a title-bar-sized sliver
+        // still visible is reachable — leave it where the user put it.
+        let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(1700.0, 300.0), egui::vec2(520.0, 760.0));
+        assert!(!window_is_offscreen(rect, &monitors));
+    }
+
+    #[test]
+    fn window_with_hairline_overlap_is_offscreen() {
+        // 20pt of the window peeking in is not enough to grab.
+        let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(1900.0, 300.0), egui::vec2(520.0, 760.0));
+        assert!(window_is_offscreen(rect, &monitors));
+    }
+
+    #[test]
+    fn empty_monitor_list_never_reports_offscreen() {
+        // No display info (non-macOS build, or enumerated too early) — never
+        // teleport a window on the strength of no data.
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(9000.0, 9000.0), egui::vec2(520.0, 760.0));
+        assert!(!window_is_offscreen(rect, &[]));
+    }
+
+    #[test]
+    fn window_spanning_two_monitors_is_not_offscreen() {
+        let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0), mon(1920.0, 0.0, 2560.0, 1440.0)];
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(1800.0, 200.0), egui::vec2(520.0, 760.0));
+        assert!(!window_is_offscreen(rect, &monitors));
     }
 
     #[test]
