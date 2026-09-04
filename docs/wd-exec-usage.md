@@ -39,33 +39,33 @@ wd --exec "git -C C:\\repo status"
 
 ### SSH через host (на любую linux-машину куда у host'а есть доступ)
 ```bash
-wd --exec --ssh prod-mup "docker ps"
-wd --exec --ssh prod-mup "kubectl get pods -n prod"
-wd --exec --ssh prod-mup "tail -100 /var/log/syslog"
-wd --exec --ssh prod-mup "git -C /opt/app log --oneline -10"
+wd --exec --ssh prod-box "docker ps"
+wd --exec --ssh prod-box "kubectl get pods -n prod"
+wd --exec --ssh prod-box "tail -100 /var/log/syslog"
+wd --exec --ssh prod-box "git -C /opt/app log --oneline -10"
 ```
 
 `<alias>` — это alias из `~/.ssh/config` **на host'е** (не на Mac'е). Управление SSH — через стандартный OpenSSH ControlMaster, не наш код.
 
 ### Pipe-friendly
 ```bash
-wd --exec --ssh prod-mup "docker ps" | grep mup.web
-wd --exec --ssh prod-mup "ps aux" | head -20
+wd --exec --ssh prod-box "docker ps" | grep app.web
+wd --exec --ssh prod-box "ps aux" | head -20
 ```
 
 ### Long-running с custom timeout
 ```bash
-wd --exec --timeout 300 --ssh prod-mup "apt-get update && apt-get -y dist-upgrade"
+wd --exec --timeout 300 --ssh prod-box "apt-get update && apt-get -y dist-upgrade"
 ```
 
 ### Compression для больших текстовых выводов
 
 ```bash
 # До: ~18 сек на 200 KB логов
-wd --exec --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"
+wd --exec --ssh prod-box "docker logs --tail 5000 app.main 2>&1"
 
 # После: ~3 сек (×6 быстрее)
-wd --exec --compress --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"
+wd --exec --compress --ssh prod-box "docker logs --tail 5000 app.main 2>&1"
 ```
 
 Сжимает stdout на host'е (gzip+base64), разворачивает на Mac. Stdout байт-в-байт идентичен non-compress версии — pipe-friendly работает: `wd --exec --compress --ssh prod 'docker logs ...' | grep ERROR | head -20`.
@@ -113,7 +113,7 @@ Decode error → exit 125 (transport-class) с диагностикой в stder
 - **Если в команде есть одинарные кавычки** — используй внешние двойные с экранированием: `wd --exec --ssh prod "docker ps --filter \"status=running\""`. Edge case.
 - **Persistent SSH** — настраивается через ControlMaster в `~/.ssh/config` **на host'е** (не на Mac'е), и это вне нашего кода:
   ```
-  Host prod-mup
+  Host prod-box
       ControlMaster auto
       ControlPath /tmp/ssh-%r@%h:%p
       ControlPersist 10m
@@ -136,8 +136,8 @@ Decode error → exit 125 (transport-class) с диагностикой в stder
 QUERY_B64=$(printf '%s' '{"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"now-1h"}}}]}}}' | base64)
 
 # Single wd --exec call: decode на remote → temp-file → curl --data-binary → cleanup:
-wd --exec --ssh prod-mup "echo '$QUERY_B64' | base64 -d > /tmp/wd-q.json && \
-  curl -s -XPOST 'http://10.24.200.219:9200/_search' \
+wd --exec --ssh prod-box "echo '$QUERY_B64' | base64 -d > /tmp/wd-q.json && \
+  curl -s -XPOST 'http://es.internal.example:9200/_search' \
     -H 'Content-Type: application/json' \
     --data-binary @/tmp/wd-q.json && \
   rm /tmp/wd-q.json"
@@ -182,8 +182,8 @@ ERROR:  invalid byte sequence for encoding "UTF8": 0xa6
 `chcp 65001` + `[Console]::OutputEncoding = [Text.Encoding]::UTF8` помогает не всегда (зависит от того, как PowerShell конвертирует argv → child process). Workaround на стороне SQL — **Unicode escape** `U&'\NNNN'`:
 
 ```bash
-# Найти "Стародумов" / "Виктор":
-wd --exec --ssh prod-mup "psql ... -c \"select * from official where last_name = U&'\\0421\\0442\\0430\\0440\\043E\\0434\\0443\\043C\\043E\\0432' and first_name = U&'\\0412\\0438\\043A\\0442\\043E\\0440'\""
+# Найти "Иванов" / "Иван":
+wd --exec --ssh prod-box "psql ... -c \"select * from persons where last_name = U&'\\0418\\0432\\0430\\043D\\043E\\0432' and first_name = U&'\\0418\\0432\\0430\\043D'\""
 ```
 
 Codepoint каждой буквы: А=0410, Б=0411, ..., Я=042F, а=0430, ..., я=044F, Ё=0401, ё=0451.
@@ -279,9 +279,9 @@ def wd_exec(cmd: str, ssh: str | None = None, timeout: int = 90) -> tuple[int, s
     r = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 10)
     return r.returncode, r.stdout
 
-rc, probe = wd_exec("test-something", ssh="prod-mup")
+rc, probe = wd_exec("test-something", ssh="prod-box")
 if rc == 0 and probe.strip():
-    wd_exec("do-the-thing", ssh="prod-mup")  # works, никакого closed-channel
+    wd_exec("do-the-thing", ssh="prod-box")  # works, никакого closed-channel
 ```
 
 Если bash обязателен — workaround не подтверждён. Redirect в файл (`wd --exec "..." > /tmp/probe.out`) **может** обойти проблему, но это не проверено эмпирически. До root-cause investigation'а — рекомендация однозначно Python orchestrator.

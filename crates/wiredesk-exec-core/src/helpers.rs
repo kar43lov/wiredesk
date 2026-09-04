@@ -407,14 +407,14 @@ mod tests {
         // cursor line is just `➜ `.
         assert!(is_remote_prompt("➜"));
         assert!(is_remote_prompt("➜ "));
-        assert!(is_remote_prompt("karlovpg in 🌐 knd02 in ~ ➜ "));
+        assert!(is_remote_prompt("user in 🌐 buildbox in ~ ➜ "));
     }
 
     #[test]
     fn is_remote_prompt_rejects_non_prompt() {
         assert!(!is_remote_prompt(""));
         assert!(!is_remote_prompt("Welcome to Ubuntu 20.04.6 LTS"));
-        assert!(!is_remote_prompt("karlovpg in 🌐 knd02 in ~"));
+        assert!(!is_remote_prompt("user in 🌐 buildbox in ~"));
         assert!(!is_remote_prompt("PS C:\\>"));
     }
 

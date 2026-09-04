@@ -18,7 +18,7 @@
 ## Что делает
 
 ```bash
-wd --exec --compress --ssh prod-mup "docker logs --tail 1000 mup.srv.main.NNNNNN 2>&1"
+wd --exec --compress --ssh prod-box "docker logs --tail 1000 app.main.NNNNNN 2>&1"
 ```
 
 С точки зрения вызывающего — то же что и без `--compress`: `stdout` чистый текст, `exit-code` пробрасывается, sentinel-парсинг работает как обычно. Compression — internal.
@@ -93,13 +93,13 @@ compress: bool,
 
 | # | Критерий |
 |---|---|
-| **AC1** | `wd --exec --compress --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"` отрабатывает за <30 сек на выводе ~200 KB (без compress — ~18 сек или timeout). |
+| **AC1** | `wd --exec --compress --ssh prod-box "docker logs --tail 5000 app.main 2>&1"` отрабатывает за <30 сек на выводе ~200 KB (без compress — ~18 сек или timeout). |
 | **AC2** | Stdout идентичен байт-в-байт варианту без `--compress` для того же вывода. Exit code тот же. |
 | **AC3** | Команда роняется с non-zero exit — exit-code корректно пробрасывается (НЕ exit-code от gzip/base64/Out-String). Тесты: bash `false`, PS `Get-Item /nonexistent`, PS external `cmd /c "exit 42"`. |
 | **AC4** | **Кириллица в output** не корраптится. Тест PS-host: `wd --exec --compress "Get-Content C:\test\русский.txt"` → текст идентичен файлу. Тест bash: `wd --exec --compress --ssh prod 'echo "Привет мир"'`. |
 | **AC5** | **PS-host без `--ssh`** работает: `wd --exec --compress "Get-ChildItem C:\Users -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5000"` — отрабатывает быстрее не-compress версии. |
 | **AC6** | Binary output не падает (ratio ~1×, но команда отрабатывает): `wd --exec --compress --ssh prod 'cat /usr/bin/ls'`. |
-| **AC7** | Малый output (<1 KB) — overhead ≤ +0.5 сек: `wd --exec --compress --ssh prod-mup "echo alive"` → exit 0. |
+| **AC7** | Малый output (<1 KB) — overhead ≤ +0.5 сек: `wd --exec --compress --ssh prod-box "echo alive"` → exit 0. |
 | **AC8** | Регрессия: 395 существующих тестов проходят без изменений. Без флага `--compress` поведение wd 1-в-1 как до. |
 | **AC9** | Через **IPC bridge** (GUI запущен) `wd --exec --compress` работает идентично direct-serial mode. `IpcRequest::compress` пробрасывается. |
 | **AC10** | `--timeout` корректно срабатывает с base64-payload: sentinel `__WD_DONE_` парсится **после** base64-блока. |
@@ -117,7 +117,7 @@ compress: bool,
 - `MockExecTransport` — три scenario: compressed bash payload, compressed PS payload, mixed output (READY → garbage → b64 → DONE).
 
 **Live (final gate перед merge в master):**
-- **bash path:** `docker logs --tail 5000` через prod-mup. Замер: time без compress vs с compress.
+- **bash path:** `docker logs --tail 5000` через prod-box. Замер: time без compress vs с compress.
 - **PS path:** `Get-EventLog -LogName System -Newest 5000` или `Get-Content C:\<big.log>`. Замер аналогичный.
 - **Кириллица PS:** `Get-Content C:\test\русский.txt` (создать заранее).
 - **Smoke на трёх размерах:** 1 KB, 50 KB, 500 KB через обе path'и.

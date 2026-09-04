@@ -13,7 +13,7 @@
 **Функциональные**
 
 - **F1.** `wd --exec "Get-ChildItem"` — выполнить на host'ском PowerShell, stdout (без stdin echo, без prompt'а), exit с `$LASTEXITCODE` команды.
-- **F2.** `wd --exec --ssh prod-mup "docker ps"` — на host'е сначала `ssh -tt prod-mup`, дождаться remote prompt'а, послать команду+sentinel, exit с `$?` команды на remote bash.
+- **F2.** `wd --exec --ssh prod-box "docker ps"` — на host'е сначала `ssh -tt prod-box`, дождаться remote prompt'а, послать команду+sentinel, exit с `$?` команды на remote bash.
 - **F3.** `--timeout SECONDS` (default 30) — exit 124 если sentinel не пришёл за указанное время.
 - **F4.** Exit code пробрасывается напрямую: `wd --exec "exit 7"` → exit 7.
 - **F5.** Не включать raw_mode, не open stdin. Просто читать ShellOutput → buffer → искать sentinel.
@@ -35,12 +35,12 @@
 - **AC1.** `wd --exec "echo hello"` → stdout: `hello`, exit 0.
 - **AC2.** `wd --exec "exit 7"` → exit 7, stdout empty.
 - **AC2a.** `wd --exec "Get-Item /nonexistent/path"` (PS terminating error) → exit 1 (через `try/catch` wrapper в `format_command`), **не** timeout 124. Stderr-style error message в stdout.
-- **AC3.** `wd --exec --ssh prod-mup "docker ps"` → stdout содержит docker ps таблицу **без** Welcome-banner'а Ubuntu и MOTD, exit 0.
-- **AC4.** `wd --exec --ssh prod-mup "docker logs nonexistent-container"` → stderr-style error в stdout (host шлёт всё одним `ShellOutput`'ом, MVP не разделяет), exit ≠ 0.
+- **AC3.** `wd --exec --ssh prod-box "docker ps"` → stdout содержит docker ps таблицу **без** Welcome-banner'а Ubuntu и MOTD, exit 0.
+- **AC4.** `wd --exec --ssh prod-box "docker logs nonexistent-container"` → stderr-style error в stdout (host шлёт всё одним `ShellOutput`'ом, MVP не разделяет), exit ≠ 0.
 - **AC5.** `wd --exec --timeout 2 "Start-Sleep 5"` → exit 124, no hang.
 - **AC6.** Два последовательных `wd --exec` без open GUI — оба завершаются, host slot free'ится между ними (как уже работает в bridge_loop через `ShellClose + Disconnect`).
 - **AC7.** Stdout чистый — ни PS prompt'а, ни echo введённой команды, ни sentinel-строки. Только то, что команда вернула.
-- **AC8.** `wd --exec` совместимый с Bash-tool как drop-in replacement: `Bash("wd --exec --ssh prod-mup 'docker ps' | head -20")` работает как нативный shell call.
+- **AC8.** `wd --exec` совместимый с Bash-tool как drop-in replacement: `Bash("wd --exec --ssh prod-box 'docker ps' | head -20")` работает как нативный shell call.
 
 ## Тестирование
 
@@ -48,7 +48,7 @@
 
 - Pure helpers с MockTransport pair и unit-level table tests:
   - `is_powershell_prompt(line) -> bool` — regex `^PS\s+[A-Z]:.*?>\s*$`. Test cases: `PS C:\> ` true, `PS C:\Users\User> ` true, `bash$ ` false, `> ` false.
-  - `is_remote_prompt(line) -> bool` — соответствует Starship `➜ ` и стандартному bash `\$\s*$`/`#\s*$`. Test cases: `➜ ` true, `user@host:~$ ` true, `karlovpg in 🌐 knd02 in ~` false (это пред-строка Starship'а), `➜ /tmp` true (with whitespace tolerance).
+  - `is_remote_prompt(line) -> bool` — соответствует Starship `➜ ` и стандартному bash `\$\s*$`/`#\s*$`. Test cases: `➜ ` true, `user@host:~$ ` true, `user in 🌐 buildbox in ~` false (это пред-строка Starship'а), `➜ /tmp` true (with whitespace tolerance).
   - `format_command(uuid, shell, cmd) -> String`:
     - Для PS (host): `try { <cmd> } catch { $LASTEXITCODE = 1 }; "__WD_DONE_<uuid>__$LASTEXITCODE"\r`. **try/catch wrapper обязателен** — если `<cmd>` роняет PS terminating error без try, sentinel-эхо не выполнится → wd зависнет до timeout(124) вместо корректного exit 1.
     - Для bash post-ssh: `<cmd>; echo "__WD_DONE_<uuid>__$?"\r` (bash continues после non-zero exit, sentinel выполнится в любом случае).
@@ -62,7 +62,7 @@
   - SSH path: host шлёт PS prompt → wd шлёт `ssh -tt prod`\r → host шлёт SSH-handshake-mock → remote prompt → wd шлёт command → host echoes → output → sentinel.
 
 **Live-тесты** (after build):
-- AC1-AC8 на реальном hardware с CH340 + prod-mup.
+- AC1-AC8 на реальном hardware с CH340 + prod-box.
 - Latency: `time wd --exec "Get-Date"` ≤ ~2 сек (handshake + ShellOpen + первый prompt + cmd + sentinel).
 
 ## Риски
@@ -80,12 +80,12 @@
 3. `Args` extension: `#[arg(long)] exec: Option<String>`, `#[arg(long)] ssh: Option<String>`, `#[arg(long, default_value = "30")] timeout: u64`.
 4. В `run()` — branch: если `exec.is_some()` → `run_oneshot(args, transport, reader)` без `enable_raw_mode`, иначе текущий `bridge_loop`.
 5. `run_oneshot`: handshake → ShellOpen → wait_for_prompt(is_powershell_prompt, timeout) → if `--ssh`: send `ssh -tt ALIAS\r`, wait_for_prompt(is_remote_prompt, timeout) → format_command → send → accumulate output → find sentinel → clean_stdout → print → ShellClose + Disconnect → exit(code).
-6. README section: usage examples, ControlMaster setup для prod-mup в `~/.ssh/config` на host'е.
+6. README section: usage examples, ControlMaster setup для prod-box в `~/.ssh/config` на host'е.
 
 ## Что НЕ входит в scope
 
 - **stderr separation.** Всё в stdout. Если нужно — нужны host-side изменения (Message::ShellStderr).
-- **Persistent SSH session между разными `wd --exec` вызовами.** Каждый вызов — fresh ssh handshake (~1 сек на prod-mup). Persistent — через **OpenSSH ControlMaster** в `~/.ssh/config` host'а (mulitplexed connection, sub-second). Это вне нашего кода — стандартный ssh feature.
+- **Persistent SSH session между разными `wd --exec` вызовами.** Каждый вызов — fresh ssh handshake (~1 сек на prod-box). Persistent — через **OpenSSH ControlMaster** в `~/.ssh/config` host'а (mulitplexed connection, sub-second). Это вне нашего кода — стандартный ssh feature.
 - **Persistent state PS shell** между вызовами (cwd / env). Каждый `wd --exec` — fresh PS process. Нужно — daemon (Variant B follow-up если ControlMaster не покроет).
 - **JSON output mode** (`--json`).
 - **`--shell` flag** (выбор bash/cmd как target host shell). Default PowerShell — host's default. Если будет нужно cmd — добавим позже.

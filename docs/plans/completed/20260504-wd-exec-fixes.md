@@ -160,9 +160,9 @@ None => {
 *Items requiring manual intervention or external systems — no checkboxes, informational only*
 
 **Live verification (требуется Win11 host + CH340):**
-- AC2: `wd --exec --ssh prod-mup "$(python3 -c 'print(\"echo \" + \"a\" * 700)')"` → проходит без `payload too large` (раньше падал на 619+).
+- AC2: `wd --exec --ssh prod-box "$(python3 -c 'print(\"echo \" + \"a\" * 700)')"` → проходит без `payload too large` (раньше падал на 619+).
 - AC4: `wd --exec --ssh nonexistent-host "ping"` (или любой ssh chain который зависнет на handshake'е) → exit 124 после timeout. Stderr содержит `last bytes received: "..."` с фрагментом MOTD/error.
-- AC2-equivalent: реальный компактный ES `_search` через `wd --exec --ssh prod-mup`, который раньше падал на 619 byte → теперь проходит.
+- AC2-equivalent: реальный компактный ES `_search` через `wd --exec --ssh prod-box`, который раньше падал на 619 byte → теперь проходит.
 
 **Deployment notes:**
 - MAX_PAYLOAD bump затрагивает обе стороны (host + client). Старый host (≤512) при получении 4 KB пакета отвергнет с `payload too large` ошибкой → recoverable, не data corruption. Старый serial.rs reader (≤1024) silently дискар'дит frame с `frame too large`. Деплой обеих сторон одновременно — стандартный workflow для serial-link single-user setup.

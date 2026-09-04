@@ -6,14 +6,14 @@
 
 ## Симптом
 
-`wd --exec --ssh prod-mup "<reasonable read-only command>"` отрабатывает на remote за ~4 сек, sentinel генерируется и попадает в client buffer, но `wd --exec` **не распознаёт его** и продолжает ждать до `--timeout` истечения. Exit code — 124 (timeout convention) хотя реальный exit команды был 0.
+`wd --exec --ssh prod-box "<reasonable read-only command>"` отрабатывает на remote за ~4 сек, sentinel генерируется и попадает в client buffer, но `wd --exec` **не распознаёт его** и продолжает ждать до `--timeout` истечения. Exit code — 124 (timeout convention) хотя реальный exit команды был 0.
 
 ## Воспроизведение
 
 Команда (один из подтверждённых случаев — ES `_search` с тремя aggregations, payload ~619 байт, помещается в новый `MAX_PAYLOAD = 4096`):
 
 ```bash
-wd --exec --timeout 90 --ssh prod-mup "curl -s -XPOST 'http://10.24.200.219:9200/mup-srv-production-*/_search?size=0' -H 'Content-Type: application/json' -d '{\"query\":{\"bool\":{\"filter\":[{\"range\":{\"@timestamp\":{\"gte\":\"now-1h\"}}},{\"terms\":{\"level.keyword\":[\"Error\",\"Fatal\"]}}]}},\"aggs\":{\"by_min\":{\"date_histogram\":{\"field\":\"@timestamp\",\"fixed_interval\":\"5m\"}},\"by_class\":{\"terms\":{\"field\":\"exceptions.ClassName.keyword\",\"size\":5}},\"by_path\":{\"terms\":{\"field\":\"fields.RequestPath.keyword\",\"size\":5}}}}' | head -c 800"
+wd --exec --timeout 90 --ssh prod-box "curl -s -XPOST 'http://es.internal.example:9200/logs-production-*/_search?size=0' -H 'Content-Type: application/json' -d '{\"query\":{\"bool\":{\"filter\":[{\"range\":{\"@timestamp\":{\"gte\":\"now-1h\"}}},{\"terms\":{\"level.keyword\":[\"Error\",\"Fatal\"]}}]}},\"aggs\":{\"by_min\":{\"date_histogram\":{\"field\":\"@timestamp\",\"fixed_interval\":\"5m\"}},\"by_class\":{\"terms\":{\"field\":\"exceptions.ClassName.keyword\",\"size\":5}},\"by_path\":{\"terms\":{\"field\":\"fields.RequestPath.keyword\",\"size\":5}}}}' | head -c 800"
 ```
 
 Ожидаемое: stdout с ES JSON (≤ 800 байт после `head -c`), exit 0, latency ~5 сек.
@@ -76,7 +76,7 @@ Sentinel прибыл в буфер, но `parse_sentinel` (или вышест�
 **Integration** в `apps/wiredesk-term/tests/`:
 - `oneshot_completes_when_sentinel_chunked_with_prompt`: `MockTransport::pair`, host шлёт `ShellOpen`-handshake, потом несколько `ShellOutput`'ов с output, последний chunk = `<command output>\n__WD_DONE_<uuid>__0\r\n<ANSI Starship junk>\r\n➜ `. Wd-term завершается за < 1 сек, exit 0, clean stdout.
 
-**Live re-test** на CH340 + prod-mup:
+**Live re-test** на CH340 + prod-box:
 - Тот же запрос из «Воспроизведение». Ожидаемое: завершение за ~5 сек, exit 0.
 
 ## Не в scope

@@ -303,7 +303,7 @@ async fn find_matching_peripheral(
     // local_name differs from the configured peer_name (helpful for
     // multi-host setups), but we don't gate on it — the Win side
     // typically advertises as the computer hostname (e.g.
-    // `DESKTOP-GSE79B8`), not as the configured peer_name, because
+    // `DESKTOP-A1B2C3D`), not as the configured peer_name, because
     // WinRT's advertisement payload is bounded and the local_name
     // there is the OS computer name.
     let peripherals = adapter.peripherals().await.ok()?;

@@ -64,7 +64,7 @@ last 256 bytes received: "...<tail>..."
 ## Acceptance criteria
 
 1. **AC1 (P1):** unit test в `crates/wiredesk-protocol/src/packet.rs::tests` — `roundtrip(Message::ShellInput { data: vec![0xAA; 4000] })` проходит. Прежний test на overflow (`MAX_PAYLOAD + 1`) обновлён под новое значение.
-2. **AC2 (P1 live):** `wd --exec "echo test"` с командой длиной 700 байт (можно собрать через `wd --exec --ssh prod-mup "$(python -c 'print(\"echo \" + \"a\" * 700)')"` или аналог) — проходит без `payload too large`. Verify локально на CH340 + Win11.
+2. **AC2 (P1 live):** `wd --exec "echo test"` с командой длиной 700 байт (можно собрать через `wd --exec --ssh prod-box "$(python -c 'print(\"echo \" + \"a\" * 700)')"` или аналог) — проходит без `payload too large`. Verify локально на CH340 + Win11.
 3. **AC3 (P2):** unit test — mock'нутый run_oneshot с тихим host'ом за `--timeout 1` возвращает `Ok(124)` + stderr содержит "last 256 bytes received".
 4. **AC4 (P2 live):** реальный `wd --exec --ssh nonexistent-host "ping"` (ssh fail) — exit 124 + dump показывает MOTD-текст или ssh-error в stderr.
 5. **AC5 (B2):** unit test — mock host emit'ит `__WD_DONE_<uuid>__1` сразу, без READY → `run_oneshot` returns `Ok(1)`, не timeout.

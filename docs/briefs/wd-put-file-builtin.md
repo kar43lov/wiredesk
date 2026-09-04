@@ -27,7 +27,7 @@ def push_file(local_path, remote_path):
 
 ~50 строк ad-hoc кода, который должен быть **в каждом** orchestrator'е. Уже сейчас:
 - `mup/.claude/scripts/itsm.py` — для пуша `itsm_run.ps1` и (раньше) `itsm_parser.py`.
-- Будущие helper'ы (Дознание, Справочники, любой кастомный prod-инструмент) повторят то же самое.
+- Будущие helper'ы (любой кастомный prod-инструмент) повторят то же самое.
 
 ## Грабли которые pattern избегает (см. `feedback_wd_chunked_push_lessons.md`)
 
@@ -111,7 +111,7 @@ Documented в brief `wd-exec-host-environment-quirks.md`. Каждый orchestra
 
 3. **AC3 (Cyrillic UTF-8 file content):** `.txt` с UTF-8 кириллицей и BOM — round-trip preserves bytes (включая BOM-байты). Не должно быть UTF-8 byte-loss как в `wd-exec-utf8-byte-loss.md` (round-trip через ASCII-base64 неуязвим).
 
-4. **AC4 (--ssh):** `wd put-file --src ./local --dst /tmp/remote --ssh prod-mup` работает на Linux-host'е через ssh-chain, использует `cat | base64 -d > $dst` на удалённой стороне.
+4. **AC4 (--ssh):** `wd put-file --src ./local --dst /tmp/remote --ssh prod-box` работает на Linux-host'е через ssh-chain, использует `cat | base64 -d > $dst` на удалённой стороне.
 
 5. **AC5 (verify):** размер на host'е сравнивается с локальным — на mismatch wd возвращает rc≠0 и stderr с диффом. Не «тихо успешно».
 

@@ -102,7 +102,7 @@ Write-Output "__WD_DONE_<uuid>__$rc"
 - ⚠️ На timeout с partial buffer'ом (host оборвался mid-base64) — `Err(Timeout(_))` возвращается **до** decode-попытки, partial buffer не decode'ится (это не данные, а fragment).
 
 **Sequence (компилирует все слои):**
-1. `wd --exec --compress "..."` или `wd --exec --compress --ssh prod-mup "..."` пользователем.
+1. `wd --exec --compress "..."` или `wd --exec --compress --ssh prod-box "..."` пользователем.
 2. `wiredesk-term` парсит clap, формирует `RunRequest { cmd, ssh, compress: true, timeout: 90 }`.
 3. Если IPC-socket доступен → `IpcRequest { cmd, ssh, timeout_secs, compress: true }` через UnixStream к GUI handler'у.
 4. GUI handler / direct-term зовёт `format_compressed_command(cmd, uuid, kind)` → отсылает на host через `Message::ShellInput`.
@@ -318,14 +318,14 @@ Workspace `Cargo.toml` — версии добавляются в `[workspace.de
 Все тесты на real hardware (Mac + Win11 host через serial). Записать timing в PR description.
 
 1. **bash path baseline + compress:**
-   - `time wd --exec --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"` (без compress)
-   - `time wd --exec --compress --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"` (с compress)
+   - `time wd --exec --ssh prod-box "docker logs --tail 5000 app.main 2>&1"` (без compress)
+   - `time wd --exec --compress --ssh prod-box "docker logs --tail 5000 app.main 2>&1"` (с compress)
    - **Expected:** второй <30 сек на ~200 KB output (AC1), первый ~18 сек или timeout
    - **Verify:** stdout байт-в-байт идентичен (AC2) — `diff` двух сохранённых выводов
 
 2. **bash path exit-code propagation (AC3):**
-   - `wd --exec --compress --ssh prod-mup 'false'` → exit 1
-   - `wd --exec --compress --ssh prod-mup 'exit 42'` → exit 42 (если SSH limitation позволяет — пре-existing baseline)
+   - `wd --exec --compress --ssh prod-box 'false'` → exit 1
+   - `wd --exec --compress --ssh prod-box 'exit 42'` → exit 42 (если SSH limitation позволяет — пре-existing baseline)
 
 3. **PS path baseline + compress:**
    - `time wd --exec "Get-EventLog -LogName System -Newest 5000"` (или аналогичный 100+ KB вывод)
@@ -341,14 +341,14 @@ Workspace `Cargo.toml` — версии добавляются в `[workspace.de
    - `wd --exec --compress "Get-ChildItem C:\Users -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5000 | Out-String"` — отрабатывает быстрее non-compress версии
 
 6. **Binary output (AC6):**
-   - `wd --exec --compress --ssh prod-mup 'cat /usr/bin/ls | base64'` — не падает (ratio ~1×, но завершается)
+   - `wd --exec --compress --ssh prod-box 'cat /usr/bin/ls | base64'` — не падает (ratio ~1×, но завершается)
 
 7. **Малый output overhead (AC7):**
-   - `time wd --exec --compress --ssh prod-mup "echo alive"` — overhead ≤0.5 сек по сравнению с non-compress
+   - `time wd --exec --compress --ssh prod-box "echo alive"` — overhead ≤0.5 сек по сравнению с non-compress
 
 8. **IPC bridge (AC9):**
    - запустить `WireDesk.app`
-   - `wd --exec --compress --ssh prod-mup "docker logs --tail 1000 ..."` — отрабатывает идентично direct-serial
+   - `wd --exec --compress --ssh prod-box "docker logs --tail 1000 ..."` — отрабатывает идентично direct-serial
    - проверить что GUI clipboard sync продолжает работать параллельно
 
 9. **Smoke 1 KB / 50 KB / 500 KB:**

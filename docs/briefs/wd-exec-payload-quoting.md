@@ -15,7 +15,7 @@ macOS bash double-quotes  →  wd serial transport  →  PowerShell single-quote
 **Симптом** (воспроизведено вживую):
 
 ```bash
-wd --exec "curl.exe -s -XPOST 'http://10.24.200.219:9200/mup-srv-production-*/_search?size=10' \
+wd --exec "curl.exe -s -XPOST 'http://es.internal.example:9200/logs-production-*/_search?size=10' \
   -H 'Content-Type: application/json' \
   -d '{\"query\":{\"bool\":{\"filter\":[{\"range\":{\"@timestamp\":{\"gte\":\"now-24h\"}},...]}}}'"
 ```
@@ -54,7 +54,7 @@ ES возвращает HTTP 400:
 
 ```bash
 echo '{"query":{"bool":{"filter":[...]}}}' | \
-  wd --exec --stdin "curl.exe -s -XPOST 'http://10.24.200.219:9200/_search' -H 'Content-Type: application/json' --data-binary @-"
+  wd --exec --stdin "curl.exe -s -XPOST 'http://es.internal.example:9200/_search' -H 'Content-Type: application/json' --data-binary @-"
 ```
 
 curl `--data-binary @-` читает payload со stdin без любых преобразований. Никаких escape'ов на вызывающей стороне.
@@ -104,8 +104,8 @@ Wd подставляет в команду путь host-side temp-файла (
 
 2. **AC2 (preferred — `--stdin`):** реализован `--stdin` flag в `wiredesk-term`. Сценарий из bash:
    ```bash
-   echo '{"q":{"match_all":{}}}' | wd --exec --stdin --ssh prod-mup \
-     "curl.exe -s -XPOST 'http://10.24.200.219:9200/_search' -H 'Content-Type: application/json' --data-binary @-"
+   echo '{"q":{"match_all":{}}}' | wd --exec --stdin --ssh prod-box \
+     "curl.exe -s -XPOST 'http://es.internal.example:9200/_search' -H 'Content-Type: application/json' --data-binary @-"
    ```
    проходит, ES возвращает 200 с реальными hits.
 

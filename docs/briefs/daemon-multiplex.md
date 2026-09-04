@@ -14,7 +14,7 @@
 
 Сейчас `WireDesk.app` (GUI) и `wd --exec` (CLI) **взаимоисключающие** — оба процесса хотят open()'нуть один и тот же serial-порт, OS-level эксклюзивный. Workflow ломается так:
 - GUI открыт, активный capture, мышь/клавиатура работают на Host.
-- В терминале нужно быстро отстрелить `wd --exec --ssh prod-mup "..."` для триажа.
+- В терминале нужно быстро отстрелить `wd --exec --ssh prod-box "..."` для триажа.
 - Quit GUI → запустить `wd --exec` → дождаться → перезапустить GUI → восстановить fullscreen + Cmd+Esc engage. Каждый цикл — 30+ секунд.
 
 `docs/wd-exec-usage.md` пункт 1 это явно документирует. `feedback_serial_terminal_bridge.md` (memory) — section 5 «Single-port ownership».

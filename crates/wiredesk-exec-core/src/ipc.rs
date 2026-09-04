@@ -267,7 +267,7 @@ mod tests {
     fn request_round_trip() {
         let req = IpcRequest {
             cmd: "docker ps".into(),
-            ssh: Some("prod-mup".into()),
+            ssh: Some("prod-box".into()),
             timeout_secs: 90,
             compress: false,
         };
@@ -373,7 +373,7 @@ mod tests {
     fn connect_frame_exec_round_trip() {
         let conn = IpcConnect::Exec(IpcRequest {
             cmd: "docker ps".into(),
-            ssh: Some("prod-mup".into()),
+            ssh: Some("prod-box".into()),
             timeout_secs: 90,
             compress: true,
         });

@@ -9,9 +9,9 @@
 
 **Что произошло** (live-test 2026-05-05, ветка `chore/wd-exec-quoting-probe`):
 
-1. `wd --exec --ssh prod-mup "echo hello"` → ok.
-2. `wd --exec --ssh prod-mup "curl ... -d \"{\\\"query\\\":...}\""` → **timeout 124** (sentinel не пришёл).
-3. `wd --exec --ssh prod-mup "echo recovery-check"` через 5s → ok (канал восстановился).
+1. `wd --exec --ssh prod-box "echo hello"` → ok.
+2. `wd --exec --ssh prod-box "curl ... -d \"{\\\"query\\\":...}\""` → **timeout 124** (sentinel не пришёл).
+3. `wd --exec --ssh prod-box "echo recovery-check"` через 5s → ok (канал восстановился).
 4. Повтор того же broken-quoting cmd → `transport: IPC read: failed to fill whole buffer`, exit 1.
 5. User: «host-канал зависает, я его перезапускаю».
 
@@ -92,7 +92,7 @@ open target/release/WireDesk.app
 sleep 3
 
 # 2. Вызвать wd --exec, который timeout'ится:
-./target/release/wiredesk-term --exec --timeout 5 --ssh prod-mup "sleep 30"
+./target/release/wiredesk-term --exec --timeout 5 --ssh prod-box "sleep 30"
 
 # 3. Найти client.log:
 ls -la ~/Library/Application\ Support/WireDesk/client.log.*

@@ -196,11 +196,11 @@ wd --exec "Get-ChildItem"
 wd --exec "exit 7"     # exits with 7
 
 # Through SSH to a remote box:
-wd --exec --ssh prod-mup "docker ps"
-wd --exec --ssh prod-mup "tail -100 /var/log/syslog"
+wd --exec --ssh prod-box "docker ps"
+wd --exec --ssh prod-box "tail -100 /var/log/syslog"
 
 # Compress stdout for large text output (5-10x speedup):
-wd --exec --compress --ssh prod-mup "docker logs --tail 5000 mup.srv.main 2>&1"
+wd --exec --compress --ssh prod-box "docker logs --tail 5000 app.main 2>&1"
 ```
 
 This skips raw mode and the interactive bridge entirely. The CLI sends the command wrapped in a UUID-tagged sentinel and reads the host's output until that sentinel line is seen, strips the prompt / banner / echoed command, and exits with the same code the command produced.
@@ -211,10 +211,10 @@ PS-only wrapper sets `$LASTEXITCODE=0; $ErrorActionPreference='Stop'` and wraps 
 
 **For agent / automation authors:** writing helpers on top of `wd --exec` (binary push, `.ps1` generation, multi-call orchestration)? Read [Host environment quirks](docs/wd-exec-usage.md#host-environment-quirks) — three Win-host gotchas (`AppendAllBytes` missing in .NET 4.x, ru-RU PS parser without UTF-8 BOM, bash `$()` subshell killing serial channel) that look like `wd` bugs but aren't. Each costs hours if you don't know.
 
-For sub-second persistent SSH (so consecutive `--ssh prod-mup` calls don't re-handshake every time), set up OpenSSH ControlMaster on the host's `~/.ssh/config`:
+For sub-second persistent SSH (so consecutive `--ssh prod-box` calls don't re-handshake every time), set up OpenSSH ControlMaster on the host's `~/.ssh/config`:
 
 ```
-Host prod-mup
+Host prod-box
     HostName 10.x.x.x
     User <user>
     ControlMaster auto
@@ -222,7 +222,7 @@ Host prod-mup
     ControlPersist 10m
 ```
 
-The first `wd --exec --ssh prod-mup ...` call creates the multiplexed connection; the next ten minutes of calls re-use it. No daemon required on the WireDesk side.
+The first `wd --exec --ssh prod-box ...` call creates the multiplexed connection; the next ten minutes of calls re-use it. No daemon required on the WireDesk side.
 
 On macOS, `wiredesk-client` (GUI) and `wiredesk-term` (`wd`) now **coexist** — both interactive `wd` and `wd --exec` run in parallel with a running GUI, including during active mouse/keyboard capture. When the GUI is up it holds the serial port and `wd` routes through it over a Unix-socket IPC relay (`wd-exec.sock`); when the GUI is closed, `wd` opens the serial port directly, exactly as before. The host holds a single shell slot, so a second shell acquirer (e.g. `wd --exec` fired while an interactive `wd` is live, or vice versa) fails fast with a clear "shell busy" message — no queuing, no hang (a refused `wd --exec` exits 125, a refused interactive `wd` exits 1). The old "quit the GUI before launching the CLI" restriction no longer applies.
 
