@@ -374,6 +374,7 @@ pub fn to_transport_config(cfg: &ClientConfig) -> TransportConfig {
             mtu: cfg.bluetooth.mtu,
             connect_timeout_secs: cfg.bluetooth.connect_timeout_secs,
             reconnect_max_attempts: cfg.bluetooth.reconnect_max_attempts,
+            require_encryption: cfg.bluetooth.require_encryption,
         },
         fallback: cfg.transport_fallback.clone(),
     }
@@ -446,6 +447,7 @@ mod tests {
                 mtu: 244,
                 connect_timeout_secs: 5,
                 reconnect_max_attempts: 3,
+                require_encryption: true,
             },
             ..ClientConfig::default()
         };
@@ -884,6 +886,7 @@ mod tests {
                 mtu: 244,
                 connect_timeout_secs: 5,
                 reconnect_max_attempts: 3,
+                require_encryption: true,
             },
             ..ClientConfig::default()
         };

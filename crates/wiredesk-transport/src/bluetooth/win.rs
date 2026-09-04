@@ -103,7 +103,7 @@ impl BluetoothLeTransport {
         // pattern; we don't pay an event-loop overhead during init since
         // we're already on a single thread here.
         let (provider, tx_char, _rx_char) =
-            build_service(service_uuid, tx, Arc::clone(&is_connected))?;
+            build_service(service_uuid, tx, Arc::clone(&is_connected), cfg.require_encryption)?;
 
         let inner = Arc::new(Inner {
             rt,
@@ -149,7 +149,23 @@ fn build_service(
     service_uuid: UuidStr,
     tx: mpsc::UnboundedSender<Result<Packet>>,
     is_connected_flag: Arc<AtomicBool>,
+    require_encryption: bool,
 ) -> Result<(GattServiceProvider, GattLocalCharacteristic, GattLocalCharacteristic)> {
+    // The wire protocol authenticates nobody: a peer that completes the
+    // handshake can inject input and open a shell. Demanding link-layer
+    // encryption makes Windows require pairing first, which is the only
+    // gate this transport has. `Plain` is kept reachable through config
+    // for setups where pairing isn't practical — it is the pre-2026-09
+    // behaviour and leaves the host open to anyone in radio range.
+    let protection = if require_encryption {
+        GattProtectionLevel::EncryptionRequired
+    } else {
+        log::warn!(
+            "BLE: characteristics published WITHOUT encryption (require_encryption = false) \
+             — any device in radio range that knows the service UUID can drive this host"
+        );
+        GattProtectionLevel::Plain
+    };
     let svc_guid = uuid_to_guid(service_uuid);
     let result = GattServiceProvider::CreateAsync(svc_guid)
         .map_err(|e| WireDeskError::Transport(format!("BLE CreateAsync: {e}")))?
@@ -168,12 +184,8 @@ fn build_service(
     tx_params
         .SetCharacteristicProperties(GattCharacteristicProperties::Notify)
         .map_err(|e| WireDeskError::Transport(format!("BLE TX SetProps: {e}")))?;
-    tx_params
-        .SetReadProtectionLevel(GattProtectionLevel::Plain)
-        .ok();
-    tx_params
-        .SetWriteProtectionLevel(GattProtectionLevel::Plain)
-        .ok();
+    tx_params.SetReadProtectionLevel(protection).ok();
+    tx_params.SetWriteProtectionLevel(protection).ok();
     let tx_char_result = service
         .CreateCharacteristicAsync(uuid_to_guid(uuids::TX_CHAR_UUID), &tx_params)
         .map_err(|e| WireDeskError::Transport(format!("BLE TX CreateChar: {e}")))?
@@ -198,6 +210,11 @@ fn build_service(
                 | GattCharacteristicProperties::WriteWithoutResponse,
         )
         .map_err(|e| WireDeskError::Transport(format!("BLE RX SetProps: {e}")))?;
+    // RX carries inbound input events and shell input — the direction that
+    // actually drives the host — yet it previously carried no protection
+    // level at all, only TX did.
+    rx_params.SetReadProtectionLevel(protection).ok();
+    rx_params.SetWriteProtectionLevel(protection).ok();
     let rx_char_result = service
         .CreateCharacteristicAsync(uuid_to_guid(uuids::RX_CHAR_UUID), &rx_params)
         .map_err(|e| WireDeskError::Transport(format!("BLE RX CreateChar: {e}")))?
@@ -450,6 +467,7 @@ mod tests {
             mtu: 247,
             connect_timeout_secs: 1,
             reconnect_max_attempts: 0,
+            require_encryption: true,
         }
     }
 

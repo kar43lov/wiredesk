@@ -33,6 +33,9 @@ pub struct BluetoothFactoryConfig {
     pub mtu: u16,
     pub connect_timeout_secs: u32,
     pub reconnect_max_attempts: u32,
+    /// Windows Peripheral only: publish characteristics as
+    /// encryption-required (forces pairing) instead of plain.
+    pub require_encryption: bool,
 }
 
 // Concrete BluetoothLeTransport is provided by exactly one of these

@@ -504,6 +504,7 @@ mod tests {
             mtu: 247,
             connect_timeout_secs: 1,
             reconnect_max_attempts: 0,
+            require_encryption: true,
         }
     }
 

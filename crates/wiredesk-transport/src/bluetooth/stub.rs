@@ -65,6 +65,7 @@ mod tests {
             mtu: 247,
             connect_timeout_secs: 2,
             reconnect_max_attempts: 0,
+            require_encryption: true,
         };
         let result = BluetoothLeTransport::open(&cfg);
         assert!(result.is_err());

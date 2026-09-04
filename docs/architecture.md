@@ -143,7 +143,9 @@ crates/wiredesk-transport/src/bluetooth/
 
 **Factory** (`crates/wiredesk-transport/src/factory.rs`): `open_transport(&TransportConfig)` switch'ит между `SerialTransport::open` и `BluetoothLeTransport::open`. На BLE failure + `transport_fallback = "serial"` — log::warn + retry serial. Unrecognised fallback strings ignored (no recurse).
 
-**Config** (`wiredesk-core::BluetoothConfig`): single source of truth для shared fields (service_uuid, peer_name, mtu, connect_timeout_secs, reconnect_max_attempts) — гарантирует идентичность между host и client.
+**Config** (`wiredesk-core::BluetoothConfig`): single source of truth для shared fields (service_uuid, peer_name, mtu, connect_timeout_secs, reconnect_max_attempts, require_encryption) — гарантирует идентичность между host и client.
+
+**Защита канала**: GATT-характеристики — обе, TX и RX — публикуются как `EncryptionRequired`, то есть Windows требует pairing прежде чем пойдут данные. Это единственная аутентификация на BLE-пути: сам протокол WireDesk не аутентифицирует никого, а пир матчится по service-UUID, который лежит константой в открытом репозитории. До 2026-09 стояло `Plain`, а на RX (входящее направление — события ввода и shell-input) protection level не выставлялся вовсе. Откат — `bluetooth.require_encryption = false`, host пишет warning. Живьём pairing ещё не проверялся.
 
 **Continent compatibility**: AC0 verified live 2026-05-06. WFP-фильтры Континента работают на IP/TCP/UDP стеке; BT-радио идёт через отдельный device-driver path и не попадает в WFP. Custom service-UUID broadcast + GATT connect/read проходят без вмешательства.
 
@@ -154,6 +156,7 @@ crates/wiredesk-transport/src/bluetooth/
 - EWMA throughput counter — deferred. Nice-to-have для bench-tool, не в AC.
 
 ---
+
 
 ## Clipboard sync
 

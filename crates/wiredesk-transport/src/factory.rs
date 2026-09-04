@@ -76,6 +76,7 @@ mod tests {
             mtu: 247,
             connect_timeout_secs: 1,
             reconnect_max_attempts: 1,
+            require_encryption: true,
         }
     }
 

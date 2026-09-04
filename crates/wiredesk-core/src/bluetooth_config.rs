@@ -33,6 +33,14 @@ pub const DEFAULT_RECONNECT_MAX_ATTEMPTS: u32 = 0;
 /// scan response payload.
 pub const DEFAULT_PEER_NAME: &str = "WireDeskHost";
 
+/// Require link-layer encryption (and therefore pairing) on the GATT
+/// characteristics. Defaults to on: the application protocol has no
+/// authentication of its own, so without this anyone in radio range who
+/// knows the service UUID — a constant in this repository — can drive the
+/// host. Turning it off restores the pre-2026-09 behaviour for a setup
+/// where pairing is impractical; see README, "Security model".
+pub const DEFAULT_REQUIRE_ENCRYPTION: bool = true;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct BluetoothConfig {
@@ -55,6 +63,11 @@ pub struct BluetoothConfig {
     /// for headless agents where you want a hard fail rather than a silent
     /// background loop).
     pub reconnect_max_attempts: u32,
+
+    /// Publish the GATT characteristics as encryption-required rather than
+    /// plain, so the peers must pair before any data flows. Windows-side
+    /// setting; the Mac Central follows whatever the host demands.
+    pub require_encryption: bool,
 }
 
 impl Default for BluetoothConfig {
@@ -65,6 +78,7 @@ impl Default for BluetoothConfig {
             mtu: DEFAULT_MTU,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             reconnect_max_attempts: DEFAULT_RECONNECT_MAX_ATTEMPTS,
+            require_encryption: DEFAULT_REQUIRE_ENCRYPTION,
         }
     }
 }
@@ -72,6 +86,24 @@ impl Default for BluetoothConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encryption_is_required_by_default() {
+        assert!(
+            BluetoothConfig::default().require_encryption,
+            "BLE must demand pairing unless explicitly opted out — the app protocol has no auth"
+        );
+    }
+
+    /// A config written before the field existed must load as
+    /// encryption-required, not as plain: a silent downgrade on upgrade
+    /// would be the worst of both worlds.
+    #[test]
+    fn missing_field_in_toml_defaults_to_required() {
+        let toml = "service_uuid = \"cc7d466c-21f3-41ba-a711-991adf9f218e\"\nmtu = 244\n";
+        let cfg: BluetoothConfig = toml::from_str(toml).expect("parse");
+        assert!(cfg.require_encryption);
+    }
 
     #[test]
     fn defaults_match_constants() {
@@ -101,6 +133,7 @@ mod tests {
             mtu: 244,
             connect_timeout_secs: 5,
             reconnect_max_attempts: 3,
+            require_encryption: false,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: BluetoothConfig = toml::from_str(&s).unwrap();
