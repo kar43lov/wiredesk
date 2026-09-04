@@ -191,10 +191,34 @@ mod imp {
             true
         }
     }
+
+    /// Hide (or restore) the menu bar and Dock.
+    ///
+    /// `NSApplicationPresentationHideMenuBar` (1 << 3) plus
+    /// `NSApplicationPresentationHideDock` (1 << 1). AppKit rejects
+    /// HideMenuBar without HideDock, so the two always travel together.
+    ///
+    /// This is a no-op under native fullscreen — the documented dead end
+    /// behind the "menu bar reveal" limitation — but works for a borderless
+    /// window covering a display, which is how fullscreen is implemented now.
+    pub fn set_presentation_hidden(hidden: bool) {
+        const HIDE_DOCK: usize = 1 << 1;
+        const HIDE_MENU_BAR: usize = 1 << 3;
+
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let options: usize = if hidden { HIDE_DOCK | HIDE_MENU_BAR } else { 0 };
+            let _: () = msg_send![app, setPresentationOptions: options];
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
+    pub fn set_presentation_hidden(_hidden: bool) {}
     pub fn real_outer_rect() -> Option<(f32, f32, f32, f32)> {
         None
     }
@@ -207,7 +231,9 @@ mod imp {
     }
 }
 
-pub use imp::{bring_to_current_space, diagnostics, real_outer_rect, set_outer_rect};
+pub use imp::{
+    bring_to_current_space, diagnostics, real_outer_rect, set_outer_rect, set_presentation_hidden,
+};
 
 /// Convert an AppKit window origin (y-up, from the bottom of the primary
 /// screen) into winit's y-down top-left origin.

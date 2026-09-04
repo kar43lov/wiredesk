@@ -1123,8 +1123,7 @@ impl WireDeskApp {
             let target = monitor::resolve_target_monitor(preferred, &monitors);
             match target {
                 Some(m) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(m.frame.min));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    self.enter_borderless_fullscreen(ctx, m.frame.min, m.frame.size());
                 }
                 None => {
                     // runtime_preferred_monitor was Some(name) but no live
@@ -1142,7 +1141,23 @@ impl WireDeskApp {
                             Instant::now(),
                         ));
                     }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    // No resolvable monitor: cover whichever display currently
+                    // holds the window, falling back to the primary.
+                    let here = self
+                        .pre_fullscreen_geometry
+                        .map(|(pos, _)| pos)
+                        .unwrap_or(egui::Pos2::ZERO);
+                    let monitors = monitor::list_monitors();
+                    let host = monitors
+                        .iter()
+                        .find(|m| m.frame.contains(here))
+                        .or_else(|| monitors.first());
+                    match host {
+                        Some(m) => {
+                            self.enter_borderless_fullscreen(ctx, m.frame.min, m.frame.size())
+                        }
+                        None => ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true)),
+                    }
                 }
             }
             // Going fullscreen implies "I want to drive the Host" — auto-engage
@@ -1160,9 +1175,45 @@ impl WireDeskApp {
             if self.capturing {
                 self.toggle_capture();
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            self.queue_position_restore(ctx);
+            self.exit_borderless_fullscreen(ctx);
         }
+    }
+
+    /// Cover a monitor without asking macOS for a native fullscreen Space.
+    ///
+    /// Native fullscreen moves the window into its own Space, and when that
+    /// Space collapses on exit the window can be left assigned to it: the
+    /// WindowServer stops listing it, nothing paints, yet AppKit still
+    /// reports `isVisible = true` at the right coordinates. Verified live on
+    /// 2026-09-04 — the window was simply absent from `CGWindowListCopyWindowInfo`
+    /// while `NSWindow` insisted it was fine. No amount of ordering or
+    /// re-positioning fixes that from inside the app, because Space
+    /// filtering happens after level sorting.
+    ///
+    /// Undecorated + monitor-sized sidesteps Spaces entirely. It also lets
+    /// `HideMenuBar` work, which native fullscreen ignores.
+    fn enter_borderless_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        size: egui::Vec2,
+    ) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        mac_window::set_presentation_hidden(true);
+    }
+
+    /// Undo [`Self::enter_borderless_fullscreen`] and put the window back.
+    fn exit_borderless_fullscreen(&mut self, ctx: &egui::Context) {
+        mac_window::set_presentation_hidden(false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        // Belt and braces: a native fullscreen entered outside our control
+        // (⌃⌘F, the green button while decorations were on) still has to be
+        // cleared, and this is a no-op when we were borderless.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        self.queue_position_restore(ctx);
     }
 
     /// Snapshot the current outer position + inner size as the place to
