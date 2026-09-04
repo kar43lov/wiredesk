@@ -1,7 +1,9 @@
-//! macOS menu bar status item — the WireDesk glyph, plus clipboard
-//! transfer progress ("↓ 43%" / "↑ 67%") so the user sees a transfer
-//! without bringing the window to front. Lives on the right-hand side of
-//! the system menu bar.
+//! Status area item — the WireDesk glyph plus clipboard transfer progress
+//! ("↓ 43%" / "↑ 67%"), so the user sees a transfer without bringing the
+//! window to front. The macOS menu bar and the Windows notification area
+//! serve the same purpose and get the same numbers; where they differ is
+//! that a menu bar item can show text next to its icon and a tray icon
+//! cannot, so on Windows the progress goes into the tooltip.
 //!
 //! ## Threading
 //!
@@ -9,6 +11,11 @@
 //! main thread. We spawn a background `std::thread` that polls the four
 //! `Arc<AtomicU64>` progress counters every 250 ms and dispatches the
 //! resulting title string to the main queue via `dispatch_async_f`.
+//!
+//! Windows has the mirror-image constraint: `Shell_NotifyIconW` wants the
+//! *same* thread that owns the window it was registered with, so the tray
+//! thread owns a message-only window and does its own polling loop rather
+//! than hopping anywhere.
 //!
 //! Pure helper [`format_status_bar_title`] is unit-tested cross-platform;
 //! the AppKit wiring is `#[cfg(target_os = "macos")]`.
@@ -132,7 +139,7 @@ mod macos {
         // once a transfer starts.
         set_item_image(&item);
         set_item_title(&item, "");
-        set_item_tooltip(&item, "WireDesk");
+        set_item_tooltip(&item, super::MENU_BAR_ICON_TOOLTIP);
 
         // Smuggle the NSStatusItem pointer + counters into a polling
         // thread. The pointer itself is `Send`-unsafe (AppKit objects are
@@ -284,6 +291,373 @@ mod macos {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    //! Notification-area ("tray") icon.
+    //!
+    //! ## Why its own thread and window
+    //!
+    //! `Shell_NotifyIconW` identifies an icon by `(hwnd, uid)` and delivers
+    //! its callbacks to that window's thread. eframe owns the main thread,
+    //! so the icon gets a message-only window (`HWND_MESSAGE`) on a thread
+    //! of its own, which also lets the progress poll live there instead of
+    //! costing the UI thread a wake-up every 250 ms.
+    //!
+    //! ## Icon source
+    //!
+    //! The `.ico` is embedded with `include_bytes!` and decoded at runtime
+    //! via `CreateIconFromResourceEx`, rather than loaded from the binary's
+    //! resource section. The resource section only exists when the build
+    //! host had `rc.exe`/`windres` (see `build.rs`), so a Mac-cross-built
+    //! `.exe` would otherwise show the generic default icon.
+
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+        NOTIFYICONDATAW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
+        DispatchMessageW, GetSystemMetrics, PeekMessageW, PostQuitMessage, RegisterClassW,
+        TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR, MSG, PM_REMOVE, SM_CXSMICON,
+        SM_CYSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY, WNDCLASSW,
+    };
+
+    use super::{format_status_bar_title, StatusBarCounters, MENU_BAR_ICON_TOOLTIP};
+
+    /// Same `.ico` the executable and the host tray use — one icon for the
+    /// whole product.
+    const APP_ICON_ICO: &[u8] = include_bytes!("../../../assets/app-icon.ico");
+
+    /// Arbitrary per-window id for our single icon; only has to be stable
+    /// between `NIM_ADD` and `NIM_DELETE`.
+    const TRAY_UID: u32 = 1;
+
+    /// Callback message the shell sends us for clicks. Unused today (the
+    /// macOS item has no click handler either) but required by `NIF_MESSAGE`,
+    /// and picking a `WM_APP`-based value keeps it out of the system range.
+    const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
+
+    /// Keep-alive token: dropping it removes the icon and stops the thread.
+    pub struct StatusBarHandle {
+        stop_tx: mpsc::Sender<()>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for StatusBarHandle {
+        fn drop(&mut self) {
+            let _ = self.stop_tx.send(());
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    /// Create the tray icon and start polling the transfer counters.
+    ///
+    /// Returns `None` if the window class, window, or icon could not be
+    /// created — the app is perfectly usable without a tray icon, so every
+    /// failure here is logged and swallowed.
+    pub fn init(counters: StatusBarCounters) -> Option<StatusBarHandle> {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<bool>();
+
+        let join = thread::Builder::new()
+            .name("wiredesk-tray".into())
+            .spawn(move || {
+                let Some(state) = TrayState::create() else {
+                    let _ = ready_tx.send(false);
+                    return;
+                };
+                let _ = ready_tx.send(true);
+                state.run(counters, stop_rx);
+            })
+            .ok()?;
+
+        // Block until the icon exists (or failed), so `init` reports the
+        // truth to its caller rather than an optimistic handle.
+        match ready_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(true) => Some(StatusBarHandle {
+                stop_tx,
+                join: Some(join),
+            }),
+            Ok(false) => None,
+            Err(_) => {
+                log::warn!("status bar: tray thread did not report readiness");
+                None
+            }
+        }
+    }
+
+    /// Everything the tray thread owns. Confined to that thread — Win32
+    /// handles are not `Send` and `Shell_NotifyIconW` is thread-affine.
+    struct TrayState {
+        hwnd: HWND,
+        icon: HICON,
+    }
+
+    impl TrayState {
+        fn create() -> Option<Self> {
+            let class_name: Vec<u16> = "WireDeskTrayWindow\0".encode_utf16().collect();
+            let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }.ok()?.into();
+
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(wnd_proc),
+                hInstance: hinstance,
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
+            // A zero return means the class could not be registered; a
+            // duplicate registration is only possible if init ran twice,
+            // which main.rs does not do.
+            if unsafe { RegisterClassW(&class) } == 0 {
+                log::warn!("status bar: RegisterClassW failed");
+                return None;
+            }
+
+            // HWND_MESSAGE: invisible, never activated, exists purely to
+            // receive the shell's callbacks.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR(class_name.as_ptr()),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    None,
+                    hinstance,
+                    None,
+                )
+            }
+            .ok()?;
+
+            let icon = load_tray_icon().unwrap_or_default();
+            let mut data = notify_data(hwnd, icon, MENU_BAR_ICON_TOOLTIP);
+            data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+                log::warn!("status bar: Shell_NotifyIconW(NIM_ADD) failed");
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                    if !icon.is_invalid() {
+                        let _ = DestroyIcon(icon);
+                    }
+                }
+                return None;
+            }
+            Some(Self { hwnd, icon })
+        }
+
+        /// Poll the counters and keep the tooltip in step, pumping messages
+        /// in between so the shell's callbacks are serviced.
+        fn run(self, counters: StatusBarCounters, stop_rx: mpsc::Receiver<()>) {
+            let mut last_tip = String::new();
+            loop {
+                // Non-blocking pump: this thread has to stay responsive to
+                // both the message queue and the stop channel, and blocking
+                // in GetMessageW would starve the latter.
+                let mut msg = MSG::default();
+                while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+
+                let out_p = counters.outgoing_progress.load(Ordering::Relaxed);
+                let out_t = counters.outgoing_total.load(Ordering::Relaxed);
+                let in_p = counters.incoming_progress.load(Ordering::Relaxed);
+                let in_t = counters.incoming_total.load(Ordering::Relaxed);
+                let tip = super::tray_tooltip(format_status_bar_title(out_p, out_t, in_p, in_t));
+                if tip != last_tip {
+                    let mut data = notify_data(self.hwnd, self.icon, &tip);
+                    data.uFlags = NIF_TIP;
+                    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+                        log::debug!("status bar: NIM_MODIFY failed (icon removed?)");
+                    }
+                    last_tip = tip;
+                }
+
+                match stop_rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+
+            let data = notify_data(self.hwnd, self.icon, "");
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+                let _ = DestroyWindow(self.hwnd);
+                if !self.icon.is_invalid() {
+                    let _ = DestroyIcon(self.icon);
+                }
+            }
+        }
+    }
+
+    /// Fill in the parts of `NOTIFYICONDATAW` that never vary; the caller
+    /// sets `uFlags` to say which of them this particular call means.
+    fn notify_data(hwnd: HWND, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_UID,
+            uCallbackMessage: WM_TRAY_CALLBACK,
+            hIcon: icon,
+            ..Default::default()
+        };
+        // szTip is a fixed 128-wchar array including the NUL, so a long
+        // string is truncated rather than overflowing.
+        let wide: Vec<u16> = tip.encode_utf16().take(data.szTip.len() - 1).collect();
+        data.szTip[..wide.len()].copy_from_slice(&wide);
+        data
+    }
+
+    /// Decode the embedded `.ico` into an `HICON` at the shell's small-icon
+    /// size.
+    fn load_tray_icon() -> Option<HICON> {
+        let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
+        let (offset, len) = super::pick_ico_image(APP_ICON_ICO, want)?;
+        let height = unsafe { GetSystemMetrics(SM_CYSMICON) }.max(16) as u32;
+        // 0x00030000 is the ICO/CUR resource version every .ico file uses;
+        // `fIcon = true` selects icon (as opposed to cursor) semantics.
+        let icon = unsafe {
+            CreateIconFromResourceEx(
+                &APP_ICON_ICO[offset..offset + len],
+                true,
+                0x0003_0000,
+                want as i32,
+                height as i32,
+                LR_DEFAULTCOLOR,
+            )
+        };
+        match icon {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::warn!("status bar: CreateIconFromResourceEx failed: {e}");
+                None
+            }
+        }
+    }
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_DESTROY => {
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+            // Clicks land here. Deliberately ignored for now — the macOS
+            // item has no click handler either (see the module TODO).
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+}
+
+/// Tooltip / accessibility name for the status item on both platforms.
+const MENU_BAR_ICON_TOOLTIP: &str = "WireDesk";
+
+/// Compose the Windows tray tooltip from the shared progress string.
+///
+/// A tray icon has no room for text beside it, so the percentages that the
+/// macOS menu bar shows inline go into the tooltip instead: "WireDesk" when
+/// idle, "WireDesk — ↑ 43%" during a transfer.
+// Used by the Windows tray loop and by the tests on every platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn tray_tooltip(progress: String) -> String {
+    if progress.is_empty() {
+        MENU_BAR_ICON_TOOLTIP.to_string()
+    } else {
+        format!("{MENU_BAR_ICON_TOOLTIP} — {progress}")
+    }
+}
+
+/// Locate the image inside a `.ico` container that best matches `desired`
+/// pixels, returning its `(offset, length)` byte range.
+///
+/// `.ico` is a directory of independently-encoded images; Win32's
+/// `CreateIconFromResourceEx` wants one of those images, not the container.
+/// Prefers an exact size match, then the smallest image that is still at
+/// least `desired` (scaling down beats scaling up), and falls back to the
+/// largest available.
+///
+/// Returns `None` if the header is malformed or any entry points outside
+/// the buffer — a truncated asset must not become an out-of-bounds slice.
+// Used by the Windows tray loader and by the tests on every platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn pick_ico_image(ico: &[u8], desired: u32) -> Option<(usize, usize)> {
+    const HEADER: usize = 6;
+    const ENTRY: usize = 16;
+
+    if ico.len() < HEADER {
+        return None;
+    }
+    // Reserved must be 0 and type must be 1 (icon, not cursor).
+    if u16::from_le_bytes([ico[0], ico[1]]) != 0 || u16::from_le_bytes([ico[2], ico[3]]) != 1 {
+        return None;
+    }
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    if count == 0 || ico.len() < HEADER + count * ENTRY {
+        return None;
+    }
+
+    let mut best: Option<(u32, usize, usize)> = None;
+    for i in 0..count {
+        let e = HEADER + i * ENTRY;
+        // Width/height of 0 means 256 in the .ico format.
+        let width = match ico[e] {
+            0 => 256u32,
+            w => w as u32,
+        };
+        let len = u32::from_le_bytes([ico[e + 8], ico[e + 9], ico[e + 10], ico[e + 11]]) as usize;
+        let offset =
+            u32::from_le_bytes([ico[e + 12], ico[e + 13], ico[e + 14], ico[e + 15]]) as usize;
+        if len == 0 || offset.checked_add(len).is_none_or(|end| end > ico.len()) {
+            continue;
+        }
+        best = Some(match best {
+            None => (width, offset, len),
+            Some(current) => pick_better(current, (width, offset, len), desired),
+        });
+    }
+    best.map(|(_, offset, len)| (offset, len))
+}
+
+/// Ranking rule behind [`pick_ico_image`], split out so the preference order
+/// is testable on its own: exact match wins; otherwise the smallest image
+/// that is still ≥ desired; otherwise the largest one available.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn pick_better(
+    current: (u32, usize, usize),
+    candidate: (u32, usize, usize),
+    desired: u32,
+) -> (u32, usize, usize) {
+    let score = |w: u32| match w.cmp(&desired) {
+        std::cmp::Ordering::Equal => (0u8, 0u32),
+        std::cmp::Ordering::Greater => (1, w - desired),
+        std::cmp::Ordering::Less => (2, desired - w),
+    };
+    if score(candidate.0) < score(current.0) {
+        candidate
+    } else {
+        current
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::init;
 // `StatusBarHandle` is the keep-alive token for the NSStatusItem. main.rs
@@ -295,14 +669,20 @@ pub use macos::init;
 #[allow(unused_imports)]
 pub use macos::StatusBarHandle;
 
-/// Stub for non-macOS builds — the workspace compiles on Linux/Windows
-/// for cross-checks, but the status bar is a no-op there.
-#[cfg(not(target_os = "macos"))]
+// `StatusBarHandle` is the keep-alive token; main.rs leaks it deliberately
+// (see the macOS note above), so nothing else names the type.
+#[cfg(target_os = "windows")]
+#[allow(unused_imports)]
+pub use windows_impl::{init, StatusBarHandle};
+
+/// Stub for platforms with neither a menu bar nor a notification area — the
+/// workspace still compiles there for cross-checks.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn init(_counters: StatusBarCounters) -> Option<StatusBarHandle> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub struct StatusBarHandle;
 
 #[cfg(test)]
@@ -362,6 +742,91 @@ mod tests {
             "asset looks truncated: {} bytes",
             bytes.len()
         );
+    }
+
+    // --- Windows tray helpers (pure, tested on every platform) ---------
+
+    const APP_ICO: &[u8] = include_bytes!("../../../assets/app-icon.ico");
+
+    #[test]
+    fn tray_tooltip_is_plain_name_when_idle() {
+        assert_eq!(tray_tooltip(String::new()), "WireDesk");
+    }
+
+    #[test]
+    fn tray_tooltip_appends_progress() {
+        let tip = tray_tooltip("\u{2191} 43%".to_string());
+        assert!(tip.starts_with("WireDesk"), "{tip}");
+        assert!(tip.contains("43%"), "{tip}");
+    }
+
+    #[test]
+    fn tray_tooltip_fits_the_win32_field() {
+        // szTip holds 128 wchars including the NUL. Even a two-direction
+        // transfer must stay well inside that.
+        let tip = tray_tooltip(format_status_bar_title(43, 100, 67, 100));
+        assert!(tip.encode_utf16().count() < 127, "tooltip too long: {tip}");
+    }
+
+    #[test]
+    fn pick_ico_prefers_exact_size() {
+        // The asset carries 16/32/48/256 px images; asking for the shell's
+        // usual small-icon size must select the 16 px one, whose byte range
+        // matches what the .ico directory advertises.
+        let (offset, len) = pick_ico_image(APP_ICO, 16).expect("16px image");
+        assert_eq!(offset, 70);
+        assert_eq!(len, 916);
+    }
+
+    #[test]
+    fn pick_ico_rounds_up_then_down() {
+        // 20 px: no exact match, so the smallest image at least that big
+        // (32 px) wins — downscaling looks better than upscaling.
+        let (offset, _) = pick_ico_image(APP_ICO, 20).expect("32px image");
+        assert_eq!(offset, 986);
+        // 512 px: nothing is big enough, so the largest available wins.
+        let (offset, _) = pick_ico_image(APP_ICO, 512).expect("256px image");
+        assert_eq!(offset, 7236);
+    }
+
+    #[test]
+    fn pick_ico_rejects_malformed_headers() {
+        assert_eq!(pick_ico_image(&[], 16), None);
+        assert_eq!(pick_ico_image(&[0, 0, 1, 0], 16), None, "truncated header");
+        // type 2 = cursor, not icon
+        assert_eq!(pick_ico_image(&[0, 0, 2, 0, 1, 0], 16), None);
+        // count = 0
+        assert_eq!(pick_ico_image(&[0, 0, 1, 0, 0, 0], 16), None);
+    }
+
+    #[test]
+    fn pick_ico_rejects_entry_pointing_past_the_buffer() {
+        // One entry, 16×16, claiming 4096 bytes at offset 22 in a 22-byte
+        // file. Slicing that range would panic; the picker must refuse.
+        let mut ico = vec![0u8, 0, 1, 0, 1, 0];
+        ico.extend_from_slice(&[16, 16, 0, 0, 1, 0, 32, 0]);
+        ico.extend_from_slice(&4096u32.to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes());
+        assert_eq!(ico.len(), 22);
+        assert_eq!(pick_ico_image(&ico, 16), None);
+    }
+
+    #[test]
+    fn pick_ico_treats_zero_width_as_256() {
+        // The .ico format encodes 256 as a width byte of 0; a naive reader
+        // would rank it as the smallest image instead of the largest.
+        let mut ico = vec![0u8, 0, 1, 0, 2, 0];
+        // entry 0: 256×256 (width byte 0), 4 bytes at offset 38
+        ico.extend_from_slice(&[0, 0, 0, 0, 1, 0, 32, 0]);
+        ico.extend_from_slice(&4u32.to_le_bytes());
+        ico.extend_from_slice(&38u32.to_le_bytes());
+        // entry 1: 16×16, 4 bytes at offset 42
+        ico.extend_from_slice(&[16, 16, 0, 0, 1, 0, 32, 0]);
+        ico.extend_from_slice(&4u32.to_le_bytes());
+        ico.extend_from_slice(&42u32.to_le_bytes());
+        ico.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(pick_ico_image(&ico, 16), Some((42, 4)), "16px must win");
+        assert_eq!(pick_ico_image(&ico, 256), Some((38, 4)), "256px must win");
     }
 
     #[test]

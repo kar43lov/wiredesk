@@ -206,6 +206,14 @@ pub struct WireDeskApp {
     // plenty for a UI that's already gated behind an open settings panel,
     // and avoids hammering the call at 60 FPS while the panel just sits open.
     cached_monitors: Vec<monitor::MonitorInfo>,
+    /// Keep-alive for the Windows tray icon. Dropping it removes the icon
+    /// and joins its thread, so parking it in `App` means the icon
+    /// disappears when the window closes instead of lingering in the
+    /// notification area until the user waves the mouse over it. macOS
+    /// keeps using the leak in `main.rs` — an `NSStatusItem` goes away with
+    /// the process either way.
+    #[cfg(target_os = "windows")]
+    status_bar: Option<crate::status_bar::StatusBarHandle>,
     cached_monitors_at: Option<Instant>,
     // Sticky banner shown when an entered fullscreen fell back to "current
     // display" because the saved `preferred_monitor` name doesn't match any
@@ -301,6 +309,11 @@ pub struct WireDeskApp {
     /// Karabiner-Elements `left_command ↔ left_option` compensation. Shared
     /// with the keyboard tap thread; flipping the Settings checkbox takes
     /// effect on the next FlagsChanged / KeyDown the tap sees.
+    ///
+    /// macOS-only in practice: the Windows hook ignores the flag and the
+    /// Settings checkbox is hidden there, but the field stays so the value
+    /// survives a config round-trip on either platform.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     swap_option_command: Arc<AtomicBool>,
     /// User-pressed Cancel for the outgoing transfer. Shared with the
     /// writer thread, which drops queued ClipOffer/ClipChunk packets while
@@ -526,6 +539,8 @@ impl WireDeskApp {
             available_ports: Vec::new(),
             cached_monitors: Vec::new(),
             cached_monitors_at: None,
+            #[cfg(target_os = "windows")]
+            status_bar: None,
             monitor_fallback_msg: None,
             pre_fullscreen_geometry: None,
             fullscreen_cmd_at: None,
@@ -929,29 +944,35 @@ impl WireDeskApp {
                         dirty = true;
                     }
                 });
-                let mut swap_oc = cfg.swap_option_command;
-                if ui
-                    .checkbox(
-                        &mut swap_oc,
-                        "Swap ⌥/⌘ on Host (Karabiner-Elements compensation)",
-                    )
-                    .changed()
+                // Karabiner-Elements is a macOS tool; on Windows nothing
+                // remaps modifiers below the OS, so the toggle would be a
+                // switch that does nothing.
+                #[cfg(target_os = "macos")]
                 {
-                    cfg.swap_option_command = swap_oc;
-                    self.swap_option_command.store(swap_oc, Ordering::Relaxed);
-                    dirty = true;
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Enable if you remap left_command ↔ left_option in \
+                    let mut swap_oc = cfg.swap_option_command;
+                    if ui
+                        .checkbox(
+                            &mut swap_oc,
+                            "Swap ⌥/⌘ on Host (Karabiner-Elements compensation)",
+                        )
+                        .changed()
+                    {
+                        cfg.swap_option_command = swap_oc;
+                        self.swap_option_command.store(swap_oc, Ordering::Relaxed);
+                        dirty = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Enable if you remap left_command ↔ left_option in \
                          Karabiner-Elements so the same physical keyboard \
                          works on macOS and Windows. Without this WireDesk \
                          forwards Cmd+V as Alt+V to Host. Cmd+Esc / Cmd+Enter \
                          keep firing on the same physical key you press today.",
-                    )
-                    .small()
-                    .color(egui::Color32::GRAY),
-                );
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                }
             });
 
             ui.horizontal(|ui| {
@@ -1202,12 +1223,26 @@ impl WireDeskApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // Windows keeps the taskbar above an ordinary window even when that
+        // window covers the whole display — the shell only yields to a
+        // window it recognises as fullscreen, which a borderless one is not.
+        // Raising the level is the standard way out; it is undone on exit.
+        #[cfg(target_os = "windows")]
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::viewport::WindowLevel::AlwaysOnTop,
+        ));
+        // macOS hides the menu bar and Dock instead, which native fullscreen
+        // refuses to do for a window that hides them itself.
         mac_window::set_presentation_hidden(true);
     }
 
     /// Undo [`Self::enter_borderless_fullscreen`] and put the window back.
     fn exit_borderless_fullscreen(&mut self, ctx: &egui::Context) {
         mac_window::set_presentation_hidden(false);
+        #[cfg(target_os = "windows")]
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::viewport::WindowLevel::Normal,
+        ));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         // Belt and braces: a native fullscreen entered outside our control
         // (⌃⌘F, the green button while decorations were on) still has to be
@@ -1336,6 +1371,13 @@ impl WireDeskApp {
 
     #[cfg(not(target_os = "macos"))]
     fn reapply_dock_icon_if_needed(&mut self) {}
+
+    /// Hand the tray-icon keep-alive to the app so the icon lives exactly as
+    /// long as the window does. Called once, from the eframe creator.
+    #[cfg(target_os = "windows")]
+    pub fn attach_status_bar(&mut self, handle: Option<crate::status_bar::StatusBarHandle>) {
+        self.status_bar = handle;
+    }
 
     /// Sample the window rectangle and persist it once it settles.
     ///
@@ -2252,10 +2294,11 @@ impl eframe::App for WireDeskApp {
 
         // Handle captured input — push to outgoing channel (non-blocking).
         if self.capturing && self.state == ConnectionState::Connected {
-            // When the OS-level keyboard tap is active (macOS + permission),
-            // it's the sole source of key events — skip egui forwarding to
-            // avoid double KeyDown. Mouse always goes through egui (the tap
-            // only intercepts keyboard).
+            // When the OS-level keyboard hijack is running (a CGEventTap on
+            // macOS, a low-level hook on Windows) it is the sole source of
+            // key events — skip egui forwarding to avoid double KeyDown.
+            // Mouse always goes through egui: neither platform's keyboard
+            // interception touches pointer events.
             let tap_owns_keys = self
                 .tap_handle
                 .as_ref()

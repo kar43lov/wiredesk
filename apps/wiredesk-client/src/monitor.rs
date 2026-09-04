@@ -1,9 +1,10 @@
-//! Physical monitor enumeration via `NSScreen` (macOS) — for «Display X»
-//! selection in Settings + per-monitor fullscreen orchestration.
+//! Physical monitor enumeration — for «Display X» selection in Settings +
+//! per-monitor fullscreen orchestration. `NSScreen` on macOS,
+//! `EnumDisplayMonitors` on Windows.
 //!
-//! On non-macOS targets [`list_monitors`] returns an empty `Vec` (we don't
-//! ship a Linux/Windows client today, but keeping the module cross-platform
-//! avoids `#[cfg]` noise at the call sites).
+//! On every other target [`list_monitors`] returns an empty `Vec`, which the
+//! callers already treat as "fullscreen on whatever display holds the
+//! window".
 //!
 //! ## Coordinate-system note (macOS)
 //!
@@ -24,6 +25,24 @@
 //! the primary (positive Y in NSScreen) would be rendered with a negative
 //! winit Y — wrong direction — and `OuterPosition` would land on the
 //! wrong physical display before fullscreen kicks in.
+//!
+//! ## Coordinate-system note (Windows)
+//!
+//! Win32 already uses top-left y-down, so there is no flip. What there *is*
+//! instead is DPI: `GetMonitorInfoW` reports **physical** pixels, while
+//! `ViewportCommand::OuterPosition` multiplies what we give it by the
+//! window's `pixels_per_point` before handing it to winit. So we divide each
+//! monitor's rectangle by that monitor's own scale factor
+//! (`GetDpiForMonitor / 96`), which round-trips exactly as long as the
+//! window's scale matches the target monitor's.
+//!
+//! Mixed-DPI caveat: with two monitors at different scaling (say 100% and
+//! 150%), the window's `pixels_per_point` still belongs to the display it is
+//! *leaving*, so the computed position is off by the ratio between the two
+//! scales and fullscreen can land on the wrong display. Documented in
+//! `docs/known-limitations.md`; the fix would be for the fullscreen path to
+//! carry physical pixels end-to-end, which is a larger change than this
+//! module.
 
 #![allow(dead_code)]
 
@@ -36,13 +55,16 @@ use eframe::egui;
 /// "Display N — Name (W×H)" labels in the Settings combo-box.
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
-    /// Index in the `NSScreen::screens()` array at enumeration time. Useful
-    /// only for "Display N" labels — the index is **not** stable across
-    /// reboots, dock events, or hot-plugs, so config persistence keys off
-    /// the human-readable `name` instead.
+    /// Position in the enumeration order at snapshot time (primary display
+    /// first, then left-to-right, top-to-bottom). Useful only for
+    /// "Display N" labels — the index is **not** stable across reboots,
+    /// dock events, or hot-plugs, so config persistence keys off the
+    /// human-readable `name` instead.
     pub index: usize,
-    /// Human-readable name from `NSScreen.localizedName` ("Studio Display",
-    /// "Built-in Retina Display", …). This is the persistence key for
+    /// Human-readable name: `NSScreen.localizedName` on macOS ("Studio
+    /// Display", "Built-in Retina Display", …), the monitor's
+    /// `EnumDisplayDevicesW` device string on Windows ("Generic PnP
+    /// Monitor", "DELL U2720Q", …). This is the persistence key for
     /// `ClientConfig::preferred_monitor` — survives reboots, robust against
     /// re-ordering. Best-effort against renames in System Settings; if the
     /// user renames the display the saved preference falls back to "active
@@ -109,9 +131,175 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows implementation: `EnumDisplayMonitors` for the rectangles,
+/// `GetDpiForMonitor` for the per-display scale factor, and
+/// `EnumDisplayDevicesW` for a name a human recognises.
+///
+/// Unlike `NSScreen::screens()`, `EnumDisplayMonitors` promises no
+/// particular order — not even that the primary display comes first — so
+/// [`order_monitors`] sorts the snapshot before indices are assigned.
+///
+/// Safe to call from any thread (unlike the macOS path); it is only ever
+/// called from `update()` in practice.
+#[cfg(target_os = "windows")]
+pub fn list_monitors() -> Vec<MonitorInfo> {
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR,
+        MONITORINFOEXW,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    // Lives under WindowsAndMessaging in windows-rs 0.58, not Gdi, even
+    // though the flag belongs to MONITORINFO.
+    use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+
+    /// Callback accumulator — `EnumDisplayMonitors` hands us one display at
+    /// a time through an `LPARAM`, so the Vec lives on the caller's stack
+    /// and is reached through a raw pointer.
+    unsafe extern "system" fn collect(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let out = unsafe { &mut *(lparam.0 as *mut Vec<RawMonitor>) };
+
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        // GetMonitorInfoW takes a MONITORINFO*; MONITORINFOEXW is the same
+        // struct with the device-name array appended, which is exactly how
+        // the API is meant to be called (cbSize tells it which one it got).
+        let ok = unsafe { GetMonitorInfoW(hmon, std::ptr::addr_of_mut!(info) as *mut _) };
+        if !ok.as_bool() {
+            // Skip this display rather than abort the enumeration — one
+            // unreadable monitor should not cost us the others.
+            return TRUE;
+        }
+
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        // A failure here is not fatal: 96 DPI (scale 1.0) is the right
+        // fallback and matches what a DPI-unaware process would see.
+        let _ = unsafe { GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+
+        let device = wide_to_string(&info.szDevice);
+        out.push(RawMonitor {
+            rect: info.monitorInfo.rcMonitor,
+            dpi: dpi_x.max(1),
+            primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            name: monitor_device_name(&device).unwrap_or(device),
+        });
+        TRUE
+    }
+
+    /// Resolve `\\.\DISPLAY1` into whatever the monitor calls itself.
+    ///
+    /// `EnumDisplayDevicesW` on an adapter name enumerates the monitors
+    /// attached to it; index 0 is the one we want. Returns `None` when the
+    /// call fails or the string is empty, so the caller can fall back to
+    /// the adapter name.
+    fn monitor_device_name(adapter: &str) -> Option<String> {
+        use windows::core::PCWSTR;
+
+        let wide: Vec<u16> = adapter.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut dd = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut dd, 0) };
+        if !ok.as_bool() {
+            return None;
+        }
+        let name = wide_to_string(&dd.DeviceString);
+        (!name.is_empty()).then_some(name)
+    }
+
+    let mut raw: Vec<RawMonitor> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(std::ptr::addr_of_mut!(raw) as isize),
+        )
+    };
+    if !ok.as_bool() {
+        log::warn!("monitor: EnumDisplayMonitors failed; returning empty list");
+        return Vec::new();
+    }
+    order_monitors(raw)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn list_monitors() -> Vec<MonitorInfo> {
     Vec::new()
+}
+
+/// One display as Win32 reports it, before ordering and DPI conversion.
+/// Split out from [`list_monitors`] so the ordering and scaling logic is
+/// testable on any platform.
+#[derive(Debug, Clone)]
+pub struct RawMonitor {
+    /// Rectangle in **physical** pixels of the virtual desktop.
+    pub rect: PhysRect,
+    /// Effective DPI of this display; 96 means scale 1.0.
+    pub dpi: u32,
+    /// Whether Windows marks this as the primary display.
+    pub primary: bool,
+    pub name: String,
+}
+
+/// Platform-independent stand-in for Win32's `RECT`, so [`order_monitors`]
+/// can be exercised without the `windows` crate.
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhysRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+#[cfg(target_os = "windows")]
+pub type PhysRect = windows::Win32::Foundation::RECT;
+
+/// Sort a raw snapshot into a stable order and convert it to egui points.
+///
+/// Order: primary display first, then by `top`, then by `left`. Win32
+/// enumerates in an order that depends on the graphics driver and can
+/// change between boots; without this, "Display 1" in Settings would drift.
+/// Conversion: physical pixels ÷ (dpi / 96), matching what
+/// `ViewportCommand::OuterPosition` expects (see module docs).
+pub fn order_monitors(mut raw: Vec<RawMonitor>) -> Vec<MonitorInfo> {
+    raw.sort_by(|a, b| {
+        b.primary
+            .cmp(&a.primary)
+            .then(a.rect.top.cmp(&b.rect.top))
+            .then(a.rect.left.cmp(&b.rect.left))
+    });
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, m)| {
+            let scale = m.dpi as f32 / 96.0;
+            let origin = egui::Pos2::new(m.rect.left as f32 / scale, m.rect.top as f32 / scale);
+            let size = egui::Vec2::new(
+                (m.rect.right - m.rect.left) as f32 / scale,
+                (m.rect.bottom - m.rect.top) as f32 / scale,
+            );
+            MonitorInfo {
+                index,
+                name: m.name,
+                frame: egui::Rect::from_min_size(origin, size),
+            }
+        })
+        .collect()
+}
+
+/// Decode a fixed-size, NUL-padded UTF-16 buffer as Win32 hands them out.
+#[cfg(target_os = "windows")]
+fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
 }
 
 /// Convert an NSScreen y-coordinate (bottom-left y-up) to winit's top-left
@@ -383,9 +571,95 @@ mod tests {
         assert_eq!(secondary + 1440.0, primary);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
-    fn list_monitors_non_macos_returns_empty() {
+    fn list_monitors_unsupported_platform_returns_empty() {
         assert!(list_monitors().is_empty());
+    }
+
+    // --- Windows ordering / DPI conversion (pure, tested everywhere) ----
+
+    fn raw(name: &str, l: i32, t: i32, r: i32, b: i32, dpi: u32, primary: bool) -> RawMonitor {
+        RawMonitor {
+            rect: PhysRect {
+                left: l,
+                top: t,
+                right: r,
+                bottom: b,
+            },
+            dpi,
+            primary,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn order_monitors_puts_primary_first() {
+        // Driver order with the primary last — what EnumDisplayMonitors is
+        // free to hand us, and what would otherwise make "Display 1" point
+        // at a secondary screen.
+        let out = order_monitors(vec![
+            raw("Left", -1920, 0, 0, 1080, 96, false),
+            raw("Main", 0, 0, 2560, 1440, 96, true),
+        ]);
+        assert_eq!(out[0].name, "Main");
+        assert_eq!(out[0].index, 0);
+        assert_eq!(out[1].name, "Left");
+        assert_eq!(out[1].index, 1);
+    }
+
+    #[test]
+    fn order_monitors_sorts_secondaries_top_then_left() {
+        let out = order_monitors(vec![
+            raw("Right", 2560, 0, 4480, 1080, 96, false),
+            raw("Above", 0, -1080, 1920, 0, 96, false),
+            raw("Main", 0, 0, 2560, 1440, 96, true),
+        ]);
+        let names: Vec<&str> = out.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["Main", "Above", "Right"]);
+    }
+
+    #[test]
+    fn order_monitors_divides_by_scale_factor() {
+        // 150% scaling: 2880×1620 physical is 1920×1080 in egui points, and
+        // an origin of 2880 physical is 1920 in points.
+        let out = order_monitors(vec![raw("Scaled", 2880, 0, 5760, 1620, 144, true)]);
+        let f = out[0].frame;
+        assert_eq!(f.min, egui::Pos2::new(1920.0, 0.0));
+        assert_eq!(f.size(), egui::Vec2::new(1920.0, 1080.0));
+    }
+
+    #[test]
+    fn order_monitors_treats_96_dpi_as_unscaled() {
+        let out = order_monitors(vec![raw("Plain", 0, 0, 1920, 1080, 96, true)]);
+        assert_eq!(
+            out[0].frame,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1920.0, 1080.0))
+        );
+    }
+
+    #[test]
+    fn order_monitors_negative_origin_survives_scaling() {
+        // A display to the left of the primary has a negative origin; the
+        // division must not flip its sign or clamp it to zero.
+        let out = order_monitors(vec![
+            raw("Main", 0, 0, 1920, 1080, 96, true),
+            raw("Left", -2560, 0, 0, 1440, 192, false),
+        ]);
+        assert_eq!(out[1].frame.min, egui::Pos2::new(-1280.0, 0.0));
+        assert_eq!(out[1].frame.size(), egui::Vec2::new(1280.0, 720.0));
+    }
+
+    #[test]
+    fn order_monitors_identity_round_trips_through_resolve() {
+        // End-to-end: what Windows enumeration produces must be findable by
+        // the identity string Settings persists.
+        let out = order_monitors(vec![
+            raw("Main", 0, 0, 1920, 1080, 96, true),
+            raw("Capture", 1920, 0, 3840, 1080, 96, false),
+        ]);
+        let saved = monitor_identity(&out[1]);
+        let found = resolve_target_monitor(Some(&saved), &out).expect("identity must resolve");
+        assert_eq!(found.name, "Capture");
     }
 }

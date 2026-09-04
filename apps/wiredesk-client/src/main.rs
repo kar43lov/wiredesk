@@ -408,19 +408,23 @@ fn main() {
             unsafe {
                 force_dock_icon_from_bundle();
             }
-            // Stash the StatusBarHandle inside the egui app via a Box leak
-            // so it lives for the program's lifetime. The handle's only job
-            // is to keep the NSStatusItem alive — once dropped, AppKit
-            // removes the menu bar item.
             let _handle = status_bar::init(creator_status_bar_counters);
-            // On macOS the handle pins the NSStatusItem for the program's
-            // lifetime — leak it so AppKit keeps the menu-bar item alive. On
-            // other targets the handle is an empty no-Drop placeholder, so
-            // there's nothing to keep alive (and `mem::forget` on a non-Drop
-            // type is a no-op clippy rejects under `-D warnings`).
+            // macOS: leak the handle so AppKit keeps the menu-bar item for
+            // the program's lifetime — an NSStatusItem is torn down with the
+            // process anyway.
             #[cfg(target_os = "macos")]
             std::mem::forget(_handle);
-            #[cfg(not(target_os = "macos"))]
+            // Windows: park it in the app instead. The tray handle's Drop
+            // removes the icon; leaking it would leave a ghost icon in the
+            // notification area until the user happens to hover over it.
+            #[cfg(target_os = "windows")]
+            let mut app = app;
+            #[cfg(target_os = "windows")]
+            app.attach_status_bar(_handle);
+            // Anywhere else the handle is an empty no-Drop placeholder, so
+            // there is nothing to keep alive (and `mem::forget` on a non-Drop
+            // type is a no-op clippy rejects under `-D warnings`).
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = _handle;
             Ok(Box::new(app))
         }),

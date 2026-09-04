@@ -1698,9 +1698,10 @@ impl IncomingClipboard {
             });
         }
 
-        // Point the OS pasteboard at the new file. FFI errors are non-fatal
-        // — the bytes are on disk and the user can still recover them. We
-        // skip the FFI call entirely on non-macOS (the stub returns
+        // Point the OS clipboard at the new file (NSPasteboard on macOS,
+        // CF_HDROP on Windows). FFI errors are non-fatal — the bytes are on
+        // disk and the user can still recover them. On a platform with no
+        // clipboard backend we skip the call entirely (the stub returns
         // `PasteboardUnavailable`, which is noisy on the log but expected).
         //
         // CRITICAL: only stamp `LastSeen.file` when the pasteboard write
@@ -1709,7 +1710,7 @@ impl IncomingClipboard {
         // hash anyway would mean the next poll tick treats the user's
         // (un-replaced) clipboard as "fresh" and re-emits it, creating a
         // bidirectional re-emit loop. Mirrors `commit_text` / `commit_image`.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let wrote_ok = match clipboard_files::set_file_url(&path) {
             Ok(()) => {
                 log::debug!(
@@ -1724,7 +1725,7 @@ impl IncomingClipboard {
                 false
             }
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let wrote_ok = {
             log::debug!(
                 "clipboard: wrote file {} ({} content bytes) from host (no pasteboard backend)",

@@ -5428,6 +5428,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui_extras",
+ "embed-manifest",
  "filetime",
  "image",
  "log",
@@ -5443,6 +5444,8 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
+ "windows 0.58.0",
+ "winresource",
  "wiredesk-core",
  "wiredesk-exec-core",
  "wiredesk-protocol",
@@ -5461,6 +5464,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "uuid",
+ "windows 0.58.0",
 ]
 
 [[package]]

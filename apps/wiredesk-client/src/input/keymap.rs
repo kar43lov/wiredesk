@@ -204,8 +204,14 @@ pub const CG_FLAG_ALT: u64 = 1 << 19; // Mac Option key
 pub const CG_FLAG_COMMAND: u64 = 1 << 20;
 
 /// Win Set 1 scancodes for modifier keys (left-side variants).
+///
+/// Only the macOS tap needs these: it synthesises modifier scancodes from a
+/// CGEventFlags bitmap. The Windows hook reports the scancode directly.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const WIN_SCAN_LCTRL: u16 = 0x1D;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const WIN_SCAN_LSHIFT: u16 = 0x2A;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const WIN_SCAN_LALT: u16 = 0x38;
 
 /// Pure function: given current and previous CGEventFlags state, produce the
@@ -214,6 +220,10 @@ pub const WIN_SCAN_LALT: u16 = 0x38;
 /// Cmd OR Ctrl on Mac collapses to Ctrl on Windows — pressing both at once
 /// emits a single Ctrl-down, releasing one while holding the other emits no
 /// up event. Caller should hold prev_flags between FlagsChanged events.
+// macOS-only in a release build: the CGEventTap modifier path is the
+// only caller. Still compiled everywhere so the unit tests below run
+// on any host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cg_flag_change_to_scancodes(flags: u64, prev: u64) -> Vec<(u16, bool)> {
     let mut out = Vec::new();
 
@@ -250,6 +260,10 @@ pub fn cg_flag_change_to_scancodes(flags: u64, prev: u64) -> Vec<(u16, bool)> {
 /// at the HID level — our tap then has to undo that swap before
 /// translating to Windows scancodes so Host receives the user-intended
 /// modifiers (physical Cmd → Ctrl, physical Option → Alt).
+// macOS-only in a release build: the CGEventTap modifier path is the
+// only caller. Still compiled everywhere so the unit tests below run
+// on any host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn swap_cmd_alt_bits(f: u64) -> u64 {
     let cmd = (f & CG_FLAG_COMMAND) != 0;
     let alt = (f & CG_FLAG_ALT) != 0;
@@ -267,6 +281,10 @@ fn swap_cmd_alt_bits(f: u64) -> u64 {
 /// in both inputs. Use when the user has Karabiner-Elements (or similar
 /// HID remapper) swapping the keys on their keyboard — without this the
 /// tap forwards e.g. Cmd+V as Alt+V to Host.
+// macOS-only in a release build: the CGEventTap modifier path is the
+// only caller. Still compiled everywhere so the unit tests below run
+// on any host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cg_flag_change_to_scancodes_swapped(flags: u64, prev: u64) -> Vec<(u16, bool)> {
     cg_flag_change_to_scancodes(swap_cmd_alt_bits(flags), swap_cmd_alt_bits(prev))
 }

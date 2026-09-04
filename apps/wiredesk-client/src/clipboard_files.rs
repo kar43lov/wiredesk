@@ -1,8 +1,14 @@
-//! macOS NSPasteboard FFI for file URL clipboard operations.
+//! File-path clipboard access for the client: `NSPasteboard` on macOS,
+//! `CF_HDROP` on Windows.
 //!
-//! Bridges `public.file-url` (UTI) entries on the general pasteboard to/from
-//! `std::path::PathBuf` so the clipboard sync loop can detect Finder copies
-//! and inject incoming files as drag-paste sources.
+//! Bridges `public.file-url` (UTI) pasteboard entries — or the shell drop
+//! list on Windows — to/from `std::path::PathBuf` so the clipboard sync loop
+//! can detect Finder / Explorer copies and inject incoming files as
+//! drag-paste sources.
+//!
+//! The Windows half is a thin wrapper over `wiredesk_core::file_clipboard`,
+//! the same code the host runs; only the change-detection differs
+//! (`GetClipboardSequenceNumber` instead of `NSPasteboard.changeCount`).
 //!
 //! ## Scope
 //!
@@ -63,7 +69,7 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FileClipboardError {
-    #[error("pasteboard unavailable (non-macOS build or no AppKit session)")]
+    #[error("pasteboard unavailable (unsupported platform or no AppKit session)")]
     PasteboardUnavailable,
     #[error("invalid path for clipboard: {0}")]
     BadPath(String),
@@ -147,7 +153,27 @@ pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
     Some(path)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: probe the clipboard for a single-file `CF_HDROP` entry.
+///
+/// Change detection uses `GetClipboardSequenceNumber`, the Win32 equivalent
+/// of `NSPasteboard.changeCount`: it bumps on every clipboard write by any
+/// process. As on macOS the stored counter is updated **before** the read is
+/// judged, so a rejected clipboard (multi-file, text, an FFI hiccup) does not
+/// get retried on every tick.
+///
+/// The sequence number is a `u32` that wraps; widening it to `i64` keeps the
+/// shared counter type, and a wrap merely costs one extra probe.
+#[cfg(target_os = "windows")]
+pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
+    let current = wiredesk_core::file_clipboard::current_clipboard_seq() as i64;
+    if current == *last_change_count {
+        return None;
+    }
+    *last_change_count = current;
+    wiredesk_core::file_clipboard::poll_cf_hdrop()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn poll_file_url(_last_change_count: &mut i64) -> Option<PathBuf> {
     None
 }
@@ -197,8 +223,26 @@ pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)] // production caller is cfg(macos)-gated; stub documents the contract
+/// Windows: publish `path` as a single-entry `CF_HDROP` drop list, which is
+/// what Explorer pastes.
+///
+/// Core reports its own error type; it is folded into this module's so the
+/// call site in `clipboard.rs` stays platform-agnostic. The mapping keeps
+/// the distinction that matters to the caller — a bad path is the caller's
+/// fault, anything else is the environment's.
+#[cfg(target_os = "windows")]
+pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
+    use wiredesk_core::file_clipboard::FileClipboardError as CoreError;
+
+    wiredesk_core::file_clipboard::set_cf_hdrop(path).map_err(|e| match e {
+        CoreError::BadPath(p) => FileClipboardError::BadPath(p),
+        CoreError::ClipboardLocked => FileClipboardError::PasteboardUnavailable,
+        other => FileClipboardError::FfiError(other.to_string()),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[allow(dead_code)] // production caller is cfg-gated; stub documents the contract
 pub fn set_file_url(_path: &Path) -> Result<(), FileClipboardError> {
     Err(FileClipboardError::PasteboardUnavailable)
 }

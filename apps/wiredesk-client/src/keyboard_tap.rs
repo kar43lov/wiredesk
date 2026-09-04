@@ -1,4 +1,4 @@
-//! macOS CGEventTap-based keyboard hijack for capture-mode.
+//! OS-level keyboard hijack for capture-mode.
 //!
 //! On macOS: spawns a dedicated thread with a CFRunLoop. A session-level
 //! CGEventTap intercepts all keyboard events. When the enable flag is true,
@@ -6,12 +6,20 @@
 //! false the callback returns the event untouched and macOS handles it
 //! normally.
 //!
-//! On non-macOS platforms all functions are no-ops, and
+//! On Windows: spawns a dedicated thread with a message loop and installs a
+//! `WH_KEYBOARD_LL` hook. Same contract — same `TapHandle`, same
+//! `TapEvent`s — but the decoding is much shorter, because the hook already
+//! reports the Set-1 scancode the protocol carries, so no keycode table is
+//! involved. See [`windows_impl`] for the differences that are visible to a
+//! user (hotkeys, and the two key combos the OS refuses to hand over).
+//!
+//! On every other platform all functions are no-ops, and
 //! `is_permission_granted` returns true (no permission system to check).
 //!
-//! Permission requirement: System Settings → Privacy & Security → Accessibility
-//! must list this binary. Without it CGEventTap creation succeeds but the
-//! tap never fires. We don't auto-prompt — UX guides the user instead.
+//! Permission requirement (macOS only): System Settings → Privacy & Security
+//! → Accessibility must list this binary. Without it CGEventTap creation
+//! succeeds but the tap never fires. We don't auto-prompt — UX guides the
+//! user instead. Windows needs no permission for a low-level hook.
 
 // This whole module is macOS CGEventTap machinery with no-op stubs on other
 // targets, so its hotkey constants/helpers are dead in a non-macOS build.
@@ -21,13 +29,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
-use crate::input::keymap::{
-    cg_flag_change_to_scancodes, cg_flag_change_to_scancodes_swapped, CG_FLAG_ALT, CG_FLAG_COMMAND,
-    CG_FLAG_CONTROL, CG_FLAG_SHIFT,
-};
+// The modifier-bitmap machinery is CGEventTap's; the Windows hook reports
+// plain scancodes and needs none of it.
+#[cfg(target_os = "macos")]
+use crate::input::keymap::{cg_flag_change_to_scancodes, cg_flag_change_to_scancodes_swapped};
+use crate::input::keymap::{CG_FLAG_ALT, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_SHIFT};
+#[cfg(target_os = "macos")]
+use wiredesk_protocol::message::Message;
 
 /// Mac VK code constants used for hotkey detection.
 const CG_KEY_RETURN: u16 = 0x24;
@@ -124,6 +134,8 @@ pub struct TapHandle {
     /// macOS (Cmd+V, Cmd+Tab etc. still work normally on the Mac side).
     passive: Arc<AtomicBool>,
     /// Karabiner-Elements `left_command ↔ left_option` compensation.
+    /// macOS-only: nothing remaps modifiers below the OS on Windows, so the
+    /// Windows hook ignores this flag entirely.
     /// When true the tap pre-swaps Cmd↔Option bits before mapping to Win
     /// scancodes (so Host receives the user-intended modifier) and uses
     /// the swapped flag for local hotkey detection (so the same physical
@@ -133,6 +145,8 @@ pub struct TapHandle {
     outgoing_tx: mpsc::Sender<Packet>,
     #[cfg(target_os = "macos")]
     inner: Option<macos::Inner>,
+    #[cfg(target_os = "windows")]
+    inner: Option<windows_impl::Inner>,
 }
 
 impl TapHandle {
@@ -163,23 +177,35 @@ impl TapHandle {
     pub fn disable(&self) {
         self.enabled.store(false, Ordering::SeqCst);
         self.passive.store(false, Ordering::SeqCst);
-        // Sticky-modifier cleanup. Whatever was in prev_flags is now released.
-        let prev = self.prev_flags.swap(0, Ordering::SeqCst);
-        let pairs = if self.swap_om_cmd.load(Ordering::SeqCst) {
-            cg_flag_change_to_scancodes_swapped(0, prev)
-        } else {
-            cg_flag_change_to_scancodes(0, prev)
-        };
-        for (sc, pressed) in pairs {
-            // pressed should always be false here (current = 0).
-            debug_assert!(!pressed);
-            let _ = self.outgoing_tx.send(Packet::new(
-                Message::KeyUp {
-                    scancode: sc,
-                    modifiers: 0,
-                },
-                0,
-            ));
+
+        // Sticky-key cleanup. The two platforms track "what is currently
+        // held" differently — macOS keeps a modifier bitmap fed by
+        // FlagsChanged, Windows keeps the set of scancodes the hook saw go
+        // down — so the release path differs even though the intent (leave
+        // no key stuck on the host) is identical.
+        #[cfg(target_os = "macos")]
+        {
+            let prev = self.prev_flags.swap(0, Ordering::SeqCst);
+            let pairs = if self.swap_om_cmd.load(Ordering::SeqCst) {
+                cg_flag_change_to_scancodes_swapped(0, prev)
+            } else {
+                cg_flag_change_to_scancodes(0, prev)
+            };
+            for (sc, pressed) in pairs {
+                // pressed should always be false here (current = 0).
+                debug_assert!(!pressed);
+                let _ = self.outgoing_tx.send(Packet::new(
+                    Message::KeyUp {
+                        scancode: sc,
+                        modifiers: 0,
+                    },
+                    0,
+                ));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows_impl::release_held_keys(&self.outgoing_tx);
         }
     }
 
@@ -196,18 +222,18 @@ impl TapHandle {
     /// whether egui-side key forwarding should be skipped (when the tap is
     /// active, it's the sole source of key events to avoid double KeyDown).
     pub fn is_active(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             self.inner.is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             false
         }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for TapHandle {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
@@ -267,7 +293,30 @@ pub fn start(
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = synth_tx;
+        let _ = poll_kick_tx;
+        let inner = windows_impl::Inner::start(
+            Arc::clone(&enabled),
+            Arc::clone(&passive),
+            outgoing_tx.clone(),
+            _tap_events_tx,
+        );
+        if inner.is_none() {
+            log::warn!("keyboard_tap: low-level keyboard hook unavailable — capture disabled");
+        }
+        TapHandle {
+            enabled,
+            passive,
+            swap_om_cmd,
+            prev_flags,
+            outgoing_tx,
+            inner,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = _tap_events_tx;
         let _ = synth_tx;
@@ -706,6 +755,503 @@ mod macos {
                 }
             }
         }
+    }
+}
+
+/// Windows hotkey / scancode helpers.
+///
+/// Compiled on every platform — not behind `cfg(windows)` — so the decoding
+/// rules can be unit-tested on the development Mac. They deal only in plain
+/// integers (virtual-key codes and Set-1 scancodes), which is all the hook
+/// hands us.
+pub(crate) mod win_keys {
+    // Used by `windows_impl` and by the tests; dead in a non-Windows
+    // release build.
+    #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
+    /// Virtual-key codes we compare against. Values are fixed by Win32
+    /// (`winuser.h`) and are the same numbers `windows-rs` wraps in `VIRTUAL_KEY`.
+    pub(crate) mod vk {
+        pub const RETURN: u32 = 0x0D;
+        pub const ESCAPE: u32 = 0x1B;
+        pub const SHIFT: u32 = 0x10;
+        pub const CONTROL: u32 = 0x11;
+        pub const MENU: u32 = 0x12;
+        pub const CAPITAL: u32 = 0x14;
+        pub const LWIN: u32 = 0x5B;
+        pub const RWIN: u32 = 0x5C;
+        pub const LSHIFT: u32 = 0xA0;
+        pub const RSHIFT: u32 = 0xA1;
+        pub const LCONTROL: u32 = 0xA2;
+        pub const RCONTROL: u32 = 0xA3;
+        pub const LMENU: u32 = 0xA4;
+        pub const RMENU: u32 = 0xA5;
+    }
+
+    /// Windows counterpart of the Mac's Cmd+Enter: **Ctrl+Enter** toggles
+    /// fullscreen. Cmd maps to Ctrl on the Windows side of every other WireDesk
+    /// shortcut, so the muscle memory carries over.
+    pub(crate) fn is_win_toggle_fullscreen(vk: u32, ctrl: bool) -> bool {
+        ctrl && vk == vk::RETURN
+    }
+
+    /// Windows counterpart of the Mac's Cmd+Esc: **Ctrl+Esc** releases capture
+    /// (or engages it from passive mode).
+    ///
+    /// Ctrl+Esc is also the Windows shortcut for opening the Start menu. Inside
+    /// capture-mode that is exactly what we want to suppress — the keystroke is
+    /// meant for the host, not for the local Start menu — and the low-level hook
+    /// sees it before the shell does, so returning "handled" swallows it.
+    pub(crate) fn is_win_toggle_capture(vk: u32, ctrl: bool) -> bool {
+        ctrl && vk == vk::ESCAPE
+    }
+
+    /// Is this virtual key a modifier?
+    ///
+    /// Modifiers are forwarded to the host **and** passed on to Windows, the
+    /// same compromise the macOS tap makes for `FlagsChanged`: a lone modifier
+    /// is harmless locally (it triggers nothing on its own), while letting it
+    /// through keeps modifier-driven tools working on the client machine. Any
+    /// non-modifier key is swallowed, so combinations like Ctrl+C still cannot
+    /// fire locally while capture is on.
+    pub(crate) fn is_modifier_vk(vk: u32) -> bool {
+        matches!(
+            vk,
+            vk::SHIFT
+                | vk::CONTROL
+                | vk::MENU
+                | vk::CAPITAL
+                | vk::LWIN
+                | vk::RWIN
+                | vk::LSHIFT
+                | vk::RSHIFT
+                | vk::LCONTROL
+                | vk::RCONTROL
+                | vk::LMENU
+                | vk::RMENU
+        )
+    }
+
+    /// Fold the hook's `(scanCode, extended)` pair into the single `u16` the
+    /// protocol carries: extended keys become `0xE0xx`, which is precisely what
+    /// the host's `WindowsInjector` unpacks again before `SendInput`
+    /// (`apps/wiredesk-host/src/injector.rs`).
+    ///
+    /// `scan` is masked to a byte first: the hook occasionally reports the
+    /// extended bit inside `scanCode` itself for injected events.
+    pub(crate) fn compose_scancode(scan: u32, extended: bool) -> Option<u16> {
+        let base = (scan & 0xFF) as u16;
+        if base == 0 {
+            // No scancode at all — an injected event that only set a virtual
+            // key. The caller retries via MapVirtualKeyW; if that fails too the
+            // keystroke is dropped rather than sent as scancode 0, which the
+            // host would inject as a null key.
+            return None;
+        }
+        Some(if extended { 0xE000 | base } else { base })
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    //! `WH_KEYBOARD_LL` hijack — the Windows half of capture-mode.
+    //!
+    //! ## Why a dedicated thread
+    //!
+    //! A low-level hook is delivered to the thread that installed it, and
+    //! only while that thread pumps messages. eframe owns the main thread's
+    //! message loop and we must not add latency to it — Windows silently
+    //! removes a hook whose callback exceeds `LowLevelHooksTimeout`
+    //! (300 ms by default). So the hook lives on its own thread whose only
+    //! job is `GetMessageW`, and the callback does nothing but decode and
+    //! `send` on an mpsc channel.
+    //!
+    //! ## Why global state
+    //!
+    //! `SetWindowsHookExW` takes a bare `extern "system" fn` — no closure,
+    //! no user-data pointer. The state therefore lives in a `OnceLock`
+    //! written once at startup. Only one tap is ever created per process
+    //! (`main.rs` calls `start` exactly once), so a second `Inner::start`
+    //! reuses the existing state rather than racing it.
+    //!
+    //! ## What the OS keeps for itself
+    //!
+    //! Ctrl+Alt+Del and Win+L are handled below the hook chain and never
+    //! reach us — the same limitation the host already documents for
+    //! `SendInput`. Everything else, Ctrl+Esc and Alt+Tab included, is ours
+    //! while capture is on.
+
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, MapVirtualKeyW, MAPVK_VK_TO_VSC, VK_CONTROL,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
+        TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
+        WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    use wiredesk_protocol::message::Message;
+    use wiredesk_protocol::packet::Packet;
+
+    use super::win_keys::{
+        compose_scancode, is_modifier_vk, is_win_toggle_capture, is_win_toggle_fullscreen,
+    };
+    use super::TapEvent;
+
+    /// Everything the hook callback needs, reachable from a bare `fn`.
+    struct HookState {
+        enabled: Arc<AtomicBool>,
+        passive: Arc<AtomicBool>,
+        outgoing_tx: mpsc::Sender<Packet>,
+        tap_events_tx: mpsc::Sender<TapEvent>,
+        /// Scancodes currently held down as far as the *host* is concerned.
+        /// Capture can be released mid-chord (Ctrl+Esc with Shift held), and
+        /// without this the host would keep the modifier pressed forever.
+        held: Mutex<BTreeSet<u16>>,
+    }
+
+    static HOOK_STATE: OnceLock<HookState> = OnceLock::new();
+
+    /// Release every key the host still believes is down, and forget them.
+    ///
+    /// Called from `TapHandle::disable`, i.e. on every capture release.
+    /// Sends through the caller's channel rather than the stored one so it
+    /// works even if the hook never started.
+    pub(super) fn release_held_keys(outgoing_tx: &mpsc::Sender<Packet>) {
+        let Some(state) = HOOK_STATE.get() else {
+            return;
+        };
+        let Ok(mut held) = state.held.lock() else {
+            log::warn!("keyboard_tap: held-key set poisoned; skipping release");
+            return;
+        };
+        for scancode in std::mem::take(&mut *held) {
+            let _ = outgoing_tx.send(Packet::new(
+                Message::KeyUp {
+                    scancode,
+                    modifiers: 0,
+                },
+                0,
+            ));
+        }
+    }
+
+    /// Is a Ctrl key physically down right now?
+    ///
+    /// Asked of the OS rather than tracked ourselves: the hook is installed
+    /// for the whole process lifetime, but a Ctrl pressed *before* WireDesk
+    /// started, or released while another desktop had focus, would leave a
+    /// self-maintained flag lying. `GetAsyncKeyState` cannot drift.
+    fn ctrl_is_down() -> bool {
+        // High bit set = currently down. The low bit ("pressed since last
+        // call") is deliberately ignored.
+        (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0
+    }
+
+    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // Negative codes must be passed straight through, per the hook
+        // contract; anything else risks breaking the chain for other apps.
+        if code < 0 {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+        let Some(state) = HOOK_STATE.get() else {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        };
+
+        let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let msg = wparam.0 as u32;
+        let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+        if !is_down && !is_up {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+
+        let vk = info.vkCode;
+        let active = state.enabled.load(Ordering::SeqCst);
+        let passive = state.passive.load(Ordering::SeqCst);
+
+        // Hotkeys fire on key-down only, in both capture and passive mode,
+        // and never reach the host or the local desktop.
+        if (active || passive) && is_down {
+            let ctrl = ctrl_is_down();
+            if is_win_toggle_fullscreen(vk, ctrl) {
+                let _ = state.tap_events_tx.send(TapEvent::ToggleFullscreen);
+                return LRESULT(1);
+            }
+            if is_win_toggle_capture(vk, ctrl) {
+                let event = if active {
+                    TapEvent::ReleaseCapture
+                } else {
+                    TapEvent::EngageCapture
+                };
+                let _ = state.tap_events_tx.send(event);
+                return LRESULT(1);
+            }
+        }
+
+        // Passive mode watches for the hotkeys above and nothing else, so
+        // the user's own machine keeps working normally while WireDesk is
+        // merely focused. Fully-off behaves the same way.
+        if !active {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+
+        let extended = (info.flags.0 & LLKHF_EXTENDED.0) != 0;
+        let scancode = compose_scancode(info.scanCode, extended).or_else(|| {
+            // Injected events (on-screen keyboard, automation tools) can
+            // carry a virtual key with no scancode; derive one.
+            let mapped = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) };
+            compose_scancode(mapped, extended)
+        });
+        let Some(scancode) = scancode else {
+            log::debug!("keyboard_tap: no scancode for vk {vk:#x}; dropping");
+            return LRESULT(1);
+        };
+
+        if let Ok(mut held) = state.held.lock() {
+            if is_down {
+                held.insert(scancode);
+            } else {
+                held.remove(&scancode);
+            }
+        }
+
+        let message = if is_down {
+            Message::KeyDown {
+                scancode,
+                modifiers: 0,
+            }
+        } else {
+            Message::KeyUp {
+                scancode,
+                modifiers: 0,
+            }
+        };
+        let _ = state.outgoing_tx.send(Packet::new(message, 0));
+
+        if is_modifier_vk(vk) {
+            // Forwarded *and* passed through — see `is_modifier_vk`.
+            unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        } else {
+            // Swallowed: the keystroke belongs to the host.
+            LRESULT(1)
+        }
+    }
+
+    pub(super) struct Inner {
+        thread_id: u32,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Inner {
+        /// Install the hook on a dedicated thread. `None` means the hook
+        /// could not be installed, in which case capture-mode stays off and
+        /// the UI falls back to forwarding egui key events.
+        pub(super) fn start(
+            enabled: Arc<AtomicBool>,
+            passive: Arc<AtomicBool>,
+            outgoing_tx: mpsc::Sender<Packet>,
+            tap_events_tx: mpsc::Sender<TapEvent>,
+        ) -> Option<Self> {
+            // A second call would silently keep the first call's channels,
+            // which is a confusing failure mode; refuse instead.
+            if HOOK_STATE.get().is_some() {
+                log::warn!("keyboard_tap: hook state already initialised; refusing second start");
+                return None;
+            }
+            let _ = HOOK_STATE.set(HookState {
+                enabled,
+                passive,
+                outgoing_tx,
+                tap_events_tx,
+                held: Mutex::new(BTreeSet::new()),
+            });
+
+            let thread_id = Arc::new(AtomicU32::new(0));
+            let installed = Arc::new(AtomicBool::new(false));
+            let ready = Arc::new(AtomicBool::new(false));
+            let thread_id_thread = Arc::clone(&thread_id);
+            let installed_thread = Arc::clone(&installed);
+            let ready_thread = Arc::clone(&ready);
+
+            let join = thread::Builder::new()
+                .name("wiredesk-keyboard-hook".into())
+                .spawn(move || {
+                    thread_id_thread.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+
+                    // hmod = None is correct for WH_KEYBOARD_LL when the
+                    // hook procedure lives in the calling process.
+                    let hook =
+                        unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) };
+                    let hook: HHOOK = match hook {
+                        Ok(h) => {
+                            installed_thread.store(true, Ordering::SeqCst);
+                            h
+                        }
+                        Err(e) => {
+                            log::error!("keyboard_tap: SetWindowsHookExW failed: {e}");
+                            ready_thread.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+                    ready_thread.store(true, Ordering::SeqCst);
+                    log::debug!("keyboard_tap: low-level hook installed");
+
+                    // Pumping messages is not optional: it is what lets
+                    // Windows deliver the hook callbacks at all.
+                    let mut msg = MSG::default();
+                    loop {
+                        let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+                        // 0 = WM_QUIT, -1 = error; both end the loop.
+                        if got.0 <= 0 {
+                            break;
+                        }
+                        unsafe {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+
+                    if let Err(e) = unsafe { UnhookWindowsHookEx(hook) } {
+                        log::warn!("keyboard_tap: UnhookWindowsHookEx failed: {e}");
+                    }
+                    log::debug!("keyboard_tap: hook thread exited");
+                })
+                .ok()?;
+
+            // Wait for the install attempt to resolve so `is_active()` is
+            // truthful by the time `start` returns — the UI reads it
+            // immediately to decide whether to forward egui key events.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !ready.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !installed.load(Ordering::SeqCst) {
+                return None;
+            }
+
+            Some(Self {
+                thread_id: thread_id.load(Ordering::SeqCst),
+                join: Some(join),
+            })
+        }
+
+        pub(super) fn shutdown(self) {
+            if self.thread_id != 0 {
+                // WM_QUIT drops GetMessageW out of its loop, after which the
+                // thread unhooks itself.
+                let _ =
+                    unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+            }
+            if let Some(handle) = self.join {
+                let start = Instant::now();
+                while !handle.is_finished() && start.elapsed() < Duration::from_secs(1) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                } else {
+                    log::warn!("keyboard_tap: hook thread did not exit within 1s");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod win_keys_tests {
+    use super::win_keys::{compose_scancode, is_modifier_vk, vk};
+    use super::win_keys::{is_win_toggle_capture, is_win_toggle_fullscreen};
+
+    #[test]
+    fn ctrl_enter_toggles_fullscreen() {
+        assert!(is_win_toggle_fullscreen(vk::RETURN, true));
+        assert!(!is_win_toggle_fullscreen(vk::RETURN, false));
+        assert!(!is_win_toggle_fullscreen(vk::ESCAPE, true));
+    }
+
+    #[test]
+    fn ctrl_escape_toggles_capture() {
+        assert!(is_win_toggle_capture(vk::ESCAPE, true));
+        assert!(!is_win_toggle_capture(vk::ESCAPE, false));
+        assert!(!is_win_toggle_capture(vk::RETURN, true));
+    }
+
+    #[test]
+    fn hotkeys_do_not_overlap() {
+        // A single key-down must never fire both events.
+        for key in [vk::RETURN, vk::ESCAPE] {
+            assert!(!(is_win_toggle_fullscreen(key, true) && is_win_toggle_capture(key, true)));
+        }
+    }
+
+    #[test]
+    fn modifiers_are_recognised_both_sided() {
+        for key in [
+            vk::SHIFT,
+            vk::CONTROL,
+            vk::MENU,
+            vk::CAPITAL,
+            vk::LWIN,
+            vk::RWIN,
+            vk::LSHIFT,
+            vk::RSHIFT,
+            vk::LCONTROL,
+            vk::RCONTROL,
+            vk::LMENU,
+            vk::RMENU,
+        ] {
+            assert!(is_modifier_vk(key), "vk {key:#x} should be a modifier");
+        }
+    }
+
+    #[test]
+    fn letters_and_arrows_are_not_modifiers() {
+        // 'A' = 0x41, Left arrow = 0x25 — both must be swallowed and sent,
+        // not passed through to the local desktop.
+        for key in [0x41, 0x25, vk::RETURN, vk::ESCAPE] {
+            assert!(!is_modifier_vk(key), "vk {key:#x} must not be a modifier");
+        }
+    }
+
+    #[test]
+    fn plain_scancode_passes_through() {
+        // 'A' is 0x1E in Set 1, and the host expects it unprefixed.
+        assert_eq!(compose_scancode(0x1E, false), Some(0x1E));
+    }
+
+    #[test]
+    fn extended_scancode_gets_e0_prefix() {
+        // Right Ctrl: scancode 0x1D with the extended flag → 0xE01D, which
+        // the host splits back into 0x1D + KEYEVENTF_EXTENDEDKEY.
+        assert_eq!(compose_scancode(0x1D, true), Some(0xE01D));
+        // Arrow Left: 0x4B extended → 0xE04B.
+        assert_eq!(compose_scancode(0x4B, true), Some(0xE04B));
+    }
+
+    #[test]
+    fn scancode_high_bits_are_masked_off() {
+        // Some injected events carry the extended bit inside scanCode
+        // itself; only the low byte is a Set-1 scancode.
+        assert_eq!(compose_scancode(0xE01D, false), Some(0x1D));
+        assert_eq!(compose_scancode(0xE01D, true), Some(0xE01D));
+    }
+
+    #[test]
+    fn zero_scancode_is_rejected() {
+        // Sending scancode 0 would make the host inject a null key.
+        assert_eq!(compose_scancode(0, false), None);
+        assert_eq!(compose_scancode(0, true), None);
+        assert_eq!(compose_scancode(0xE000, false), None);
     }
 }
 
