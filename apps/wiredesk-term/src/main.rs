@@ -1160,28 +1160,27 @@ mod tests {
             heartbeat_thread(hb_transport, hb_stop);
         });
 
-        // Wait long enough for at least one HEARTBEAT_INTERVAL tick to
-        // fire (2 s + a small slack).
-        thread::sleep(Duration::from_millis(2_300));
+        // Wait for the packet itself rather than for a wall-clock interval,
+        // then stop the thread. Sleeping ~one HEARTBEAT_INTERVAL and hoping
+        // the tick landed inside it is a race the test loses on a loaded
+        // runner: the first tick needs a full 2 s, and a 2.3 s budget left
+        // 300 ms of slack that a two-core CI box does not have. Failed on
+        // GitHub Actions 2026-09-04 while passing locally every time.
+        //
+        // `recv_timeout`, not `recv`: this test still holds the sending half
+        // through `transport`, so a plain `recv` would block forever instead
+        // of failing if no heartbeat were ever emitted.
+        let deadline = Duration::from_secs(15);
+        let heartbeat = std::iter::from_fn(|| b.recv_timeout(deadline))
+            .find(|pkt| matches!(pkt.message, Message::Heartbeat));
+
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
 
-        // Drain whatever B received; expect ≥ 1 Heartbeat packet.
-        //
-        // Deliberately `recv_timeout`, not `recv`: this test still holds the
-        // sending half through `transport`, so a plain `recv` would block
-        // forever if no heartbeat had been emitted, and the failure would
-        // present as a hung job rather than a failed assertion.
-        let mut heartbeats = 0;
-        while let Some(pkt) = b.recv_timeout(Duration::from_secs(2)) {
-            if matches!(pkt.message, Message::Heartbeat) {
-                heartbeats += 1;
-                break;
-            }
-        }
         assert!(
-            heartbeats >= 1,
-            "heartbeat thread should have emitted at least one Heartbeat packet"
+            heartbeat.is_some(),
+            "heartbeat thread should have emitted at least one Heartbeat packet \
+             within {deadline:?}"
         );
     }
 
