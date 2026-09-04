@@ -13,6 +13,7 @@ mod ipc;
 mod keyboard_tap;
 mod link;
 mod logging;
+mod mac_window;
 mod monitor;
 mod restart;
 mod shell_channel;

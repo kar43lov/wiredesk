@@ -10,6 +10,7 @@ use wiredesk_protocol::packet::Packet;
 use crate::config::ClientConfig;
 use crate::input::mapper::InputMapper;
 use crate::keyboard_tap::{self, TapEvent, TapHandle};
+use crate::mac_window;
 use crate::monitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1441,12 +1442,45 @@ impl WireDeskApp {
         }
 
         // Did the previous attempt take effect?
+        //
+        // Verified against AppKit, not against `viewport().outer_rect`. The
+        // winit-side report echoes the position we asked for, so checking it
+        // only proves we sent the command — the loop then declares success
+        // on the first retry while the window is elsewhere. That is what
+        // produced "restored to [1375, 823] after 1 attempt" in the log for
+        // a window the user could not find on any display.
         if pending.attempts > 0 {
-            if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                if restore_landed(outer.min, pending.pos) {
+            let winit_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+            let real = mac_window::real_outer_rect();
+
+            if let Some((rx, ry, _, _)) = real {
+                let actual = egui::pos2(rx, ry);
+                if restore_landed(actual, pending.pos) {
                     log::info!(
-                        "fullscreen exit: window restored to {:?} after {} attempt(s)",
-                        outer.min,
+                        "fullscreen exit: window restored to {actual:?} after {} attempt(s)",
+                        pending.attempts
+                    );
+                    // Re-home it on the Space the user is actually looking at.
+                    // Coming out of native fullscreen the window can stay tied
+                    // to the Space that just collapsed: Mission Control lists
+                    // it, it answers as the active window, and nothing paints.
+                    mac_window::bring_to_current_space();
+                    self.pending_position_restore = None;
+                    return;
+                }
+                log::debug!(
+                    "fullscreen exit: attempt {} — AppKit says {actual:?}, winit says \
+                     {winit_pos:?}, target {:?}",
+                    pending.attempts,
+                    pending.pos
+                );
+            } else if let Some(pos) = winit_pos {
+                // No AppKit answer (non-macOS, or no window yet) — fall back to
+                // the winit report rather than retrying forever.
+                if restore_landed(pos, pending.pos) {
+                    log::info!(
+                        "fullscreen exit: window restored to {pos:?} after {} attempt(s) \
+                         (winit-reported)",
                         pending.attempts
                     );
                     self.pending_position_restore = None;
@@ -1458,14 +1492,26 @@ impl WireDeskApp {
         if pending.attempts >= RESTORE_MAX_ATTEMPTS {
             log::warn!(
                 "fullscreen exit: window did not move to {:?} after {} attempts; \
-                 leaving it in place",
+                 placing it through AppKit",
                 pending.pos,
                 pending.attempts
             );
             self.pending_position_restore = None;
-            // Last resort: if it also ended up on no display at all, at least
-            // make it reachable.
-            self.move_onto_primary_if_offscreen(ctx);
+            // Straight to setFrame:display: — the same call a window manager
+            // makes when the user nudges the window and it reappears.
+            let placed = mac_window::set_outer_rect(
+                pending.pos.x,
+                pending.pos.y,
+                pending.size.x,
+                pending.size.y,
+            );
+            if placed {
+                mac_window::bring_to_current_space();
+            } else {
+                // Last resort: if it also ended up on no display at all, at
+                // least make it reachable.
+                self.move_onto_primary_if_offscreen(ctx);
+            }
             return;
         }
 
@@ -1479,6 +1525,7 @@ impl WireDeskApp {
         // Raise it — after a Spaces transition the window can end up behind
         // whatever else is on the destination display.
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        mac_window::bring_to_current_space();
         ctx.request_repaint_after(RESTORE_RETRY);
     }
 
