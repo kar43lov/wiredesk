@@ -239,3 +239,24 @@ Interactive `wd` теперь использует настоящий PTY на h
 2. **Континент включён** → запускаешь `wiredesk-host` на Windows и `wiredesk-client` (или `wiredesk-term`) на Mac, работаешь
 
 После первой сборки сеть на Windows больше не нужна.
+
+### Обновление host'а на Windows
+
+```powershell
+# Континент выключить — он нужен только для git fetch. Если Cargo.lock не менялся,
+# сборка идёт из кеша и сеть дальше не потребуется.
+cd C:\<путь к репо>\wiredesk
+git pull
+
+# Остановить host: правый клик по иконке в трее → Quit.
+# Windows не даст перезаписать запущенный .exe, а mutex WireDeskHostSingleton
+# не отпустит новый процесс. Если tray не отвечает:
+Stop-Process -Name wiredesk-host -Force
+
+cargo build --release -p wiredesk-host
+.\target\release\wiredesk-host.exe
+```
+
+⚠️ С момента остановки и до запуска канал мёртв — `wd` и `wd --exec` с Мака не работают, так что все три шага делаются на самой Windows-машине, а не через `wd --exec`.
+
+⚠️ **Смена `assets/` требует пересборки host'а, даже если Rust-код не трогали:** `assets/tray-*.png` и `assets/app-icon.ico` попадают в бинарь через `include_bytes!`, а иконка `.exe` — через ресурс-секцию (только при сборке на Windows, см. [known-limitations](known-limitations.md)). Explorer может продолжать показывать старую иконку из своего кеша — `ie4uinit.exe -show`.
