@@ -323,9 +323,9 @@ fn main() {
     );
 
     // Status bar item — same Arcs the egui status row reads from. Idle
-    // shows "W"; in-flight transfer shows "↑ N%" / "↓ N%". Initialised
-    // inside the eframe creator below to satisfy AppKit's main-thread
-    // invariant (eframe creator runs on the main thread on macOS).
+    // shows the icon alone; an in-flight transfer adds "↑ N%" / "↓ N%".
+    // Initialised inside the eframe creator below to satisfy AppKit's
+    // main-thread invariant (eframe creator runs on the main thread on macOS).
     let status_bar_counters = status_bar::StatusBarCounters {
         outgoing_progress: outgoing_progress.clone(),
         outgoing_total: outgoing_total.clone(),
@@ -402,8 +402,8 @@ fn main() {
             // AppIcon.icns is correct. Force-loading the bundle icon and
             // re-applying via setApplicationIconImage on the main thread
             // (which is where eframe creator callbacks run) overrides
-            // whatever winit did and pins the W to the Dock for the whole
-            // process lifetime.
+            // whatever winit did and pins the app icon to the Dock for the
+            // whole process lifetime.
             #[cfg(target_os = "macos")]
             unsafe {
                 force_dock_icon_from_bundle();
