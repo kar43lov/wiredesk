@@ -15,6 +15,9 @@ jobs:
   macos:
     name: Test & clippy (macOS)
     runs-on: macos-latest
+    # Without a cap a blocking test pins the runner for the 6-hour default.
+    # The suite takes ~3 min locally; 20 leaves room for a cold cache.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +38,7 @@ jobs:
   windows:
     name: Test & clippy (Windows)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -49,6 +53,12 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # The action reports findings by creating a check run, which the default
+    # read-only GITHUB_TOKEN cannot do — without this the job fails with
+    # "Resource not accessible by integration" even when the audit is clean.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       # The action runs `cargo audit` with its own flags and does not pick up

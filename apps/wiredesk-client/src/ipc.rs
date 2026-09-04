@@ -75,6 +75,32 @@ impl ExecTransport for IpcExecTransport {
     }
 }
 
+/// Narrow the socket's directory to 0700. Best-effort: a failure is not
+/// fatal, the 0600 on the socket itself still applies a moment later.
+///
+/// Split out from `spawn_ipc_acceptor` so it can be tested without starting
+/// an acceptor thread — that thread outlives the test, and once the test's
+/// temp dir is removed its listener would return errors forever.
+fn narrow_socket_dir(dir: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    let mut perms = meta.permissions();
+    if perms.mode() & 0o077 == 0 {
+        return;
+    }
+    perms.set_mode(0o700);
+    if let Err(e) = std::fs::set_permissions(dir, perms) {
+        log::warn!("IPC acceptor: chmod 0700 on {} failed: {e}", dir.display());
+    }
+}
+
+/// How long to wait after a failed `accept` before trying again, and how
+/// many consecutive failures to tolerate before concluding the socket is
+/// gone for good. 10 × 200 ms ≈ 2 s of a genuinely broken listener.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_ACCEPT_ERRORS: u32 = 10;
+
 /// Bind the Unix socket and spawn an acceptor thread. Failure to bind
 /// (missing parent dir, EADDRINUSE race, permission denied) logs a
 /// warning and returns — GUI continues without IPC, term's
@@ -111,18 +137,7 @@ pub fn spawn_ipc_acceptor(
             );
             return;
         }
-        // Best-effort: an existing dir with wider perms gets narrowed, but
-        // a failure here is not fatal — the 0600 on the socket still
-        // applies a moment later.
-        if let Ok(meta) = std::fs::metadata(parent) {
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o077 != 0 {
-                perms.set_mode(0o700);
-                if let Err(e) = std::fs::set_permissions(parent, perms) {
-                    log::warn!("IPC acceptor: chmod 0700 on {} failed: {e}", parent.display());
-                }
-            }
-        }
+        narrow_socket_dir(parent);
     }
 
     let listener = match UnixListener::bind(&socket_path) {
@@ -152,9 +167,11 @@ pub fn spawn_ipc_acceptor(
     log::info!("IPC acceptor listening at {}", socket_path.display());
 
     thread::spawn(move || {
+        let mut consecutive_accept_errors: u32 = 0;
         for incoming in listener.incoming() {
             match incoming {
                 Ok(stream) => {
+                    consecutive_accept_errors = 0;
                     log::info!("IPC connection accepted");
                     let outgoing_tx = outgoing_tx.clone();
                     let exec_slot = exec_slot.clone();
@@ -175,7 +192,27 @@ pub fn spawn_ipc_acceptor(
                     });
                 }
                 Err(e) => {
-                    log::warn!("IPC accept error: {e}; continuing");
+                    // A transient accept error (EINTR, a client that hung up
+                    // between connect and accept) is worth retrying. A
+                    // permanent one is not: if the socket is gone — its
+                    // directory removed, the fd exhausted — `incoming()`
+                    // returns Err immediately, forever, and an unpaced loop
+                    // here burns a core and floods the log. Back off, and
+                    // give up once it is clearly not coming back; without a
+                    // socket the acceptor has nothing left to do, and `wd`
+                    // falls back to direct serial on its own.
+                    consecutive_accept_errors += 1;
+                    log::warn!(
+                        "IPC accept error ({consecutive_accept_errors}/{MAX_ACCEPT_ERRORS}): {e}"
+                    );
+                    if consecutive_accept_errors >= MAX_ACCEPT_ERRORS {
+                        log::error!(
+                            "IPC acceptor giving up after {MAX_ACCEPT_ERRORS} consecutive \
+                             accept errors; wd will use direct serial fallback"
+                        );
+                        return;
+                    }
+                    thread::sleep(ACCEPT_ERROR_BACKOFF);
                 }
             }
         }
@@ -886,7 +923,7 @@ mod tests {
     /// window where the socket itself still carries umask-derived perms
     /// is not reachable by another local user.
     #[test]
-    fn acceptor_narrows_socket_dir_permissions() {
+    fn narrow_socket_dir_makes_dir_owner_only() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
@@ -894,19 +931,35 @@ mod tests {
         std::fs::create_dir(&dir).expect("mkdir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
 
-        spawn_ipc_acceptor(
-            dir.join("wd-exec.sock"),
-            mpsc::channel::<Packet>().0,
-            Arc::new(Mutex::new(None)),
-            new_shared_owner(),
-            Arc::new(Mutex::new(())),
-            populated_host_info(),
-            Arc::new(AtomicBool::new(true)),
-        );
-        thread::sleep(Duration::from_millis(50));
+        narrow_socket_dir(&dir);
 
         let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "socket dir should be owner-only, got {:o}", mode & 0o777);
+        assert_eq!(mode & 0o777, 0o700, "expected owner-only, got {:o}", mode & 0o777);
+    }
+
+    /// Already-narrow dirs are left exactly as they are — no needless chmod,
+    /// and a stricter mode (0500) is not widened back to 0700.
+    #[test]
+    fn narrow_socket_dir_leaves_already_private_dir_alone() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("WireDesk");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod 500");
+
+        narrow_socket_dir(&dir);
+
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o500);
+    }
+
+    /// A missing dir is a no-op, not a panic.
+    #[test]
+    fn narrow_socket_dir_tolerates_missing_dir() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        narrow_socket_dir(&tmp.path().join("does-not-exist"));
     }
 
     /// stage events directly into `exec_slot` and let the handler's
