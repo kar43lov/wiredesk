@@ -1,6 +1,6 @@
 # Investigation: `wd --exec` host channel hang after broken-quoting timeout
 
-> **STATUS 2026-05-06: COMPLETED** — все запланированные fix'ы shipped (B, C, D). Можно переместить в `docs/plans/completed/20260506-channel-hang-fixes.md` отдельным cleanup commit'ом. Auto-generated имя оставлено — содержание актуально для исторической справки.
+> **STATUS 2026-05-06: COMPLETED** — все запланированные fix'ы shipped (B, C, D). Перемещён в `completed/` 2026-09-04; прежнее auto-generated имя — `concurrent-finding-lighthouse.md`.
 >
 > **Shipped:** PR #19 (Mac file logging) → PR #20 (heartbeat extends to shell-busy) → PR #21 (IPC post-run drain).
 > **Verified live 2026-05-06:** T3 (heavy timeout, 837 events drained over 22.3s) → T4 (echo) **passed** в clean state — cascade сломан.

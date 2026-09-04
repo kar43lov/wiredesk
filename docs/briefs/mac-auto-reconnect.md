@@ -92,12 +92,12 @@ In-process reconnect (Вариант 1) с timeout 30s или 5 попыток. 
 ## Что НЕ входит в scope
 
 - **Auto-reconnect host-side**: host уже handle'ит reconnect (см. session.rs `WaitingForHello` state). Этот бриф только про Mac.
-- **Heartbeat decoupling в отдельный thread на Mac side** (Variant C из старого `concurrent-finding-lighthouse.md` плана) — отдельный fix, ортогональный auto-reconnect'у. PR #20+#21 уже покрыли наблюдаемый pain, decoupling deferred.
+- **Heartbeat decoupling в отдельный thread на Mac side** (Variant C из старого `docs/plans/completed/20260506-channel-hang-fixes.md` плана) — отдельный fix, ортогональный auto-reconnect'у. PR #20+#21 уже покрыли наблюдаемый pain, decoupling deferred.
 
 ## Связанное
 
 - `feedback_wd_exec_timeout_channel_hang.md` — старая cascade-проблема, теперь FIXED через PR #20+#21. Auto-reconnect — следующий уровень reliability.
-- `concurrent-finding-lighthouse.md` plan (теперь COMPLETED) — упоминает auto-reconnect как Variant C followup.
+- `docs/plans/completed/20260506-channel-hang-fixes.md` plan (теперь COMPLETED) — упоминает auto-reconnect как Variant C followup.
 - `apps/wiredesk-client/src/restart.rs` — existing self-relaunch helper, reusable для Вариант 2.
 
 ## Первые шаги

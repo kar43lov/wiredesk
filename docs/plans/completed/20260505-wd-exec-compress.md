@@ -4,7 +4,7 @@
 
 Опциональный флаг `--compress` для `wd --exec`, который сжимает stdout команды на host'е (gzip+base64) и разворачивает обратно на client'е. Для крупных текстовых выводов (логи, ES-ответы, дампы конфигов) даёт кратное ускорение по wire (5–10×) без изменения base-канала. Поддерживаются **обе path'и**: bash через `--ssh` и PowerShell на host'е напрямую.
 
-Полный спек — в [`docs/briefs/wd-exec-compression.md`](../briefs/wd-exec-compression.md).
+Полный спек — в [`docs/briefs/wd-exec-compression.md`](../../briefs/wd-exec-compression.md).
 
 **Branch:** `feat/wd-exec-compress`. Master остаётся стабильным; merge только после live-тестов трёх размеров (1 KB, 50 KB, 500 KB) на обеих путях + кириллица + IPC bridge.
 

@@ -283,7 +283,7 @@ apps/
   wiredesk-term       — macOS CLI: raw-mode terminal bridge для Ghostty/iTerm (shell) + `wd --exec` non-interactive mode
 ```
 
-Полный архитектурный разбор (module maps Host + Client, threading, data flow, protocol details, clipboard sync, keyboard hijack, shell-over-serial, key design decisions) — в [`docs/architecture.md`](docs/architecture.md). Ключевые точки ниже:
+Полный архитектурный разбор (module maps Host + Client, threading, data flow, protocol details, clipboard sync, keyboard hijack, shell-over-serial, key design decisions) — в секциях выше по этому же файлу. Ключевые точки ниже — краткая выжимка, жившая в `CLAUDE.md` до переноса:
 
 - **Threading клиента:** writer / reader / clipboard poll / keyboard tap (CFRunLoop) — serial-порт расщеплён через `Transport::try_clone()`. Латенси UI→провод ~µs.
 - **Протокол:** binary, COBS-framed, CRC-16 packet-level. Header `[magic][type][flags][seq:u16][len:u16]`. **MAX_PAYLOAD = 4096** + matched `MAX_FRAME_SIZE = 8192` в SerialTransport.

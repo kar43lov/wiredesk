@@ -33,6 +33,7 @@ Host компилируется и на macOS (с MockInjector), и на Windows
 
 Полные формулировки с причинами — `docs/known-limitations.md`.
 
+- Канал не аутентифицирован и не шифрован ни на одном транспорте; для BLE это реальная дыра (GATT `Plain`,…
 - Ctrl+Alt+Del через SendInput не сработает на Windows (защищено ядром, нужен SAS API в SYSTEM-сервисе или…
 - macOS Secure Input — поля паролей в любом приложении на Mac отключают CGEventTap системно
 - Accessibility permission требуется и привязана к binary

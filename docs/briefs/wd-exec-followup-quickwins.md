@@ -89,7 +89,7 @@ let _ = tracing_subscriber::fmt()
 ## Что НЕ входит в scope
 
 - Mac auto-reconnect — отдельный бриф `mac-auto-reconnect.md` (medium-high effort)
-- Mac heartbeat decoupling в отдельный thread — отдельный followup из `concurrent-finding-lighthouse.md` (Variant C)
+- Mac heartbeat decoupling в отдельный thread — отдельный followup из `docs/plans/completed/20260506-channel-hang-fixes.md` (Variant C)
 - `wd --exec --stdin` — отдельный бриф `wd-exec-payload-quoting.md` (medium effort)
 
 ## Связанное

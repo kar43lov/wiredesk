@@ -4,7 +4,7 @@
 
 Embedded IPC поверх GUI client'а позволяет `wd --exec` работать параллельно с активным GUI (clipboard sync, capture). Сейчас оба процесса хотят `open()`'нуть один serial-порт — workflow ломается. После реализации GUI exposes Unix socket; `wd --exec` коннектится к нему и шлёт sentinel-команду через тот же serial, через который GUI делает clipboard sync. Если GUI закрыт — `wd --exec` falls back на текущий direct-open serial, поведение байт-в-байт идентично.
 
-Полный спек — в [`docs/briefs/wd-exec-via-gui-ipc.md`](../briefs/wd-exec-via-gui-ipc.md).
+Полный спек — в [`docs/briefs/wd-exec-via-gui-ipc.md`](../../briefs/wd-exec-via-gui-ipc.md).
 
 ## Context (from discovery)
 

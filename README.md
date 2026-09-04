@@ -48,6 +48,19 @@ Host (Windows 11)                       Client (macOS)
 - Bulk file transfer or multi-file selection (single files up to 20 MB sync through the clipboard; for multi-GB transfers a USB flash drive is still faster — serial channel is ~11 KB/s on CH340 / ~300 KB/s on FT232H). Multi-file selection and directories are out of scope for Phase 1.
 - Audio
 
+## Security model
+
+**The link is neither authenticated nor encrypted.** The handshake is a plain `Hello`/`HelloAck` exchange carrying a name and a protocol version — there is no pairing code, no shared secret, no challenge. Whoever can talk to the other end of the channel can inject keyboard and mouse input into the Windows session, open a shell on it, and read or write files through the clipboard. That is the whole point of the tool, so treat access to the channel as equivalent to sitting down at the machine.
+
+What that means per transport:
+
+- **Serial (default).** Trust rests on physical access to the cable. Someone who can reach the null-modem wiring could already reach the keyboard, so this is an acceptable trade — but it does mean an unattended machine with the cable exposed is an unattended machine, full stop.
+- **Bluetooth LE (opt-in).** Here the same absence of authentication is a real exposure: the GATT characteristics are published with `GattProtectionLevel::Plain`, the peer is matched by service UUID alone (`peer_name` is advisory), and that UUID is a constant in this repository. Any device in radio range can therefore complete the handshake and drive the host. BLE is **not** the default (`transport = "serial"`, no fallback) — enable it only on a network you would be comfortable leaving the machine unlocked on, and prefer the cable everywhere else.
+
+Files arriving over the clipboard are written into a cache directory (`~/Library/Caches/WireDesk/`, `%TEMP%\WireDesk\`) with the basename sanitized against path traversal and NTFS device names, so a hostile peer cannot choose where they land — but it can still place arbitrary bytes there, and the receiving side then points the OS clipboard at them.
+
+The Mac IPC socket (`wd-exec.sock`) is chmod 0600 and therefore local-user-only.
+
 ## Hardware
 
 | Component | Price | Purpose |
