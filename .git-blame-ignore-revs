@@ -1,0 +1,8 @@
+# Commits that only reformat. `git blame` skips them so the line history
+# points at whoever wrote the code, not at the reformat.
+#
+# Locally this needs one-time setup (GitHub reads the file on its own):
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style: привести всё дерево к rustfmt
+3808043ca9023e6618e7545c31bf006165c11b80
