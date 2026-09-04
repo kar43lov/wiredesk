@@ -806,14 +806,20 @@ pub(crate) mod win_keys {
         ctrl && vk == vk::ESCAPE
     }
 
-    /// Is this virtual key a modifier?
+    /// Is this virtual key a modifier that may also reach the local desktop?
     ///
-    /// Modifiers are forwarded to the host **and** passed on to Windows, the
-    /// same compromise the macOS tap makes for `FlagsChanged`: a lone modifier
-    /// is harmless locally (it triggers nothing on its own), while letting it
-    /// through keeps modifier-driven tools working on the client machine. Any
-    /// non-modifier key is swallowed, so combinations like Ctrl+C still cannot
-    /// fire locally while capture is on.
+    /// Such modifiers are forwarded to the host **and** passed on to Windows,
+    /// the same compromise the macOS tap makes for `FlagsChanged`: a lone
+    /// modifier triggers nothing on its own, and letting it through keeps
+    /// modifier-driven tools working on the client machine. Any other key is
+    /// swallowed, so combinations like Ctrl+C cannot fire locally while
+    /// capture is on.
+    ///
+    /// **The Windows key is deliberately excluded.** Unlike Shift, Ctrl or
+    /// Alt it does do something on its own — releasing it opens the Start
+    /// menu, which would pop over WireDesk on every Win keystroke meant for
+    /// the host. It is still forwarded, it just does not reach the local
+    /// shell as well.
     pub(crate) fn is_modifier_vk(vk: u32) -> bool {
         matches!(
             vk,
@@ -821,8 +827,6 @@ pub(crate) mod win_keys {
                 | vk::CONTROL
                 | vk::MENU
                 | vk::CAPITAL
-                | vk::LWIN
-                | vk::RWIN
                 | vk::LSHIFT
                 | vk::RSHIFT
                 | vk::LCONTROL
@@ -880,6 +884,17 @@ mod windows_impl {
     //! reach us — the same limitation the host already documents for
     //! `SendInput`. Everything else, Ctrl+Esc and Alt+Tab included, is ours
     //! while capture is on.
+    //!
+    //! ## No Secure Input equivalent
+    //!
+    //! macOS switches CGEventTap off while a password field has focus, which
+    //! is why capture-mode "breaks" over password prompts there — an
+    //! annoyance that is also a safety net. Windows has no such thing: a
+    //! low-level hook sees password fields like any other input. So while
+    //! capture is on, *everything* typed on this machine goes to the host,
+    //! including a local password typed by mistake. Capture is explicit and
+    //! visibly banner-marked, but the asymmetry is worth knowing (recorded
+    //! in `docs/known-limitations.md`).
 
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -930,11 +945,19 @@ mod windows_impl {
         let Some(state) = HOOK_STATE.get() else {
             return;
         };
-        let Ok(mut held) = state.held.lock() else {
-            log::warn!("keyboard_tap: held-key set poisoned; skipping release");
-            return;
+        // Take the set and drop the guard *before* sending: the hook
+        // callback locks this same mutex on every keystroke, and Windows
+        // uninstalls a low-level hook whose callback overruns
+        // `LowLevelHooksTimeout` (300 ms by default). An unbounded send is
+        // fast, but "fast" is not a guarantee worth betting the keyboard on.
+        let released = {
+            let Ok(mut held) = state.held.lock() else {
+                log::warn!("keyboard_tap: held-key set poisoned; skipping release");
+                return;
+            };
+            std::mem::take(&mut *held)
         };
-        for scancode in std::mem::take(&mut *held) {
+        for scancode in released {
             let _ = outgoing_tx.send(Packet::new(
                 Message::KeyUp {
                     scancode,
@@ -1013,7 +1036,11 @@ mod windows_impl {
             compose_scancode(mapped, extended)
         });
         let Some(scancode) = scancode else {
-            log::debug!("keyboard_tap: no scancode for vk {vk:#x}; dropping");
+            // Deliberately without the virtual-key code: this module sees
+            // every keystroke on the machine, and client.log.* is a plain
+            // file on disk. "A key was dropped" is all a diagnosis needs;
+            // *which* key is the beginning of a keylog.
+            log::debug!("keyboard_tap: keystroke with no usable scancode; dropping");
             return LRESULT(1);
         };
 
@@ -1063,18 +1090,23 @@ mod windows_impl {
             tap_events_tx: mpsc::Sender<TapEvent>,
         ) -> Option<Self> {
             // A second call would silently keep the first call's channels,
-            // which is a confusing failure mode; refuse instead.
-            if HOOK_STATE.get().is_some() {
+            // which is a confusing failure mode; refuse instead. The refusal
+            // hangs off `set` rather than a preceding `get`, so two threads
+            // racing here cannot both proceed to install a hook — the loser
+            // of the `set` gets the `Err` and backs out.
+            if HOOK_STATE
+                .set(HookState {
+                    enabled,
+                    passive,
+                    outgoing_tx,
+                    tap_events_tx,
+                    held: Mutex::new(BTreeSet::new()),
+                })
+                .is_err()
+            {
                 log::warn!("keyboard_tap: hook state already initialised; refusing second start");
                 return None;
             }
-            let _ = HOOK_STATE.set(HookState {
-                enabled,
-                passive,
-                outgoing_tx,
-                tap_events_tx,
-                held: Mutex::new(BTreeSet::new()),
-            });
 
             let thread_id = Arc::new(AtomicU32::new(0));
             let installed = Arc::new(AtomicBool::new(false));
@@ -1201,8 +1233,6 @@ mod win_keys_tests {
             vk::CONTROL,
             vk::MENU,
             vk::CAPITAL,
-            vk::LWIN,
-            vk::RWIN,
             vk::LSHIFT,
             vk::RSHIFT,
             vk::LCONTROL,
@@ -1212,6 +1242,14 @@ mod win_keys_tests {
         ] {
             assert!(is_modifier_vk(key), "vk {key:#x} should be a modifier");
         }
+    }
+
+    #[test]
+    fn windows_key_is_swallowed_not_passed_through() {
+        // Passing the Win key on to the local desktop opens the Start menu
+        // over WireDesk on every Win keystroke meant for the host.
+        assert!(!is_modifier_vk(vk::LWIN));
+        assert!(!is_modifier_vk(vk::RWIN));
     }
 
     #[test]

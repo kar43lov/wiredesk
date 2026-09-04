@@ -317,7 +317,9 @@ mod windows_impl {
     use std::time::Duration;
 
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{
+        GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -326,8 +328,9 @@ mod windows_impl {
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
         DispatchMessageW, GetSystemMetrics, PeekMessageW, PostQuitMessage, RegisterClassW,
-        TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR, MSG, PM_REMOVE, SM_CXSMICON,
-        SM_CYSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY, WNDCLASSW,
+        RegisterWindowMessageW, TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR, MSG,
+        PM_REMOVE, SM_CXSMICON, SM_CYSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY,
+        WNDCLASSW,
     };
 
     use super::{format_status_bar_title, StatusBarCounters, MENU_BAR_ICON_TOOLTIP};
@@ -339,6 +342,26 @@ mod windows_impl {
     /// Arbitrary per-window id for our single icon; only has to be stable
     /// between `NIM_ADD` and `NIM_DELETE`.
     const TRAY_UID: u32 = 1;
+
+    /// Name of the shell's "the notification area is back" broadcast,
+    /// NUL-terminated for `RegisterWindowMessageW`.
+    const TASKBAR_CREATED: &[u16] = &[
+        b'T' as u16,
+        b'a' as u16,
+        b's' as u16,
+        b'k' as u16,
+        b'b' as u16,
+        b'a' as u16,
+        b'r' as u16,
+        b'C' as u16,
+        b'r' as u16,
+        b'e' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b'e' as u16,
+        b'd' as u16,
+        0,
+    ];
 
     /// Callback message the shell sends us for clicks. Unused today (the
     /// macOS item has no click handler either) but required by `NIF_MESSAGE`,
@@ -401,6 +424,10 @@ mod windows_impl {
     struct TrayState {
         hwnd: HWND,
         icon: HICON,
+        /// The shell broadcasts this message to every top-level window after
+        /// Explorer restarts, which is the only notice we get that the
+        /// notification area was rebuilt and our icon is gone.
+        taskbar_created: u32,
     }
 
     impl TrayState {
@@ -414,12 +441,16 @@ mod windows_impl {
                 lpszClassName: PCWSTR(class_name.as_ptr()),
                 ..Default::default()
             };
-            // A zero return means the class could not be registered; a
-            // duplicate registration is only possible if init ran twice,
-            // which main.rs does not do.
+            // A zero return means the class was not registered *this* call.
+            // "Already exists" is fine — it means an earlier init in this
+            // process registered it and the class is still usable; anything
+            // else is a real failure.
             if unsafe { RegisterClassW(&class) } == 0 {
-                log::warn!("status bar: RegisterClassW failed");
-                return None;
+                let err = unsafe { GetLastError() };
+                if err != ERROR_CLASS_ALREADY_EXISTS {
+                    log::warn!("status bar: RegisterClassW failed: {err:?}");
+                    return None;
+                }
             }
 
             // HWND_MESSAGE: invisible, never activated, exists purely to
@@ -442,32 +473,62 @@ mod windows_impl {
             }
             .ok()?;
 
-            let icon = load_tray_icon().unwrap_or_default();
-            let mut data = notify_data(hwnd, icon, MENU_BAR_ICON_TOOLTIP);
-            data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            // A failed decode is not fatal: the shell draws its own
+            // placeholder for an icon-less entry, whereas NIF_ICON with a
+            // null handle asks it to draw nothing at all.
+            let icon = load_tray_icon();
+            let mut data = notify_data(hwnd, icon.unwrap_or_default(), MENU_BAR_ICON_TOOLTIP);
+            data.uFlags = NIF_MESSAGE | NIF_TIP;
+            if icon.is_some() {
+                data.uFlags |= NIF_ICON;
+            }
             if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
                 log::warn!("status bar: Shell_NotifyIconW(NIM_ADD) failed");
                 unsafe {
                     let _ = DestroyWindow(hwnd);
-                    if !icon.is_invalid() {
+                    if let Some(icon) = icon {
                         let _ = DestroyIcon(icon);
                     }
                 }
                 return None;
             }
-            Some(Self { hwnd, icon })
+            // Registering the message can only fail if the atom table is
+            // exhausted; 0 then means "never matches", which degrades to the
+            // old behaviour of not recovering from an Explorer restart.
+            let taskbar_created =
+                unsafe { RegisterWindowMessageW(PCWSTR(TASKBAR_CREATED.as_ptr())) };
+
+            Some(Self {
+                hwnd,
+                icon: icon.unwrap_or_default(),
+                taskbar_created,
+            })
         }
 
         /// Poll the counters and keep the tooltip in step, pumping messages
         /// in between so the shell's callbacks are serviced.
         fn run(self, counters: StatusBarCounters, stop_rx: mpsc::Receiver<()>) {
-            let mut last_tip = String::new();
+            // Seeded with what `create` already put on the icon, so the first
+            // poll does not re-send an identical tooltip — and so an
+            // Explorer-restart re-add carries the current text.
+            let mut last_tip = MENU_BAR_ICON_TOOLTIP.to_string();
             loop {
                 // Non-blocking pump: this thread has to stay responsive to
                 // both the message queue and the stop channel, and blocking
                 // in GetMessageW would starve the latter.
                 let mut msg = MSG::default();
                 while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    // Explorer restarted and took every tray icon with it.
+                    // Re-adding is the documented way back; nothing else
+                    // brings the icon home.
+                    if self.taskbar_created != 0 && msg.message == self.taskbar_created {
+                        log::info!("status bar: Explorer restarted — re-adding tray icon");
+                        let mut data = notify_data(self.hwnd, self.icon, &last_tip);
+                        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+                        if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+                            log::warn!("status bar: re-adding the tray icon failed");
+                        }
+                    }
                     unsafe {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
