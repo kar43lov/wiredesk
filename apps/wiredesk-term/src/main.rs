@@ -1167,15 +1167,15 @@ mod tests {
         let _ = handle.join();
 
         // Drain whatever B received; expect ≥ 1 Heartbeat packet.
+        //
+        // Deliberately `recv_timeout`, not `recv`: this test still holds the
+        // sending half through `transport`, so a plain `recv` would block
+        // forever if no heartbeat had been emitted, and the failure would
+        // present as a hung job rather than a failed assertion.
         let mut heartbeats = 0;
-        while let Ok(pkt) = b.recv() {
+        while let Some(pkt) = b.recv_timeout(Duration::from_secs(2)) {
             if matches!(pkt.message, Message::Heartbeat) {
                 heartbeats += 1;
-            }
-            // recv() blocks; break once we've drained the synchronous
-            // queue. We can't easily detect "no more pending" without a
-            // try_recv, so cap by what we expect plus a bit.
-            if heartbeats >= 1 {
                 break;
             }
         }

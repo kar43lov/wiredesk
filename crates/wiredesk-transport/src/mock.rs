@@ -14,6 +14,20 @@ pub struct MockTransport {
 }
 
 impl MockTransport {
+    /// Receive with a deadline instead of blocking forever.
+    ///
+    /// `Transport::recv` maps onto `mpsc::Receiver::recv`, which only returns
+    /// once a packet arrives or every sender is dropped. A test that holds a
+    /// clone of the sending side and waits for a packet that never comes
+    /// therefore hangs outright rather than failing — which is exactly what
+    /// pinned a CI runner for 17 minutes on 2026-09-04. Tests that expect a
+    /// packet should use this and assert on the `None`.
+    pub fn recv_timeout(&mut self, timeout: std::time::Duration) -> Option<Packet> {
+        let encoded = self.rx.recv_timeout(timeout).ok()?;
+        let raw = cobs::decode(&encoded).ok()?;
+        Packet::from_bytes(&raw).ok()
+    }
+
     /// Create a pair of connected transports (A↔B).
     pub fn pair() -> (Self, Self) {
         let (tx_a, rx_b) = mpsc::channel();
