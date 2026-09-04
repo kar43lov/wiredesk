@@ -1512,7 +1512,10 @@ impl WireDeskApp {
                         pending.attempts
                     );
                     if let Some(d) = mac_window::diagnostics() {
-                        log::info!("fullscreen exit: window state after restore — {d}");
+                        // RUST_LOG=debug to get this back — it was what
+                        // finally localised the lost-window bug (WindowServer
+                        // dropping the window while AppKit reported it fine).
+                        log::debug!("fullscreen exit: window state after restore — {d}");
                     }
                     // Re-home it on the Space the user is actually looking at.
                     // Coming out of native fullscreen the window can stay tied
@@ -1570,7 +1573,7 @@ impl WireDeskApp {
         }
 
         if let Some(d) = mac_window::diagnostics() {
-            log::info!(
+            log::debug!(
                 "fullscreen exit: attempt {} — window state before nudge: {d}",
                 pending.attempts + 1
             );
