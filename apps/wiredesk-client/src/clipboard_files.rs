@@ -219,7 +219,9 @@ pub(crate) fn parse_file_url(url: &str) -> Option<PathBuf> {
     // Strip the scheme. We accept both `file:///abs/path` and `file:/abs/path`
     // (older NSURL output) — anything that doesn't start with `file:` is
     // rejected outright.
-    let rest = url.strip_prefix("file://").or_else(|| url.strip_prefix("file:"))?;
+    let rest = url
+        .strip_prefix("file://")
+        .or_else(|| url.strip_prefix("file:"))?;
     // Some `file://` URLs include a host (e.g. `file://localhost/path`); for
     // local files NSURL produces an empty host so `rest` starts with `/`.
     // Drop a `localhost` prefix if present.
@@ -305,10 +307,8 @@ mod tests {
     fn parse_file_url_unicode_percent_encoded() {
         // NSURL UTF-8 percent-encodes non-ASCII: "привет.txt" → UTF-8 bytes
         // 0xD0 0xBF 0xD1 0x80 0xD0 0xB8 0xD0 0xB2 0xD0 0xB5 0xD1 0x82.
-        let p = parse_file_url(
-            "file:///tmp/%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82.txt",
-        )
-        .expect("parse");
+        let p =
+            parse_file_url("file:///tmp/%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82.txt").expect("parse");
         assert_eq!(p, PathBuf::from("/tmp/привет.txt"));
     }
 

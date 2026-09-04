@@ -78,11 +78,8 @@ fn main() {
     // legitimate first instance over the tray icon and the serial port —
     // both visible-bad failure modes. Better to surface the error and
     // refuse to start than to fan out into duplicate hosts.
-    let _instance_guard = match ui::single_instance::try_acquire_with_retry(
-        "WireDeskHostSingleton",
-        5,
-        100,
-    ) {
+    let _instance_guard =
+        match ui::single_instance::try_acquire_with_retry("WireDeskHostSingleton", 5, 100) {
             ui::single_instance::SingleInstanceResult::Acquired(g) => g,
             ui::single_instance::SingleInstanceResult::AlreadyRunning => {
                 log::warn!("another wiredesk-host instance is already running");
@@ -197,10 +194,7 @@ fn run_windows(
         log::error!("FATAL @ {stage}: {err}");
         // MessageBox so the user sees something even when the tray icon
         // failed to appear (or appeared and vanished).
-        nwg::simple_message(
-            "WireDesk Host — startup failed",
-            &format!("{stage}: {err}"),
-        );
+        nwg::simple_message("WireDesk Host — startup failed", &format!("{stage}: {err}"));
     }
 
     log::debug!("run_windows: nwg::init");
@@ -226,7 +220,10 @@ fn run_windows(
 
     let log_dir = logging::log_dir();
 
-    log::debug!("run_windows: building TrayUi (log_dir={})", log_dir.display());
+    log::debug!(
+        "run_windows: building TrayUi (log_dir={})",
+        log_dir.display()
+    );
     let tray = match ui::tray::TrayUi::build(log_dir) {
         Ok(t) => t,
         Err(e) => {
@@ -304,7 +301,9 @@ fn run_windows(
                 }))
             }
             None => {
-                log::warn!("create_show_settings_event failed — second-instance launch will be silent");
+                log::warn!(
+                    "create_show_settings_event failed — second-instance launch will be silent"
+                );
                 None
             }
         }
@@ -336,112 +335,113 @@ fn run_windows(
     // `OnNotice` arm needs `borrow_mut()` to update the icon, and a second
     // borrow on a RefCell already-borrowed → panic → process abort. Take
     // the borrow lazily inside each arm.
-    let event_handler = nwg::full_bind_event_handler(&tray_handle, move |evt, _evt_data, handle| {
-        use nwg::Event as E;
-        use nwg::MousePressEvent as MP;
-        match evt {
-            E::OnNotice => {
-                // Status bridge fired. The Notice multiplexes three signals:
-                //   1) cross-process "show settings" (set by the wait
-                //      thread for the named event when a second-instance
-                //      launch fires SetEvent),
-                //   2) pending notification (transient balloon, doesn't
-                //      change persistent UI state),
-                //   3) persistent status (tray icon color + settings row).
-                // Handle (1) first so a stacked event still surfaces it,
-                // then drop into the existing notification + persistent
-                // pipeline.
-                if show_settings_pending_clone
-                    .swap(false, std::sync::atomic::Ordering::AcqRel)
-                {
-                    settings_clone.borrow().show();
-                }
-                let notification = if let Ok(mut g) = last_clone.lock() {
-                    g.pending_notification.take()
-                } else {
-                    None
-                };
-                if let Some(msg) = notification {
-                    if let Err(e) = tray_clone
-                        .borrow_mut()
-                        .update_status(&SessionStatus::Notification(msg))
+    let event_handler =
+        nwg::full_bind_event_handler(&tray_handle, move |evt, _evt_data, handle| {
+            use nwg::Event as E;
+            use nwg::MousePressEvent as MP;
+            match evt {
+                E::OnNotice => {
+                    // Status bridge fired. The Notice multiplexes three signals:
+                    //   1) cross-process "show settings" (set by the wait
+                    //      thread for the named event when a second-instance
+                    //      launch fires SetEvent),
+                    //   2) pending notification (transient balloon, doesn't
+                    //      change persistent UI state),
+                    //   3) persistent status (tray icon color + settings row).
+                    // Handle (1) first so a stacked event still surfaces it,
+                    // then drop into the existing notification + persistent
+                    // pipeline.
+                    if show_settings_pending_clone.swap(false, std::sync::atomic::Ordering::AcqRel)
                     {
-                        log::warn!("tray balloon failed: {e}");
+                        settings_clone.borrow().show();
                     }
-                }
-                let persistent = last_clone
-                    .lock()
-                    .ok()
-                    .map(|g| g.persistent.to_session_status());
-                if let Some(s) = persistent {
-                    if let Err(e) = tray_clone.borrow_mut().update_status(&s) {
-                        log::warn!("tray icon update failed: {e}");
-                    }
-                    settings_clone.borrow_mut().set_status(&s);
-                }
-            }
-            E::OnContextMenu => {
-                let t = tray_clone.borrow();
-                if handle == t.tray.handle {
-                    t.show_popup();
-                }
-            }
-            E::OnMousePress(MP::MousePressLeftUp) => {
-                // Synthetic double-click detection. Only react when the
-                // event came from the tray icon — `MousePressLeftUp` also
-                // fires for left-clicks on the popup menu host window.
-                let is_tray = {
-                    let t = tray_clone.borrow();
-                    handle == t.tray.handle
-                };
-                if !is_tray {
-                    return;
-                }
-                let now = Instant::now();
-                let prev = last_left_up_for_handler.replace(Some(now));
-                let is_double = matches!(prev, Some(p) if now.duration_since(p) <= DOUBLE_CLICK_WINDOW);
-                if is_double {
-                    // Reset so a third quick click doesn't immediately
-                    // count as another double-click.
-                    last_left_up_for_handler.set(None);
-                    settings_clone.borrow().show();
-                }
-            }
-            E::OnMenuItemSelected => {
-                let t = tray_clone.borrow();
-                if handle == t.menu_show_settings.handle {
-                    drop(t);
-                    settings_clone.borrow().show();
-                } else if handle == t.menu_open_logs.handle {
-                    t.open_logs();
-                } else if handle == t.menu_restart.handle {
-                    drop(t);
-                    // Spawn a fresh host process, then ask the current
-                    // event loop to exit. Same pattern as Save & Restart
-                    // in the Settings window — single-instance retry-loop
-                    // covers the brief window where both processes hold
-                    // the named mutex.
-                    match std::env::current_exe() {
-                        Ok(exe) => match std::process::Command::new(exe).spawn() {
-                            Ok(_) => {
-                                log::info!("restart: spawned new host process from tray");
-                                nwg::stop_thread_dispatch();
-                            }
-                            Err(e) => {
-                                log::warn!("restart from tray: spawn failed: {e}");
-                            }
-                        },
-                        Err(e) => {
-                            log::warn!("restart from tray: current_exe failed: {e}");
+                    let notification = if let Ok(mut g) = last_clone.lock() {
+                        g.pending_notification.take()
+                    } else {
+                        None
+                    };
+                    if let Some(msg) = notification {
+                        if let Err(e) = tray_clone
+                            .borrow_mut()
+                            .update_status(&SessionStatus::Notification(msg))
+                        {
+                            log::warn!("tray balloon failed: {e}");
                         }
                     }
-                } else if handle == t.menu_quit.handle {
-                    nwg::stop_thread_dispatch();
+                    let persistent = last_clone
+                        .lock()
+                        .ok()
+                        .map(|g| g.persistent.to_session_status());
+                    if let Some(s) = persistent {
+                        if let Err(e) = tray_clone.borrow_mut().update_status(&s) {
+                            log::warn!("tray icon update failed: {e}");
+                        }
+                        settings_clone.borrow_mut().set_status(&s);
+                    }
                 }
+                E::OnContextMenu => {
+                    let t = tray_clone.borrow();
+                    if handle == t.tray.handle {
+                        t.show_popup();
+                    }
+                }
+                E::OnMousePress(MP::MousePressLeftUp) => {
+                    // Synthetic double-click detection. Only react when the
+                    // event came from the tray icon — `MousePressLeftUp` also
+                    // fires for left-clicks on the popup menu host window.
+                    let is_tray = {
+                        let t = tray_clone.borrow();
+                        handle == t.tray.handle
+                    };
+                    if !is_tray {
+                        return;
+                    }
+                    let now = Instant::now();
+                    let prev = last_left_up_for_handler.replace(Some(now));
+                    let is_double =
+                        matches!(prev, Some(p) if now.duration_since(p) <= DOUBLE_CLICK_WINDOW);
+                    if is_double {
+                        // Reset so a third quick click doesn't immediately
+                        // count as another double-click.
+                        last_left_up_for_handler.set(None);
+                        settings_clone.borrow().show();
+                    }
+                }
+                E::OnMenuItemSelected => {
+                    let t = tray_clone.borrow();
+                    if handle == t.menu_show_settings.handle {
+                        drop(t);
+                        settings_clone.borrow().show();
+                    } else if handle == t.menu_open_logs.handle {
+                        t.open_logs();
+                    } else if handle == t.menu_restart.handle {
+                        drop(t);
+                        // Spawn a fresh host process, then ask the current
+                        // event loop to exit. Same pattern as Save & Restart
+                        // in the Settings window — single-instance retry-loop
+                        // covers the brief window where both processes hold
+                        // the named mutex.
+                        match std::env::current_exe() {
+                            Ok(exe) => match std::process::Command::new(exe).spawn() {
+                                Ok(_) => {
+                                    log::info!("restart: spawned new host process from tray");
+                                    nwg::stop_thread_dispatch();
+                                }
+                                Err(e) => {
+                                    log::warn!("restart from tray: spawn failed: {e}");
+                                }
+                            },
+                            Err(e) => {
+                                log::warn!("restart from tray: current_exe failed: {e}");
+                            }
+                        }
+                    } else if handle == t.menu_quit.handle {
+                        nwg::stop_thread_dispatch();
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        }
-    });
+        });
 
     // Wire settings-window events.
     //
@@ -673,9 +673,7 @@ fn handle_restart(
 }
 
 #[cfg(windows)]
-fn handle_detect(
-    settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>,
-) {
+fn handle_detect(settings: &std::rc::Rc<std::cell::RefCell<ui::settings_window::SettingsWindow>>) {
     let s = settings.borrow();
     let ports = match ui::format::enumerate_ports_now() {
         Ok(ports) => ports,
@@ -699,8 +697,10 @@ fn handle_detect(
             if targets.len() == 1 {
                 s.set_message(&format!("Detected {}.", chosen.label));
             } else {
-                let coms: Vec<&str> =
-                    targets.iter().map(|&i| ports[i].port_name.as_str()).collect();
+                let coms: Vec<&str> = targets
+                    .iter()
+                    .map(|&i| ports[i].port_name.as_str())
+                    .collect();
                 s.set_message(&format!(
                     "Multiple adapters found ({}) — selected {}; pick another from the list if needed.",
                     coms.join(", "),
@@ -719,4 +719,3 @@ fn handle_detect(
         }
     }
 }
-

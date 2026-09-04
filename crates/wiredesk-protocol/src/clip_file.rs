@@ -311,7 +311,8 @@ mod tests {
         let mut payload = Vec::with_capacity(2 + MAX_FILENAME_LEN);
         payload.extend_from_slice(&(MAX_FILENAME_LEN as u16).to_le_bytes());
         payload.resize(payload.len() + MAX_FILENAME_LEN, b'A');
-        let (name, content) = unpack_first_chunk(&payload).expect("MAX_FILENAME_LEN must be accepted");
+        let (name, content) =
+            unpack_first_chunk(&payload).expect("MAX_FILENAME_LEN must be accepted");
         assert_eq!(name.len(), MAX_FILENAME_LEN);
         assert!(content.is_empty());
     }

@@ -98,13 +98,19 @@ impl HostConfig {
             Ok(s) => match toml::from_str::<HostConfig>(&s) {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    log::warn!("config parse error at {}: {e}; using defaults", path.display());
+                    log::warn!(
+                        "config parse error at {}: {e}; using defaults",
+                        path.display()
+                    );
                     Self::default()
                 }
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
-                log::warn!("config read error at {}: {e}; using defaults", path.display());
+                log::warn!(
+                    "config read error at {}: {e}; using defaults",
+                    path.display()
+                );
                 Self::default()
             }
         }
@@ -360,11 +366,16 @@ mod tests {
         let matches = Args::command()
             .try_get_matches_from([
                 "wiredesk-host",
-                "--port", "COM7",
-                "--baud", "57600",
-                "--name", "cli-host",
-                "--width", "1920",
-                "--height", "1080",
+                "--port",
+                "COM7",
+                "--baud",
+                "57600",
+                "--name",
+                "cli-host",
+                "--width",
+                "1920",
+                "--height",
+                "1080",
             ])
             .unwrap();
         let merged = merge_args(&matches, toml_cfg());
@@ -488,7 +499,10 @@ mod tests {
         };
         let tc = to_transport_config(&cfg);
         assert_eq!(tc.transport, "bluetooth");
-        assert_eq!(tc.bluetooth.service_uuid, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            tc.bluetooth.service_uuid,
+            "11111111-2222-3333-4444-555555555555"
+        );
         assert_eq!(tc.bluetooth.peer_name, "TestHost");
         assert_eq!(tc.bluetooth.mtu, 244);
         assert_eq!(tc.bluetooth.connect_timeout_secs, 5);

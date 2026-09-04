@@ -25,8 +25,8 @@ use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::Packet;
 
 use crate::input::keymap::{
-    cg_flag_change_to_scancodes, cg_flag_change_to_scancodes_swapped, CG_FLAG_ALT,
-    CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_SHIFT,
+    cg_flag_change_to_scancodes, cg_flag_change_to_scancodes_swapped, CG_FLAG_ALT, CG_FLAG_COMMAND,
+    CG_FLAG_CONTROL, CG_FLAG_SHIFT,
 };
 
 /// Mac VK code constants used for hotkey detection.
@@ -237,9 +237,7 @@ pub fn start(
     #[cfg(target_os = "macos")]
     {
         if !is_permission_granted() {
-            log::warn!(
-                "keyboard_tap: Accessibility permission not granted — tap will not start"
-            );
+            log::warn!("keyboard_tap: Accessibility permission not granted — tap will not start");
             return TapHandle {
                 enabled,
                 passive,
@@ -302,8 +300,7 @@ pub fn is_permission_granted() -> bool {
 
         let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
         let value = CFBoolean::false_value();
-        let opts =
-            CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
+        let opts = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
 
         unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) }
     }
@@ -433,8 +430,8 @@ mod macos {
                             //   0  = CombinedSessionState (synthetic from app)
                             //  -1  = Private (rare)
                             const HID_SYSTEM_STATE_ID: i64 = 1;
-                            let state_id = event
-                                .get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
+                            let state_id =
+                                event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
                             let is_physical = state_id == HID_SYSTEM_STATE_ID;
                             let swap = swap_setting && is_physical;
 
@@ -445,18 +442,16 @@ mod macos {
                             // Cmd+Tab etc.) still work.
                             if !is_active && is_passive {
                                 if matches!(event_type, CGEventType::KeyDown) {
-                                    let kc = event.get_integer_value_field(
-                                        EventField::KEYBOARD_EVENT_KEYCODE,
-                                    ) as u16;
+                                    let kc = event
+                                        .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                        as u16;
                                     let flags = event.get_flags().bits();
                                     if super::is_cmd_enter(kc, flags, swap) {
-                                        let _ =
-                                            tap_events_cb.send(TapEvent::ToggleFullscreen);
+                                        let _ = tap_events_cb.send(TapEvent::ToggleFullscreen);
                                         return CallbackResult::Drop;
                                     }
                                     if super::is_release_capture(kc, flags, swap) {
-                                        let _ =
-                                            tap_events_cb.send(TapEvent::EngageCapture);
+                                        let _ = tap_events_cb.send(TapEvent::EngageCapture);
                                         return CallbackResult::Drop;
                                     }
                                 }
@@ -472,9 +467,9 @@ mod macos {
 
                             match event_type {
                                 CGEventType::KeyDown => {
-                                    let kc = event.get_integer_value_field(
-                                        EventField::KEYBOARD_EVENT_KEYCODE,
-                                    ) as u16;
+                                    let kc = event
+                                        .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                        as u16;
                                     let flags = event.get_flags().bits();
 
                                     // Local hotkeys — handled in the UI thread,
@@ -523,12 +518,9 @@ mod macos {
                                             let _ = poll_kick_cb.send(());
                                         }
 
-                                        let mut combo: super::SyntheticCombo =
-                                            Vec::new();
+                                        let mut combo: super::SyntheticCombo = Vec::new();
                                         if (flags & super::CG_MODIFIER_MASK) != 0 {
-                                            for (sc, _) in
-                                                cg_flag_change_to_scancodes(flags, 0)
-                                            {
+                                            for (sc, _) in cg_flag_change_to_scancodes(flags, 0) {
                                                 combo.push(Packet::new(
                                                     Message::KeyDown {
                                                         scancode: sc,
@@ -565,9 +557,9 @@ mod macos {
                                     CallbackResult::Drop
                                 }
                                 CGEventType::KeyUp => {
-                                    let kc = event.get_integer_value_field(
-                                        EventField::KEYBOARD_EVENT_KEYCODE,
-                                    ) as u16;
+                                    let kc = event
+                                        .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                        as u16;
                                     let flags = event.get_flags().bits();
 
                                     // Pair with the synthetic KeyDown — we
@@ -576,8 +568,7 @@ mod macos {
                                     // release goes through the same queue
                                     // (in arrival order: V-up then Ctrl-up).
                                     if !is_physical {
-                                        let mut combo: super::SyntheticCombo =
-                                            Vec::new();
+                                        let mut combo: super::SyntheticCombo = Vec::new();
                                         if let Some(sc) = cgkeycode_to_scancode(kc) {
                                             combo.push(Packet::new(
                                                 Message::KeyUp {
@@ -588,9 +579,7 @@ mod macos {
                                             ));
                                         }
                                         if (flags & super::CG_MODIFIER_MASK) != 0 {
-                                            for (sc, _) in
-                                                cg_flag_change_to_scancodes(0, flags)
-                                            {
+                                            for (sc, _) in cg_flag_change_to_scancodes(0, flags) {
                                                 combo.push(Packet::new(
                                                     Message::KeyUp {
                                                         scancode: sc,
@@ -669,10 +658,7 @@ mod macos {
                     );
 
                     unsafe {
-                        CGEventTapEnable(
-                            tap.mach_port().as_concrete_TypeRef() as *mut _,
-                            true,
-                        );
+                        CGEventTapEnable(tap.mach_port().as_concrete_TypeRef() as *mut _, true);
                     }
 
                     let source = tap
@@ -716,9 +702,7 @@ mod macos {
                 if handle.is_finished() {
                     let _ = handle.join();
                 } else {
-                    log::warn!(
-                        "keyboard_tap: thread did not exit within 1s — leaving as daemon"
-                    );
+                    log::warn!("keyboard_tap: thread did not exit within 1s — leaving as daemon");
                 }
             }
         }
@@ -753,7 +737,10 @@ mod tests {
         // Cmd+V → paste.
         assert!(is_synthetic_paste(CG_KEY_V, CG_FLAG_COMMAND));
         // Cmd+V with extra modifiers still counts (paste apps vary).
-        assert!(is_synthetic_paste(CG_KEY_V, CG_FLAG_COMMAND | CG_FLAG_SHIFT));
+        assert!(is_synthetic_paste(
+            CG_KEY_V,
+            CG_FLAG_COMMAND | CG_FLAG_SHIFT
+        ));
         // V without Cmd → not a paste.
         assert!(!is_synthetic_paste(CG_KEY_V, 0));
         assert!(!is_synthetic_paste(CG_KEY_V, CG_FLAG_CONTROL));
@@ -765,7 +752,13 @@ mod tests {
     fn handle_starts_disabled() {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
+        let h = start(
+            out_tx,
+            tap_tx,
+            make_swap_flag(),
+            make_synth_tx(),
+            make_kick_tx(),
+        );
         assert!(!h.is_enabled());
     }
 
@@ -773,7 +766,13 @@ mod tests {
     fn enable_disable_toggles_flag() {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
+        let h = start(
+            out_tx,
+            tap_tx,
+            make_swap_flag(),
+            make_synth_tx(),
+            make_kick_tx(),
+        );
         h.enable();
         assert!(h.is_enabled());
         h.disable();
@@ -784,7 +783,13 @@ mod tests {
     fn drop_does_not_panic() {
         let (out_tx, _out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let _h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
+        let _h = start(
+            out_tx,
+            tap_tx,
+            make_swap_flag(),
+            make_synth_tx(),
+            make_kick_tx(),
+        );
     }
 
     #[test]
@@ -796,7 +801,13 @@ mod tests {
     fn disable_emits_keyup_for_held_modifiers() {
         let (out_tx, out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
+        let h = start(
+            out_tx,
+            tap_tx,
+            make_swap_flag(),
+            make_synth_tx(),
+            make_kick_tx(),
+        );
 
         // Pretend Cmd + Shift were held at the moment of disable.
         h.prev_flags
@@ -822,10 +833,19 @@ mod tests {
     fn disable_when_no_modifiers_is_silent() {
         let (out_tx, out_rx) = mpsc::channel();
         let (tap_tx, _tap_rx) = mpsc::channel();
-        let h = start(out_tx, tap_tx, make_swap_flag(), make_synth_tx(), make_kick_tx());
+        let h = start(
+            out_tx,
+            tap_tx,
+            make_swap_flag(),
+            make_synth_tx(),
+            make_kick_tx(),
+        );
 
         h.disable();
-        assert!(out_rx.try_recv().is_err(), "no modifiers held → no KeyUp packets");
+        assert!(
+            out_rx.try_recv().is_err(),
+            "no modifiers held → no KeyUp packets"
+        );
     }
 
     #[test]
@@ -887,7 +907,11 @@ mod tests {
 
     #[test]
     fn release_capture_matches_cmd_esc() {
-        assert!(super::is_release_capture(CG_KEY_ESCAPE, CG_FLAG_COMMAND, false));
+        assert!(super::is_release_capture(
+            CG_KEY_ESCAPE,
+            CG_FLAG_COMMAND,
+            false
+        ));
     }
 
     #[test]
@@ -917,7 +941,11 @@ mod tests {
         // Plain Esc.
         assert!(!super::is_release_capture(CG_KEY_ESCAPE, 0, false));
         // Ctrl+Esc.
-        assert!(!super::is_release_capture(CG_KEY_ESCAPE, CG_FLAG_CONTROL, false));
+        assert!(!super::is_release_capture(
+            CG_KEY_ESCAPE,
+            CG_FLAG_CONTROL,
+            false
+        ));
     }
 
     #[test]
@@ -943,7 +971,11 @@ mod tests {
     #[test]
     fn swap_mode_release_capture_matches_either_flag() {
         assert!(super::is_release_capture(CG_KEY_ESCAPE, CG_FLAG_ALT, true));
-        assert!(super::is_release_capture(CG_KEY_ESCAPE, CG_FLAG_COMMAND, true));
+        assert!(super::is_release_capture(
+            CG_KEY_ESCAPE,
+            CG_FLAG_COMMAND,
+            true
+        ));
     }
 
     #[test]

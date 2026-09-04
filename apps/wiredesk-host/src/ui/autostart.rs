@@ -12,8 +12,7 @@ pub fn enable() -> std::io::Result<()> {
     use std::path::PathBuf;
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-        REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
     };
 
     let exe: PathBuf = std::env::current_exe()?;
@@ -120,7 +119,10 @@ pub fn is_enabled() -> bool {
 fn encode_utf16(s: &str) -> Vec<u16> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 // --- Non-Windows stubs ------------------------------------------------------

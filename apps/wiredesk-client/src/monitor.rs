@@ -161,11 +161,7 @@ pub fn monitor_identity(m: &MonitorInfo) -> String {
     let origin = m.frame.min;
     format!(
         "{} ({}×{} @ {},{})",
-        m.name,
-        size.x as u32,
-        size.y as u32,
-        origin.x as i32,
-        origin.y as i32,
+        m.name, size.x as u32, size.y as u32, origin.x as i32, origin.y as i32,
     )
 }
 

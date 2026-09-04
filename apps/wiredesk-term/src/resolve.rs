@@ -109,7 +109,10 @@ pub fn detect_target_ports() -> Vec<String> {
 /// config.toml/fallback. No-op on naming schemes without the cu./tty.
 /// split (Windows `COMn` never matches the `/dev/tty.` prefix).
 fn dedupe_tty_variants(names: Vec<String>) -> Vec<String> {
-    names.into_iter().filter(|n| !n.starts_with("/dev/tty.")).collect()
+    names
+        .into_iter()
+        .filter(|n| !n.starts_with("/dev/tty."))
+        .collect()
 }
 
 /// Pure decision: given what CLI/detection/config.toml produced, which port
@@ -138,7 +141,11 @@ pub fn resolve_port(
 
 /// Pure decision for baud: no hardware signal to auto-detect a line rate
 /// from, so this tier is just CLI > config.toml > fallback.
-pub fn resolve_baud(cli_baud: Option<u32>, toml_baud: Option<u32>, fallback: u32) -> (u32, ValueSource) {
+pub fn resolve_baud(
+    cli_baud: Option<u32>,
+    toml_baud: Option<u32>,
+    fallback: u32,
+) -> (u32, ValueSource) {
     if let Some(b) = cli_baud {
         return (b, ValueSource::Cli);
     }

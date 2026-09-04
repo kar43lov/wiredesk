@@ -261,8 +261,8 @@ mod tests {
         let owner_clone = owner.clone();
 
         let handle = thread::spawn(move || {
-            let _guard = try_acquire(&owner_clone, ShellOwner::Interactive)
-                .expect("acquire ok in thread");
+            let _guard =
+                try_acquire(&owner_clone, ShellOwner::Interactive).expect("acquire ok in thread");
             panic!("simulated handler panic");
         });
 

@@ -3,13 +3,13 @@ mod clipboard;
 mod clipboard_files;
 mod config;
 mod exec_bridge;
-#[cfg(target_os = "macos")]
-mod ipc;
+mod input;
 /// End-to-end interactive-IPC round-trip test (Task 9). Test-only — the crate
 /// is binary-only, so this integ suite lives in-tree instead of `tests/`.
 #[cfg(all(test, target_os = "macos"))]
 mod interactive_ipc_e2e;
-mod input;
+#[cfg(target_os = "macos")]
+mod ipc;
 mod keyboard_tap;
 mod link;
 mod logging;
@@ -18,9 +18,9 @@ mod restart;
 mod shell_channel;
 mod status_bar;
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
@@ -82,7 +82,12 @@ fn main() {
     log::info!("WireDesk Client");
     log::info!("log dir: {}", logging::log_dir().display());
     log::info!("config: {}", ClientConfig::config_path().display());
-    log::info!("transport: {} (port={} baud={})", cfg.transport, cfg.port, cfg.baud);
+    log::info!(
+        "transport: {} (port={} baud={})",
+        cfg.transport,
+        cfg.port,
+        cfg.baud
+    );
 
     // Cache vacuum: clear stale inbound-file cache entries older than 24h.
     // Runs synchronously — the directory is small (≤20 MB per file × few
@@ -142,8 +147,7 @@ fn main() {
     // session restart, parallel to `receive_images` behaviour. Default
     // value sourced from `cfg.receive_files` (default-on for back-compat
     // with pre-Task-8 TOML configs).
-    let receive_files =
-        Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_files));
+    let receive_files = Arc::new(std::sync::atomic::AtomicBool::new(cfg.receive_files));
     // Outbound file toggle. Opt-in (default false): a Cmd+C on a file only
     // reaches the wire when the user explicitly enables "Send files" in
     // Settings. Shared with the poll thread, flipped live by the checkbox.
@@ -184,8 +188,7 @@ fn main() {
         // interactive handlers fail-fast cross-kind against it (see
         // shell_channel); exec-vs-exec FIFO stays nested under `single_inflight`.
         let shell_owner = shell_channel::new_shared_owner();
-        let single_inflight: Arc<std::sync::Mutex<()>> =
-            Arc::new(std::sync::Mutex::new(()));
+        let single_inflight: Arc<std::sync::Mutex<()>> = Arc::new(std::sync::Mutex::new(()));
         let ipc_host_info = host_info.clone();
         let socket_path = wiredesk_exec_core::default_socket_path();
         let ipc_link_up = link_up.clone();
@@ -233,8 +236,7 @@ fn main() {
     {
         let supervisor_transport_cfg = transport_cfg.clone();
         let supervisor_events_tx = events_tx.clone();
-        let open_fn =
-            move || wiredesk_transport::open_transport(&supervisor_transport_cfg);
+        let open_fn = move || wiredesk_transport::open_transport(&supervisor_transport_cfg);
         link::spawn_supervisor(
             open_fn,
             link::backoff_delay,
@@ -257,8 +259,7 @@ fn main() {
     // the start of every text-send and clears it on the next tick;
     // meanwhile the tap shoves all synthetic combos through `synth_tx`,
     // and the dispatcher below drains the channel, waiting on the flag.
-    let outgoing_text_in_flight =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let outgoing_text_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (synth_tx, synth_rx) = std::sync::mpsc::channel::<keyboard_tap::SyntheticCombo>();
     // Wake-up channel: keyboard tap nudges the poll thread on synthetic
     // Cmd+V so we don't wait the full poll interval before noticing the

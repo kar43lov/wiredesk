@@ -56,7 +56,13 @@ impl InputMapper {
 
     /// Normalize mouse position from window coordinates to 0..65535 range,
     /// accounting for aspect ratio difference between window and host screen.
-    pub fn normalize_mouse(&self, window_x: f32, window_y: f32, window_w: f32, window_h: f32) -> (u16, u16) {
+    pub fn normalize_mouse(
+        &self,
+        window_x: f32,
+        window_y: f32,
+        window_w: f32,
+        window_h: f32,
+    ) -> (u16, u16) {
         if window_w <= 0.0 || window_h <= 0.0 {
             return (0, 0);
         }
@@ -125,9 +131,15 @@ impl InputMapper {
         let mods = keymap::egui_modifiers_to_u8(modifiers);
         let seq = self.next_seq();
         let msg = if pressed {
-            Message::KeyDown { scancode, modifiers: mods }
+            Message::KeyDown {
+                scancode,
+                modifiers: mods,
+            }
         } else {
-            Message::KeyUp { scancode, modifiers: mods }
+            Message::KeyUp {
+                scancode,
+                modifiers: mods,
+            }
         };
         let _ = out.send(Packet::new(msg, seq));
     }
@@ -167,7 +179,10 @@ mod tests {
 
         let packet = rx.try_recv().unwrap();
         match packet.message {
-            Message::KeyDown { scancode, modifiers } => {
+            Message::KeyDown {
+                scancode,
+                modifiers,
+            } => {
                 assert_eq!(scancode, 0x1E);
                 assert_eq!(modifiers, 0);
             }
@@ -180,12 +195,18 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut mapper = InputMapper::new(1920, 1080);
 
-        let mods = egui::Modifiers { command: true, ..Default::default() };
+        let mods = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
         mapper.send_key(&tx, &egui::Key::C, &mods, true);
 
         let packet = rx.try_recv().unwrap();
         match packet.message {
-            Message::KeyDown { scancode, modifiers } => {
+            Message::KeyDown {
+                scancode,
+                modifiers,
+            } => {
                 assert_eq!(scancode, 0x2E);
                 assert_eq!(modifiers, 0x01);
             }

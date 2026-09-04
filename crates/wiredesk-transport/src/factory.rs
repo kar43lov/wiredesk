@@ -176,9 +176,8 @@ mod tests {
         };
         let err = expect_err(open_transport(&cfg));
         let msg = err.to_string();
-        let is_ble_origin = msg.contains("BLE")
-            || msg.contains("Task 7")
-            || msg.contains("not supported");
+        let is_ble_origin =
+            msg.contains("BLE") || msg.contains("Task 7") || msg.contains("not supported");
         assert!(is_ble_origin, "expected BLE-origin error, got: {msg}");
         // Confirm we did NOT accidentally route through the serial path
         // (would surface "serial open: ...").

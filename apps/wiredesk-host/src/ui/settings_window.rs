@@ -200,8 +200,7 @@ impl SettingsWindow {
                 .h_align(nwg::HTextAlign::Right)
                 .parent(&s.connection_frame)
                 .build(&mut s.transport_label)?;
-            let transport_options =
-                vec!["USB-Serial".to_string(), "Bluetooth LE".to_string()];
+            let transport_options = vec!["USB-Serial".to_string(), "Bluetooth LE".to_string()];
             let transport_idx = if config.transport == "bluetooth" {
                 Some(1usize)
             } else {
@@ -506,8 +505,7 @@ impl SettingsWindow {
         let labels: Vec<String> = ports.iter().map(|p| p.label.clone()).collect();
         self.port_combo.set_collection(labels);
         self.port_combo.set_selection(select);
-        *self.port_choice_coms.borrow_mut() =
-            ports.iter().map(|p| p.port_name.clone()).collect();
+        *self.port_choice_coms.borrow_mut() = ports.iter().map(|p| p.port_name.clone()).collect();
     }
 
     /// Bare COM name of the currently selected dropdown entry, if any. Used by
@@ -542,8 +540,7 @@ impl SettingsWindow {
         // Save-and-Restart respawns the host process so the value takes
         // effect on the next session (no live re-arm — matches the existing
         // baud/port/transport pattern).
-        let receive_files =
-            self.receive_files_check.check_state() == nwg::CheckBoxState::Checked;
+        let receive_files = self.receive_files_check.check_state() == nwg::CheckBoxState::Checked;
         let transport = match self.transport_combo.selection() {
             Some(1) => "bluetooth".to_string(),
             _ => "serial".to_string(),

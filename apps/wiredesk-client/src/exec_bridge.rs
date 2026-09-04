@@ -156,7 +156,10 @@ mod tests {
         }
         assert!(matches!(rx2.recv().unwrap(), ExecEvent::ShellExit(1)));
         // Run 1's rx must NOT have seen run 2's event.
-        assert!(rx1.try_recv().is_err(), "run-1 receiver was already dropped");
+        assert!(
+            rx1.try_recv().is_err(),
+            "run-1 receiver was already dropped"
+        );
     }
 
     #[test]

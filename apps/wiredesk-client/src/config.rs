@@ -222,13 +222,19 @@ impl ClientConfig {
             Ok(s) => match toml::from_str::<ClientConfig>(&s) {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    log::warn!("config parse error at {}: {e}; using defaults", path.display());
+                    log::warn!(
+                        "config parse error at {}: {e}; using defaults",
+                        path.display()
+                    );
                     Self::default()
                 }
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
-                log::warn!("config read error at {}: {e}; using defaults", path.display());
+                log::warn!(
+                    "config read error at {}: {e}; using defaults",
+                    path.display()
+                );
                 Self::default()
             }
         }
@@ -310,13 +316,7 @@ fn round_point(v: f32) -> i32 {
 
 /// Path-parameterised form of [`save_window_geometry`] so the read-modify-write
 /// behaviour is testable against a temp file.
-pub fn save_window_geometry_to(
-    path: &Path,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-) -> io::Result<()> {
+pub fn save_window_geometry_to(path: &Path, x: f32, y: f32, w: f32, h: f32) -> io::Result<()> {
     let mut cfg = ClientConfig::load_from(path);
     cfg.window_x = Some(round_point(x));
     cfg.window_y = Some(round_point(y));
@@ -580,10 +580,7 @@ mod tests {
         cfg_some.save_to(&path).unwrap();
         let loaded = ClientConfig::load_from(&path);
         assert_eq!(loaded, cfg_some);
-        assert_eq!(
-            loaded.preferred_monitor.as_deref(),
-            Some("Studio Display")
-        );
+        assert_eq!(loaded.preferred_monitor.as_deref(), Some("Studio Display"));
     }
 
     #[test]
@@ -632,7 +629,10 @@ mod tests {
         };
         assert!(restore_window_geometry(&cfg).is_none());
         cfg.window_h = Some(760);
-        assert_eq!(restore_window_geometry(&cfg), Some((100.0, 100.0, 520.0, 760.0)));
+        assert_eq!(
+            restore_window_geometry(&cfg),
+            Some((100.0, 100.0, 520.0, 760.0))
+        );
     }
 
     #[test]
@@ -745,9 +745,12 @@ mod tests {
         let matches = Args::command()
             .try_get_matches_from([
                 "wiredesk-client",
-                "--port", "/dev/cu.cli",
-                "--baud", "57600",
-                "--name", "cli-name",
+                "--port",
+                "/dev/cu.cli",
+                "--baud",
+                "57600",
+                "--name",
+                "cli-name",
             ])
             .unwrap();
         let merged = merge_args(&matches, toml_cfg());
@@ -892,7 +895,10 @@ mod tests {
         };
         let tc = to_transport_config(&cfg);
         assert_eq!(tc.transport, "bluetooth");
-        assert_eq!(tc.bluetooth.service_uuid, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            tc.bluetooth.service_uuid,
+            "11111111-2222-3333-4444-555555555555"
+        );
         assert_eq!(tc.bluetooth.peer_name, "TestHost");
         assert_eq!(tc.bluetooth.mtu, 244);
         assert_eq!(tc.fallback.as_deref(), Some("serial"));

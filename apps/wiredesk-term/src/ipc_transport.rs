@@ -241,7 +241,10 @@ mod tests {
             Message::ShellInput {
                 data: b"Get-Process\r".to_vec(),
             },
-            Message::PtyResize { cols: 100, rows: 30 },
+            Message::PtyResize {
+                cols: 100,
+                rows: 30,
+            },
             Message::ShellOutput {
                 data: vec![0, 1, 0xFF, b'o', b'k'],
             },
@@ -290,8 +293,13 @@ mod tests {
         // Heartbeat is dropped by the transport — the peer must see only the
         // real packet that follows it, not a heartbeat frame.
         tx.send(&Packet::new(Message::Heartbeat, 0)).unwrap();
-        tx.send(&Packet::new(Message::ShellInput { data: b"x".to_vec() }, 5))
-            .unwrap();
+        tx.send(&Packet::new(
+            Message::ShellInput {
+                data: b"x".to_vec(),
+            },
+            5,
+        ))
+        .unwrap();
 
         let pkt = loop {
             match rx.recv() {
@@ -302,7 +310,12 @@ mod tests {
         };
         // First (and only) frame on the wire is the ShellInput, not a heartbeat.
         assert_eq!(pkt.seq, 5);
-        assert_eq!(pkt.message, Message::ShellInput { data: b"x".to_vec() });
+        assert_eq!(
+            pkt.message,
+            Message::ShellInput {
+                data: b"x".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -414,7 +427,12 @@ mod tests {
         let mut framed = Vec::new();
         write_packet_frame(
             &mut framed,
-            &Packet::new(Message::ShellInput { data: b"mid-frame".to_vec() }, 9),
+            &Packet::new(
+                Message::ShellInput {
+                    data: b"mid-frame".to_vec(),
+                },
+                9,
+            ),
         )
         .unwrap();
         // Split so the first write includes the 4-byte length prefix plus a
@@ -442,7 +460,12 @@ mod tests {
             }
         };
         assert_eq!(pkt.seq, 9);
-        assert_eq!(pkt.message, Message::ShellInput { data: b"mid-frame".to_vec() });
+        assert_eq!(
+            pkt.message,
+            Message::ShellInput {
+                data: b"mid-frame".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -454,8 +477,10 @@ mod tests {
         let mut tx = IpcStreamTransport::from_stream(a).unwrap();
         let mut rx = IpcStreamTransport::from_stream(b).unwrap();
 
-        tx.send(&Packet::new(Message::ShellExit { code: 1 }, 1)).unwrap();
-        tx.send(&Packet::new(Message::ShellExit { code: 2 }, 2)).unwrap();
+        tx.send(&Packet::new(Message::ShellExit { code: 1 }, 1))
+            .unwrap();
+        tx.send(&Packet::new(Message::ShellExit { code: 2 }, 2))
+            .unwrap();
 
         let mut got = Vec::new();
         while got.len() < 2 {
@@ -473,10 +498,12 @@ mod tests {
         let (a, b) = UnixStream::pair().expect("pair");
         let mut rx = IpcStreamTransport::from_stream(b).unwrap();
         drop(a); // peer hangs up after the handle is set up
-        // EOF surfaces as a Transport error and marks the handle disconnected.
+                 // EOF surfaces as a Transport error and marks the handle disconnected.
         let err = rx.recv().unwrap_err();
         match err {
-            WireDeskError::Transport(m) => assert!(m.contains("closed") || m.contains("read"), "got: {m}"),
+            WireDeskError::Transport(m) => {
+                assert!(m.contains("closed") || m.contains("read"), "got: {m}")
+            }
             other => panic!("expected Transport, got {other:?}"),
         }
         assert!(!rx.is_connected());

@@ -109,15 +109,18 @@ impl TrayUi {
             self.tray.show(
                 msg,
                 Some("WireDesk"),
-                Some(nwg::TrayNotificationFlags::WARNING_ICON
-                    | nwg::TrayNotificationFlags::LARGE_ICON),
+                Some(
+                    nwg::TrayNotificationFlags::WARNING_ICON
+                        | nwg::TrayNotificationFlags::LARGE_ICON,
+                ),
                 None,
             );
             return Ok(());
         }
         let icon = icons::build_status_icon(status)?;
         self.tray.set_icon(&icon);
-        self.tray.set_tip(&format!("WireDesk Host — {}", status.label()));
+        self.tray
+            .set_tip(&format!("WireDesk Host — {}", status.label()));
         Ok(())
     }
 

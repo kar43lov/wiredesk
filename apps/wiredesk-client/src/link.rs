@@ -18,14 +18,14 @@
 //! *returns* the receiver when it exits and the supervisor hands it to the
 //! next writer.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use wiredesk_core::error::WireDeskError;
-use wiredesk_core::storm::{DEFAULT_STORM_THRESHOLD, StormCounter};
+use wiredesk_core::storm::{StormCounter, DEFAULT_STORM_THRESHOLD};
 use wiredesk_protocol::message::{Message, VERSION};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
@@ -222,8 +222,7 @@ pub fn spawn_supervisor(
                 Ok(w) => w,
                 Err(e) => {
                     log::error!("try_clone failed after reopen: {e}");
-                    let _ =
-                        events_tx.send(TransportEvent::Disconnected(format!("try_clone: {e}")));
+                    let _ = events_tx.send(TransportEvent::Disconnected(format!("try_clone: {e}")));
                     // Keep the receiver for the next request and wait.
                     outgoing_rx = Some(rx);
                     continue;
@@ -799,7 +798,9 @@ mod tests {
 
         // Exactly threshold Protocol errors → reader should detect storm and
         // emit a Disconnected event, then exit.
-        let steps: Vec<Step> = (0..DEFAULT_STORM_THRESHOLD).map(|_| Step::Protocol).collect();
+        let steps: Vec<Step> = (0..DEFAULT_STORM_THRESHOLD)
+            .map(|_| Step::Protocol)
+            .collect();
         let transport = Box::new(ScriptedTransport::new(steps, true));
 
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown, ctx));
@@ -844,7 +845,10 @@ mod tests {
             "expected Heartbeat (no storm), got {evt:?}"
         );
         // No Disconnected should follow.
-        assert!(events_rx.try_recv().is_err(), "unexpected event after heartbeat");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "unexpected event after heartbeat"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -898,7 +902,10 @@ mod tests {
         assert!(matches!(evt, TransportEvent::Heartbeat), "got {evt:?}");
         // ...and no Disconnected should follow (storm never reached threshold).
         thread::sleep(Duration::from_millis(100));
-        assert!(events_rx.try_recv().is_err(), "unexpected event after reset");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "unexpected event after reset"
+        );
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
@@ -978,16 +985,14 @@ mod tests {
                 events_tx,
                 shutdown_c,
                 ctx,
-                Duration::from_millis(20),  // idle budget would fire fast...
-                Duration::from_secs(30),    // ...but busy budget keeps us alive
+                Duration::from_millis(20), // idle budget would fire fast...
+                Duration::from_secs(30),   // ...but busy budget keeps us alive
             )
         });
 
         // Well past the idle budget but far under the busy budget → silence.
         assert!(
-            events_rx
-                .recv_timeout(Duration::from_millis(200))
-                .is_err(),
+            events_rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "unexpected Disconnected while a transfer was in flight"
         );
         shutdown.store(true, Ordering::Release);
@@ -1087,8 +1092,10 @@ mod tests {
             if calls < 3 {
                 Err(WireDeskError::Transport(format!("open fail {calls}")))
             } else {
-                Ok(Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true))
-                    as Box<dyn Transport>)
+                Ok(
+                    Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true))
+                        as Box<dyn Transport>,
+                )
             }
         };
 
@@ -1117,7 +1124,10 @@ mod tests {
         // After the 3rd attempt the link is spawned → link_up flips true.
         let start = Instant::now();
         while !link_up.load(Ordering::Acquire) {
-            assert!(start.elapsed() < Duration::from_secs(2), "link never came up");
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "link never came up"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         assert!(link_up.load(Ordering::Acquire));
@@ -1141,8 +1151,10 @@ mod tests {
         // Every open succeeds with a send-OK transport that completes the
         // handshake (HelloAck) — models a fd that stays open across the storm.
         let open_fn = move || -> Result<Box<dyn Transport>> {
-            Ok(Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true))
-                as Box<dyn Transport>)
+            Ok(
+                Box::new(ScriptedTransport::new(vec![Step::Valid(hello_ack())], true))
+                    as Box<dyn Transport>,
+            )
         };
 
         let _sup = spawn_supervisor(
@@ -1157,7 +1169,10 @@ mod tests {
         let wait_up = || {
             let start = Instant::now();
             while !link_up.load(Ordering::Acquire) {
-                assert!(start.elapsed() < Duration::from_secs(3), "link never came up");
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "link never came up"
+                );
                 thread::sleep(Duration::from_millis(5));
             }
         };

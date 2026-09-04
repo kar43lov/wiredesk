@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use crossterm::terminal;
-use wiredesk_core::error::{Result, WireDeskError};
-use wiredesk_exec_core::format_timeout_diagnostic;
 #[cfg(target_os = "macos")]
 use std::path::Path;
+use wiredesk_core::error::{Result, WireDeskError};
+use wiredesk_exec_core::format_timeout_diagnostic;
 #[cfg(target_os = "macos")]
 use wiredesk_exec_core::ipc::{
     default_socket_path, read_response, write_connect, IpcConnect, IpcInteractiveOpen, IpcRequest,
@@ -173,8 +173,7 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
     #[cfg(target_os = "macos")]
     if args.exec {
         let cmd = args.command.as_deref().expect("validated above");
-        if let Some(code) =
-            try_socket_first(cmd, args.ssh.as_deref(), args.timeout, args.compress)?
+        if let Some(code) = try_socket_first(cmd, args.ssh.as_deref(), args.timeout, args.compress)?
         {
             return Ok(code);
         }
@@ -250,7 +249,9 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
     };
     let open_msg = build_shell_open_message(&args.shell, args.exec, cols, rows);
     {
-        let mut t = writer.lock().map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
+        let mut t = writer
+            .lock()
+            .map_err(|_| WireDeskError::Transport("mutex poisoned".into()))?;
         t.send(&Packet::new(open_msg, 0))?;
     }
 
@@ -270,8 +271,7 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
         )
     } else {
         // Switch local terminal to raw mode so we can forward keystrokes byte-by-byte.
-        terminal::enable_raw_mode()
-            .map_err(|e| WireDeskError::Input(format!("raw mode: {e}")))?;
+        terminal::enable_raw_mode().map_err(|e| WireDeskError::Input(format!("raw mode: {e}")))?;
         let r = bridge_loop(writer.clone(), reader).map(|_| 0);
         // Restore terminal regardless of how the loop exited.
         let _ = terminal::disable_raw_mode();
@@ -303,7 +303,9 @@ fn run(args: &Args, port_source: ValueSource, baud_source: ValueSource) -> Resul
 /// Pure helper so the choice is unit-tested without spinning serial.
 fn build_shell_open_message(shell: &str, exec: bool, cols: u16, rows: u16) -> Message {
     if exec {
-        Message::ShellOpen { shell: shell.to_owned() }
+        Message::ShellOpen {
+            shell: shell.to_owned(),
+        }
     } else {
         Message::ShellOpenPty {
             shell: shell.to_owned(),
@@ -391,11 +393,10 @@ fn try_socket_first(
 
     let first = match read_response(&mut stream) {
         Ok(r) => r,
-        Err(e)
-            if e.kind() == io::ErrorKind::WouldBlock
-                || e.kind() == io::ErrorKind::TimedOut =>
-        {
-            eprintln!("wd: GUI IPC unresponsive (no first frame in 2s), falling back to direct serial");
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            eprintln!(
+                "wd: GUI IPC unresponsive (no first frame in 2s), falling back to direct serial"
+            );
             return Ok(None);
         }
         Err(e) => return Err(WireDeskError::Transport(format!("IPC read: {e}"))),
@@ -563,13 +564,18 @@ struct SerialExecTransport {
 }
 
 impl wiredesk_exec_core::ExecTransport for SerialExecTransport {
-    fn send_input(&mut self, data: &[u8]) -> std::result::Result<(), wiredesk_exec_core::ExecError> {
+    fn send_input(
+        &mut self,
+        data: &[u8],
+    ) -> std::result::Result<(), wiredesk_exec_core::ExecError> {
         let mut t = self
             .writer
             .lock()
             .map_err(|_| wiredesk_exec_core::ExecError::Transport("mutex poisoned".into()))?;
         t.send(&Packet::new(
-            Message::ShellInput { data: data.to_vec() },
+            Message::ShellInput {
+                data: data.to_vec(),
+            },
             0,
         ))
         .map_err(|e| wiredesk_exec_core::ExecError::Transport(e.to_string()))
@@ -586,11 +592,13 @@ impl wiredesk_exec_core::ExecTransport for SerialExecTransport {
         // serial layer reports a timeout error.
         match self.reader.recv() {
             Ok(p) => match p.message {
-                Message::ShellOutput { data } => Ok(wiredesk_exec_core::ExecEvent::ShellOutput(data)),
-                Message::ShellExit { code } => Ok(wiredesk_exec_core::ExecEvent::ShellExit(code)),
-                Message::Error { code, msg } => {
-                    Ok(wiredesk_exec_core::ExecEvent::HostError(format!("{code}: {msg}")))
+                Message::ShellOutput { data } => {
+                    Ok(wiredesk_exec_core::ExecEvent::ShellOutput(data))
                 }
+                Message::ShellExit { code } => Ok(wiredesk_exec_core::ExecEvent::ShellExit(code)),
+                Message::Error { code, msg } => Ok(wiredesk_exec_core::ExecEvent::HostError(
+                    format!("{code}: {msg}"),
+                )),
                 _ => Ok(wiredesk_exec_core::ExecEvent::Idle),
             },
             Err(WireDeskError::Transport(ref m)) if m.contains("timeout") => {
@@ -658,9 +666,7 @@ fn run_exec_oneshot(
             eprintln!("{}", format_timeout_diagnostic(&buf, timeout_secs));
             Ok(124)
         }
-        Err(wiredesk_exec_core::ExecError::Transport(m)) => {
-            Err(WireDeskError::Transport(m))
-        }
+        Err(wiredesk_exec_core::ExecError::Transport(m)) => Err(WireDeskError::Transport(m)),
         Err(wiredesk_exec_core::ExecError::Closed) => {
             Err(WireDeskError::Transport("transport closed".into()))
         }
@@ -722,8 +728,7 @@ fn handshake(
     let hello_err: Option<WireDeskError> = match hello_send {
         Ok(()) => None,
         Err(e) => {
-            let is_ipc_write =
-                matches!(&e, WireDeskError::Transport(m) if m.contains("ipc write"));
+            let is_ipc_write = matches!(&e, WireDeskError::Transport(m) if m.contains("ipc write"));
             if is_ipc_write {
                 Some(e) // fall through to read the buffered refusal Error
             } else {
@@ -745,9 +750,17 @@ fn handshake(
         }
         match reader.recv() {
             Ok(p) => match p.message {
-                Message::HelloAck { host_name, screen_w, screen_h, .. } => {
+                Message::HelloAck {
+                    host_name,
+                    screen_w,
+                    screen_h,
+                    ..
+                } => {
                     if !quiet {
-                        eprintln!("{}", format_connected_banner(&host_name, screen_w, screen_h));
+                        eprintln!(
+                            "{}",
+                            format_connected_banner(&host_name, screen_w, screen_h)
+                        );
                         eprint!("{}", format_hotkey_cheatsheet());
                     }
                     return Ok(Some(()));
@@ -786,10 +799,7 @@ fn handshake(
 /// backspace-erase — anything else would double-echo. The only
 /// keystroke we still intercept is Ctrl+] (0x1D), the telnet/nc-
 /// style local quit hotkey.
-fn bridge_loop(
-    writer: Arc<Mutex<Box<dyn Transport>>>,
-    reader: Box<dyn Transport>,
-) -> Result<()> {
+fn bridge_loop(writer: Arc<Mutex<Box<dyn Transport>>>, reader: Box<dyn Transport>) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
 
     // Reader thread: pull packets on its own port handle, write
@@ -872,7 +882,9 @@ fn stdin_pump(writer: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<AtomicBool>) {
                 }
                 if let Ok(mut t) = writer.lock() {
                     if let Err(e) = t.send(&Packet::new(
-                        Message::ShellInput { data: chunk.to_vec() },
+                        Message::ShellInput {
+                            data: chunk.to_vec(),
+                        },
                         0,
                     )) {
                         eprintln!("\r\nwiredesk-term: send error: {e}");
@@ -925,7 +937,10 @@ fn resize_poll_thread(transport: Arc<Mutex<Box<dyn Transport>>>, stop: Arc<Atomi
 fn compute_resize_packet(prev: Option<(u16, u16)>, cur: (u16, u16)) -> Option<Message> {
     match prev {
         Some(p) if p == cur => None,
-        _ => Some(Message::PtyResize { cols: cur.0, rows: cur.1 }),
+        _ => Some(Message::PtyResize {
+            cols: cur.0,
+            rows: cur.1,
+        }),
     }
 }
 
@@ -1022,7 +1037,9 @@ mod tests {
     struct IpcBrokenPipeWriter;
     impl Transport for IpcBrokenPipeWriter {
         fn send(&mut self, _p: &Packet) -> Result<()> {
-            Err(WireDeskError::Transport("ipc write: Broken pipe (os error 32)".into()))
+            Err(WireDeskError::Transport(
+                "ipc write: Broken pipe (os error 32)".into(),
+            ))
         }
         fn recv(&mut self) -> Result<Packet> {
             Err(WireDeskError::Transport("recv timeout".into()))
@@ -1043,7 +1060,9 @@ mod tests {
     struct SerialFailWriter;
     impl Transport for SerialFailWriter {
         fn send(&mut self, _p: &Packet) -> Result<()> {
-            Err(WireDeskError::Transport("serial send: device not configured".into()))
+            Err(WireDeskError::Transport(
+                "serial send: device not configured".into(),
+            ))
         }
         fn recv(&mut self) -> Result<Packet> {
             Err(WireDeskError::Transport("recv timeout".into()))
@@ -1187,10 +1206,16 @@ mod tests {
     #[test]
     fn format_banner_typical_resolution() {
         let s = format_connected_banner("wiredesk-host", 2560, 1440);
-        assert!(s.contains("wiredesk-host"), "banner must include host name: {s}");
+        assert!(
+            s.contains("wiredesk-host"),
+            "banner must include host name: {s}"
+        );
         assert!(s.contains("2560"), "banner must include width: {s}");
         assert!(s.contains("1440"), "banner must include height: {s}");
-        assert!(s.contains("Ctrl+]"), "banner must mention the quit hotkey: {s}");
+        assert!(
+            s.contains("Ctrl+]"),
+            "banner must mention the quit hotkey: {s}"
+        );
     }
 
     #[test]
@@ -1255,7 +1280,13 @@ mod tests {
     #[test]
     fn compute_resize_packet_changed_emits() {
         let p = compute_resize_packet(Some((80, 24)), (120, 40));
-        assert!(matches!(p, Some(Message::PtyResize { cols: 120, rows: 40 })));
+        assert!(matches!(
+            p,
+            Some(Message::PtyResize {
+                cols: 120,
+                rows: 40
+            })
+        ));
     }
 
     #[test]
@@ -1411,11 +1442,7 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)] // test helper; descriptive tuple beats type alias here
-    fn make_split_pair() -> (
-        Arc<Mutex<Box<dyn Transport>>>,
-        Box<dyn Transport>,
-        HostSide,
-    ) {
+    fn make_split_pair() -> (Arc<Mutex<Box<dyn Transport>>>, Box<dyn Transport>, HostSide) {
         let (c2h_tx, c2h_rx) = mpsc::channel();
         let (h2c_tx, h2c_rx) = mpsc::channel();
         let writer: Box<dyn Transport> = Box::new(ClientWriter { tx: c2h_tx });
@@ -1473,7 +1500,9 @@ mod tests {
             // is_remote_prompt would never match — checking that the
             // partial-peek branch handles real Starship.
             host.emit_chunk("Welcome to Ubuntu\r\nMOTD line\r\n");
-            host.emit_chunk("\x1b[1;33muser\x1b[0m in \x1b[1;36m~\x1b[0m \r\n➜ \x1b[K\x1b[?1h\x1b=\x1b[?2004h");
+            host.emit_chunk(
+                "\x1b[1;33muser\x1b[0m in \x1b[1;36m~\x1b[0m \r\n➜ \x1b[K\x1b[?1h\x1b=\x1b[?2004h",
+            );
 
             // Step 3: client should now send the formatted command.
             let cmd = host
@@ -1520,9 +1549,7 @@ mod tests {
     fn run_oneshot_propagates_nonzero_exit() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            let cmd = host
-                .recv_shell_input(Duration::from_secs(2))
-                .expect("cmd");
+            let cmd = host.recv_shell_input(Duration::from_secs(2)).expect("cmd");
             let uuid = extract_uuid_from_payload(&cmd);
             host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
         });
@@ -1627,8 +1654,8 @@ mod tests {
         use std::os::unix::net::UnixListener;
         use wiredesk_exec_core::ipc::{read_connect, write_response, IpcConnect, IpcResponse};
 
-        let socket_path = std::env::temp_dir()
-            .join(format!("wd-exec-test-{}.sock", uuid::Uuid::new_v4()));
+        let socket_path =
+            std::env::temp_dir().join(format!("wd-exec-test-{}.sock", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&socket_path);
 
         let listener = UnixListener::bind(&socket_path).expect("bind");
@@ -1721,8 +1748,7 @@ mod tests {
         assert_eq!(diag.as_deref(), Some("wd: host error: boom"));
 
         // Exit passes the code through with no diagnostic.
-        let (code, diag) =
-            classify_terminal_response(&IpcResponse::Exit(42)).expect("terminal");
+        let (code, diag) = classify_terminal_response(&IpcResponse::Exit(42)).expect("terminal");
         assert_eq!(code, 42);
         assert!(diag.is_none());
 
@@ -1820,10 +1846,8 @@ mod tests {
         // We can't call try_socket_first directly (it pins to
         // default_socket_path), but we mirror its connect-or-fallback
         // logic here against a guaranteed-missing path.
-        let bogus = std::env::temp_dir().join(format!(
-            "wd-exec-missing-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
+        let bogus =
+            std::env::temp_dir().join(format!("wd-exec-missing-{}.sock", uuid::Uuid::new_v4()));
         let res = std::os::unix::net::UnixStream::connect(&bogus);
         assert!(res.is_err(), "connect to missing path must fail");
     }

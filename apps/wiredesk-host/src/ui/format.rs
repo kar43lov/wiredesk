@@ -4,9 +4,9 @@ use crate::session_thread::SessionStatus;
 /// Tray icon color — three discrete states the user can read at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusColor {
-    Green, // active client connection
+    Green,  // active client connection
     Yellow, // serial open, waiting for handshake
-    Gray, // disconnected / serial down
+    Gray,   // disconnected / serial down
 }
 
 pub fn status_color(status: &SessionStatus) -> StatusColor {

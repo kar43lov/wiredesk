@@ -13,14 +13,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wiredesk_protocol::clip_file::{
-    MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
+    pack_first_chunk, sanitize_basename, unpack_first_chunk, MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES,
 };
-use wiredesk_protocol::message::{FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
+use wiredesk_protocol::message::{Message, FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8};
 
 use crate::clipboard_files;
 
@@ -159,9 +159,7 @@ fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image
     reader.limits(limits);
     let dyn_img = reader.decode()?;
     let (w, h) = dyn_img.dimensions();
-    let alloc = (w as u64)
-        .saturating_mul(h as u64)
-        .saturating_mul(4);
+    let alloc = (w as u64).saturating_mul(h as u64).saturating_mul(4);
     if alloc > DECODE_MAX_ALLOC {
         return Err(image::ImageError::Limits(
             image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
@@ -237,7 +235,11 @@ pub(crate) fn format_oversize_file_toast(e: &FileTooLarge, limit: usize) -> Stri
 pub(crate) enum FilePollOutcome {
     /// File read successfully. Caller emits offer + chunks then stamps
     /// `LastKind::File(hash)`.
-    Ready { name: String, hash: u64, packed: Vec<u8> },
+    Ready {
+        name: String,
+        hash: u64,
+        packed: Vec<u8>,
+    },
     /// File exceeded `limit`. Caller stamps `LastKind::OversizeFile(path_hash)`
     /// and surfaces the toast.
     Oversize { path_hash: u64, err: FileTooLarge },
@@ -256,10 +258,7 @@ pub(crate) enum FilePollOutcome {
 ///
 /// Symmetric with the Mac side's `pack_file_or_warn` — the duplication is
 /// intentional per CLAUDE.md (both sides poll their own OS clipboard).
-pub(crate) fn pack_file_or_warn(
-    path: &std::path::Path,
-    limit: usize,
-) -> FilePollOutcome {
+pub(crate) fn pack_file_or_warn(path: &std::path::Path, limit: usize) -> FilePollOutcome {
     use std::fs;
 
     let name = match path.file_name().and_then(|s| s.to_str()) {
@@ -324,10 +323,7 @@ pub(crate) enum FilePreStampOutcome {
 /// Pure helper: I/O is unavoidable (we have to read the file to hash content),
 /// but pulled out of `stamp_initial` so unit tests can drive it with a
 /// `tempfile`-backed path and a low limit.
-pub(crate) fn pre_stamp_file_path(
-    path: &std::path::Path,
-    limit: usize,
-) -> FilePreStampOutcome {
+pub(crate) fn pre_stamp_file_path(path: &std::path::Path, limit: usize) -> FilePreStampOutcome {
     use std::fs;
 
     let name = match path.file_name().and_then(|s| s.to_str()) {
@@ -346,7 +342,9 @@ pub(crate) fn pre_stamp_file_path(
     }
 
     if check_file_size(size_usize, limit).is_err() {
-        return FilePreStampOutcome::Oversize { size_bytes: size_usize };
+        return FilePreStampOutcome::Oversize {
+            size_bytes: size_usize,
+        };
     }
 
     let content = match fs::read(path) {
@@ -511,11 +509,19 @@ pub struct ClipboardSync {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CommittedPayload {
     Text(String),
-    Image { width: usize, height: usize, bytes: Vec<u8> },
+    Image {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
     /// File materialized into the cache dir. Carries the absolute path, the
     /// sanitized basename used to compose it, and the raw content bytes so
     /// tests can assert on byte-equal roundtrip.
-    File { path: PathBuf, name: String, content: Vec<u8> },
+    File {
+        path: PathBuf,
+        name: String,
+        content: Vec<u8>,
+    },
 }
 
 /// Bundle of progress atomics shared between `ClipboardSync` and any
@@ -732,7 +738,8 @@ impl ClipboardSync {
                 // progress to 0 — a previous transfer may have left it at
                 // its terminal value (we keep it there so the 100% latch
                 // works on the receiver side).
-                self.outgoing_total.store(bytes.len() as u64, Ordering::Relaxed);
+                self.outgoing_total
+                    .store(bytes.len() as u64, Ordering::Relaxed);
                 self.outgoing_progress.store(0, Ordering::Relaxed);
                 self.pending_outbox
                     .extend(build_offer_and_chunks(FORMAT_TEXT_UTF8, bytes));
@@ -802,11 +809,9 @@ impl ClipboardSync {
             // only when clipboard content changes again. Acceptable: heartbeat
             // covers disconnect within 6s, app restart clears state.
             self.last = LastKind::Image(hash);
-            log::info!(
-                "clipboard: sending image to peer ({} bytes)",
-                png.len()
-            );
-            self.outgoing_total.store(png.len() as u64, Ordering::Relaxed);
+            log::info!("clipboard: sending image to peer ({} bytes)", png.len());
+            self.outgoing_total
+                .store(png.len() as u64, Ordering::Relaxed);
             self.outgoing_progress.store(0, Ordering::Relaxed);
             self.pending_outbox
                 .extend(build_offer_and_chunks(FORMAT_PNG_IMAGE, &png));
@@ -872,8 +877,7 @@ impl ClipboardSync {
                         err.size_bytes,
                         MAX_FILE_BYTES,
                     );
-                    self.pending_warning =
-                        Some(format_oversize_file_toast(&err, MAX_FILE_BYTES));
+                    self.pending_warning = Some(format_oversize_file_toast(&err, MAX_FILE_BYTES));
                     self.last = LastKind::OversizeFile(path_hash);
                 }
                 FilePollOutcome::Skipped(reason) => {
@@ -908,9 +912,7 @@ impl ClipboardSync {
         // for the unknown format will hit the expected_len==0 guard in
         // on_chunk and be dropped.
         if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE && format != FORMAT_FILE {
-            log::warn!(
-                "clipboard: incoming offer with unsupported format {format}, ignoring"
-            );
+            log::warn!("clipboard: incoming offer with unsupported format {format}, ignoring");
             self.expected_len = 0;
             self.expected_format = 0;
             self.received.clear();
@@ -970,7 +972,8 @@ impl ClipboardSync {
         self.expected_format = format;
         self.received.clear();
         self.received_total = 0;
-        self.incoming_total.store(total_len as u64, Ordering::Relaxed);
+        self.incoming_total
+            .store(total_len as u64, Ordering::Relaxed);
         self.incoming_progress.store(0, Ordering::Relaxed);
         log::info!("clipboard.recv START format={format} total={total_len} bytes");
         None
@@ -1104,7 +1107,11 @@ impl ClipboardSync {
         // later chunks shifted, silently corrupting the payload. Refuse to
         // commit on non-contiguous indices and reset state.
         let n = self.received.len();
-        let contiguous = self.received.keys().enumerate().all(|(i, k)| *k as usize == i);
+        let contiguous = self
+            .received
+            .keys()
+            .enumerate()
+            .all(|(i, k)| *k as usize == i);
         if !contiguous {
             log::warn!(
                 "clipboard: non-contiguous chunk indices ({n} chunks, expected 0..{n}), dropping payload"
@@ -1145,7 +1152,10 @@ impl ClipboardSync {
             FORMAT_PNG_IMAGE => self.commit_image(&buf),
             FORMAT_FILE => self.commit_file(&buf),
             other => {
-                log::warn!("clipboard: unknown format {other}, skipping {} bytes", buf.len());
+                log::warn!(
+                    "clipboard: unknown format {other}, skipping {} bytes",
+                    buf.len()
+                );
             }
         }
 
@@ -1200,10 +1210,7 @@ impl ClipboardSync {
 
         let hash = hash_bytes(&img.bytes);
 
-        log::info!(
-            "clipboard: received image from peer ({} bytes)",
-            buf.len()
-        );
+        log::info!("clipboard: received image from peer ({} bytes)", buf.len());
 
         #[cfg(test)]
         {
@@ -1219,7 +1226,10 @@ impl ClipboardSync {
         if let Some(clip) = self.clip.as_mut() {
             match clip.set_image(img) {
                 Ok(()) => {
-                    log::debug!("clipboard: wrote image from client ({} encoded bytes)", buf.len());
+                    log::debug!(
+                        "clipboard: wrote image from client ({} encoded bytes)",
+                        buf.len()
+                    );
                     wrote_ok = true;
                 }
                 Err(e) => log::warn!("clipboard: set_image failed: {e}"),
@@ -1259,7 +1269,10 @@ impl ClipboardSync {
         let basename = sanitize_basename(&raw_name);
         let dir = self.resolve_cache_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            log::warn!("clipboard: cache dir create failed at {}: {e}", dir.display());
+            log::warn!(
+                "clipboard: cache dir create failed at {}: {e}",
+                dir.display()
+            );
             return;
         }
         let path = dir.join(&basename);
@@ -1316,10 +1329,7 @@ impl ClipboardSync {
                 true
             }
             Err(e) => {
-                log::warn!(
-                    "clipboard: set_cf_hdrop failed for {}: {e}",
-                    path.display()
-                );
+                log::warn!("clipboard: set_cf_hdrop failed for {}: {e}", path.display());
                 false
             }
         };
@@ -1393,10 +1403,7 @@ pub fn run_startup_vacuum(older_than: Duration) {
     let dir = default_cache_dir();
     match wiredesk_core::cache_vacuum::vacuum_cache_dir(&dir, older_than) {
         Ok(0) => {
-            log::debug!(
-                "cache vacuum: nothing to remove under {}",
-                dir.display()
-            );
+            log::debug!("cache vacuum: nothing to remove under {}", dir.display());
         }
         Ok(n) => {
             log::info!(
@@ -1405,10 +1412,7 @@ pub fn run_startup_vacuum(older_than: Duration) {
             );
         }
         Err(e) => {
-            log::warn!(
-                "cache vacuum: enumeration of {} failed: {e}",
-                dir.display()
-            );
+            log::warn!("cache vacuum: enumeration of {} failed: {e}", dir.display());
         }
     }
 }
@@ -1450,7 +1454,10 @@ mod tests {
         let decoded = decode_png_to_rgba(&png).expect("decode");
         assert_eq!(decoded.width, original.width);
         assert_eq!(decoded.height, original.height);
-        assert_eq!(&*decoded.bytes, &*original.bytes, "RGBA must roundtrip byte-for-byte");
+        assert_eq!(
+            &*decoded.bytes, &*original.bytes,
+            "RGBA must roundtrip byte-for-byte"
+        );
     }
 
     #[test]
@@ -1491,7 +1498,9 @@ mod tests {
     #[test]
     fn host_build_offer_and_chunks_shape() {
         // Build a payload longer than CHUNK_SIZE so we get >1 chunk.
-        let payload: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7)).map(|i| (i & 0xFF) as u8).collect();
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
         let msgs = build_offer_and_chunks(FORMAT_PNG_IMAGE, &payload);
 
         match &msgs[0] {
@@ -1529,7 +1538,11 @@ mod tests {
         feed_offer(&mut sync, FORMAT_PNG_IMAGE, &png);
 
         match sync.last_committed.as_ref().expect("committed payload") {
-            CommittedPayload::Image { width, height, bytes } => {
+            CommittedPayload::Image {
+                width,
+                height,
+                bytes,
+            } => {
                 assert_eq!(*width, original.width);
                 assert_eq!(*height, original.height);
                 assert_eq!(bytes.as_slice(), &*original.bytes);
@@ -1612,7 +1625,10 @@ mod tests {
         // Unknown format with deliberately large total_len — must NOT arm.
         sync.on_offer(0xFE, u32::MAX);
 
-        assert_eq!(sync.expected_len, 0, "unknown format must not arm reassembly");
+        assert_eq!(
+            sync.expected_len, 0,
+            "unknown format must not arm reassembly"
+        );
         assert_eq!(sync.expected_format, 0);
         assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
         assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
@@ -1621,7 +1637,11 @@ mod tests {
         for i in 0..16u16 {
             sync.on_chunk(i, vec![0u8; 256]);
         }
-        assert_eq!(sync.received.len(), 0, "post-rejection chunks must not buffer");
+        assert_eq!(
+            sync.received.len(),
+            0,
+            "post-rejection chunks must not buffer"
+        );
         assert_eq!(sync.received_total, 0);
     }
 
@@ -1670,7 +1690,10 @@ mod tests {
     #[test]
     fn host_on_offer_oversize_text_rejected() {
         let mut sync = ClipboardSync::new_for_test();
-        sync.on_offer(FORMAT_TEXT_UTF8, (MAX_CLIPBOARD_BYTES as u32).saturating_add(1));
+        sync.on_offer(
+            FORMAT_TEXT_UTF8,
+            (MAX_CLIPBOARD_BYTES as u32).saturating_add(1),
+        );
 
         assert_eq!(sync.expected_len, 0);
         assert_eq!(sync.expected_format, 0);
@@ -1687,7 +1710,10 @@ mod tests {
         sync.on_chunk(5, vec![b'a'; 256]);
         sync.on_chunk(7, vec![b'b'; 256]);
 
-        assert!(sync.last_committed.is_none(), "non-contiguous must not commit");
+        assert!(
+            sync.last_committed.is_none(),
+            "non-contiguous must not commit"
+        );
         assert_eq!(sync.expected_len, 0);
         assert_eq!(sync.expected_format, 0);
         assert_eq!(sync.received_total, 0);
@@ -1967,7 +1993,10 @@ mod tests {
         assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 256);
 
         sync.on_chunk(0, vec![b'b'; 256]);
-        assert_eq!(sync.received_total, 256, "duplicate index must not bump total");
+        assert_eq!(
+            sync.received_total, 256,
+            "duplicate index must not bump total"
+        );
         assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 256);
     }
 
@@ -1995,7 +2024,10 @@ mod tests {
         assert!(sync.received.is_empty());
         assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
         assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 0);
-        assert!(matches!(sync.last, LastKind::None), "reset must clear sender dedup");
+        assert!(
+            matches!(sync.last, LastKind::None),
+            "reset must clear sender dedup"
+        );
     }
 
     #[test]
@@ -2009,7 +2041,11 @@ mod tests {
         sync.on_chunk(1, vec![0u8; 256]);
         sync.on_chunk(2, vec![0u8; 256]);
 
-        assert_eq!(sync.received.len(), 0, "chunks without offer must not buffer");
+        assert_eq!(
+            sync.received.len(),
+            0,
+            "chunks without offer must not buffer"
+        );
         assert_eq!(sync.received_total, 0);
         assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
     }
@@ -2027,7 +2063,11 @@ mod tests {
             sync.on_chunk(i, vec![0u8; 256]);
         }
 
-        assert_eq!(sync.received.len(), 0, "post-rejection chunks must not buffer");
+        assert_eq!(
+            sync.received.len(),
+            0,
+            "post-rejection chunks must not buffer"
+        );
         assert_eq!(sync.received_total, 0);
         assert_eq!(sync.incoming_progress.load(Ordering::Relaxed), 0);
     }
@@ -2041,7 +2081,10 @@ mod tests {
         let img = synthetic_rgba_4x4();
         let hash = hash_bytes(&img.bytes);
 
-        assert!(!LastKind::None.matches_image_hash(hash), "first tick must NOT skip");
+        assert!(
+            !LastKind::None.matches_image_hash(hash),
+            "first tick must NOT skip"
+        );
 
         let last_oversize = LastKind::OversizeImage(hash);
         assert!(
@@ -2092,7 +2135,10 @@ mod tests {
         // file hash is stamped, the next poll tick with the same content
         // must short-circuit (no re-read, no repeat warn-log).
         let h = 0xABCD_u64;
-        assert!(!LastKind::None.matches_file_hash(h), "first tick must NOT skip");
+        assert!(
+            !LastKind::None.matches_file_hash(h),
+            "first tick must NOT skip"
+        );
 
         let last_oversize = LastKind::OversizeFile(h);
         assert!(
@@ -2148,7 +2194,9 @@ mod tests {
     fn host_format_oversize_file_toast_includes_kb_and_limit() {
         // Toast must report size + limit in KB and instruct the user to copy
         // a smaller selection. Pure helper — keeps the wording unit-testable.
-        let e = FileTooLarge { size_bytes: 25_000 * 1024 };
+        let e = FileTooLarge {
+            size_bytes: 25_000 * 1024,
+        };
         let msg = format_oversize_file_toast(&e, MAX_FILE_BYTES);
         assert!(msg.contains("25000"), "KB count missing: {msg}");
         assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
@@ -2209,9 +2257,7 @@ mod tests {
     #[test]
     fn host_pack_file_or_warn_missing_file_skipped() {
         // Non-existent path → Skipped("stat failed"). Stable on any platform.
-        let path = std::path::PathBuf::from(
-            "/nonexistent/wiredesk-host-test-FILE-DNE-XYZ.bin",
-        );
+        let path = std::path::PathBuf::from("/nonexistent/wiredesk-host-test-FILE-DNE-XYZ.bin");
         match pack_file_or_warn(&path, MAX_FILE_BYTES) {
             FilePollOutcome::Skipped(_) => {}
             other => panic!("expected Skipped, got {other:?}"),
@@ -2265,8 +2311,9 @@ mod tests {
         // (format=FORMAT_FILE, total_len=packed_len) + chunks reassemble.
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let content: Vec<u8> =
-            (0..(CHUNK_SIZE * 4 + 17)).map(|i| (i & 0xFF) as u8).collect();
+        let content: Vec<u8> = (0..(CHUNK_SIZE * 4 + 17))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
         tmp.write_all(&content).expect("write");
         let path = tmp.path().to_owned();
 
@@ -2277,7 +2324,10 @@ mod tests {
         };
 
         let msgs = build_offer_and_chunks(FORMAT_FILE, &packed);
-        assert!(msgs.len() > 2, "must emit offer + >=2 chunks for ~4 KB payload");
+        assert!(
+            msgs.len() > 2,
+            "must emit offer + >=2 chunks for ~4 KB payload"
+        );
 
         // Offer assertion.
         match &msgs[0] {
@@ -2319,8 +2369,7 @@ mod tests {
         let mut sync = ClipboardSync::new_for_test();
         match pack_file_or_warn(&path, 256) {
             FilePollOutcome::Oversize { path_hash, err } => {
-                sync.pending_warning =
-                    Some(format_oversize_file_toast(&err, MAX_FILE_BYTES));
+                sync.pending_warning = Some(format_oversize_file_toast(&err, MAX_FILE_BYTES));
                 sync.last = LastKind::OversizeFile(path_hash);
             }
             other => panic!("expected Oversize, got {other:?}"),
@@ -2334,9 +2383,18 @@ mod tests {
 
         // Warning surfaces through take_warning.
         let warning = sync.take_warning().expect("warning must be set");
-        assert!(warning.contains("too large"), "warning missing prefix: {warning}");
-        assert!(warning.contains("smaller"), "warning missing hint: {warning}");
-        assert!(warning.contains("limit"), "warning missing limit: {warning}");
+        assert!(
+            warning.contains("too large"),
+            "warning missing prefix: {warning}"
+        );
+        assert!(
+            warning.contains("smaller"),
+            "warning missing hint: {warning}"
+        );
+        assert!(
+            warning.contains("limit"),
+            "warning missing limit: {warning}"
+        );
 
         // Oversize slot stamped via path hash so next tick short-circuits.
         let path_hash = hash_bytes(path.to_string_lossy().as_bytes());
@@ -2395,7 +2453,10 @@ mod tests {
         for i in 0..8u16 {
             sync.on_chunk(i, vec![0u8; 128]);
         }
-        assert!(sync.received.is_empty(), "post-decline chunks must not buffer");
+        assert!(
+            sync.received.is_empty(),
+            "post-decline chunks must not buffer"
+        );
         assert_eq!(sync.received_total, 0);
     }
 
@@ -2408,7 +2469,10 @@ mod tests {
         sync.set_receive_files_for_test(true);
 
         let reply = sync.on_offer(FORMAT_FILE, 4096);
-        assert!(reply.is_none(), "accepted offer must not return ClipDecline");
+        assert!(
+            reply.is_none(),
+            "accepted offer must not return ClipDecline"
+        );
         assert_eq!(sync.expected_len, 4096);
         assert_eq!(sync.expected_format, FORMAT_FILE);
         assert_eq!(sync.incoming_total.load(Ordering::Relaxed), 4096);
@@ -2533,7 +2597,11 @@ mod tests {
 
         // CommittedPayload mirror for in-test introspection.
         match sync.last_committed.as_ref().expect("committed") {
-            CommittedPayload::File { path, name: n, content: c } => {
+            CommittedPayload::File {
+                path,
+                name: n,
+                content: c,
+            } => {
                 assert_eq!(path, &expected);
                 assert_eq!(n, name);
                 assert_eq!(c, &content);
@@ -2691,7 +2759,11 @@ mod tests {
         let png = encode_rgba_to_png(&original).expect("encode");
         feed_offer(&mut sync, FORMAT_PNG_IMAGE, &png);
         match sync.last_committed.as_ref().expect("image committed") {
-            CommittedPayload::Image { width, height, bytes } => {
+            CommittedPayload::Image {
+                width,
+                height,
+                bytes,
+            } => {
                 assert_eq!(*width, original.width);
                 assert_eq!(*height, original.height);
                 assert_eq!(bytes.as_slice(), &*original.bytes);
@@ -2808,13 +2880,10 @@ mod tests {
         // %TEMP%/dirs::cache_dir() unconditionally) but we *can* assert
         // the underlying call against a known-missing path matches the
         // same Ok(0) contract the helper relies on.
-        let missing = std::env::temp_dir()
-            .join("wd-host-cache-vacuum-doesnotexist-9a-startup");
+        let missing = std::env::temp_dir().join("wd-host-cache-vacuum-doesnotexist-9a-startup");
         let _ = std::fs::remove_dir_all(&missing);
-        let res = wiredesk_core::cache_vacuum::vacuum_cache_dir(
-            &missing,
-            Duration::from_secs(24 * 3600),
-        );
+        let res =
+            wiredesk_core::cache_vacuum::vacuum_cache_dir(&missing, Duration::from_secs(24 * 3600));
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 0);
 
@@ -2833,7 +2902,7 @@ mod tests {
         // resolves %TEMP%/etc. — we can't divert it without an env
         // mutation that would race other tests, so we cover its core
         // dependency here.
-        use filetime::{FileTime, set_file_mtime};
+        use filetime::{set_file_mtime, FileTime};
         use std::fs;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2907,9 +2976,7 @@ mod tests {
         // Non-existent path → Skipped. The startup probe must not panic if
         // CF_HDROP points at a file that disappeared between sessions (user
         // deleted it during host downtime).
-        let path = std::path::PathBuf::from(
-            "/nonexistent/wiredesk-host-test-9b-missing.bin",
-        );
+        let path = std::path::PathBuf::from("/nonexistent/wiredesk-host-test-9b-missing.bin");
         match pre_stamp_file_path(&path, MAX_FILE_BYTES) {
             FilePreStampOutcome::Skipped(_) => {}
             other => panic!("expected Skipped, got {other:?}"),
@@ -2962,7 +3029,11 @@ mod tests {
             other => panic!("expected Oversize, got {other:?}"),
         };
 
-        assert_eq!(last, LastKind::None, "oversize pre-stamp must NOT set LastKind");
+        assert_eq!(
+            last,
+            LastKind::None,
+            "oversize pre-stamp must NOT set LastKind"
+        );
     }
 
     #[test]

@@ -142,10 +142,7 @@ where
                         break 'open t;
                     }
                     Err(e) => {
-                        log::error!(
-                            "failed to open transport (mode={}): {e}",
-                            config.transport
-                        );
+                        log::error!("failed to open transport (mode={}): {e}", config.transport);
                         let _ = status_tx.send(SessionStatus::Disconnected(format!(
                             "{}: {e}",
                             config.transport

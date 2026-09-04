@@ -324,13 +324,21 @@ mod tests {
 
     #[test]
     fn modifiers_cmd_to_ctrl() {
-        let mods = egui::Modifiers { command: true, ..Default::default() };
+        let mods = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
         assert_eq!(egui_modifiers_to_u8(&mods), 0x01);
     }
 
     #[test]
     fn modifiers_combined() {
-        let mods = egui::Modifiers { ctrl: true, shift: true, alt: true, ..Default::default() };
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: true,
+            ..Default::default()
+        };
         assert_eq!(egui_modifiers_to_u8(&mods), 0x07);
     }
 
@@ -412,7 +420,10 @@ mod tests {
     fn flag_change_release_one_keep_other() {
         // Both held, release Cmd → still effectively Ctrl held.
         let out = cg_flag_change_to_scancodes(CG_FLAG_CONTROL, CG_FLAG_COMMAND | CG_FLAG_CONTROL);
-        assert!(out.is_empty(), "releasing Cmd while Ctrl held shouldn't release Ctrl");
+        assert!(
+            out.is_empty(),
+            "releasing Cmd while Ctrl held shouldn't release Ctrl"
+        );
     }
 
     #[test]

@@ -164,7 +164,10 @@ mod tests {
 
     #[test]
     fn full_roundtrip_hello() {
-        full_roundtrip(Message::Hello { version: 1, client_name: "mac".into() });
+        full_roundtrip(Message::Hello {
+            version: 1,
+            client_name: "mac".into(),
+        });
     }
 
     #[test]
@@ -184,7 +187,10 @@ mod tests {
 
     #[test]
     fn full_roundtrip_key() {
-        full_roundtrip(Message::KeyDown { scancode: 0x1E, modifiers: 0x05 });
+        full_roundtrip(Message::KeyDown {
+            scancode: 0x1E,
+            modifiers: 0x05,
+        });
     }
 
     #[test]

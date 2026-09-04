@@ -155,8 +155,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     pub fn force_heartbeat_timeout(&mut self) {
         // Use the busy timeout so the rewind triggers regardless of which
         // branch the runtime check picks.
-        self.last_heartbeat_recv =
-            Instant::now() - HEARTBEAT_TIMEOUT_BUSY - Duration::from_secs(1);
+        self.last_heartbeat_recv = Instant::now() - HEARTBEAT_TIMEOUT_BUSY - Duration::from_secs(1);
     }
 
     /// Effective heartbeat timeout — extended while wire is saturated, so
@@ -181,10 +180,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// idle (e.g., user opened a shell and walked away), we wait 30s
     /// instead of 6s before tearing down. Acceptable.
     fn heartbeat_timeout(&self) -> Duration {
-        heartbeat_timeout_for(
-            self.clipboard.transfer_in_flight(),
-            self.shell.is_some(),
-        )
+        heartbeat_timeout_for(self.clipboard.transfer_in_flight(), self.shell.is_some())
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -315,7 +311,9 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         for chunk in outputs {
             // Split into max-payload-sized chunks (512 bytes is the protocol limit)
             for piece in chunk.chunks(480) {
-                self.send(Message::ShellOutput { data: piece.to_vec() })?;
+                self.send(Message::ShellOutput {
+                    data: piece.to_vec(),
+                })?;
             }
         }
 
@@ -343,7 +341,13 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
     fn handle_packet(&mut self, packet: Packet) -> Result<()> {
         match (&self.state, &packet.message) {
-            (SessionState::WaitingForHello, Message::Hello { version, client_name }) => {
+            (
+                SessionState::WaitingForHello,
+                Message::Hello {
+                    version,
+                    client_name,
+                },
+            ) => {
                 if *version != VERSION {
                     log::warn!("version mismatch: client v{version}, host v{VERSION}");
                     self.send(Message::Error {
@@ -381,11 +385,23 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.injector.mouse_scroll(*delta_x, *delta_y)?;
             }
 
-            (SessionState::Connected, Message::KeyDown { scancode, modifiers }) => {
+            (
+                SessionState::Connected,
+                Message::KeyDown {
+                    scancode,
+                    modifiers,
+                },
+            ) => {
                 self.injector.key_down(*scancode, *modifiers)?;
             }
 
-            (SessionState::Connected, Message::KeyUp { scancode, modifiers }) => {
+            (
+                SessionState::Connected,
+                Message::KeyUp {
+                    scancode,
+                    modifiers,
+                },
+            ) => {
                 self.injector.key_up(*scancode, *modifiers)?;
             }
 
@@ -422,9 +438,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 // Other formats already had no UI feedback historically —
                 // keeping that behaviour to avoid noise.
                 if *format == wiredesk_protocol::message::FORMAT_FILE {
-                    self.clipboard.push_warning(
-                        "Peer declined file (Receive files off)".into(),
-                    );
+                    self.clipboard
+                        .push_warning("Peer declined file (Receive files off)".into());
                 }
             }
 
@@ -554,10 +569,15 @@ mod tests {
         assert_eq!(session.state(), SessionState::WaitingForHello);
 
         // Client sends HELLO
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
 
         session.tick().unwrap();
         assert_eq!(session.state(), SessionState::Connected);
@@ -565,7 +585,9 @@ mod tests {
         // Host should have sent HELLO_ACK
         let ack = client.recv().unwrap();
         match ack.message {
-            Message::HelloAck { screen_w, screen_h, .. } => {
+            Message::HelloAck {
+                screen_w, screen_h, ..
+            } => {
                 assert_eq!(screen_w, 1920);
                 assert_eq!(screen_h, 1080);
             }
@@ -578,19 +600,34 @@ mod tests {
         let (mut session, mut client) = setup();
 
         // Handshake first
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
 
         // Send mouse move
-        client.send(&Packet::new(Message::MouseMove { x: 100, y: 200 }, 1)).unwrap();
+        client
+            .send(&Packet::new(Message::MouseMove { x: 100, y: 200 }, 1))
+            .unwrap();
         session.tick().unwrap();
 
         // Send key
-        client.send(&Packet::new(Message::KeyDown { scancode: 0x1E, modifiers: 0x01 }, 2)).unwrap();
+        client
+            .send(&Packet::new(
+                Message::KeyDown {
+                    scancode: 0x1E,
+                    modifiers: 0x01,
+                },
+                2,
+            ))
+            .unwrap();
         session.tick().unwrap();
 
         // Verify injector received events
@@ -603,10 +640,15 @@ mod tests {
         let (mut session, mut client) = setup();
 
         // Handshake
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
 
@@ -622,19 +664,29 @@ mod tests {
         let (mut session, mut client) = setup();
 
         // First handshake
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "first".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "first".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
         assert_eq!(session.state(), SessionState::Connected);
 
         // Second HELLO (reconnect)
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "second".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "second".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         assert_eq!(session.state(), SessionState::Connected);
 
@@ -648,21 +700,45 @@ mod tests {
     /// so the caller can keep driving messages.
     fn setup_with_partial_reassembly() -> (Session<MockTransport, MockInjector>, MockTransport) {
         let (mut session, mut client) = setup();
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
 
         // Push a partial reassembly: 1024-byte text offer + one 256-byte chunk.
-        client.send(&Packet::new(Message::ClipOffer { format: 0, total_len: 1024 }, 1)).unwrap();
+        client
+            .send(&Packet::new(
+                Message::ClipOffer {
+                    format: 0,
+                    total_len: 1024,
+                },
+                1,
+            ))
+            .unwrap();
         session.tick().unwrap();
-        client.send(&Packet::new(Message::ClipChunk { index: 0, data: vec![b'a'; 256] }, 2)).unwrap();
+        client
+            .send(&Packet::new(
+                Message::ClipChunk {
+                    index: 0,
+                    data: vec![b'a'; 256],
+                },
+                2,
+            ))
+            .unwrap();
         session.tick().unwrap();
 
-        assert_eq!(session.clipboard_state().expected_len(), 1024,
-            "precondition: in-flight reassembly must be active");
+        assert_eq!(
+            session.clipboard_state().expected_len(),
+            1024,
+            "precondition: in-flight reassembly must be active"
+        );
         (session, client)
     }
 
@@ -692,10 +768,7 @@ mod tests {
         );
 
         // Both — still busy.
-        assert_eq!(
-            heartbeat_timeout_for(true, true),
-            HEARTBEAT_TIMEOUT_BUSY,
-        );
+        assert_eq!(heartbeat_timeout_for(true, true), HEARTBEAT_TIMEOUT_BUSY,);
     }
 
     #[test]
@@ -707,8 +780,11 @@ mod tests {
         session.force_heartbeat_timeout();
         let _ = session.tick(); // returns Ok(false) once the timeout fires
 
-        assert_eq!(session.clipboard_state().expected_len(), 0,
-            "heartbeat timeout must reset clipboard reassembly");
+        assert_eq!(
+            session.clipboard_state().expected_len(),
+            0,
+            "heartbeat timeout must reset clipboard reassembly"
+        );
     }
 
     #[test]
@@ -719,8 +795,11 @@ mod tests {
         client.send(&Packet::new(Message::Disconnect, 3)).unwrap();
         session.tick().unwrap();
 
-        assert_eq!(session.clipboard_state().expected_len(), 0,
-            "Disconnect must reset clipboard reassembly");
+        assert_eq!(
+            session.clipboard_state().expected_len(),
+            0,
+            "Disconnect must reset clipboard reassembly"
+        );
     }
 
     #[test]
@@ -729,14 +808,22 @@ mod tests {
         // reassembly so the new session starts clean.
         let (mut session, mut client) = setup_with_partial_reassembly();
 
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "second".into() },
-            3,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "second".into(),
+                },
+                3,
+            ))
+            .unwrap();
         session.tick().unwrap();
 
-        assert_eq!(session.clipboard_state().expected_len(), 0,
-            "re-handshake must reset clipboard reassembly");
+        assert_eq!(
+            session.clipboard_state().expected_len(),
+            0,
+            "re-handshake must reset clipboard reassembly"
+        );
     }
 
     #[test]
@@ -745,14 +832,21 @@ mod tests {
         // with ShellOpenPty). Session must accept it, ignore it, and
         // not respond with Error.
         let (mut session, mut client) = setup();
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
 
-        client.send(&Packet::new(Message::PtyResize { cols: 80, rows: 24 }, 1)).unwrap();
+        client
+            .send(&Packet::new(Message::PtyResize { cols: 80, rows: 24 }, 1))
+            .unwrap();
         session.tick().unwrap();
 
         // Sending another packet should still work (no protocol breakage).
@@ -769,22 +863,36 @@ mod tests {
         // existing Message::Error path — silent fallback to pipe-mode
         // would mask a misconfigured deployment.
         let (mut session, mut client) = setup();
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
 
         assert!(!session.has_shell());
 
-        client.send(&Packet::new(
-            Message::ShellOpenPty { shell: "/bin/sh".into(), cols: 80, rows: 24 },
-            1,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::ShellOpenPty {
+                    shell: "/bin/sh".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+                1,
+            ))
+            .unwrap();
         session.tick().unwrap();
 
-        assert!(!session.has_shell(), "non-Windows host must refuse PTY shell");
+        assert!(
+            !session.has_shell(),
+            "non-Windows host must refuse PTY shell"
+        );
 
         // Host should have sent an Error packet — drain heartbeats /
         // other messages, but expect at least one Error.
@@ -800,7 +908,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(saw_error, "expected Message::Error from non-Windows pty-spawn");
+        assert!(
+            saw_error,
+            "expected Message::Error from non-Windows pty-spawn"
+        );
     }
 
     #[test]
@@ -820,10 +931,15 @@ mod tests {
     fn storm_resets_on_valid_packet_via_tick() {
         let (mut session, mut client) = setup();
         // Handshake so subsequent packets are processed in Connected state.
-        client.send(&Packet::new(
-            Message::Hello { version: 1, client_name: "test".into() },
-            0,
-        )).unwrap();
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
         session.tick().unwrap();
         let _ack = client.recv().unwrap();
         assert_eq!(session.storm_count(), 0, "handshake decode already reset");
@@ -837,7 +953,11 @@ mod tests {
         // A real decoded packet (heartbeat) through tick() must reset the run.
         client.send(&Packet::new(Message::Heartbeat, 1)).unwrap();
         session.tick().unwrap();
-        assert_eq!(session.storm_count(), 0, "decoded packet must reset storm run");
+        assert_eq!(
+            session.storm_count(),
+            0,
+            "decoded packet must reset storm run"
+        );
     }
 
     #[test]
@@ -858,6 +978,10 @@ mod tests {
         for _ in 0..2 {
             session.note_protocol_error();
         }
-        assert_eq!(session.storm_count(), 5, "run must persist without a decoded packet");
+        assert_eq!(
+            session.storm_count(),
+            5,
+            "run must persist without a decoded packet"
+        );
     }
 }

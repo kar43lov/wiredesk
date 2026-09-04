@@ -141,7 +141,12 @@ mod windows_impl {
                 // because `Deref::deref_mut` returns a single `&mut Self`.
                 let s_ref: &mut Self = &mut s;
                 let (x, y) = bottom_right_position(OVERLAY_WIDTH, OVERLAY_HEIGHT);
-                build_controls(&mut s_ref.window, &mut s_ref.label, &mut s_ref.timer, (x, y))?;
+                build_controls(
+                    &mut s_ref.window,
+                    &mut s_ref.label,
+                    &mut s_ref.timer,
+                    (x, y),
+                )?;
             }
             Ok(me)
         }
@@ -262,7 +267,6 @@ mod windows_impl {
         Ok(())
     }
 
-
     /// Compute the overlay's top-left position so its right/bottom edge
     /// lands `RIGHT_MARGIN` / `BOTTOM_MARGIN` away from the primary
     /// monitor's work-area corner. Falls back to `(0, 0)` if the Win32
@@ -270,7 +274,7 @@ mod windows_impl {
     fn bottom_right_position(w: i32, h: i32) -> (i32, i32) {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::UI::WindowsAndMessaging::{
-            SPI_GETWORKAREA, SystemParametersInfoW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+            SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
         };
 
         let mut rect = RECT::default();
@@ -305,7 +309,10 @@ mod tests {
     fn render_overlay_text_sending_only() {
         let s = render_overlay_text(340 * 1024, 780 * 1024, 0, 0).expect("active");
         assert!(s.contains("\u{2191}"), "should have up-arrow: {s}");
-        assert!(!s.contains("\u{2193}"), "no down-arrow when idle inbound: {s}");
+        assert!(
+            !s.contains("\u{2193}"),
+            "no down-arrow when idle inbound: {s}"
+        );
         assert!(s.contains("Sending"));
         assert!(s.contains("340/780 KB"));
         assert!(s.contains("(43%)"));
@@ -315,7 +322,10 @@ mod tests {
     fn render_overlay_text_receiving_only() {
         let s = render_overlay_text(0, 0, 256, 1024).expect("active");
         assert!(s.contains("\u{2193}"), "should have down-arrow: {s}");
-        assert!(!s.contains("\u{2191}"), "no up-arrow when idle outbound: {s}");
+        assert!(
+            !s.contains("\u{2191}"),
+            "no up-arrow when idle outbound: {s}"
+        );
         assert!(s.contains("Receiving"));
         assert!(s.contains("0/1 KB") || s.contains("0/1 KB"));
         assert!(s.contains("(25%)"));

@@ -464,18 +464,32 @@ mod tests {
     fn interactive_message_corpus() -> Vec<wiredesk_protocol::message::Message> {
         use wiredesk_protocol::message::Message;
         vec![
-            Message::Hello { version: 1, client_name: "mac-term".into() },
+            Message::Hello {
+                version: 1,
+                client_name: "mac-term".into(),
+            },
             Message::HelloAck {
                 version: 1,
                 host_name: "win-host".into(),
                 screen_w: 2560,
                 screen_h: 1440,
             },
-            Message::ShellOpenPty { shell: "powershell.exe".into(), cols: 120, rows: 40 },
-            Message::ShellInput { data: b"Get-Process\r".to_vec() },
-            Message::PtyResize { cols: 100, rows: 30 },
+            Message::ShellOpenPty {
+                shell: "powershell.exe".into(),
+                cols: 120,
+                rows: 40,
+            },
+            Message::ShellInput {
+                data: b"Get-Process\r".to_vec(),
+            },
+            Message::PtyResize {
+                cols: 100,
+                rows: 30,
+            },
             // ShellOutput may carry arbitrary bytes incl. NUL.
-            Message::ShellOutput { data: vec![0, 1, 0xFF, b'o', b'k', 0x1B, b'[', b'0', b'm'] },
+            Message::ShellOutput {
+                data: vec![0, 1, 0xFF, b'o', b'k', 0x1B, b'[', b'0', b'm'],
+            },
             Message::ShellExit { code: 0 },
             Message::ShellClose,
             Message::Disconnect,
@@ -555,7 +569,10 @@ mod tests {
     fn default_socket_path_contains_wd_exec_sock() {
         let p = default_socket_path();
         let s = p.to_string_lossy();
-        assert!(s.ends_with("wd-exec.sock"), "socket path must end with the canonical name: {s}");
+        assert!(
+            s.ends_with("wd-exec.sock"),
+            "socket path must end with the canonical name: {s}"
+        );
     }
 
     #[cfg(unix)]
@@ -587,7 +604,10 @@ mod tests {
             IpcResponse::Stdout(bytes) => assert_eq!(bytes, b"hi\n"),
             other => panic!("expected Stdout, got {other:?}"),
         }
-        assert!(matches!(read_response(&mut b).unwrap(), IpcResponse::Exit(0)));
+        assert!(matches!(
+            read_response(&mut b).unwrap(),
+            IpcResponse::Exit(0)
+        ));
 
         writer.join().expect("writer thread");
     }

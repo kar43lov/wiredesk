@@ -32,7 +32,9 @@ use wiredesk_protocol::packet::Packet;
 use crate::exec_bridge::ExecEventSlot;
 use crate::ipc::spawn_ipc_acceptor;
 use crate::link::{HostInfo, SharedHostInfo};
-use crate::shell_channel::{current_owner, new_shared_owner, try_acquire, SharedShellOwner, ShellOwner};
+use crate::shell_channel::{
+    current_owner, new_shared_owner, try_acquire, SharedShellOwner, ShellOwner,
+};
 
 /// Shared wiring for a fake-GUI: the acceptor's dependencies plus the mock
 /// `outgoing_rx` (captures packets the relay forwards to the "wire") and the
@@ -212,7 +214,13 @@ fn e2e_interactive_round_trip_through_acceptor() {
     .unwrap();
     write_packet_frame(
         &mut client,
-        &Packet::new(Message::PtyResize { cols: 100, rows: 30 }, 0),
+        &Packet::new(
+            Message::PtyResize {
+                cols: 100,
+                rows: 30,
+            },
+            0,
+        ),
     )
     .unwrap();
 
@@ -222,7 +230,10 @@ fn e2e_interactive_round_trip_through_acceptor() {
     }
     assert!(matches!(
         gui.recv_wire(),
-        Message::PtyResize { cols: 100, rows: 30 }
+        Message::PtyResize {
+            cols: 100,
+            rows: 30
+        }
     ));
 
     // Staged host ShellOutput echoes back to the socket, then ShellExit.

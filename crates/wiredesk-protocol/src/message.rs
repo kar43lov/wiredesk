@@ -84,7 +84,9 @@ impl TryFrom<u8> for MessageType {
             0x44 => Ok(Self::ShellExit),
             0x45 => Ok(Self::ShellOpenPty),
             0x46 => Ok(Self::PtyResize),
-            _ => Err(WireDeskError::Protocol(format!("unknown message type: 0x{v:02X}"))),
+            _ => Err(WireDeskError::Protocol(format!(
+                "unknown message type: 0x{v:02X}"
+            ))),
         }
     }
 }
@@ -92,35 +94,86 @@ impl TryFrom<u8> for MessageType {
 /// Payload variants for each message type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    Hello { version: u8, client_name: String },
-    HelloAck { version: u8, host_name: String, screen_w: u16, screen_h: u16 },
-    MouseMove { x: u16, y: u16 },
-    MouseButton { button: u8, pressed: bool },
-    MouseScroll { delta_x: i16, delta_y: i16 },
-    KeyDown { scancode: u16, modifiers: u8 },
-    KeyUp { scancode: u16, modifiers: u8 },
-    ClipOffer { format: u8, total_len: u32 },
-    ClipChunk { index: u16, data: Vec<u8> },
-    ClipAck { index: u16 },
+    Hello {
+        version: u8,
+        client_name: String,
+    },
+    HelloAck {
+        version: u8,
+        host_name: String,
+        screen_w: u16,
+        screen_h: u16,
+    },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    MouseScroll {
+        delta_x: i16,
+        delta_y: i16,
+    },
+    KeyDown {
+        scancode: u16,
+        modifiers: u8,
+    },
+    KeyUp {
+        scancode: u16,
+        modifiers: u8,
+    },
+    ClipOffer {
+        format: u8,
+        total_len: u32,
+    },
+    ClipChunk {
+        index: u16,
+        data: Vec<u8>,
+    },
+    ClipAck {
+        index: u16,
+    },
     /// Receiver tells sender to abandon a clipboard transfer (e.g.
     /// `receive_images` toggle is off). `format` echoes the format
     /// from the offer that was rejected, so the sender knows which
     /// outbox to drop.
-    ClipDecline { format: u8 },
+    ClipDecline {
+        format: u8,
+    },
     Heartbeat,
-    Error { code: u16, msg: String },
+    Error {
+        code: u16,
+        msg: String,
+    },
     Disconnect,
-    ShellOpen { shell: String },           // "powershell", "cmd", "" for default
-    ShellInput { data: Vec<u8> },          // bytes to write to shell stdin
-    ShellOutput { data: Vec<u8> },         // bytes from shell stdout/stderr
+    ShellOpen {
+        shell: String,
+    }, // "powershell", "cmd", "" for default
+    ShellInput {
+        data: Vec<u8>,
+    }, // bytes to write to shell stdin
+    ShellOutput {
+        data: Vec<u8>,
+    }, // bytes from shell stdout/stderr
     ShellClose,
-    ShellExit { code: i32 },
+    ShellExit {
+        code: i32,
+    },
     /// Open a shell wrapped in a real PTY. `cols`/`rows` are the
     /// initial terminal dimensions. Wire layout:
     /// `[cols u16 LE][rows u16 LE][shell-string with length prefix]`.
-    ShellOpenPty { shell: String, cols: u16, rows: u16 },
+    ShellOpenPty {
+        shell: String,
+        cols: u16,
+        rows: u16,
+    },
     /// Resize the active PTY. Wire layout: `[cols u16 LE][rows u16 LE]`.
-    PtyResize { cols: u16, rows: u16 },
+    PtyResize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 impl Message {
@@ -157,11 +210,19 @@ impl Message {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            Self::Hello { version, client_name } => {
+            Self::Hello {
+                version,
+                client_name,
+            } => {
                 buf.push(*version);
                 write_string(&mut buf, client_name, 32);
             }
-            Self::HelloAck { version, host_name, screen_w, screen_h } => {
+            Self::HelloAck {
+                version,
+                host_name,
+                screen_w,
+                screen_h,
+            } => {
                 buf.push(*version);
                 write_string(&mut buf, host_name, 32);
                 buf.extend_from_slice(&screen_w.to_le_bytes());
@@ -179,7 +240,14 @@ impl Message {
                 buf.extend_from_slice(&delta_x.to_le_bytes());
                 buf.extend_from_slice(&delta_y.to_le_bytes());
             }
-            Self::KeyDown { scancode, modifiers } | Self::KeyUp { scancode, modifiers } => {
+            Self::KeyDown {
+                scancode,
+                modifiers,
+            }
+            | Self::KeyUp {
+                scancode,
+                modifiers,
+            } => {
                 buf.extend_from_slice(&scancode.to_le_bytes());
                 buf.push(*modifiers);
             }
@@ -230,7 +298,10 @@ impl Message {
                 ensure_min_len(payload, 1 + 1)?; // version + at least 1 byte name len
                 let version = payload[0];
                 let client_name = read_string(&payload[1..])?;
-                Ok(Self::Hello { version, client_name })
+                Ok(Self::Hello {
+                    version,
+                    client_name,
+                })
             }
             MessageType::HelloAck => {
                 ensure_min_len(payload, 1 + 1 + 4)?;
@@ -239,7 +310,12 @@ impl Message {
                 ensure_min_len(rest, 4)?;
                 let screen_w = u16::from_le_bytes([rest[0], rest[1]]);
                 let screen_h = u16::from_le_bytes([rest[2], rest[3]]);
-                Ok(Self::HelloAck { version, host_name, screen_w, screen_h })
+                Ok(Self::HelloAck {
+                    version,
+                    host_name,
+                    screen_w,
+                    screen_h,
+                })
             }
             MessageType::MouseMove => {
                 ensure_min_len(payload, 4)?;
@@ -250,7 +326,10 @@ impl Message {
             }
             MessageType::MouseButton => {
                 ensure_min_len(payload, 2)?;
-                Ok(Self::MouseButton { button: payload[0], pressed: payload[1] != 0 })
+                Ok(Self::MouseButton {
+                    button: payload[0],
+                    pressed: payload[1] != 0,
+                })
             }
             MessageType::MouseScroll => {
                 ensure_min_len(payload, 4)?;
@@ -313,8 +392,12 @@ impl Message {
                 };
                 Ok(Self::ShellOpen { shell })
             }
-            MessageType::ShellInput => Ok(Self::ShellInput { data: payload.to_vec() }),
-            MessageType::ShellOutput => Ok(Self::ShellOutput { data: payload.to_vec() }),
+            MessageType::ShellInput => Ok(Self::ShellInput {
+                data: payload.to_vec(),
+            }),
+            MessageType::ShellOutput => Ok(Self::ShellOutput {
+                data: payload.to_vec(),
+            }),
             MessageType::ShellClose => Ok(Self::ShellClose),
             MessageType::ShellExit => {
                 ensure_min_len(payload, 4)?;
@@ -399,7 +482,10 @@ mod tests {
 
     #[test]
     fn roundtrip_hello() {
-        roundtrip(&Message::Hello { version: 1, client_name: "test-client".into() });
+        roundtrip(&Message::Hello {
+            version: 1,
+            client_name: "test-client".into(),
+        });
     }
 
     #[test]
@@ -419,39 +505,63 @@ mod tests {
 
     #[test]
     fn roundtrip_mouse_button() {
-        roundtrip(&Message::MouseButton { button: 0, pressed: true });
-        roundtrip(&Message::MouseButton { button: 2, pressed: false });
+        roundtrip(&Message::MouseButton {
+            button: 0,
+            pressed: true,
+        });
+        roundtrip(&Message::MouseButton {
+            button: 2,
+            pressed: false,
+        });
     }
 
     #[test]
     fn roundtrip_mouse_scroll() {
-        roundtrip(&Message::MouseScroll { delta_x: -120, delta_y: 240 });
+        roundtrip(&Message::MouseScroll {
+            delta_x: -120,
+            delta_y: 240,
+        });
     }
 
     #[test]
     fn roundtrip_key_down() {
-        roundtrip(&Message::KeyDown { scancode: 0x1E, modifiers: 0x03 });
+        roundtrip(&Message::KeyDown {
+            scancode: 0x1E,
+            modifiers: 0x03,
+        });
     }
 
     #[test]
     fn roundtrip_key_up() {
-        roundtrip(&Message::KeyUp { scancode: 0x1E, modifiers: 0 });
+        roundtrip(&Message::KeyUp {
+            scancode: 0x1E,
+            modifiers: 0,
+        });
     }
 
     #[test]
     fn roundtrip_clip_offer() {
-        roundtrip(&Message::ClipOffer { format: 1, total_len: 65536 });
+        roundtrip(&Message::ClipOffer {
+            format: 1,
+            total_len: 65536,
+        });
     }
 
     #[test]
     fn roundtrip_clip_offer_text() {
         // Regression: text format (format=0) wire-format unchanged.
-        roundtrip(&Message::ClipOffer { format: FORMAT_TEXT_UTF8, total_len: 1024 });
+        roundtrip(&Message::ClipOffer {
+            format: FORMAT_TEXT_UTF8,
+            total_len: 1024,
+        });
     }
 
     #[test]
     fn roundtrip_clip_offer_image() {
-        roundtrip(&Message::ClipOffer { format: FORMAT_PNG_IMAGE, total_len: 245_760 });
+        roundtrip(&Message::ClipOffer {
+            format: FORMAT_PNG_IMAGE,
+            total_len: 245_760,
+        });
     }
 
     #[test]
@@ -466,24 +576,36 @@ mod tests {
 
     #[test]
     fn roundtrip_clip_offer_file() {
-        roundtrip(&Message::ClipOffer { format: FORMAT_FILE, total_len: 65_536 });
+        roundtrip(&Message::ClipOffer {
+            format: FORMAT_FILE,
+            total_len: 65_536,
+        });
     }
 
     #[test]
     fn roundtrip_clip_decline_file() {
-        roundtrip(&Message::ClipDecline { format: FORMAT_FILE });
+        roundtrip(&Message::ClipDecline {
+            format: FORMAT_FILE,
+        });
     }
 
     #[test]
     fn roundtrip_clip_chunk() {
-        roundtrip(&Message::ClipChunk { index: 42, data: vec![1, 2, 3, 0, 255] });
+        roundtrip(&Message::ClipChunk {
+            index: 42,
+            data: vec![1, 2, 3, 0, 255],
+        });
     }
 
     #[test]
     fn roundtrip_clip_ack() {
         roundtrip(&Message::ClipAck { index: 42 });
-        roundtrip(&Message::ClipDecline { format: FORMAT_PNG_IMAGE });
-        roundtrip(&Message::ClipDecline { format: FORMAT_TEXT_UTF8 });
+        roundtrip(&Message::ClipDecline {
+            format: FORMAT_PNG_IMAGE,
+        });
+        roundtrip(&Message::ClipDecline {
+            format: FORMAT_TEXT_UTF8,
+        });
     }
 
     #[test]
@@ -498,28 +620,39 @@ mod tests {
 
     #[test]
     fn roundtrip_error() {
-        roundtrip(&Message::Error { code: 500, msg: "something broke".into() });
+        roundtrip(&Message::Error {
+            code: 500,
+            msg: "something broke".into(),
+        });
     }
 
     #[test]
     fn roundtrip_shell_open_default() {
-        roundtrip(&Message::ShellOpen { shell: String::new() });
+        roundtrip(&Message::ShellOpen {
+            shell: String::new(),
+        });
     }
 
     #[test]
     fn roundtrip_shell_open_powershell() {
-        roundtrip(&Message::ShellOpen { shell: "powershell".into() });
+        roundtrip(&Message::ShellOpen {
+            shell: "powershell".into(),
+        });
     }
 
     #[test]
     fn roundtrip_shell_input() {
-        roundtrip(&Message::ShellInput { data: b"ls -la\n".to_vec() });
+        roundtrip(&Message::ShellInput {
+            data: b"ls -la\n".to_vec(),
+        });
     }
 
     #[test]
     fn roundtrip_shell_output() {
         // Output may contain arbitrary bytes including 0x00
-        roundtrip(&Message::ShellOutput { data: vec![0, 1, 0xFF, b'x', b'y'] });
+        roundtrip(&Message::ShellOutput {
+            data: vec![0, 1, 0xFF, b'x', b'y'],
+        });
     }
 
     #[test]
@@ -546,7 +679,10 @@ mod tests {
 
     #[test]
     fn message_type_pty_opcodes_roundtrip() {
-        assert_eq!(MessageType::try_from(0x45).unwrap(), MessageType::ShellOpenPty);
+        assert_eq!(
+            MessageType::try_from(0x45).unwrap(),
+            MessageType::ShellOpenPty
+        );
         assert_eq!(MessageType::try_from(0x46).unwrap(), MessageType::PtyResize);
     }
 
@@ -575,7 +711,10 @@ mod tests {
 
     #[test]
     fn roundtrip_pty_resize_max() {
-        roundtrip(&Message::PtyResize { cols: 0xFFFF, rows: 0xFFFF });
+        roundtrip(&Message::PtyResize {
+            cols: 0xFFFF,
+            rows: 0xFFFF,
+        });
     }
 
     #[test]

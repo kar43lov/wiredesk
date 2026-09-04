@@ -102,8 +102,12 @@ impl BluetoothLeTransport {
         // std::future::Future natively. .get() is the canonical sync-wait
         // pattern; we don't pay an event-loop overhead during init since
         // we're already on a single thread here.
-        let (provider, tx_char, _rx_char) =
-            build_service(service_uuid, tx, Arc::clone(&is_connected), cfg.require_encryption)?;
+        let (provider, tx_char, _rx_char) = build_service(
+            service_uuid,
+            tx,
+            Arc::clone(&is_connected),
+            cfg.require_encryption,
+        )?;
 
         let inner = Arc::new(Inner {
             rt,
@@ -150,7 +154,11 @@ fn build_service(
     tx: mpsc::UnboundedSender<Result<Packet>>,
     is_connected_flag: Arc<AtomicBool>,
     require_encryption: bool,
-) -> Result<(GattServiceProvider, GattLocalCharacteristic, GattLocalCharacteristic)> {
+) -> Result<(
+    GattServiceProvider,
+    GattLocalCharacteristic,
+    GattLocalCharacteristic,
+)> {
     // The wire protocol authenticates nobody: a peer that completes the
     // handshake can inject input and open a shell. Demanding link-layer
     // encryption makes Windows require pairing first, which is the only
@@ -233,7 +241,8 @@ fn build_service(
     {
         let flag = Arc::clone(&is_connected_flag);
         let handler = TypedEventHandler::<GattLocalCharacteristic, _>::new(
-            move |sender: &Option<GattLocalCharacteristic>, _args: &Option<windows::core::IInspectable>| {
+            move |sender: &Option<GattLocalCharacteristic>,
+                  _args: &Option<windows::core::IInspectable>| {
                 if let Some(s) = sender.as_ref() {
                     let count = s
                         .SubscribedClients()
@@ -287,7 +296,9 @@ fn build_service(
 
                 // Always respond — WriteWithResponse callers wait for the
                 // ack regardless of whether assembly succeeded.
-                if request.Option().unwrap_or(GattWriteOption::WriteWithResponse)
+                if request
+                    .Option()
+                    .unwrap_or(GattWriteOption::WriteWithResponse)
                     == GattWriteOption::WriteWithResponse
                 {
                     let _ = request.Respond();
@@ -352,8 +363,8 @@ fn uuid_to_guid(u: UuidStr) -> GUID {
 }
 
 fn write_to_buffer(bytes: &[u8]) -> Result<windows::Storage::Streams::IBuffer> {
-    let writer = DataWriter::new()
-        .map_err(|e| WireDeskError::Transport(format!("BLE DataWriter: {e}")))?;
+    let writer =
+        DataWriter::new().map_err(|e| WireDeskError::Transport(format!("BLE DataWriter: {e}")))?;
     writer
         .WriteBytes(bytes)
         .map_err(|e| WireDeskError::Transport(format!("BLE DataWriter::WriteBytes: {e}")))?;

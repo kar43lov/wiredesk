@@ -14,7 +14,9 @@ fn resolve_shell(requested: &str) -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
         match req.as_str() {
-            "" | "powershell" | "pwsh" => vec!["powershell.exe".into(), "-NoLogo".into(), "-NoExit".into()],
+            "" | "powershell" | "pwsh" => {
+                vec!["powershell.exe".into(), "-NoLogo".into(), "-NoExit".into()]
+            }
             "cmd" => vec!["cmd.exe".into(), "/Q".into()],
             other => vec![other.into()],
         }
@@ -339,7 +341,10 @@ mod tests {
         let mut got = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            match sh.events_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            match sh
+                .events_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
                 Ok(ShellEvent::Output(d)) => got.extend_from_slice(&d),
                 Ok(ShellEvent::Exit(_)) => break,
                 Err(_) => {

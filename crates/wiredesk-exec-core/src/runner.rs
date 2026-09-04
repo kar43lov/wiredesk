@@ -207,37 +207,37 @@ where
                     // is_echo_line catches both bash and PS compress
                     // cmd echoes via anchor-pair signatures.
                     if !is_echo_line(line) {
-                    if let Some(code) = parse_sentinel(line, &uuid) {
-                        if let Some(pos) = line.rfind(&prefix) {
-                            if pos > 0 {
-                                let pre = line[..pos].trim_end_matches('\r');
-                                if !pre.is_empty() && !is_echo_line(pre) {
-                                    if compress {
-                                        if looks_like_base64(pre) {
-                                            compress_buf.push_str(pre.trim());
-                                            compress_buf.push('\n');
+                        if let Some(code) = parse_sentinel(line, &uuid) {
+                            if let Some(pos) = line.rfind(&prefix) {
+                                if pos > 0 {
+                                    let pre = line[..pos].trim_end_matches('\r');
+                                    if !pre.is_empty() && !is_echo_line(pre) {
+                                        if compress {
+                                            if looks_like_base64(pre) {
+                                                compress_buf.push_str(pre.trim());
+                                                compress_buf.push('\n');
+                                            }
+                                        } else {
+                                            let mut chunk = pre.to_string();
+                                            chunk.push('\n');
+                                            on_chunk(chunk.as_bytes());
                                         }
-                                    } else {
-                                        let mut chunk = pre.to_string();
-                                        chunk.push('\n');
-                                        on_chunk(chunk.as_bytes());
                                     }
                                 }
                             }
-                        }
-                        if compress && !compress_buf.is_empty() {
-                            let decoded = decode_compressed_stream(&compress_buf)?;
-                            let (clean, in_band_rc) = extract_compressed_rc(decoded);
-                            if !clean.is_empty() {
-                                on_chunk(&clean);
+                            if compress && !compress_buf.is_empty() {
+                                let decoded = decode_compressed_stream(&compress_buf)?;
+                                let (clean, in_band_rc) = extract_compressed_rc(decoded);
+                                if !clean.is_empty() {
+                                    on_chunk(&clean);
+                                }
+                                // In compress mode the sentinel rc is always 0
+                                // (set by the wrapper); the real rc is the
+                                // in-band marker we just extracted.
+                                return Ok(in_band_rc);
                             }
-                            // In compress mode the sentinel rc is always 0
-                            // (set by the wrapper); the real rc is the
-                            // in-band marker we just extracted.
-                            return Ok(in_band_rc);
+                            return Ok(code);
                         }
-                        return Ok(code);
-                    }
                     } // close the !is_echo_line guard around parse_sentinel
 
                     // Compress mode: PS path emits the READY line as
@@ -456,8 +456,7 @@ mod tests {
         // doesn't actually emit pre-prompt noise; the test is purely
         // synthetic.
         assert_eq!(
-            s,
-            "Some pre-prompt noise\nactual line 1\nactual line 2\n",
+            s, "Some pre-prompt noise\nactual line 1\nactual line 2\n",
             "PS path streams from start; only the prompt line is swallowed"
         );
     }
@@ -523,7 +522,10 @@ mod tests {
 
         assert_eq!(code, 0);
         let s = String::from_utf8(emitted).unwrap();
-        assert_eq!(s, "row1\nrow2\n", "MOTD and echo line dropped, post-READY streamed");
+        assert_eq!(
+            s, "row1\nrow2\n",
+            "MOTD and echo line dropped, post-READY streamed"
+        );
     }
 
     #[test]
@@ -569,8 +571,7 @@ mod tests {
                     // Streaming so the next line reaches the callback.
                     self.queue.push_back(out("PS C:\\>\n"));
                     self.queue.push_back(out("err: nope\n"));
-                    self.queue
-                        .push_back(out(&format!("__WD_DONE_{uuid}__7\n")));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__7\n")));
                 }
                 Ok(())
             }
@@ -649,8 +650,7 @@ mod tests {
         assert_eq!(code, 0);
         let s = String::from_utf8(emitted).unwrap();
         assert_eq!(
-            s,
-            "{\"hits\":{\"total\":42}}\n",
+            s, "{\"hits\":{\"total\":42}}\n",
             "unterminated prefix recovered, sentinel stripped"
         );
     }
@@ -698,14 +698,11 @@ mod tests {
                     let uuid = extract_uuid_from(s);
                     // Wrapper emits cmd output + __WD_RC__<rc>__ marker
                     // before sentinel; happy path uses rc=0.
-                    let b64 = make_compressed_b64_with_rc(
-                        b"the quick brown fox\nover the lazy dog\n",
-                        0,
-                    );
+                    let b64 =
+                        make_compressed_b64_with_rc(b"the quick brown fox\nover the lazy dog\n", 0);
                     self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
                     self.queue.push_back(out(&format!("{b64}\n")));
-                    self.queue
-                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
                 }
                 Ok(())
             }
@@ -769,8 +766,7 @@ mod tests {
                     // 3) Real base64 payload
                     self.queue.push_back(out(&format!("{b64}\n")));
                     // 4) Real sentinel
-                    self.queue
-                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
                 }
                 Ok(())
             }
@@ -822,8 +818,7 @@ mod tests {
                     self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
                     self.queue.push_back(out(&format!("{b64}\n")));
                     // Sentinel rc is 0 — runner must use in-band 42 instead.
-                    self.queue
-                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
                 }
                 Ok(())
             }
@@ -877,9 +872,9 @@ mod tests {
                     self.queue.push_back(out(
                         "Get-Item : Cannot find path \"C:\\nope\" because it does not exist.\n",
                     ));
-                    self.queue.push_back(out("    + CategoryInfo : ObjectNotFound\n"));
                     self.queue
-                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                        .push_back(out("    + CategoryInfo : ObjectNotFound\n"));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
                 }
                 Ok(())
             }
@@ -928,8 +923,7 @@ mod tests {
                     self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
                     // Valid base64 of "hello" — but "hello" isn't gzip.
                     self.queue.push_back(out("aGVsbG8=\n"));
-                    self.queue
-                        .push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
                 }
                 Ok(())
             }
@@ -973,7 +967,8 @@ mod tests {
                 } else if !self.sent_payload && s.contains("__WD_DONE_") {
                     self.sent_payload = true;
                     let _uuid = extract_uuid_from(s);
-                    self.queue.push_back(out(&format!("__WD_READY_{_uuid}__\n")));
+                    self.queue
+                        .push_back(out(&format!("__WD_READY_{_uuid}__\n")));
                     self.queue.push_back(out("H4sIAAAAAAAAAytJLS4BAAhJ\n"));
                     // No DONE sentinel — runner times out.
                 }
@@ -1020,8 +1015,7 @@ mod tests {
                 } else if !self.sent_payload && s.contains("__WD_DONE_") {
                     self.sent_payload = true;
                     let uuid = extract_uuid_from(s);
-                    let b64 =
-                        make_compressed_b64_with_rc(b"hello compressed world", 0);
+                    let b64 = make_compressed_b64_with_rc(b"hello compressed world", 0);
                     let single = b64.replace('\n', "");
                     // Glue: last base64 line with sentinel directly
                     // appended (no \n between them).
@@ -1105,8 +1099,14 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         let s = String::from_utf8(emitted).unwrap();
-        assert!(!s.contains("MOTD-ish"), "Mute phase must drop pre-READY noise: {s:?}");
-        assert!(!s.contains("PRE-READY"), "Mute phase must drop pre-READY noise: {s:?}");
+        assert!(
+            !s.contains("MOTD-ish"),
+            "Mute phase must drop pre-READY noise: {s:?}"
+        );
+        assert!(
+            !s.contains("PRE-READY"),
+            "Mute phase must drop pre-READY noise: {s:?}"
+        );
         assert_eq!(s, "real-output\n");
     }
 }

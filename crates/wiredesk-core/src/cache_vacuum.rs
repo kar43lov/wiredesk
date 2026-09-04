@@ -176,10 +176,8 @@ mod tests {
 
         // Rewind mtimes: old = 30h ago, mid = 25h ago, fresh = now.
         let now_ft = FileTime::from_system_time(SystemTime::now());
-        let old_ft =
-            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(30 * 3600));
-        let mid_ft =
-            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(25 * 3600));
+        let old_ft = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(30 * 3600));
+        let mid_ft = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(25 * 3600));
         set_file_mtime(&old_path, old_ft).expect("set old mtime");
         set_file_mtime(&mid_path, mid_ft).expect("set mid mtime");
         set_file_mtime(&fresh_path, now_ft).expect("set fresh mtime");
@@ -205,8 +203,7 @@ mod tests {
         let top_file = dir.path().join("top.bin");
         fs::write(&top_file, b"top").expect("write top");
 
-        let old_ft =
-            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(30 * 3600));
+        let old_ft = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(30 * 3600));
         set_file_mtime(&top_file, old_ft).expect("set top mtime");
         set_file_mtime(&sub_file, old_ft).expect("set nested mtime");
         // Also age the subdir itself.

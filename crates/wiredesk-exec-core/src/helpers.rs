@@ -136,14 +136,10 @@ pub fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
     let lines: Vec<&str> = buf.split('\n').collect();
     let prefix = format!("__WD_DONE_{uuid}__");
 
-    let sentinel_idx = lines
-        .iter()
-        .position(|l| parse_sentinel(l, uuid).is_some());
+    let sentinel_idx = lines.iter().position(|l| parse_sentinel(l, uuid).is_some());
     let upper = sentinel_idx.unwrap_or(lines.len());
 
-    let ready_idx = lines[..upper]
-        .iter()
-        .position(|l| parse_ready(l, uuid));
+    let ready_idx = lines[..upper].iter().position(|l| parse_ready(l, uuid));
     let lower = if let Some(idx) = ready_idx {
         idx + 1
     } else {
@@ -155,9 +151,8 @@ pub fn clean_stdout(buf: &str, uuid: &uuid::Uuid) -> String {
 
     let done_echo = format!("__WD_DONE_{uuid}__$");
     let ready_echo = format!("__WD_READY_{uuid}__");
-    let echo_check = |s: &str| {
-        !(s.contains(&done_echo) || s.contains("echo ") && s.contains(&ready_echo))
-    };
+    let echo_check =
+        |s: &str| !(s.contains(&done_echo) || s.contains("echo ") && s.contains(&ready_echo));
 
     let mut kept: Vec<String> = lines[lower..upper]
         .iter()
@@ -440,7 +435,10 @@ mod tests {
             s.contains("$LASTEXITCODE"),
             "PS sentinel must use $LASTEXITCODE: {s}"
         );
-        assert!(s.ends_with('\n'), "payload must end with LF for host stdin: {s}");
+        assert!(
+            s.ends_with('\n'),
+            "payload must end with LF for host stdin: {s}"
+        );
     }
 
     #[test]
@@ -464,7 +462,10 @@ mod tests {
             s.starts_with("echo __WD_READY_"),
             "bash payload must start with READY emitter: {s}"
         );
-        assert!(s.contains("docker ps;"), "bash payload must contain cmd: {s}");
+        assert!(
+            s.contains("docker ps;"),
+            "bash payload must contain cmd: {s}"
+        );
         assert!(s.contains("$?"), "bash sentinel must reference $?: {s}");
         assert!(
             !s.contains("$LASTEXITCODE"),
@@ -651,9 +652,18 @@ mod tests {
         );
         let out = clean_stdout(&buf, &uuid);
         assert!(!out.contains("Welcome"), "MOTD must be stripped: {out:?}");
-        assert!(!out.contains("__WD_READY"), "READY echo must be stripped: {out:?}");
-        assert!(!out.contains("__WD_DONE"), "echoed/expanded sentinel must be stripped: {out:?}");
-        assert!(!out.contains("docker ps;"), "echoed cmd line should be gone: {out:?}");
+        assert!(
+            !out.contains("__WD_READY"),
+            "READY echo must be stripped: {out:?}"
+        );
+        assert!(
+            !out.contains("__WD_DONE"),
+            "echoed/expanded sentinel must be stripped: {out:?}"
+        );
+        assert!(
+            !out.contains("docker ps;"),
+            "echoed cmd line should be gone: {out:?}"
+        );
         assert_eq!(out, "row1\nrow2");
     }
 
@@ -716,9 +726,18 @@ mod tests {
     #[test]
     fn parse_sentinel_matches_nonzero() {
         let uuid = uuid::Uuid::nil();
-        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__7"), &uuid), Some(7));
-        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__124"), &uuid), Some(124));
-        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__9\r"), &uuid), Some(9));
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__7"), &uuid),
+            Some(7)
+        );
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__124"), &uuid),
+            Some(124)
+        );
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__9\r"), &uuid),
+            Some(9)
+        );
     }
 
     #[test]
@@ -729,7 +748,10 @@ mod tests {
             parse_sentinel(&format!("__WD_DONE_{uuid}__$LASTEXITCODE"), &uuid),
             None
         );
-        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__$?"), &uuid), None);
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__$?"), &uuid),
+            None
+        );
     }
 
     #[test]
@@ -747,7 +769,10 @@ mod tests {
         assert_eq!(parse_sentinel("hello world", &uuid), None);
         assert_eq!(parse_sentinel("__WD_DONE__0", &uuid), None);
         assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__"), &uuid), None);
-        assert_eq!(parse_sentinel(&format!("__WD_DONE_{uuid}__abc"), &uuid), None);
+        assert_eq!(
+            parse_sentinel(&format!("__WD_DONE_{uuid}__abc"), &uuid),
+            None
+        );
     }
 
     #[test]
@@ -773,9 +798,7 @@ mod tests {
     #[test]
     fn parse_sentinel_prefers_expanded_over_echo_in_same_line() {
         let uuid = uuid::Uuid::nil();
-        let mixed = format!(
-            "echo \"__WD_DONE_{uuid}__$?\" some-output __WD_DONE_{uuid}__7"
-        );
+        let mixed = format!("echo \"__WD_DONE_{uuid}__$?\" some-output __WD_DONE_{uuid}__7");
         assert_eq!(parse_sentinel(&mixed, &uuid), Some(7));
     }
 
@@ -786,7 +809,9 @@ mod tests {
         let uuid = uuid::Uuid::nil();
         let out = format_compressed_command(&uuid, ShellKind::Bash, "ls -la");
         assert!(out.contains(&format!("__WD_READY_{uuid}__")));
-        assert!(out.contains("{ ls -la 2>&1; printf \"__WD_RC__%s__\\n\" \"$?\"; } | gzip -c | base64"));
+        assert!(
+            out.contains("{ ls -la 2>&1; printf \"__WD_RC__%s__\\n\" \"$?\"; } | gzip -c | base64")
+        );
         // sentinel rc is hardcoded 0 — real rc is in-band via __WD_RC__
         assert!(out.contains(&format!("__WD_DONE_{uuid}__0")));
         // explicit echo before the DONE sentinel so a trailing
@@ -818,22 +843,16 @@ mod tests {
     #[test]
     fn format_compressed_bash_preserves_quotes() {
         let uuid = uuid::Uuid::nil();
-        let out = format_compressed_command(
-            &uuid,
-            ShellKind::Bash,
-            "echo 'single' && echo \"double\"",
-        );
+        let out =
+            format_compressed_command(&uuid, ShellKind::Bash, "echo 'single' && echo \"double\"");
         assert!(out.contains("{ echo 'single' && echo \"double\" 2>&1;"));
     }
 
     #[test]
     fn format_compressed_powershell_preserves_cmd_verbatim() {
         let uuid = uuid::Uuid::nil();
-        let out = format_compressed_command(
-            &uuid,
-            ShellKind::PowerShell,
-            "Get-Content C:\\test.txt",
-        );
+        let out =
+            format_compressed_command(&uuid, ShellKind::PowerShell, "Get-Content C:\\test.txt");
         assert!(out.contains("& { Get-Content C:\\test.txt }"));
     }
 
@@ -973,7 +992,10 @@ mod tests {
         assert!(matches!(result, Err(ExecError::CompressionFailed(msg)) if msg.contains("empty")));
 
         let whitespace_only = decode_compressed_stream("\r\n  \t\n");
-        assert!(matches!(whitespace_only, Err(ExecError::CompressionFailed(_))));
+        assert!(matches!(
+            whitespace_only,
+            Err(ExecError::CompressionFailed(_))
+        ));
     }
 
     #[test]

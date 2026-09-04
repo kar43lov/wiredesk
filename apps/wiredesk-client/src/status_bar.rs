@@ -21,8 +21,8 @@
 //! relative to the rest of this commit — left as a follow-up. Status item
 //! is still useful as a glanceable progress indicator.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 /// Render the status bar title from the four progress atomics.
 ///
@@ -141,7 +141,11 @@ mod macos {
             let in_t = counters.incoming_total.load(Ordering::Relaxed);
             let active = format_status_bar_title(out_p, out_t, in_p, in_t);
             // Idle → show "W"; active → "↑ N%" etc.
-            let title = if active.is_empty() { String::from("W") } else { active };
+            let title = if active.is_empty() {
+                String::from("W")
+            } else {
+                active
+            };
             if title != last_title {
                 dispatch_set_title(item_ptr, &title);
                 last_title = title;
@@ -172,7 +176,10 @@ mod macos {
             }
         }
 
-        let boxed = Box::new(Update { item: item_ptr, title: title.to_string() });
+        let boxed = Box::new(Update {
+            item: item_ptr,
+            title: title.to_string(),
+        });
         let ctx = Box::into_raw(boxed) as *mut std::ffi::c_void;
         unsafe {
             dispatch_async_f(get_main_queue(), ctx, trampoline);

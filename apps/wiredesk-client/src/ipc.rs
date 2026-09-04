@@ -60,7 +60,9 @@ impl ExecTransport for IpcExecTransport {
     fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
         self.outgoing_tx
             .send(Packet::new(
-                Message::ShellInput { data: data.to_vec() },
+                Message::ShellInput {
+                    data: data.to_vec(),
+                },
                 0,
             ))
             .map_err(|_| ExecError::Closed)
@@ -156,7 +158,10 @@ pub fn spawn_ipc_acceptor(
     // depth is cheap. ⚠ unwrap on metadata: if the socket vanished
     // between bind and metadata, we're in deep trouble anyway — log
     // and continue.
-    if let Ok(meta) = listener.local_addr().and_then(|_| std::fs::metadata(&socket_path)) {
+    if let Ok(meta) = listener
+        .local_addr()
+        .and_then(|_| std::fs::metadata(&socket_path))
+    {
         let mut perms = meta.permissions();
         perms.set_mode(0o600);
         if let Err(e) = std::fs::set_permissions(&socket_path, perms) {
@@ -393,7 +398,9 @@ fn handle_connection(
     // slot is empty and our `ShellInput` packets get ignored — what
     // the user saw as "GUI IPC unresponsive (no first frame in 2s)".
     if let Err(e) = outgoing_tx.send(Packet::new(
-        Message::ShellOpen { shell: String::new() },
+        Message::ShellOpen {
+            shell: String::new(),
+        },
         0,
     )) {
         log::warn!("IPC: failed to send ShellOpen: {e}; aborting handler");
@@ -455,8 +462,7 @@ fn handle_connection(
             // avoid log spam. The runner has already committed work to
             // the host, so we let it run to completion — the final
             // frame attempt below will harmlessly fail too.
-            if let Err(e) =
-                write_response(&mut chunk_stream, &IpcResponse::Stdout(chunk.to_vec()))
+            if let Err(e) = write_response(&mut chunk_stream, &IpcResponse::Stdout(chunk.to_vec()))
             {
                 log::debug!("IPC: client write failed mid-stream: {e}");
             }
@@ -821,7 +827,8 @@ fn handle_interactive_connection(
             }
             Ok(ExecEvent::ShellExit(code)) => {
                 if let Ok(mut w) = write_stream.lock() {
-                    let _ = write_packet_frame(&mut *w, &Packet::new(Message::ShellExit { code }, 0));
+                    let _ =
+                        write_packet_frame(&mut *w, &Packet::new(Message::ShellExit { code }, 0));
                 }
                 break;
             }
@@ -934,7 +941,12 @@ mod tests {
         narrow_socket_dir(&dir);
 
         let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "expected owner-only, got {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "expected owner-only, got {:o}",
+            mode & 0o777
+        );
     }
 
     /// Already-narrow dirs are left exactly as they are — no needless chmod,
@@ -1161,12 +1173,23 @@ mod tests {
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info: SharedHostInfo = Arc::new(Mutex::new(None));
         let link_up = Arc::new(AtomicBool::new(true));
-        spawn_ipc_acceptor(socket.clone(), tx, slot, owner, inflight, host_info, link_up);
+        spawn_ipc_acceptor(
+            socket.clone(),
+            tx,
+            slot,
+            owner,
+            inflight,
+            host_info,
+            link_up,
+        );
         thread::sleep(Duration::from_millis(50));
 
         // Now it should be a real socket — connect should succeed.
         let res = UnixStream::connect(&socket);
-        assert!(res.is_ok(), "stale-unlink + bind should leave a working socket: {res:?}");
+        assert!(
+            res.is_ok(),
+            "stale-unlink + bind should leave a working socket: {res:?}"
+        );
     }
 
     #[test]
@@ -1187,7 +1210,10 @@ mod tests {
         write_request(&mut buf, &req).unwrap();
         let mut r = Cursor::new(buf);
         let decoded = read_request(&mut r).unwrap();
-        assert!(decoded.compress, "handler-side decode preserves compress flag");
+        assert!(
+            decoded.compress,
+            "handler-side decode preserves compress flag"
+        );
         assert_eq!(decoded.cmd, "echo hi");
     }
 
@@ -1219,7 +1245,9 @@ mod tests {
 
     fn stage_event(slot: &ExecEventSlot, ev: ExecEvent) {
         let guard = slot.lock().unwrap();
-        let tx = guard.as_ref().expect("slot must be installed before staging");
+        let tx = guard
+            .as_ref()
+            .expect("slot must be installed before staging");
         tx.send(ev).expect("stage into installed slot");
     }
 
@@ -1260,8 +1288,12 @@ mod tests {
             cols: 100,
             rows: 30,
         };
-        let (h_slot, h_owner, h_hi, h_link) =
-            (exec_slot.clone(), owner.clone(), host_info.clone(), link_up.clone());
+        let (h_slot, h_owner, h_hi, h_link) = (
+            exec_slot.clone(),
+            owner.clone(),
+            host_info.clone(),
+            link_up.clone(),
+        );
         let handler = thread::spawn(move || {
             handle_interactive_connection(server, open, outgoing_tx, h_slot, h_owner, h_hi, h_link);
         });
@@ -1302,7 +1334,12 @@ mod tests {
         write_packet_frame(&mut client, &Packet::new(Message::Heartbeat, 0)).unwrap();
         write_packet_frame(
             &mut client,
-            &Packet::new(Message::ShellInput { data: b"ls\r".to_vec() }, 0),
+            &Packet::new(
+                Message::ShellInput {
+                    data: b"ls\r".to_vec(),
+                },
+                0,
+            ),
         )
         .unwrap();
         write_packet_frame(
@@ -1373,11 +1410,20 @@ mod tests {
         let owner_probe = owner.clone();
         let handler = thread::spawn(move || {
             handle_interactive_connection(
-                server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
+                server,
+                open,
+                outgoing_tx,
+                exec_slot,
+                owner,
+                host_info,
+                link_up,
             );
         });
 
-        match read_packet_frame(&mut client).expect("refuse frame").message {
+        match read_packet_frame(&mut client)
+            .expect("refuse frame")
+            .message
+        {
             Message::Error { code, .. } => assert_eq!(code, RELAY_REFUSE_CODE),
             other => panic!("expected Error refuse frame, got {other:?}"),
         }
@@ -1413,12 +1459,20 @@ mod tests {
         let owner_probe = owner.clone();
         let handler = thread::spawn(move || {
             handle_interactive_connection(
-                server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
+                server,
+                open,
+                outgoing_tx,
+                exec_slot,
+                owner,
+                host_info,
+                link_up,
             );
         });
 
         assert!(matches!(
-            read_packet_frame(&mut client).expect("refuse frame").message,
+            read_packet_frame(&mut client)
+                .expect("refuse frame")
+                .message,
             Message::Error { .. }
         ));
         handler.join().unwrap();
@@ -1497,7 +1551,13 @@ mod tests {
         let link_probe = link_up.clone();
         let handler = thread::spawn(move || {
             handle_interactive_connection(
-                server, open, outgoing_tx, exec_slot, owner, host_info, link_up,
+                server,
+                open,
+                outgoing_tx,
+                exec_slot,
+                owner,
+                host_info,
+                link_up,
             );
         });
 
@@ -1545,8 +1605,12 @@ mod tests {
             cols: 80,
             rows: 24,
         };
-        let (h_slot, h_owner, h_hi, h_link) =
-            (exec_slot.clone(), owner.clone(), host_info.clone(), link_up.clone());
+        let (h_slot, h_owner, h_hi, h_link) = (
+            exec_slot.clone(),
+            owner.clone(),
+            host_info.clone(),
+            link_up.clone(),
+        );
         let handler = thread::spawn(move || {
             handle_interactive_connection(server, open, outgoing_tx, h_slot, h_owner, h_hi, h_link);
         });
@@ -1565,10 +1629,16 @@ mod tests {
 
         // Host rejects the open — HostError with no ShellExit to follow.
         wait_slot_installed(&exec_slot);
-        stage_event(&exec_slot, ExecEvent::HostError("shell already open".into()));
+        stage_event(
+            &exec_slot,
+            ExecEvent::HostError("shell already open".into()),
+        );
 
         // The error is forwarded to the term...
-        match read_packet_frame(&mut client).expect("forwarded host error").message {
+        match read_packet_frame(&mut client)
+            .expect("forwarded host error")
+            .message
+        {
             Message::Error { msg, .. } => assert!(msg.contains("shell"), "msg: {msg}"),
             other => panic!("expected forwarded Message::Error, got {other:?}"),
         }
@@ -1580,7 +1650,9 @@ mod tests {
                 .message,
             Message::ShellClose
         ));
-        handler.join().expect("handler thread must return after host error");
+        handler
+            .join()
+            .expect("handler thread must return after host error");
         assert_eq!(
             current_owner(&owner),
             ShellOwner::Idle,

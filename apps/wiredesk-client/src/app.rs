@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -51,12 +51,18 @@ fn reconnect_state(ever_connected: bool) -> ConnectionState {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum TransportEvent {
-    Connected { host_name: String, screen_w: u16, screen_h: u16 },
+    Connected {
+        host_name: String,
+        screen_w: u16,
+        screen_h: u16,
+    },
     Disconnected(String),
     /// The link supervisor is reopening the transport after a disconnect.
     /// `attempt` is the 1-based reopen attempt number (drives the
     /// "Reconnecting… (attempt N)" status, Task 5).
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     ClipboardFromHost(String),
     Heartbeat,
     /// Transient user-facing notification — surfaced as an inline toast in the
@@ -664,9 +670,7 @@ impl WireDeskApp {
                         ui.label("Connect timeout (s):");
                         let mut t_str = cfg.bluetooth.connect_timeout_secs.to_string();
                         if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut t_str).desired_width(60.0),
-                            )
+                            .add(egui::TextEdit::singleline(&mut t_str).desired_width(60.0))
                             .changed()
                         {
                             if let Ok(v) = t_str.parse::<u32>() {
@@ -692,10 +696,7 @@ impl WireDeskApp {
                             .selected_text(cfg.port.clone())
                             .show_ui(ui, |ui| {
                                 for p in &available_ports {
-                                    if ui
-                                        .selectable_value(&mut cfg.port, p.clone(), p)
-                                        .changed()
-                                    {
+                                    if ui.selectable_value(&mut cfg.port, p.clone(), p).changed() {
                                         dirty = true;
                                     }
                                 }
@@ -921,10 +922,7 @@ impl WireDeskApp {
                 ui.horizontal(|ui| {
                     ui.label("Client name:");
                     if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut cfg.client_name)
-                                .desired_width(220.0),
-                        )
+                        .add(egui::TextEdit::singleline(&mut cfg.client_name).desired_width(220.0))
                         .changed()
                     {
                         dirty = true;
@@ -932,7 +930,10 @@ impl WireDeskApp {
                 });
                 let mut swap_oc = cfg.swap_option_command;
                 if ui
-                    .checkbox(&mut swap_oc, "Swap ⌥/⌘ on Host (Karabiner-Elements compensation)")
+                    .checkbox(
+                        &mut swap_oc,
+                        "Swap ⌥/⌘ on Host (Karabiner-Elements compensation)",
+                    )
                     .changed()
                 {
                     cfg.swap_option_command = swap_oc;
@@ -998,8 +999,7 @@ impl WireDeskApp {
                     ));
                 }
                 Err(e) => {
-                    self.save_toast =
-                        Some((format!("Save failed: {e}"), Instant::now()));
+                    self.save_toast = Some((format!("Save failed: {e}"), Instant::now()));
                 }
             }
         }
@@ -1010,8 +1010,7 @@ impl WireDeskApp {
                     crate::restart::restart_app();
                 }
                 Err(e) => {
-                    self.save_toast =
-                        Some((format!("Save failed: {e}"), Instant::now()));
+                    self.save_toast = Some((format!("Save failed: {e}"), Instant::now()));
                 }
             }
         }
@@ -1028,9 +1027,15 @@ impl WireDeskApp {
         for &(scancode, modifiers, pressed) in keys {
             let seq = self.next_seq();
             let msg = if pressed {
-                Message::KeyDown { scancode, modifiers }
+                Message::KeyDown {
+                    scancode,
+                    modifiers,
+                }
             } else {
-                Message::KeyUp { scancode, modifiers }
+                Message::KeyUp {
+                    scancode,
+                    modifiers,
+                }
             };
             let _ = self.outgoing_tx.send(Packet::new(msg, seq));
         }
@@ -1117,9 +1122,7 @@ impl WireDeskApp {
             let target = monitor::resolve_target_monitor(preferred, &monitors);
             match target {
                 Some(m) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        m.frame.min,
-                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(m.frame.min));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 }
                 None => {
@@ -1228,7 +1231,10 @@ impl WireDeskApp {
             log::warn!("fullscreen command not confirmed in time; following reported state");
             self.fullscreen_cmd_at = None;
         }
-        log::info!("fullscreen changed outside the app: {} -> {actual}", self.fullscreen);
+        log::info!(
+            "fullscreen changed outside the app: {} -> {actual}",
+            self.fullscreen
+        );
         self.fullscreen = actual;
         if actual {
             // Entered fullscreen without us: the outer rect is already the
@@ -1311,9 +1317,7 @@ impl WireDeskApp {
                         self.write_window_geometry(geom);
                         self.pending_geometry = None;
                     } else {
-                        ctx.request_repaint_after(
-                            GEOMETRY_SETTLE.saturating_sub(since.elapsed()),
-                        );
+                        ctx.request_repaint_after(GEOMETRY_SETTLE.saturating_sub(since.elapsed()));
                     }
                 }
             }
@@ -1337,12 +1341,7 @@ impl WireDeskApp {
         // `with_position` takes the outer origin and `with_inner_size` the
         // inner extent, so persist exactly that pair — mixing the two would
         // walk the window down by the title-bar height on every restart.
-        crate::config::sane_window_geometry(
-            outer.min.x,
-            outer.min.y,
-            inner.width(),
-            inner.height(),
-        )
+        crate::config::sane_window_geometry(outer.min.x, outer.min.y, inner.width(), inner.height())
     }
 
     /// Write geometry to the config, keeping `persisted_geometry` in sync.
@@ -1593,17 +1592,14 @@ impl WireDeskApp {
                 egui::Frame::group(ui.style())
                     .fill(banner_fill)
                     .show(ui, |ui| {
-                        ui.with_layout(
-                            egui::Layout::top_down(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(banner_text)
-                                        .size(BANNER_FONT_SIZE)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(banner_text)
+                                    .size(BANNER_FONT_SIZE)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                        });
                     });
             });
 
@@ -1755,7 +1751,6 @@ impl WireDeskApp {
             }
         }
     }
-
 }
 
 impl eframe::App for WireDeskApp {
@@ -1770,7 +1765,11 @@ impl eframe::App for WireDeskApp {
         }
         for event in pending {
             match event {
-                TransportEvent::Connected { host_name, screen_w, screen_h } => {
+                TransportEvent::Connected {
+                    host_name,
+                    screen_w,
+                    screen_h,
+                } => {
                     self.state = ConnectionState::Connected;
                     self.ever_connected = true;
                     self.host_name = host_name;
@@ -1911,231 +1910,233 @@ impl eframe::App for WireDeskApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // 28px icon next to the heading — branding consistency with
-                // the Win host title-bar icon. egui downscales the 1024×1024
-                // source on the fly; no separate small asset needed.
-                ui.add(
-                    egui::Image::new(egui::include_image!(
-                        "../../../assets/icon-source.png"
-                    ))
-                    .fit_to_exact_size(egui::vec2(HEADING_ICON_SIZE, HEADING_ICON_SIZE)),
-                );
-                ui.heading("WireDesk");
-            });
-            ui.separator();
+                    ui.horizontal(|ui| {
+                        // 28px icon next to the heading — branding consistency with
+                        // the Win host title-bar icon. egui downscales the 1024×1024
+                        // source on the fly; no separate small asset needed.
+                        ui.add(
+                            egui::Image::new(egui::include_image!(
+                                "../../../assets/icon-source.png"
+                            ))
+                            .fit_to_exact_size(egui::vec2(HEADING_ICON_SIZE, HEADING_ICON_SIZE)),
+                        );
+                        ui.heading("WireDesk");
+                    });
+                    ui.separator();
 
-            // Connection status — large coloured circle + human-friendly
-            // text. The circle is painted directly via `ui.painter()`
-            // instead of a Unicode glyph because egui's default font lacks
-            // U+25CF (BLACK CIRCLE) on some macOS configurations and falls
-            // back to an empty tofu box (observed live, ui-redesign branch).
-            let status_color = match self.state {
-                ConnectionState::Connected => egui::Color32::GREEN,
-                ConnectionState::Connecting => egui::Color32::YELLOW,
-                ConnectionState::Reconnecting => egui::Color32::YELLOW,
-                ConnectionState::Disconnected => egui::Color32::RED,
-            };
-            let status_text = self.status_text();
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(STATUS_GLYPH_SIZE, STATUS_GLYPH_SIZE),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .circle_filled(rect.center(), STATUS_GLYPH_SIZE * 0.45, status_color);
-                ui.label(status_text);
-            });
+                    // Connection status — large coloured circle + human-friendly
+                    // text. The circle is painted directly via `ui.painter()`
+                    // instead of a Unicode glyph because egui's default font lacks
+                    // U+25CF (BLACK CIRCLE) on some macOS configurations and falls
+                    // back to an empty tofu box (observed live, ui-redesign branch).
+                    let status_color = match self.state {
+                        ConnectionState::Connected => egui::Color32::GREEN,
+                        ConnectionState::Connecting => egui::Color32::YELLOW,
+                        ConnectionState::Reconnecting => egui::Color32::YELLOW,
+                        ConnectionState::Disconnected => egui::Color32::RED,
+                    };
+                    let status_text = self.status_text();
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(STATUS_GLYPH_SIZE, STATUS_GLYPH_SIZE),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            STATUS_GLYPH_SIZE * 0.45,
+                            status_color,
+                        );
+                        ui.label(status_text);
+                    });
 
-            // Show the actual transport that's open. Pre-Plan-C this was
-            // always "Serial: /dev/cu.…"; with the BLE option in play we
-            // show "Bluetooth: <peer-name>" when transport=bluetooth so
-            // the chrome reflects what actually opened.
-            if self.pending_config.transport == "bluetooth" {
-                let peer = if self.pending_config.bluetooth.peer_name.is_empty() {
-                    "(any host)".to_string()
-                } else {
-                    self.pending_config.bluetooth.peer_name.clone()
-                };
-                ui.label(format!("Bluetooth: {peer}"));
-            } else {
-                ui.label(format!("Serial: {}", self.runtime_serial_port));
-            }
-
-            // Clipboard progress line — only renders when a transfer is
-            // active. Outgoing and incoming are both possible at the same
-            // time (peer copies an image while we copy text); show both in
-            // a single row so the chrome layout stays compact.
-            // Codex C4: labels are intentionally generic ("clipboard", not
-            // "image") — the same counters track text and image transfers
-            // and a text Cmd+C briefly flashed "Sending image — 0/512 B"
-            // before being dropped. The status-line consumer only knows
-            // bytes/total, not the format (which lives one layer down in
-            // the Message::ClipOffer that's already long-since enqueued).
-            // Visual progress bars per direction. ProgressBar fills from
-            // left as bytes hit the wire; text inside the bar shows
-            // "Sending/Receiving clipboard — N/M KB (P%)". Bars only render
-            // when their respective transfer is active (total > 0).
-            let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
-            let out_tot = self.outgoing_total.load(Ordering::Relaxed);
-            let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
-            let inc_tot = self.incoming_total.load(Ordering::Relaxed);
-            let out_label_action = outgoing_action_label(
-                &self
-                    .current_outgoing_label
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default(),
-            );
-            if let (Some(ratio), Some(text)) = (
-                progress_ratio(out_cur, out_tot),
-                format_progress(&out_label_action, out_cur, out_tot),
-            ) {
-                render_progress_row(
-                    ui,
-                    ratio,
-                    &text,
-                    &self.outgoing_cancel,
-                    &self.outgoing_progress,
-                    &self.outgoing_total,
-                    Some(&self.current_outgoing_label),
-                );
-                ctx.request_repaint_after(Duration::from_millis(250));
-            }
-            if let (Some(ratio), Some(text)) = (
-                progress_ratio(inc_cur, inc_tot),
-                format_progress("Receiving clipboard", inc_cur, inc_tot),
-            ) {
-                render_progress_row(
-                    ui,
-                    ratio,
-                    &text,
-                    &self.incoming_cancel,
-                    &self.incoming_progress,
-                    &self.incoming_total,
-                    None,
-                );
-                ctx.request_repaint_after(Duration::from_millis(250));
-            }
-
-            ui.separator();
-
-            // Capture toggle — primary action, prominent. RichText size
-            // 16pt strong + colored fill + min_size [200, 32] makes it the
-            // visual anchor of the chrome panel. Color flips between blue
-            // (idle) and red (capturing) as a state cue, matching the
-            // capture-banner palette in `render_capture_info`.
-            let (btn_text, btn_fill) = if self.capturing {
-                ("Release Input", COLOR_CAPTURE_RED)
-            } else {
-                ("Capture Input", COLOR_CAPTURE_BLUE)
-            };
-            let capture_btn = egui::Button::new(
-                egui::RichText::new(btn_text).size(16.0).strong(),
-            )
-            .fill(btn_fill)
-            .min_size(CAPTURE_BTN_MIN_SIZE);
-            if ui.add(capture_btn).clicked() {
-                self.toggle_capture();
-            }
-            let capture_label = if self.capturing {
-                "Input: CAPTURED (Cmd+Esc to release)"
-            } else {
-                "Input: released"
-            };
-            ui.label(capture_label);
-
-            ui.separator();
-
-            // Clipboard
-            if !self.clipboard_text.is_empty() {
-                ui.label("Clipboard from Host:");
-                let preview = if self.clipboard_text.chars().count() > 200 {
-                    let truncated: String = self.clipboard_text.chars().take(200).collect();
-                    format!("{truncated}...")
-                } else {
-                    self.clipboard_text.clone()
-                };
-                ui.code(preview);
-                if ui.button("Copy to Mac clipboard").clicked() {
-                    ctx.copy_text(self.clipboard_text.clone());
-                }
-            }
-
-            ui.separator();
-
-            // Special keys buttons
-            let mut send_cad = false;
-            let mut send_win = false;
-            let mut send_lang = false;
-            if self.state == ConnectionState::Connected {
-                ui.horizontal(|ui| {
-                    if ui.button("Ctrl+Alt+Del").clicked() {
-                        send_cad = true;
+                    // Show the actual transport that's open. Pre-Plan-C this was
+                    // always "Serial: /dev/cu.…"; with the BLE option in play we
+                    // show "Bluetooth: <peer-name>" when transport=bluetooth so
+                    // the chrome reflects what actually opened.
+                    if self.pending_config.transport == "bluetooth" {
+                        let peer = if self.pending_config.bluetooth.peer_name.is_empty() {
+                            "(any host)".to_string()
+                        } else {
+                            self.pending_config.bluetooth.peer_name.clone()
+                        };
+                        ui.label(format!("Bluetooth: {peer}"));
+                    } else {
+                        ui.label(format!("Serial: {}", self.runtime_serial_port));
                     }
-                    if ui.button("Win key").clicked() {
-                        send_win = true;
-                    }
-                    if ui.button("Lang (Win+Space)").clicked() {
-                        send_lang = true;
-                    }
-                });
-            }
-            if send_cad {
-                self.send_key_sequence(&[
-                    (0x1D, 0x01, true),   // Ctrl down
-                    (0x38, 0x05, true),   // Alt down
-                    (0xE053, 0x05, true), // Del down
-                    (0xE053, 0x00, false),
-                    (0x38, 0x00, false),
-                    (0x1D, 0x00, false),
-                ]);
-            }
-            if send_win {
-                self.send_key_sequence(&[
-                    (0xE05B, 0x00, true),  // Win down
-                    (0xE05B, 0x00, false), // Win up
-                ]);
-            }
-            if send_lang {
-                // Win+Space — стандартный шорткат смены языка в Windows 11.
-                self.send_key_sequence(&[
-                    (0xE05B, 0x08, true), // Win down (META=0x08)
-                    (0x39, 0x08, true),   // Space down
-                    (0x39, 0x00, false),  // Space up
-                    (0xE05B, 0x00, false), // Win up
-                ]);
-            }
 
-            ui.separator();
-            self.render_settings_panel(ui);
+                    // Clipboard progress line — only renders when a transfer is
+                    // active. Outgoing and incoming are both possible at the same
+                    // time (peer copies an image while we copy text); show both in
+                    // a single row so the chrome layout stays compact.
+                    // Codex C4: labels are intentionally generic ("clipboard", not
+                    // "image") — the same counters track text and image transfers
+                    // and a text Cmd+C briefly flashed "Sending image — 0/512 B"
+                    // before being dropped. The status-line consumer only knows
+                    // bytes/total, not the format (which lives one layer down in
+                    // the Message::ClipOffer that's already long-since enqueued).
+                    // Visual progress bars per direction. ProgressBar fills from
+                    // left as bytes hit the wire; text inside the bar shows
+                    // "Sending/Receiving clipboard — N/M KB (P%)". Bars only render
+                    // when their respective transfer is active (total > 0).
+                    let out_cur = self.outgoing_progress.load(Ordering::Relaxed);
+                    let out_tot = self.outgoing_total.load(Ordering::Relaxed);
+                    let inc_cur = self.incoming_progress.load(Ordering::Relaxed);
+                    let inc_tot = self.incoming_total.load(Ordering::Relaxed);
+                    let out_label_action = outgoing_action_label(
+                        &self
+                            .current_outgoing_label
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default(),
+                    );
+                    if let (Some(ratio), Some(text)) = (
+                        progress_ratio(out_cur, out_tot),
+                        format_progress(&out_label_action, out_cur, out_tot),
+                    ) {
+                        render_progress_row(
+                            ui,
+                            ratio,
+                            &text,
+                            &self.outgoing_cancel,
+                            &self.outgoing_progress,
+                            &self.outgoing_total,
+                            Some(&self.current_outgoing_label),
+                        );
+                        ctx.request_repaint_after(Duration::from_millis(250));
+                    }
+                    if let (Some(ratio), Some(text)) = (
+                        progress_ratio(inc_cur, inc_tot),
+                        format_progress("Receiving clipboard", inc_cur, inc_tot),
+                    ) {
+                        render_progress_row(
+                            ui,
+                            ratio,
+                            &text,
+                            &self.incoming_cancel,
+                            &self.incoming_progress,
+                            &self.incoming_total,
+                            None,
+                        );
+                        ctx.request_repaint_after(Duration::from_millis(250));
+                    }
 
-            ui.separator();
-            ui.small(&self.status_msg);
-            // Inline TTL banner for the per-monitor fullscreen fallback —
-            // separate from `status_msg` so it doesn't overwrite a real
-            // disconnect reason when both happen at once. Shows for 5 s
-            // then disappears on its own.
-            if let Some((msg, when)) = &self.monitor_fallback_msg {
-                if when.elapsed() < Duration::from_secs(5) {
-                    ui.colored_label(COLOR_WARNING, msg);
-                }
-            }
-            // Generic transient toast (Task 7b) — currently the
-            // "image too large" warning from the clipboard poll thread.
-            // Rendered in warning-orange to match the other inline alert
-            // hue. After the 3-second TTL elapses, drop the value so the
-            // chrome doesn't keep allocating layout space for an empty row.
-            if self
-                .transient_toast
-                .as_ref()
-                .is_some_and(|(_, when)| when.elapsed() >= Duration::from_secs(3))
-            {
-                self.transient_toast = None;
-            }
-            if let Some((msg, _)) = &self.transient_toast {
-                ui.colored_label(COLOR_WARNING, msg);
-            }
+                    ui.separator();
+
+                    // Capture toggle — primary action, prominent. RichText size
+                    // 16pt strong + colored fill + min_size [200, 32] makes it the
+                    // visual anchor of the chrome panel. Color flips between blue
+                    // (idle) and red (capturing) as a state cue, matching the
+                    // capture-banner palette in `render_capture_info`.
+                    let (btn_text, btn_fill) = if self.capturing {
+                        ("Release Input", COLOR_CAPTURE_RED)
+                    } else {
+                        ("Capture Input", COLOR_CAPTURE_BLUE)
+                    };
+                    let capture_btn =
+                        egui::Button::new(egui::RichText::new(btn_text).size(16.0).strong())
+                            .fill(btn_fill)
+                            .min_size(CAPTURE_BTN_MIN_SIZE);
+                    if ui.add(capture_btn).clicked() {
+                        self.toggle_capture();
+                    }
+                    let capture_label = if self.capturing {
+                        "Input: CAPTURED (Cmd+Esc to release)"
+                    } else {
+                        "Input: released"
+                    };
+                    ui.label(capture_label);
+
+                    ui.separator();
+
+                    // Clipboard
+                    if !self.clipboard_text.is_empty() {
+                        ui.label("Clipboard from Host:");
+                        let preview = if self.clipboard_text.chars().count() > 200 {
+                            let truncated: String = self.clipboard_text.chars().take(200).collect();
+                            format!("{truncated}...")
+                        } else {
+                            self.clipboard_text.clone()
+                        };
+                        ui.code(preview);
+                        if ui.button("Copy to Mac clipboard").clicked() {
+                            ctx.copy_text(self.clipboard_text.clone());
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Special keys buttons
+                    let mut send_cad = false;
+                    let mut send_win = false;
+                    let mut send_lang = false;
+                    if self.state == ConnectionState::Connected {
+                        ui.horizontal(|ui| {
+                            if ui.button("Ctrl+Alt+Del").clicked() {
+                                send_cad = true;
+                            }
+                            if ui.button("Win key").clicked() {
+                                send_win = true;
+                            }
+                            if ui.button("Lang (Win+Space)").clicked() {
+                                send_lang = true;
+                            }
+                        });
+                    }
+                    if send_cad {
+                        self.send_key_sequence(&[
+                            (0x1D, 0x01, true),   // Ctrl down
+                            (0x38, 0x05, true),   // Alt down
+                            (0xE053, 0x05, true), // Del down
+                            (0xE053, 0x00, false),
+                            (0x38, 0x00, false),
+                            (0x1D, 0x00, false),
+                        ]);
+                    }
+                    if send_win {
+                        self.send_key_sequence(&[
+                            (0xE05B, 0x00, true),  // Win down
+                            (0xE05B, 0x00, false), // Win up
+                        ]);
+                    }
+                    if send_lang {
+                        // Win+Space — стандартный шорткат смены языка в Windows 11.
+                        self.send_key_sequence(&[
+                            (0xE05B, 0x08, true),  // Win down (META=0x08)
+                            (0x39, 0x08, true),    // Space down
+                            (0x39, 0x00, false),   // Space up
+                            (0xE05B, 0x00, false), // Win up
+                        ]);
+                    }
+
+                    ui.separator();
+                    self.render_settings_panel(ui);
+
+                    ui.separator();
+                    ui.small(&self.status_msg);
+                    // Inline TTL banner for the per-monitor fullscreen fallback —
+                    // separate from `status_msg` so it doesn't overwrite a real
+                    // disconnect reason when both happen at once. Shows for 5 s
+                    // then disappears on its own.
+                    if let Some((msg, when)) = &self.monitor_fallback_msg {
+                        if when.elapsed() < Duration::from_secs(5) {
+                            ui.colored_label(COLOR_WARNING, msg);
+                        }
+                    }
+                    // Generic transient toast (Task 7b) — currently the
+                    // "image too large" warning from the clipboard poll thread.
+                    // Rendered in warning-orange to match the other inline alert
+                    // hue. After the 3-second TTL elapses, drop the value so the
+                    // chrome doesn't keep allocating layout space for an empty row.
+                    if self
+                        .transient_toast
+                        .as_ref()
+                        .is_some_and(|(_, when)| when.elapsed() >= Duration::from_secs(3))
+                    {
+                        self.transient_toast = None;
+                    }
+                    if let Some((msg, _)) = &self.transient_toast {
+                        ui.colored_label(COLOR_WARNING, msg);
+                    }
                 }); // ScrollArea
         });
 
@@ -2151,15 +2152,19 @@ impl eframe::App for WireDeskApp {
                 .map(|h| h.is_active())
                 .unwrap_or(false);
 
-            let events: Vec<egui::Event> = ctx.input(|input: &egui::InputState| {
-                input.events.clone()
-            });
+            let events: Vec<egui::Event> =
+                ctx.input(|input: &egui::InputState| input.events.clone());
             let mouse_pos = ctx.input(|input: &egui::InputState| input.pointer.hover_pos());
             let screen_rect = ctx.screen_rect();
 
             for event in &events {
                 match event {
-                    egui::Event::Key { key, pressed, modifiers, .. } => {
+                    egui::Event::Key {
+                        key,
+                        pressed,
+                        modifiers,
+                        ..
+                    } => {
                         if tap_owns_keys {
                             continue;
                         }
@@ -2171,11 +2176,15 @@ impl eframe::App for WireDeskApp {
                         if *key == egui::Key::Enter && modifiers.command {
                             continue;
                         }
-                        self.mapper.send_key(&self.outgoing_tx, key, modifiers, *pressed);
+                        self.mapper
+                            .send_key(&self.outgoing_tx, key, modifiers, *pressed);
                     }
-                    egui::Event::PointerButton { button, pressed, .. } => {
+                    egui::Event::PointerButton {
+                        button, pressed, ..
+                    } => {
                         let btn = crate::input::mapper::pointer_button_to_proto(*button);
-                        self.mapper.send_mouse_button(&self.outgoing_tx, btn, *pressed);
+                        self.mapper
+                            .send_mouse_button(&self.outgoing_tx, btn, *pressed);
                     }
                     egui::Event::MouseWheel { delta, .. } => {
                         self.mapper.send_mouse_scroll(
@@ -2223,13 +2232,8 @@ mod tests {
         let swap_flag = Arc::new(AtomicBool::new(false));
         let (synth_tx, _synth_rx) = mpsc::channel();
         let (kick_tx, _kick_rx) = mpsc::channel();
-        let tap_handle = keyboard_tap::start(
-            out_tx.clone(),
-            tap_tx,
-            swap_flag.clone(),
-            synth_tx,
-            kick_tx,
-        );
+        let tap_handle =
+            keyboard_tap::start(out_tx.clone(), tap_tx, swap_flag.clone(), synth_tx, kick_tx);
         let outgoing_cancel = Arc::new(AtomicBool::new(false));
         let incoming_cancel = Arc::new(AtomicBool::new(false));
         let cfg = ClientConfig {
@@ -2369,7 +2373,10 @@ mod tests {
 
     #[test]
     fn restore_landed_accepts_exact_match() {
-        assert!(restore_landed(egui::pos2(1375.0, 823.0), egui::pos2(1375.0, 823.0)));
+        assert!(restore_landed(
+            egui::pos2(1375.0, 823.0),
+            egui::pos2(1375.0, 823.0)
+        ));
     }
 
     #[test]
@@ -2377,7 +2384,10 @@ mod tests {
         // AppKit nudges windows out from under the menu bar, so the origin
         // we asked for and the one we get back differ by a few points on a
         // perfectly successful restore.
-        assert!(restore_landed(egui::pos2(1375.0, 838.0), egui::pos2(1375.0, 823.0)));
+        assert!(restore_landed(
+            egui::pos2(1375.0, 838.0),
+            egui::pos2(1375.0, 823.0)
+        ));
     }
 
     #[test]
@@ -2385,12 +2395,18 @@ mod tests {
         // The bug this guards: the window comes back on the fullscreen
         // display instead of the one it was opened on. Thousands of points
         // away must never read as "landed".
-        assert!(!restore_landed(egui::pos2(2560.0, 146.0), egui::pos2(1375.0, 823.0)));
+        assert!(!restore_landed(
+            egui::pos2(2560.0, 146.0),
+            egui::pos2(1375.0, 823.0)
+        ));
     }
 
     #[test]
     fn restore_landed_rejects_vertical_miss() {
-        assert!(!restore_landed(egui::pos2(1375.0, 1200.0), egui::pos2(1375.0, 823.0)));
+        assert!(!restore_landed(
+            egui::pos2(1375.0, 1200.0),
+            egui::pos2(1375.0, 823.0)
+        ));
     }
 
     #[test]
@@ -2429,8 +2445,7 @@ mod tests {
     fn window_on_unplugged_second_monitor_is_offscreen() {
         // Closed on a display at x=1920; came back with only the built-in.
         let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(2400.0, 300.0), egui::vec2(520.0, 760.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(2400.0, 300.0), egui::vec2(520.0, 760.0));
         assert!(window_is_offscreen(rect, &monitors));
     }
 
@@ -2439,8 +2454,7 @@ mod tests {
         // A window hanging off the right edge with a title-bar-sized sliver
         // still visible is reachable — leave it where the user put it.
         let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(1700.0, 300.0), egui::vec2(520.0, 760.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(1700.0, 300.0), egui::vec2(520.0, 760.0));
         assert!(!window_is_offscreen(rect, &monitors));
     }
 
@@ -2448,8 +2462,7 @@ mod tests {
     fn window_with_hairline_overlap_is_offscreen() {
         // 20pt of the window peeking in is not enough to grab.
         let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0)];
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(1900.0, 300.0), egui::vec2(520.0, 760.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(1900.0, 300.0), egui::vec2(520.0, 760.0));
         assert!(window_is_offscreen(rect, &monitors));
     }
 
@@ -2457,16 +2470,17 @@ mod tests {
     fn empty_monitor_list_never_reports_offscreen() {
         // No display info (non-macOS build, or enumerated too early) — never
         // teleport a window on the strength of no data.
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(9000.0, 9000.0), egui::vec2(520.0, 760.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(9000.0, 9000.0), egui::vec2(520.0, 760.0));
         assert!(!window_is_offscreen(rect, &[]));
     }
 
     #[test]
     fn window_spanning_two_monitors_is_not_offscreen() {
-        let monitors = vec![mon(0.0, 0.0, 1920.0, 1080.0), mon(1920.0, 0.0, 2560.0, 1440.0)];
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(1800.0, 200.0), egui::vec2(520.0, 760.0));
+        let monitors = vec![
+            mon(0.0, 0.0, 1920.0, 1080.0),
+            mon(1920.0, 0.0, 2560.0, 1440.0),
+        ];
+        let rect = egui::Rect::from_min_size(egui::pos2(1800.0, 200.0), egui::vec2(520.0, 760.0));
         assert!(!window_is_offscreen(rect, &monitors));
     }
 
@@ -2482,7 +2496,10 @@ mod tests {
         // Codex C4: label is "Sending clipboard" (generic) — "image" was
         // wrong for text transfers and confused users.
         let s = format_progress("Sending clipboard", 340 * 1024, 780 * 1024).expect("active");
-        assert!(s.contains("Sending clipboard"), "action prefix missing: {s}");
+        assert!(
+            s.contains("Sending clipboard"),
+            "action prefix missing: {s}"
+        );
         assert!(s.contains("340"), "current KB missing: {s}");
         assert!(s.contains("780"), "total KB missing: {s}");
         assert!(s.contains("43%"), "percentage missing: {s}");
@@ -2553,7 +2570,10 @@ mod tests {
     #[test]
     fn progress_ratio_overshoot_clamped() {
         let r = progress_ratio(2048, 1024).expect("active");
-        assert!((r - 1.0).abs() < f32::EPSILON, "overshoot must clamp to 1.0, got {r}");
+        assert!(
+            (r - 1.0).abs() < f32::EPSILON,
+            "overshoot must clamp to 1.0, got {r}"
+        );
     }
 
     #[test]
@@ -2588,9 +2608,11 @@ mod tests {
         // single-quote wrapping.
         let action = outgoing_action_label("contract.pdf");
         assert_eq!(action, "Sending file 'contract.pdf'");
-        let line =
-            format_progress(&action, 340 * 1024, 780 * 1024).expect("active");
-        assert!(line.contains("Sending file 'contract.pdf'"), "label: {line}");
+        let line = format_progress(&action, 340 * 1024, 780 * 1024).expect("active");
+        assert!(
+            line.contains("Sending file 'contract.pdf'"),
+            "label: {line}"
+        );
         assert!(line.contains("340"), "current KB: {line}");
         assert!(line.contains("780"), "total KB: {line}");
         assert!(line.contains("43%"), "percent: {line}");

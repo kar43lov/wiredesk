@@ -87,11 +87,7 @@ pub enum SingleInstanceResult {
 ///
 /// `Error` and `Acquired` short-circuit out — only `AlreadyRunning` is
 /// retried.
-pub fn try_acquire_with_retry(
-    name: &str,
-    attempts: u8,
-    delay_ms: u64,
-) -> SingleInstanceResult {
+pub fn try_acquire_with_retry(name: &str, attempts: u8, delay_ms: u64) -> SingleInstanceResult {
     if attempts == 0 {
         return SingleInstanceResult::AlreadyRunning;
     }
@@ -247,11 +243,14 @@ mod tests {
         let name = "WireDeskHostSingleton-retry-busy-test";
         let _held = match SingleInstanceGuard::acquire(name) {
             SingleInstanceResult::Acquired(g) => g,
-            other => panic!("expected initial acquire to succeed, got {:?}", match other {
-                SingleInstanceResult::AlreadyRunning => "AlreadyRunning",
-                SingleInstanceResult::Error(_) => "Error",
-                SingleInstanceResult::Acquired(_) => unreachable!(),
-            }),
+            other => panic!(
+                "expected initial acquire to succeed, got {:?}",
+                match other {
+                    SingleInstanceResult::AlreadyRunning => "AlreadyRunning",
+                    SingleInstanceResult::Error(_) => "Error",
+                    SingleInstanceResult::Acquired(_) => unreachable!(),
+                }
+            ),
         };
         let r = try_acquire_with_retry(name, 2, 10);
         assert!(matches!(r, SingleInstanceResult::AlreadyRunning));

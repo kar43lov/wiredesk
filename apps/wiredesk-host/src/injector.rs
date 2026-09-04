@@ -191,22 +191,30 @@ impl InputInjector for MockInjector {
     }
 
     fn mouse_button(&mut self, button: u8, pressed: bool) -> Result<()> {
-        self.events.push(InjectorEvent::MouseButton { button, pressed });
+        self.events
+            .push(InjectorEvent::MouseButton { button, pressed });
         Ok(())
     }
 
     fn mouse_scroll(&mut self, delta_x: i16, delta_y: i16) -> Result<()> {
-        self.events.push(InjectorEvent::MouseScroll { delta_x, delta_y });
+        self.events
+            .push(InjectorEvent::MouseScroll { delta_x, delta_y });
         Ok(())
     }
 
     fn key_down(&mut self, scancode: u16, modifiers: u8) -> Result<()> {
-        self.events.push(InjectorEvent::KeyDown { scancode, modifiers });
+        self.events.push(InjectorEvent::KeyDown {
+            scancode,
+            modifiers,
+        });
         Ok(())
     }
 
     fn key_up(&mut self, scancode: u16, modifiers: u8) -> Result<()> {
-        self.events.push(InjectorEvent::KeyUp { scancode, modifiers });
+        self.events.push(InjectorEvent::KeyUp {
+            scancode,
+            modifiers,
+        });
         Ok(())
     }
 
@@ -231,7 +239,13 @@ mod tests {
 
         assert_eq!(inj.events.len(), 5);
         assert_eq!(inj.events[0], InjectorEvent::MouseMove { x: 100, y: 200 });
-        assert_eq!(inj.events[1], InjectorEvent::KeyDown { scancode: 0x1E, modifiers: 0x01 });
+        assert_eq!(
+            inj.events[1],
+            InjectorEvent::KeyDown {
+                scancode: 0x1E,
+                modifiers: 0x01
+            }
+        );
         assert_eq!(inj.events[4], InjectorEvent::ReleaseAll);
     }
 }

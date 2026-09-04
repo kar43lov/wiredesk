@@ -15,9 +15,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use wiredesk_protocol::clip_file::{
-    MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES, pack_first_chunk, sanitize_basename, unpack_first_chunk,
+    pack_first_chunk, sanitize_basename, unpack_first_chunk, MAX_FILE_BYTES, MAX_FILE_PAYLOAD_BYTES,
 };
-use wiredesk_protocol::message::{FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8, Message};
+use wiredesk_protocol::message::{Message, FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_TEXT_UTF8};
 use wiredesk_protocol::packet::Packet;
 
 use crate::app::TransportEvent;
@@ -304,7 +304,11 @@ pub(crate) fn format_oversize_file_toast(e: &FileTooLarge, _limit: usize) -> Str
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FilePollOutcome {
     /// File read successfully. Caller emits offer + chunks then stamps `LastSeen.file`.
-    Ready { name: String, hash: u64, packed: Vec<u8> },
+    Ready {
+        name: String,
+        hash: u64,
+        packed: Vec<u8>,
+    },
     /// File exceeded `limit`. Caller stamps `LastSeen.oversize_file(path_hash)`
     /// and emits the toast.
     Oversize { path_hash: u64, err: FileTooLarge },
@@ -345,10 +349,7 @@ pub(crate) enum FilePreStampOutcome {
 /// Pure helper: I/O is unavoidable (we have to read the file to hash content),
 /// but pulled out of the startup block so unit tests can drive it with a
 /// `tempfile`-backed path and a low limit.
-pub(crate) fn pre_stamp_file_path(
-    path: &std::path::Path,
-    limit: usize,
-) -> FilePreStampOutcome {
+pub(crate) fn pre_stamp_file_path(path: &std::path::Path, limit: usize) -> FilePreStampOutcome {
     use std::fs;
 
     let name = match path.file_name().and_then(|s| s.to_str()) {
@@ -367,7 +368,9 @@ pub(crate) fn pre_stamp_file_path(
     }
 
     if check_file_size(size_usize, limit).is_err() {
-        return FilePreStampOutcome::Oversize { size_bytes: size_usize };
+        return FilePreStampOutcome::Oversize {
+            size_bytes: size_usize,
+        };
     }
 
     let content = match fs::read(path) {
@@ -390,10 +393,7 @@ pub(crate) fn pre_stamp_file_path(
 /// I/O is unavoidable (we have to read the file), but the helper is pulled out
 /// of `spawn_poll_thread` so a unit test can drive it directly with a
 /// `tempfile`-backed path.
-pub(crate) fn pack_file_or_warn(
-    path: &std::path::Path,
-    limit: usize,
-) -> FilePollOutcome {
+pub(crate) fn pack_file_or_warn(path: &std::path::Path, limit: usize) -> FilePollOutcome {
     use std::fs;
 
     let name = match path.file_name().and_then(|s| s.to_str()) {
@@ -464,9 +464,7 @@ fn decode_png_to_rgba(bytes: &[u8]) -> Result<arboard::ImageData<'static>, image
     reader.limits(limits);
     let dyn_img = reader.decode()?;
     let (w, h) = dyn_img.dimensions();
-    let alloc = (w as u64)
-        .saturating_mul(h as u64)
-        .saturating_mul(4);
+    let alloc = (w as u64).saturating_mul(h as u64).saturating_mul(4);
     if alloc > DECODE_MAX_ALLOC {
         return Err(image::ImageError::Limits(
             image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
@@ -641,9 +639,10 @@ fn apply_outgoing_progress_inner(
             // Milestone logging — every 25% of total. `checked_div` keeps
             // the divide-by-zero guard idiomatic (total == 0 → None → no log)
             // instead of a manual `if total > 0` wrapper.
-            if let (Some(prev_q), Some(new_q)) =
-                ((prev * 4).checked_div(total), (new_progress * 4).checked_div(total))
-            {
+            if let (Some(prev_q), Some(new_q)) = (
+                (prev * 4).checked_div(total),
+                (new_progress * 4).checked_div(total),
+            ) {
                 if new_q > prev_q {
                     log::info!(
                         "clipboard.send {}/{} bytes ({}%)",
@@ -1066,9 +1065,10 @@ pub fn spawn_poll_thread(
                             err.size_bytes,
                             MAX_FILE_BYTES,
                         );
-                        let _ = events_tx.send(TransportEvent::Toast(
-                            format_oversize_file_toast(&err, MAX_FILE_BYTES),
-                        ));
+                        let _ = events_tx.send(TransportEvent::Toast(format_oversize_file_toast(
+                            &err,
+                            MAX_FILE_BYTES,
+                        )));
                         state.set_oversize_file(path_hash);
                     }
                     FilePollOutcome::Skipped(reason) => {
@@ -1146,8 +1146,7 @@ pub fn spawn_poll_thread(
                                             "clipboard: pushing {} bytes to host",
                                             bytes.len()
                                         );
-                                        outgoing_text_in_flight
-                                            .store(true, Ordering::Release);
+                                        outgoing_text_in_flight.store(true, Ordering::Release);
                                         emit_offer_and_chunks(
                                             &outgoing_tx,
                                             FORMAT_TEXT_UTF8,
@@ -1225,7 +1224,10 @@ pub fn spawn_poll_thread(
                 // heartbeat covers disconnect within 6s, app restart clears state.
                 state.set_image(hash);
 
-                log::debug!("clipboard: pushing image to host ({} encoded bytes)", png.len());
+                log::debug!(
+                    "clipboard: pushing image to host ({} encoded bytes)",
+                    png.len()
+                );
                 emit_offer_and_chunks(&outgoing_tx, FORMAT_PNG_IMAGE, &png);
             }
         }
@@ -1283,11 +1285,19 @@ pub struct IncomingClipboard {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CommittedPayload {
     Text(String),
-    Image { width: usize, height: usize, bytes: Vec<u8> },
+    Image {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
     /// File written to the cache dir. Carries the absolute path, sanitized
     /// basename used to compose it, and the raw content for byte-equal
     /// roundtrip assertions.
-    File { path: PathBuf, name: String, content: Vec<u8> },
+    File {
+        path: PathBuf,
+        name: String,
+        content: Vec<u8>,
+    },
 }
 
 impl IncomingClipboard {
@@ -1373,9 +1383,7 @@ impl IncomingClipboard {
         // for the unknown format will hit the expected_len==0 guard in
         // on_chunk and be dropped.
         if format != FORMAT_TEXT_UTF8 && format != FORMAT_PNG_IMAGE && format != FORMAT_FILE {
-            log::warn!(
-                "clipboard: incoming offer with unsupported format {format}, ignoring"
-            );
+            log::warn!("clipboard: incoming offer with unsupported format {format}, ignoring");
             self.expected_len = 0;
             self.expected_format = 0;
             self.received.clear();
@@ -1450,7 +1458,8 @@ impl IncomingClipboard {
         self.expected_format = format;
         self.received.clear();
         self.received_total = 0;
-        self.incoming_total.store(total_len as u64, Ordering::Relaxed);
+        self.incoming_total
+            .store(total_len as u64, Ordering::Relaxed);
         self.incoming_progress.store(0, Ordering::Relaxed);
         log::info!("clipboard.recv START format={format} total={total_len} bytes");
         None
@@ -1546,7 +1555,11 @@ impl IncomingClipboard {
         // later chunks shifted, silently corrupting the payload. Refuse to
         // commit on non-contiguous indices and reset state.
         let n = self.received.len();
-        let contiguous = self.received.keys().enumerate().all(|(i, k)| *k as usize == i);
+        let contiguous = self
+            .received
+            .keys()
+            .enumerate()
+            .all(|(i, k)| *k as usize == i);
         if !contiguous {
             log::warn!(
                 "clipboard: non-contiguous chunk indices ({n} chunks, expected 0..{n}), dropping payload"
@@ -1580,7 +1593,10 @@ impl IncomingClipboard {
             FORMAT_PNG_IMAGE => self.commit_image(&buf),
             FORMAT_FILE => self.commit_file(&buf),
             other => {
-                log::warn!("clipboard: unknown format {other}, skipping {} bytes", buf.len());
+                log::warn!(
+                    "clipboard: unknown format {other}, skipping {} bytes",
+                    buf.len()
+                );
             }
         }
 
@@ -1704,10 +1720,7 @@ impl IncomingClipboard {
                 true
             }
             Err(e) => {
-                log::warn!(
-                    "clipboard: set_file_url failed for {}: {e}",
-                    path.display()
-                );
+                log::warn!("clipboard: set_file_url failed for {}: {e}", path.display());
                 false
             }
         };
@@ -1781,7 +1794,10 @@ impl IncomingClipboard {
         if let Some(clip) = self.clip.as_mut() {
             match clip.set_image(img) {
                 Ok(()) => {
-                    log::debug!("clipboard: wrote image from host ({} encoded bytes)", buf.len());
+                    log::debug!(
+                        "clipboard: wrote image from host ({} encoded bytes)",
+                        buf.len()
+                    );
                     wrote_ok = true;
                 }
                 Err(e) => log::warn!("clipboard: set_image failed: {e}"),
@@ -1821,10 +1837,7 @@ pub fn run_startup_vacuum(older_than: Duration) {
     let dir = default_cache_dir();
     match wiredesk_core::cache_vacuum::vacuum_cache_dir(&dir, older_than) {
         Ok(0) => {
-            log::debug!(
-                "cache vacuum: nothing to remove under {}",
-                dir.display()
-            );
+            log::debug!("cache vacuum: nothing to remove under {}", dir.display());
         }
         Ok(n) => {
             log::info!(
@@ -1833,10 +1846,7 @@ pub fn run_startup_vacuum(older_than: Duration) {
             );
         }
         Err(e) => {
-            log::warn!(
-                "cache vacuum: enumeration of {} failed: {e}",
-                dir.display()
-            );
+            log::warn!("cache vacuum: enumeration of {} failed: {e}", dir.display());
         }
     }
 }
@@ -2081,7 +2091,10 @@ mod tests {
         let decoded = decode_png_to_rgba(&png).expect("decode");
         assert_eq!(decoded.width, original.width);
         assert_eq!(decoded.height, original.height);
-        assert_eq!(&*decoded.bytes, &*original.bytes, "RGBA must roundtrip byte-for-byte");
+        assert_eq!(
+            &*decoded.bytes, &*original.bytes,
+            "RGBA must roundtrip byte-for-byte"
+        );
     }
 
     #[test]
@@ -2161,7 +2174,7 @@ mod tests {
         let state = ClipboardState::new();
         state.set_text(0xAAAA); // prev (e.g. host-pushed text)
         state.set_text(0xBBBB); // Whispr writes transcript
-        // Whispr restores prev — must NOT mark as new.
+                                // Whispr restores prev — must NOT mark as new.
         assert!(state.get().matches_text_hash(0xAAAA));
         // New transcript still detected as new.
         assert!(!state.get().matches_text_hash(0xCCCC));
@@ -2202,7 +2215,11 @@ mod tests {
     #[test]
     fn check_image_size_within_limit() {
         assert_eq!(check_image_size(100, 1024), Ok(()));
-        assert_eq!(check_image_size(1024, 1024), Ok(()), "boundary is inclusive");
+        assert_eq!(
+            check_image_size(1024, 1024),
+            Ok(()),
+            "boundary is inclusive"
+        );
     }
 
     #[test]
@@ -2256,13 +2273,18 @@ mod tests {
                 other => panic!("expected ClipChunk at idx {i}, got {other:?}"),
             }
         }
-        assert_eq!(reassembled, png, "concatenated chunks must reassemble to PNG");
+        assert_eq!(
+            reassembled, png,
+            "concatenated chunks must reassemble to PNG"
+        );
     }
 
     #[test]
     fn image_emit_chunks_respect_chunk_size() {
         // Build a payload longer than CHUNK_SIZE so we get >1 chunk.
-        let payload: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7)).map(|i| (i & 0xFF) as u8).collect();
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
 
         let (tx, rx) = mpsc::channel::<Packet>();
 
@@ -2292,11 +2314,22 @@ mod tests {
         let progress = Arc::new(AtomicU64::new(999));
         let total = Arc::new(AtomicU64::new(0));
 
-        let msg = Message::ClipOffer { format: FORMAT_PNG_IMAGE, total_len: 1234 };
+        let msg = Message::ClipOffer {
+            format: FORMAT_PNG_IMAGE,
+            total_len: 1234,
+        };
         apply_outgoing_progress(&msg, &progress, &total);
 
-        assert_eq!(progress.load(Ordering::Relaxed), 0, "offer must reset progress");
-        assert_eq!(total.load(Ordering::Relaxed), 1234, "offer must store total");
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            0,
+            "offer must reset progress"
+        );
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            1234,
+            "offer must store total"
+        );
     }
 
     #[test]
@@ -2306,11 +2339,17 @@ mod tests {
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(1024));
 
-        let msg1 = Message::ClipChunk { index: 0, data: vec![0u8; 256] };
+        let msg1 = Message::ClipChunk {
+            index: 0,
+            data: vec![0u8; 256],
+        };
         apply_outgoing_progress(&msg1, &progress, &total);
         assert_eq!(progress.load(Ordering::Relaxed), 256);
 
-        let msg2 = Message::ClipChunk { index: 1, data: vec![0u8; 200] };
+        let msg2 = Message::ClipChunk {
+            index: 1,
+            data: vec![0u8; 200],
+        };
         apply_outgoing_progress(&msg2, &progress, &total);
         assert_eq!(progress.load(Ordering::Relaxed), 456);
         // Total untouched by mid-transfer chunks.
@@ -2327,16 +2366,30 @@ mod tests {
         let total = Arc::new(AtomicU64::new(512));
 
         // Mid-transfer chunk: 256 bytes. Counters keep climbing.
-        let msg1 = Message::ClipChunk { index: 0, data: vec![0u8; 256] };
+        let msg1 = Message::ClipChunk {
+            index: 0,
+            data: vec![0u8; 256],
+        };
         apply_outgoing_progress(&msg1, &progress, &total);
         assert_eq!(progress.load(Ordering::Relaxed), 256);
         assert_eq!(total.load(Ordering::Relaxed), 512);
 
         // Terminal chunk: another 256 bytes. progress == total → zero both.
-        let msg2 = Message::ClipChunk { index: 1, data: vec![0u8; 256] };
+        let msg2 = Message::ClipChunk {
+            index: 1,
+            data: vec![0u8; 256],
+        };
         apply_outgoing_progress(&msg2, &progress, &total);
-        assert_eq!(progress.load(Ordering::Relaxed), 0, "terminal chunk must zero progress");
-        assert_eq!(total.load(Ordering::Relaxed), 0, "terminal chunk must zero total");
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            0,
+            "terminal chunk must zero progress"
+        );
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            0,
+            "terminal chunk must zero total"
+        );
     }
 
     #[test]
@@ -2347,7 +2400,10 @@ mod tests {
         let progress = Arc::new(AtomicU64::new(400));
         let total = Arc::new(AtomicU64::new(512));
 
-        let msg = Message::ClipChunk { index: 5, data: vec![0u8; 200] };
+        let msg = Message::ClipChunk {
+            index: 5,
+            data: vec![0u8; 200],
+        };
         apply_outgoing_progress(&msg, &progress, &total);
         assert_eq!(progress.load(Ordering::Relaxed), 0);
         assert_eq!(total.load(Ordering::Relaxed), 0);
@@ -2395,11 +2451,7 @@ mod tests {
         let total = Arc::new(AtomicU64::new(99));
 
         apply_outgoing_progress(&Message::Heartbeat, &progress, &total);
-        apply_outgoing_progress(
-            &Message::MouseMove { x: 100, y: 100 },
-            &progress,
-            &total,
-        );
+        apply_outgoing_progress(&Message::MouseMove { x: 100, y: 100 }, &progress, &total);
 
         assert_eq!(progress.load(Ordering::Relaxed), 42);
         assert_eq!(total.load(Ordering::Relaxed), 99);
@@ -2427,7 +2479,11 @@ mod tests {
         feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &png);
 
         match incoming.last_committed.as_ref().expect("committed payload") {
-            CommittedPayload::Image { width, height, bytes } => {
+            CommittedPayload::Image {
+                width,
+                height,
+                bytes,
+            } => {
                 assert_eq!(*width, original.width);
                 assert_eq!(*height, original.height);
                 assert_eq!(bytes.as_slice(), &*original.bytes);
@@ -2468,7 +2524,10 @@ mod tests {
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
         feed_offer(&mut incoming, FORMAT_PNG_IMAGE, &garbage);
 
-        assert!(incoming.last_committed.is_none(), "no payload should commit");
+        assert!(
+            incoming.last_committed.is_none(),
+            "no payload should commit"
+        );
         let s = state.get();
         assert!(s.text_history.is_empty() && s.image.is_none() && s.oversize_image.is_none());
         // After failed commit the receiver must be ready for a new offer.
@@ -2487,7 +2546,10 @@ mod tests {
         let invalid = vec![0xFF, 0xFE, 0xFD];
         feed_offer(&mut incoming, FORMAT_TEXT_UTF8, &invalid);
 
-        assert!(incoming.last_committed.is_none(), "no payload should commit");
+        assert!(
+            incoming.last_committed.is_none(),
+            "no payload should commit"
+        );
         let s = state.get();
         assert!(s.text_history.is_empty() && s.image.is_none() && s.oversize_image.is_none());
         assert_eq!(incoming.expected_len, 0);
@@ -2544,7 +2606,10 @@ mod tests {
         // Unknown format with deliberately large total_len — must NOT arm.
         incoming.on_offer(0xFE, u32::MAX);
 
-        assert_eq!(incoming.expected_len, 0, "unknown format must not arm reassembly");
+        assert_eq!(
+            incoming.expected_len, 0,
+            "unknown format must not arm reassembly"
+        );
         assert_eq!(incoming.expected_format, 0);
         assert_eq!(total.load(Ordering::Relaxed), 0);
         assert_eq!(progress.load(Ordering::Relaxed), 0);
@@ -2554,7 +2619,11 @@ mod tests {
         for i in 0..16u16 {
             incoming.on_chunk(i, vec![0u8; 256]);
         }
-        assert_eq!(incoming.received.len(), 0, "post-rejection chunks must not buffer");
+        assert_eq!(
+            incoming.received.len(),
+            0,
+            "post-rejection chunks must not buffer"
+        );
         assert_eq!(incoming.received_total, 0);
     }
 
@@ -2574,7 +2643,10 @@ mod tests {
         assert_eq!(incoming.expected_format, FORMAT_PNG_IMAGE);
         assert_eq!(incoming.expected_len, 512);
         assert_eq!(incoming.received_total, 0);
-        assert!(incoming.received.is_empty(), "previous chunks must be dropped");
+        assert!(
+            incoming.received.is_empty(),
+            "previous chunks must be dropped"
+        );
     }
 
     #[test]
@@ -2637,7 +2709,9 @@ mod tests {
         // - report the encoded size in KB (the user thinks in MB-ish, KB
         //   gives more precision near the 1 MB cap),
         // - include an actionable hint so the user knows what to do.
-        let e = ImageTooLarge { png_len: 1_500 * 1024 };
+        let e = ImageTooLarge {
+            png_len: 1_500 * 1024,
+        };
         let msg = format_oversize_toast(&e);
         assert!(msg.contains("1500"), "KB count missing: {msg}");
         assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
@@ -2713,7 +2787,10 @@ mod tests {
 
         incoming.on_offer(FORMAT_PNG_IMAGE, (MAX_IMAGE_BYTES as u32).saturating_add(1));
 
-        assert_eq!(incoming.expected_len, 0, "oversize offer must not be stored");
+        assert_eq!(
+            incoming.expected_len, 0,
+            "oversize offer must not be stored"
+        );
         assert_eq!(incoming.expected_format, 0);
         assert_eq!(total.load(Ordering::Relaxed), 0);
         assert_eq!(progress.load(Ordering::Relaxed), 0);
@@ -2727,7 +2804,10 @@ mod tests {
         incoming.incoming_progress = progress.clone();
         incoming.incoming_total = total.clone();
 
-        incoming.on_offer(FORMAT_TEXT_UTF8, (MAX_CLIPBOARD_BYTES as u32).saturating_add(1));
+        incoming.on_offer(
+            FORMAT_TEXT_UTF8,
+            (MAX_CLIPBOARD_BYTES as u32).saturating_add(1),
+        );
 
         assert_eq!(incoming.expected_len, 0);
         assert_eq!(incoming.expected_format, 0);
@@ -2785,7 +2865,10 @@ mod tests {
 
         // Replace chunk 0 with shorter content (50 B). Counter stays 200.
         incoming.on_chunk(0, vec![b'x'; 50]);
-        assert_eq!(incoming.received_total, 200, "duplicate must not bump counter");
+        assert_eq!(
+            incoming.received_total, 200,
+            "duplicate must not bump counter"
+        );
 
         incoming.on_chunk(1, vec![b'b'; 256]);
         incoming.on_chunk(2, vec![b'c'; 312]);
@@ -2949,7 +3032,11 @@ mod tests {
         incoming.on_chunk(1, vec![0u8; 256]);
         incoming.on_chunk(2, vec![0u8; 256]);
 
-        assert_eq!(incoming.received.len(), 0, "chunks without offer must not buffer");
+        assert_eq!(
+            incoming.received.len(),
+            0,
+            "chunks without offer must not buffer"
+        );
         assert_eq!(incoming.received_total, 0);
         assert_eq!(progress.load(Ordering::Relaxed), 0);
     }
@@ -2974,7 +3061,11 @@ mod tests {
             incoming.on_chunk(i, vec![0u8; 256]);
         }
 
-        assert_eq!(incoming.received.len(), 0, "post-rejection chunks must not buffer");
+        assert_eq!(
+            incoming.received.len(),
+            0,
+            "post-rejection chunks must not buffer"
+        );
         assert_eq!(incoming.received_total, 0);
         assert_eq!(progress.load(Ordering::Relaxed), 0);
     }
@@ -3004,8 +3095,14 @@ mod tests {
         state.set_file(h);
         let s = state.get();
         assert!(s.matches_file_hash(h));
-        assert!(!s.matches_image_hash(h), "file hash must not match image slot");
-        assert!(!s.matches_text_hash(h), "file hash must not match text slot");
+        assert!(
+            !s.matches_image_hash(h),
+            "file hash must not match image slot"
+        );
+        assert!(
+            !s.matches_text_hash(h),
+            "file hash must not match text slot"
+        );
     }
 
     #[test]
@@ -3021,7 +3118,10 @@ mod tests {
 
         let s = state.get();
         assert!(s.file.is_none(), "reset must clear file slot");
-        assert!(s.oversize_file.is_none(), "reset must clear oversize_file slot");
+        assert!(
+            s.oversize_file.is_none(),
+            "reset must clear oversize_file slot"
+        );
     }
 
     #[test]
@@ -3039,7 +3139,10 @@ mod tests {
 
         let s = state.get();
         assert_eq!(s.file, Some(h));
-        assert!(s.oversize_file.is_none(), "set_file must clear matching oversize_file");
+        assert!(
+            s.oversize_file.is_none(),
+            "set_file must clear matching oversize_file"
+        );
     }
 
     #[test]
@@ -3055,11 +3158,17 @@ mod tests {
 
         let s = state.get();
         assert!(s.matches_text_hash(0xDDDD), "latest text in history");
-        assert!(s.matches_text_hash(0xAAAA), "older text still in history (LRU)");
+        assert!(
+            s.matches_text_hash(0xAAAA),
+            "older text still in history (LRU)"
+        );
         assert_eq!(s.image, Some(0xBBBB), "image survives all text+file writes");
         assert_eq!(s.file, Some(0xCCCC), "file survives subsequent text write");
         assert!(s.matches_file_hash(0xCCCC));
-        assert!(!s.matches_file_hash(0xAAAA), "text hash must not match file slot");
+        assert!(
+            !s.matches_file_hash(0xAAAA),
+            "text hash must not match file slot"
+        );
     }
 
     #[test]
@@ -3087,7 +3196,10 @@ mod tests {
 
         // First tick: no prior state, would proceed to encode → oversize.
         let hash = hash_bytes(&img.bytes);
-        assert!(!state.get().matches_image_hash(hash), "first tick must NOT skip");
+        assert!(
+            !state.get().matches_image_hash(hash),
+            "first tick must NOT skip"
+        );
 
         // Stamp oversize as if poll thread just ran encode + check_image_size.
         state.set(LastKind::OversizeImage(hash));
@@ -3131,7 +3243,9 @@ mod tests {
         // `host_format_oversize_file_toast_includes_kb_and_limit`; the
         // wording diverges by design (chrome-panel toast vs Win11 tray
         // balloon) — see `format_oversize_file_toast` doc-comment.
-        let e = FileTooLarge { size_bytes: 25_000 * 1024 };
+        let e = FileTooLarge {
+            size_bytes: 25_000 * 1024,
+        };
         let msg = format_oversize_file_toast(&e, MAX_FILE_BYTES);
         assert!(msg.contains("25000"), "KB count missing: {msg}");
         assert!(msg.contains("smaller"), "actionable hint missing: {msg}");
@@ -3249,7 +3363,9 @@ mod tests {
         // shape (format=FORMAT_FILE, total_len=packed_len) + chunks reassemble.
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let content: Vec<u8> = (0..(CHUNK_SIZE * 4 + 17)).map(|i| (i & 0xFF) as u8).collect();
+        let content: Vec<u8> = (0..(CHUNK_SIZE * 4 + 17))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
         tmp.write_all(&content).expect("write");
         let path = tmp.path().to_owned();
 
@@ -3322,7 +3438,10 @@ mod tests {
         drop(events_tx);
 
         // No packets emitted.
-        assert!(packets_rx.recv().is_err(), "no offer/chunk packets for oversize");
+        assert!(
+            packets_rx.recv().is_err(),
+            "no offer/chunk packets for oversize"
+        );
 
         // Toast emitted with expected wording.
         let evt = events_rx.recv().expect("toast event");
@@ -3402,7 +3521,10 @@ mod tests {
         for i in 0..8u16 {
             inc.on_chunk(i, vec![0u8; 128]);
         }
-        assert!(inc.received.is_empty(), "post-decline chunks must not buffer");
+        assert!(
+            inc.received.is_empty(),
+            "post-decline chunks must not buffer"
+        );
         assert_eq!(inc.received_total, 0);
     }
 
@@ -3415,7 +3537,10 @@ mod tests {
         let mut inc = incoming_with_receive_files(state, true);
 
         let reply = inc.on_offer(FORMAT_FILE, 4096);
-        assert!(reply.is_none(), "accepted offer must not return ClipDecline");
+        assert!(
+            reply.is_none(),
+            "accepted offer must not return ClipDecline"
+        );
         assert_eq!(inc.expected_len, 4096);
         assert_eq!(inc.expected_format, FORMAT_FILE);
         assert_eq!(inc.incoming_total.load(Ordering::Relaxed), 4096);
@@ -3478,7 +3603,11 @@ mod tests {
 
         // CommittedPayload mirror for in-test introspection.
         match inc.last_committed.as_ref().expect("committed") {
-            CommittedPayload::File { path, name: n, content: c } => {
+            CommittedPayload::File {
+                path,
+                name: n,
+                content: c,
+            } => {
                 assert_eq!(path, &expected);
                 assert_eq!(n, name);
                 assert_eq!(c, &content);
@@ -3565,7 +3694,10 @@ mod tests {
             .expect("read_dir")
             .next()
             .is_none();
-        assert!(dir_empty, "cache dir must remain empty after oversize reject");
+        assert!(
+            dir_empty,
+            "cache dir must remain empty after oversize reject"
+        );
         assert!(inc.last_committed.is_none());
     }
 
@@ -3631,7 +3763,11 @@ mod tests {
         let png = encode_rgba_to_png(&original).expect("encode");
         feed_offer(&mut inc, FORMAT_PNG_IMAGE, &png);
         match inc.last_committed.as_ref().expect("image committed") {
-            CommittedPayload::Image { width, height, bytes } => {
+            CommittedPayload::Image {
+                width,
+                height,
+                bytes,
+            } => {
                 assert_eq!(*width, original.width);
                 assert_eq!(*height, original.height);
                 assert_eq!(bytes.as_slice(), &*original.bytes);
@@ -3668,7 +3804,10 @@ mod tests {
         let content = b"valid".to_vec();
         let packed = pack_first_chunk("good.txt", &content).expect("pack");
         feed_offer(&mut inc, FORMAT_FILE, &packed);
-        assert!(dir.path().join("good.txt").exists(), "next file must commit");
+        assert!(
+            dir.path().join("good.txt").exists(),
+            "next file must commit"
+        );
     }
 
     #[test]
@@ -3722,7 +3861,10 @@ mod tests {
         let total = Arc::new(AtomicU64::new(0));
         let label = Arc::new(Mutex::new("contract.pdf".to_string()));
 
-        let msg = Message::ClipOffer { format: FORMAT_FILE, total_len: 4096 };
+        let msg = Message::ClipOffer {
+            format: FORMAT_FILE,
+            total_len: 4096,
+        };
         apply_outgoing_progress_with_label(&msg, &progress, &total, &label);
 
         assert_eq!(total.load(Ordering::Relaxed), 4096);
@@ -3749,17 +3891,19 @@ mod tests {
         let total = Arc::new(AtomicU64::new(0));
         let label = Arc::new(Mutex::new("report.pdf".to_string()));
 
-        let offer = Message::ClipOffer { format: FORMAT_FILE, total_len: 8 };
+        let offer = Message::ClipOffer {
+            format: FORMAT_FILE,
+            total_len: 8,
+        };
         apply_outgoing_progress_with_label(&offer, &progress, &total, &label);
-        let chunk = Message::ClipChunk { index: 0, data: vec![0u8; 8] };
+        let chunk = Message::ClipChunk {
+            index: 0,
+            data: vec![0u8; 8],
+        };
         apply_outgoing_progress_with_label(&chunk, &progress, &total, &label);
 
         assert_eq!(total.load(Ordering::Relaxed), 0, "DONE zeroes total");
-        assert_eq!(
-            &*label.lock().unwrap(),
-            "",
-            "DONE clears the filename slot"
-        );
+        assert_eq!(&*label.lock().unwrap(), "", "DONE clears the filename slot");
     }
 
     #[test]
@@ -3798,7 +3942,10 @@ mod tests {
         // Without the flag flip, a 20 MB declined file would saturate the
         // serial link for ~70s before the writer noticed.
         let cancel = Arc::new(AtomicBool::new(false));
-        assert!(!cancel.load(Ordering::Acquire), "precondition: cancel disarmed");
+        assert!(
+            !cancel.load(Ordering::Acquire),
+            "precondition: cancel disarmed"
+        );
 
         let _toast = apply_clip_decline(FORMAT_FILE, &cancel);
 
@@ -3856,7 +4003,10 @@ mod tests {
 
         let _ = apply_clip_decline_with_label(FORMAT_TEXT_UTF8, &cancel, &label);
 
-        assert!(label.lock().unwrap().is_empty(), "slot cleared unconditionally");
+        assert!(
+            label.lock().unwrap().is_empty(),
+            "slot cleared unconditionally"
+        );
     }
 
     // --- Task 9a: cache vacuum startup hookup -------------------------------
@@ -3881,13 +4031,10 @@ mod tests {
         // exist yet. Test against an explicit missing path to pin the
         // behaviour; then call the production helper to assert it
         // doesn't panic against whatever the live resolver yields.
-        let missing = std::env::temp_dir()
-            .join("wd-mac-cache-vacuum-doesnotexist-9a-startup");
+        let missing = std::env::temp_dir().join("wd-mac-cache-vacuum-doesnotexist-9a-startup");
         let _ = std::fs::remove_dir_all(&missing);
-        let res = wiredesk_core::cache_vacuum::vacuum_cache_dir(
-            &missing,
-            Duration::from_secs(24 * 3600),
-        );
+        let res =
+            wiredesk_core::cache_vacuum::vacuum_cache_dir(&missing, Duration::from_secs(24 * 3600));
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 0);
 
@@ -3905,7 +4052,7 @@ mod tests {
         // that would race other tests). Asserts the end-to-end contract
         // production relies on: old files get removed, fresh files
         // survive.
-        use filetime::{FileTime, set_file_mtime};
+        use filetime::{set_file_mtime, FileTime};
         use std::fs;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4048,7 +4195,10 @@ mod tests {
         }
 
         let s = state.get();
-        assert!(s.file.is_none(), "file slot must remain empty after oversize pre-stamp");
+        assert!(
+            s.file.is_none(),
+            "file slot must remain empty after oversize pre-stamp"
+        );
         assert!(
             s.oversize_file.is_none(),
             "oversize_file slot must also remain empty — runtime poll owns the toast"

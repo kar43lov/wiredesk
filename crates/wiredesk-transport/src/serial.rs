@@ -113,11 +113,16 @@ impl Transport for SerialTransport {
                     // Partial frame in buffer — retry, but not forever
                     self.partial_timeouts += 1;
                     if self.partial_timeouts > MAX_PARTIAL_TIMEOUTS {
-                        log::warn!("partial frame abandoned after {} timeouts ({} bytes)",
-                            self.partial_timeouts, self.read_buf.len());
+                        log::warn!(
+                            "partial frame abandoned after {} timeouts ({} bytes)",
+                            self.partial_timeouts,
+                            self.read_buf.len()
+                        );
                         self.read_buf.clear();
                         self.partial_timeouts = 0;
-                        return Err(WireDeskError::Transport("recv timeout (partial frame abandoned)".into()));
+                        return Err(WireDeskError::Transport(
+                            "recv timeout (partial frame abandoned)".into(),
+                        ));
                     }
                     continue;
                 }

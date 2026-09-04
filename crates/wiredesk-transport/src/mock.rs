@@ -33,8 +33,16 @@ impl MockTransport {
         let (tx_a, rx_b) = mpsc::channel();
         let (tx_b, rx_a) = mpsc::channel();
 
-        let a = Self { tx: tx_a, rx: rx_a, connected: true };
-        let b = Self { tx: tx_b, rx: rx_b, connected: true };
+        let a = Self {
+            tx: tx_a,
+            rx: rx_a,
+            connected: true,
+        };
+        let b = Self {
+            tx: tx_b,
+            rx: rx_b,
+            connected: true,
+        };
 
         (a, b)
     }
@@ -82,7 +90,10 @@ mod tests {
     #[test]
     fn send_recv_hello() {
         let (mut a, mut b) = MockTransport::pair();
-        let msg = Message::Hello { version: 1, client_name: "test".into() };
+        let msg = Message::Hello {
+            version: 1,
+            client_name: "test".into(),
+        };
         let packet = Packet::new(msg.clone(), 1);
 
         a.send(&packet).unwrap();
@@ -99,8 +110,14 @@ mod tests {
         let messages = [
             Message::Heartbeat,
             Message::MouseMove { x: 100, y: 200 },
-            Message::KeyDown { scancode: 0x1E, modifiers: 0x01 },
-            Message::ClipChunk { index: 0, data: vec![0, 1, 2, 255] },
+            Message::KeyDown {
+                scancode: 0x1E,
+                modifiers: 0x01,
+            },
+            Message::ClipChunk {
+                index: 0,
+                data: vec![0, 1, 2, 255],
+            },
         ];
 
         for (i, msg) in messages.iter().enumerate() {
@@ -118,14 +135,27 @@ mod tests {
     fn bidirectional() {
         let (mut a, mut b) = MockTransport::pair();
 
-        a.send(&Packet::new(Message::Hello { version: 1, client_name: "c".into() }, 0)).unwrap();
+        a.send(&Packet::new(
+            Message::Hello {
+                version: 1,
+                client_name: "c".into(),
+            },
+            0,
+        ))
+        .unwrap();
         let hello = b.recv().unwrap();
         assert!(matches!(hello.message, Message::Hello { .. }));
 
         b.send(&Packet::new(
-            Message::HelloAck { version: 1, host_name: "h".into(), screen_w: 1920, screen_h: 1080 },
+            Message::HelloAck {
+                version: 1,
+                host_name: "h".into(),
+                screen_w: 1920,
+                screen_h: 1080,
+            },
             1,
-        )).unwrap();
+        ))
+        .unwrap();
         let ack = a.recv().unwrap();
         assert!(matches!(ack.message, Message::HelloAck { .. }));
     }

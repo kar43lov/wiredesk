@@ -42,14 +42,14 @@ pub struct BluetoothFactoryConfig {
 // platform-fenced submodules. They all expose the same public API surface.
 #[cfg(target_os = "macos")]
 mod mac;
-#[cfg(target_os = "windows")]
-mod win;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod stub;
+#[cfg(target_os = "windows")]
+mod win;
 
 #[cfg(target_os = "macos")]
 pub use mac::BluetoothLeTransport;
-#[cfg(target_os = "windows")]
-pub use win::BluetoothLeTransport;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use stub::BluetoothLeTransport;
+#[cfg(target_os = "windows")]
+pub use win::BluetoothLeTransport;

@@ -221,7 +221,7 @@ pub fn set_cf_hdrop(path: &Path) -> Result<(), FileClipboardError> {
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{
-        GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
     };
     use windows::Win32::System::Ole::CF_HDROP;
 

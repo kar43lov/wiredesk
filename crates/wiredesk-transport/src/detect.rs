@@ -225,7 +225,10 @@ mod tests {
             non_usb("COM1", SerialPortType::Unknown),
         ]);
         assert_eq!(
-            ports.iter().map(|p| p.port_name.as_str()).collect::<Vec<_>>(),
+            ports
+                .iter()
+                .map(|p| p.port_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["COM3", "COM7", "COM1"]
         );
     }
