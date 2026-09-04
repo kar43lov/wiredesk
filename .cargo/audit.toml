@@ -1,0 +1,19 @@
+# cargo-audit configuration. Everything ignored here must carry a reason and
+# a re-check trigger — an ignore without one turns the audit job into noise.
+
+[advisories]
+ignore = [
+    # quick-xml DoS advisories (quadratic attribute check / unbounded namespace
+    # allocation). Patched in >= 0.41.0, which neither consumer has moved to.
+    #
+    # Both consumers are Linux-only and WireDesk does not build for Linux: the
+    # client is macOS (objc2 / CoreFoundation) and the host is Windows. The
+    # pullers are `zbus_xml` (D-Bus) and `wayland-scanner` (a proc-macro, so
+    # build-time only). Neither reaches a shipped binary, and nothing in
+    # WireDesk parses untrusted XML.
+    #
+    # Re-check when: egui/winit bump their Linux backends, or if a Linux
+    # target is ever added — at which point these stop being theoretical.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

@@ -371,7 +371,7 @@ main.rs:
 **Files:**
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
-- Modify: `/Users/pgmac/.claude/projects/-Users-pgmac-Data-prjcts-wiredesk/memory/project_wiredesk.md`
+- Modify: `~/.claude/projects/<project>/memory/project_wiredesk.md`
 - Move: `docs/plans/20260502-clipboard-images.md` → `docs/plans/completed/20260502-clipboard-images.md`
 
 - [x] запустить `cargo test --workspace` — все тесты зелёные. Записать total count в commit message. (211 passed)

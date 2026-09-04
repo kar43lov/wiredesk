@@ -732,6 +732,11 @@ fn handle_interactive_connection(
                             r_stop.store(true, Ordering::Relaxed);
                             break;
                         }
+                        // clippy 1.98 wants this folded into a match guard, but
+                        // the guard would have to move `pkt` into `send`, which
+                        // match guards cannot do (E0382). The lint's own
+                        // suggestion does not compile — verified 2026-09-04.
+                        #[allow(clippy::collapsible_match)]
                         Message::ShellInput { .. } | Message::PtyResize { .. } => {
                             if r_outgoing.send(pkt).is_err() {
                                 r_stop.store(true, Ordering::Relaxed);
