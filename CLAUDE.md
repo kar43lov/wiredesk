@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
+cargo fmt                                           # CI проверяет `--check`; дерево приведено к rustfmt 2026-09-04
 cargo build --release --workspace
 
 # Один крейт / один тест по имени (substring-фильтр):
