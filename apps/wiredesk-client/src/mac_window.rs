@@ -79,25 +79,86 @@ mod imp {
         }
     }
 
+    /// Everything AppKit will tell us about why a window might not be on
+    /// screen, as one log line.
+    ///
+    /// The position turned out to be a red herring — AppKit agrees with the
+    /// coordinates we set — so the answer has to be in one of these flags:
+    /// the window being miniaturised, not visible, transparent, or living on
+    /// a Space other than the one in front of the user.
+    pub fn diagnostics() -> Option<String> {
+        unsafe {
+            let win = app_window();
+            if win.is_null() {
+                return Some("no NSWindow".to_string());
+            }
+            let frame: CGRect = msg_send![win, frame];
+            let visible: bool = msg_send![win, isVisible];
+            let miniaturized: bool = msg_send![win, isMiniaturized];
+            let on_active_space: bool = msg_send![win, isOnActiveSpace];
+            let key: bool = msg_send![win, isKeyWindow];
+            let main: bool = msg_send![win, isMainWindow];
+            let alpha: CGFloat = msg_send![win, alphaValue];
+            let level: isize = msg_send![win, level];
+            let behavior: usize = msg_send![win, collectionBehavior];
+            let occlusion: usize = msg_send![win, occlusionState];
+            let screen: *mut AnyObject = msg_send![win, screen];
+            let screen_desc = if screen.is_null() {
+                // A window whose frame lies on no screen returns nil here —
+                // the single most telling flag if the frame looks sane.
+                "nil".to_string()
+            } else {
+                let sf: CGRect = msg_send![screen, frame];
+                format!(
+                    "({},{}) {}x{}",
+                    sf.origin.x, sf.origin.y, sf.size.width, sf.size.height
+                )
+            };
+            Some(format!(
+                "frame=({},{}) {}x{} visible={visible} miniaturized={miniaturized} \
+                 onActiveSpace={on_active_space} key={key} main={main} alpha={alpha} \
+                 level={level} collectionBehavior={behavior:#x} occlusion={occlusion:#x} \
+                 screen={screen_desc}",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+            ))
+        }
+    }
+
     /// Pull the window into the active Space and focus it.
     ///
     /// After a native-fullscreen exit the window can stay associated with the
     /// Space that just collapsed: Mission Control still lists it, it still
     /// answers as the active window, but nothing paints on the current
-    /// desktop. `makeKeyAndOrderFront:` is what re-homes it — the same thing
-    /// that happens when a third-party window mover nudges it and it
-    /// "reappears".
+    /// desktop.
+    ///
+    /// Order matters. A miniaturised window ignores ordering messages, so it
+    /// has to be deminiaturised first. `NSWindowCollectionBehaviorMoveToActiveSpace`
+    /// (0x02) is what actually re-homes a window stranded on a dead Space —
+    /// `makeKeyAndOrderFront:` alone will happily "raise" it on the Space it
+    /// is already stuck to. `orderFrontRegardless` skips the check that
+    /// suppresses ordering for a not-quite-active app.
     pub fn bring_to_current_space() {
+        const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+
         unsafe {
             let win = app_window();
             if win.is_null() {
                 return;
             }
+            let miniaturized: bool = msg_send![win, isMiniaturized];
+            if miniaturized {
+                let _: () = msg_send![win, deminiaturize: std::ptr::null::<AnyObject>()];
+            }
+
+            let behavior: usize = msg_send![win, collectionBehavior];
+            let _: () = msg_send![win, setCollectionBehavior: behavior | MOVE_TO_ACTIVE_SPACE];
+
             let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             if !app.is_null() {
                 let _: () = msg_send![app, activateIgnoringOtherApps: true];
             }
             let _: () = msg_send![win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            let _: () = msg_send![win, orderFrontRegardless];
         }
     }
 
@@ -137,13 +198,16 @@ mod imp {
     pub fn real_outer_rect() -> Option<(f32, f32, f32, f32)> {
         None
     }
+    pub fn diagnostics() -> Option<String> {
+        None
+    }
     pub fn bring_to_current_space() {}
     pub fn set_outer_rect(_x: f32, _y: f32, _w: f32, _h: f32) -> bool {
         false
     }
 }
 
-pub use imp::{bring_to_current_space, real_outer_rect, set_outer_rect};
+pub use imp::{bring_to_current_space, diagnostics, real_outer_rect, set_outer_rect};
 
 /// Convert an AppKit window origin (y-up, from the bottom of the primary
 /// screen) into winit's y-down top-left origin.

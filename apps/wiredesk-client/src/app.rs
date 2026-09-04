@@ -1460,6 +1460,9 @@ impl WireDeskApp {
                         "fullscreen exit: window restored to {actual:?} after {} attempt(s)",
                         pending.attempts
                     );
+                    if let Some(d) = mac_window::diagnostics() {
+                        log::info!("fullscreen exit: window state after restore — {d}");
+                    }
                     // Re-home it on the Space the user is actually looking at.
                     // Coming out of native fullscreen the window can stay tied
                     // to the Space that just collapsed: Mission Control lists
@@ -1515,6 +1518,12 @@ impl WireDeskApp {
             return;
         }
 
+        if let Some(d) = mac_window::diagnostics() {
+            log::info!(
+                "fullscreen exit: attempt {} — window state before nudge: {d}",
+                pending.attempts + 1
+            );
+        }
         pending.attempts += 1;
         pending.next_at = now + RESTORE_RETRY;
         self.pending_position_restore = Some(pending);
