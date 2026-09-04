@@ -1,3 +1,11 @@
+// Hide the console window on Windows: this is a GUI app, and a stray
+// console behind the window is both ugly and a way to kill the process by
+// accident (Ctrl+C in a window the user did not know was focused). Logs go
+// to %APPDATA%\WireDesk\client.log via tracing-appender, so nothing is
+// lost. Unconditional rather than release-only, matching the host — mixing
+// windows_subsystem with debug_assertions is finicky in the linker.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod clipboard;
 mod clipboard_files;

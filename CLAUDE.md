@@ -18,9 +18,13 @@ cargo build --release --workspace
 cargo test -p wiredesk-client                       # все тесты крейта
 cargo test -p wiredesk-client decide_text_send      # тесты с этой подстрокой в имени
 cargo test -p wiredesk-host -- --test-threads=1     # host флакает на parallel runner'е macOS (~50% SIGABRT) — для надёжности
+
+# Windows-код (host И клиент) с мака — clippy проверяет типы, build проверяет линковку:
+cargo clippy -p wiredesk-client --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+cargo build  -p wiredesk-client --target x86_64-pc-windows-gnu    # нужен `brew install mingw-w64`
 ```
 
-Host компилируется и на macOS (с MockInjector), и на Windows (`WindowsInjector` за `cfg(target_os = "windows")` через crate `windows`). На macOS реальный SendInput не вызывается — для dev-цикла без Windows это нормально.
+🔴 **Обе стороны собираются под обе ОС, и правка платформенного кода должна проверяться обеими командами выше.** Host: `WindowsInjector` на Windows, `MockInjector` на macOS (реальный SendInput не зовётся — для dev-цикла нормально). Клиент: полноценные реализации на обеих платформах за фасадами `keyboard_tap` / `status_bar` / `monitor` / `clipboard_files`; `cargo check` на маке НЕ увидит поломку Windows-ветки.
 
 ## Run
 
@@ -52,6 +56,7 @@ Host компилируется и на macOS (с MockInjector), и на Windows
 - PTY-mode только на Windows host'е
 - Параллельный cargo test флакает на macOS для host'-пакета (~50% SIGABRT) — это pre-existing baseline issue…
 - Fullscreen — borderless (не native): Spaces-переход терял окно в WindowServer. Побочно закрыт пункт про меню-бар
+- Windows-клиент: `wd`/`wd --exec` только с Mac; BLE недоступен (роль Peripheral занята хостом, принудительный откат на serial); разные…
 
 ## Hardware setup
 

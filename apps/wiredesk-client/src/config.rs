@@ -173,10 +173,23 @@ where
     })
 }
 
+/// First-run serial port, before the user picks one in Settings.
+///
+/// Nothing about a default port is portable: macOS names the FTDI/CH34x
+/// adapter `/dev/cu.usbserial-NNN` (the number follows the physical USB
+/// socket), Windows hands out `COMn`. Neither guess is reliable — the
+/// adapter may well be somewhere else — but a wrong guess of the right
+/// *shape* fails visibly and is one dropdown click from correct, whereas a
+/// `/dev/...` path on Windows reads like a bug in the app.
+#[cfg(target_os = "windows")]
+pub const DEFAULT_PORT: &str = "COM3";
+#[cfg(not(target_os = "windows"))]
+pub const DEFAULT_PORT: &str = "/dev/cu.usbserial-120";
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            port: "/dev/cu.usbserial-120".to_string(),
+            port: DEFAULT_PORT.to_string(),
             baud: 115_200,
             width: 2560,
             height: 1440,
@@ -361,9 +374,42 @@ fn from_user(src: Option<ValueSource>) -> bool {
 
 /// Build the transport-layer's `TransportConfig` from a `ClientConfig`.
 /// Mirrors the host-side helper — see `apps/wiredesk-host/src/config.rs`.
+/// Decide which transport the client can actually open, given what the
+/// config asks for.
+///
+/// The one case where the answer is not "what you asked for" is BLE on a
+/// Windows client. `wiredesk-transport` picks the GATT role from the target
+/// OS — macOS is the Central (scanner), Windows is the Peripheral (server) —
+/// because until now only the host ran on Windows. A Windows *client* would
+/// therefore start advertising, exactly like the host it is trying to reach,
+/// and two peripherals never connect: `open()` succeeds, nothing links up,
+/// and the failure is silent.
+///
+/// So we downgrade to serial and say why. Returns the transport name plus an
+/// optional message for the log.
+///
+/// Pure, and takes the platform as an argument, so both branches are testable
+/// on any host.
+pub fn resolve_transport(requested: &str, client_is_windows: bool) -> (String, Option<String>) {
+    if client_is_windows && requested.eq_ignore_ascii_case("bluetooth") {
+        return (
+            "serial".to_string(),
+            Some(
+                "transport=bluetooth is not supported on the Windows client                  (the BLE role is fixed to Peripheral there, same as the host)                  — falling back to serial"
+                    .to_string(),
+            ),
+        );
+    }
+    (requested.to_string(), None)
+}
+
 pub fn to_transport_config(cfg: &ClientConfig) -> TransportConfig {
+    let (transport, note) = resolve_transport(&cfg.transport, cfg!(target_os = "windows"));
+    if let Some(note) = note {
+        log::warn!("{note}");
+    }
     TransportConfig {
-        transport: cfg.transport.clone(),
+        transport,
         serial: SerialFactoryConfig {
             port: cfg.port.clone(),
             baud: cfg.baud,
@@ -388,9 +434,61 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn default_port_has_the_shape_of_this_platform() {
+        // A macOS device path on Windows (or vice versa) can never open, and
+        // reads as a bug rather than "pick your port".
+        if cfg!(target_os = "windows") {
+            assert!(DEFAULT_PORT.starts_with("COM"), "{DEFAULT_PORT}");
+        } else {
+            assert!(DEFAULT_PORT.starts_with("/dev/"), "{DEFAULT_PORT}");
+        }
+    }
+
+    #[test]
+    fn resolve_transport_passes_serial_through() {
+        for windows in [false, true] {
+            let (t, note) = resolve_transport("serial", windows);
+            assert_eq!(t, "serial");
+            assert!(note.is_none());
+        }
+    }
+
+    #[test]
+    fn resolve_transport_keeps_bluetooth_on_mac() {
+        let (t, note) = resolve_transport("bluetooth", false);
+        assert_eq!(t, "bluetooth");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn resolve_transport_downgrades_bluetooth_on_windows() {
+        let (t, note) = resolve_transport("bluetooth", true);
+        assert_eq!(t, "serial");
+        let note = note.expect("a silent downgrade would be worse than none");
+        assert!(note.contains("Windows"), "{note}");
+    }
+
+    #[test]
+    fn resolve_transport_is_case_insensitive() {
+        // config.toml is hand-edited; "Bluetooth" must not slip past the
+        // check and start advertising.
+        let (t, _) = resolve_transport("Bluetooth", true);
+        assert_eq!(t, "serial");
+    }
+
+    #[test]
+    fn resolve_transport_leaves_unknown_values_alone() {
+        // Unknown names are the factory's business to reject, with its own
+        // error message; silently rewriting them would hide a typo.
+        let (t, note) = resolve_transport("carrier-pigeon", true);
+        assert_eq!(t, "carrier-pigeon");
+        assert!(note.is_none());
+    }
+
+    #[test]
     fn defaults_match_hardcodes() {
         let cfg = ClientConfig::default();
-        assert_eq!(cfg.port, "/dev/cu.usbserial-120");
+        assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.baud, 115_200);
         assert_eq!(cfg.width, 2560);
         assert_eq!(cfg.height, 1440);

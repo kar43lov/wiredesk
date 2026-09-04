@@ -13,15 +13,21 @@ You have two computers side by side. One runs Windows with security software ("C
 WireDesk sends keyboard/mouse input and clipboard data over either a **USB-Serial null-modem** (default; ~11 KB/s on CH340 @ 115200, or **up to ~300 KB/s on FT232H @ 3 Mbaud** — verified live, only the `baud` setting changes) or a **Bluetooth LE** link (live-measured ~4-5 KB/s — slower than serial, kept as a no-cable fallback; see [`docs/bluetooth-transport.md`](docs/bluetooth-transport.md)). Video comes separately through an HDMI capture card viewed in QuickTime or VLC.
 
 ```
-Host (Windows 11)                       Client (macOS)
+Host (Windows 11)                       Client (macOS or Windows)
     |                                        |
     |-- HDMI --> [splitter] --> capture --> QuickTime/VLC
     |                                        |
     |-- USB-Serial <-- null-modem --> USB-Serial
     |                                        |
     wiredesk-host                       wiredesk-client (GUI)
-    (console agent)                     wiredesk-term   (terminal-only, e.g. in Ghostty)
+    (console agent)                     wiredesk-term   (macOS only, terminal-only, e.g. in Ghostty)
 ```
+
+The client GUI runs on **macOS and Windows** from the same codebase — input
+capture, clipboard sync, per-monitor fullscreen and the status-area icon are
+implemented against each platform's own API behind one interface. A Windows
+client drives a Windows host over the same serial link; `wd` / `wd --exec`
+remain macOS-only (see [Known limitations](docs/known-limitations.md)).
 
 ## What WireDesk does
 
@@ -97,6 +103,21 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+On Windows, build the client with `.\scripts\build-win-client.ps1` — it is
+the same `cargo build --release -p wiredesk-client`, but building *on*
+Windows is what embeds the app icon into the `.exe` (build.rs needs rc.exe
+or windres, which a cross-build from the Mac does not have).
+
+Cross-checking the Windows build from macOS needs the target and, for a real
+link rather than a type check, mingw-w64:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+brew install mingw-w64                       # only needed for `build`
+cargo clippy -p wiredesk-client --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+cargo build  -p wiredesk-client --target x86_64-pc-windows-gnu
+```
+
 ## Run
 
 > First time? Read **[docs/setup.md](docs/setup.md)** — covers wiring, port discovery, Rust install on Windows (incl. how to do it under "Continent" lockdown), and handshake troubleshooting.
@@ -155,6 +176,38 @@ wiredesk-client --port /dev/cu.usbserial-XXX
 ```
 
 Logs roll daily into `~/Library/Application Support/WireDesk/client.log.YYYY-MM-DD` and also stream to stderr. Both `WireDesk.app` and the bare binary write to the same file, so post-mortem after a hang or disconnect is now possible without re-running with `RUST_LOG=debug`. The `RUST_LOG` env-filter still works for raising verbosity (defaults to `info`).
+
+### Client (Windows) — `wiredesk-client.exe`
+
+The same GUI, built for Windows. Use it to drive one Windows machine from
+another over the serial link.
+
+```powershell
+.\scripts\build-win-client.ps1
+.\target\release\wiredesk-client.exe
+```
+
+Differences from the Mac client, all of them consequences of the platform:
+
+| | macOS | Windows |
+|---|---|---|
+| Keyboard hijack | CGEventTap (needs Accessibility permission) | `WH_KEYBOARD_LL` hook (no permission needed) |
+| Release capture | `Cmd+Esc` | `Ctrl+Esc` |
+| Toggle fullscreen | `Cmd+Enter` | `Ctrl+Enter` |
+| Status area | menu bar item, progress shown as text | tray icon, progress shown in the tooltip |
+| Files on the clipboard | `NSPasteboard` file URL | `CF_HDROP` |
+| Transport | serial or BLE | serial only |
+| `wd` / `wd --exec` | yes | not yet |
+
+Settings and logs live in `%APPDATA%\WireDesk\` — same layout as the host,
+so a machine running both keeps `config.toml` for the client and
+`host.log.*` / `client.log.*` side by side. First launch defaults to `COM3`;
+pick the real adapter in Settings → Port and hit **Save & Restart**.
+
+`Ctrl+Esc` is normally the Windows shortcut for the Start menu. While capture
+is on, the hook takes it first, which is the point — the keystroke is meant
+for the host. Two combos the OS keeps for itself and never delivers to any
+hook: **Ctrl+Alt+Del** and **Win+L**.
 
 **Client (macOS) — terminal only** (run inside Ghostty/iTerm/Terminal.app for a real shell experience with history, scrollback, copy/paste):
 
@@ -257,19 +310,19 @@ Default baud rate 115200 (~11 KB/s on CH340) — rock-solid for mouse+keyboard (
 
 ```
 crates/
-  wiredesk-core        — error types, shared types
+  wiredesk-core        — error types, shared types, CF_HDROP file clipboard (shared by host and Windows client)
   wiredesk-protocol    — packet format, messages, COBS, CRC-16
   wiredesk-transport   — Transport trait, SerialTransport, MockTransport, detect (USB VID classification, shared by host's Detect button and `wd`'s auto-resolve)
   wiredesk-exec-core   — shared sentinel-runner + ExecTransport trait for `wd --exec` (used by term and client)
 apps/
   wiredesk-host        — Windows agent (Session + InputInjector + shell subprocess)
-  wiredesk-client      — macOS GUI (egui — input capture, keymap, clipboard) + IPC relay hosting parallel `wd`/`wd --exec` over wd-exec.sock (exec handler + interactive streaming relay + shell-channel owner lock)
+  wiredesk-client      — GUI for macOS and Windows (egui — input capture, keymap, clipboard); platform code sits behind one facade per concern (keyboard_tap, status_bar, monitor, clipboard_files, mac_window). macOS additionally hosts the IPC relay for parallel `wd`/`wd --exec` over wd-exec.sock (exec handler + interactive streaming relay + shell-channel owner lock)
   wiredesk-term        — macOS CLI (raw-mode terminal bridge — runs inside Ghostty/iTerm)
 ```
 
 ## Status
 
-MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded + single files up to 20 MB via NSPasteboard `file URL` / CF_HDROP, cached under `~/Library/Caches/WireDesk/` and `%TEMP%\WireDesk\` with 24 h vacuum on startup; receive-side sanitize against path traversal and NTFS reserved names; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode pass-through bridge in Ghostty/iTerm against a real PTY on the host — vim/htop/ssh without `-tt`/PSReadLine arrow-up + Tab autocomplete work natively; window resize reflows the host's `htop`/`vim` within 500 ms; hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately; the interactive session runs in parallel with a live GUI over the IPC relay, while `wd --exec` non-interactive mode keeps using the legacy pipe path with zero regressions; the dead GUI shell-panel was removed). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (template-image glyph, plus ↑% / ↓% during a transfer), Settings → System (Karabiner swap, Save & Restart) and Clipboard (6 toggles: send/receive × text/image plus receive-files and send-files; Mac→Host file send is opt-in, default off). Win host: tray agent (nwg) with **labeled serial-port dropdown + auto-detect** recognizing both CH340 (VID 0x1A86) and FTDI FT232H/R/2232/4232 (VID 0x0403), **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), **Receive files** checkbox in the Clipboard group, Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. On macOS both interactive `wd` and `wd --exec` run in parallel with a live GUI (including active capture) via the `wd-exec.sock` IPC relay, with a fail-fast single-owner lock on the host's single shell slot; the GUI shell-panel was removed. 310 client + 148 host + 94 exec-core + 88 protocol + 51 transport + 50 term + 20 wiredesk-core = 761 tests passing (+5 ignored; use `cargo test --workspace -- --test-threads=1` on macOS — host-side parallel runner has a pre-existing flake).
+MVP working end-to-end on real hardware: handshake, mouse, keyboard (incl. Cyrillic via scancodes), language toggle via Cmd+Space, bidirectional clipboard sync via Cmd+C/Cmd+V (text + PNG images up to 1 MB encoded + single files up to 20 MB via NSPasteboard `file URL` / CF_HDROP, cached under `~/Library/Caches/WireDesk/` and `%TEMP%\WireDesk\` with 24 h vacuum on startup; receive-side sanitize against path traversal and NTFS reserved names; LRU text-history dedup tolerates Whispr Flow-style "save→inject→restore" patterns; modifier-only hotkeys like Ctrl+Option pass through to macOS even in capture mode so dictation tools keep working; synthetic Cmd+V from Whispr/TextExpander is held until Mac→Host clipboard sync completes; Karabiner-Elements ⌥/⌘ swap is compensated via a Settings toggle; **`ClipDecline` protocol message** lets a peer abort an unwanted transfer instantly so a toggle-off no longer saturates the link with chunks the receiver would discard), OS-level keyboard hijack on macOS, fullscreen toggle (per-monitor on macOS) with auto-engage/release of capture, **shell-over-serial as a polished CLI** (raw-mode pass-through bridge in Ghostty/iTerm against a real PTY on the host — vim/htop/ssh without `-tt`/PSReadLine arrow-up + Tab autocomplete work natively; window resize reflows the host's `htop`/`vim` within 500 ms; hotkey cheatsheet on connect, heartbeat-kept idle sessions, clean shutdown that frees the host slot immediately; the interactive session runs in parallel with a live GUI over the IPC relay, while `wd --exec` non-interactive mode keeps using the legacy pipe path with zero regressions; the dead GUI shell-panel was removed). Mac UI: scrollable Settings, visual progress bars with Cancel button (in the chrome panel and inside the capture banner so they're visible in fullscreen), `NSStatusItem` in the menu bar (template-image glyph, plus ↑% / ↓% during a transfer), Settings → System (Karabiner swap, Save & Restart) and Clipboard (6 toggles: send/receive × text/image plus receive-files and send-files; Mac→Host file send is opt-in, default off). Win host: tray agent (nwg) with **labeled serial-port dropdown + auto-detect** recognizing both CH340 (VID 0x1A86) and FTDI FT232H/R/2232/4232 (VID 0x0403), **Restart entry** in the tray menu, **Quit button** in Settings, **double-click the .exe surfaces the existing Settings window** (instead of nagging "already running"), **Receive files** checkbox in the Clipboard group, Save & Restart, balloon notification on oversize image, double-click on tray icon opens Settings, host-spawned shell process runs hidden (`CREATE_NO_WINDOW`), .exe carries an embedded WireDesk icon when built on Windows. Adaptive heartbeat timeout 6 s idle → 30 s during clipboard transfer keeps the session alive on bidirectional CH340 saturation. TOML-backed settings on both sides, file logging on Windows, autostart toggle, single-instance lock. On macOS both interactive `wd` and `wd --exec` run in parallel with a live GUI (including active capture) via the `wd-exec.sock` IPC relay, with a fail-fast single-owner lock on the host's single shell slot; the GUI shell-panel was removed. **The client also builds and runs on Windows** (low-level keyboard hook, tray icon, `EnumDisplayMonitors` + per-monitor DPI, CF_HDROP clipboard files, borderless fullscreen above the taskbar), so a Windows machine can drive a Windows host; `wd`, `wd --exec` and the BLE transport stay macOS-only. 340 client + 146 host + 94 exec-core + 88 protocol + 51 transport + 50 term + 25 wiredesk-core = 794 tests passing (+5 ignored; use `cargo test --workspace -- --test-threads=1` on macOS — host-side parallel runner has a pre-existing flake).
 
 ## License
 
