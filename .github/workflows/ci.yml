@@ -51,6 +51,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The action runs `cargo audit` with its own flags and does not pick up
+      # .cargo/audit.toml, so the ignore list has to be repeated here. Keep
+      # the two in sync — audit.toml is what a local `cargo audit` reads, and
+      # it carries the reasoning for each entry.
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
