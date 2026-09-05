@@ -371,14 +371,14 @@ fixed rather than things that are missing.
 
 | Component | Tests |
 |---|--:|
-| `wiredesk-client` (GUI, input, clipboard) | 348 |
-| `wiredesk-host` (Windows agent) | 146 |
-| `wiredesk-exec-core` (shared `wd --exec` runner) | 94 |
+| `wiredesk-client` (GUI, input, clipboard) | 356 |
+| `wiredesk-host` (Windows agent) | 151 |
+| `wiredesk-exec-core` (shared `wd --exec` runner) | 100 |
 | `wiredesk-protocol` (framing, COBS, CRC-16) | 88 |
 | `wiredesk-transport` (serial, BLE, port detection) | 51 |
 | `wiredesk-term` (`wd` CLI) | 50 |
 | `wiredesk-core` (shared types, clipboard files) | 25 |
-| **Total** | **802** |
+| **Total** | **821** |
 
 Plus 5 ignored tests that need a live Windows session. On macOS run the suite
 with `cargo test --workspace -- --test-threads=1` — the host package has a
