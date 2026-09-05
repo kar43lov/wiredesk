@@ -932,6 +932,13 @@ mod windows_impl {
         /// Capture can be released mid-chord (Ctrl+Esc with Shift held), and
         /// without this the host would keep the modifier pressed forever.
         held: Mutex<BTreeSet<u16>>,
+        /// Virtual keys whose key-*down* was consumed as a local hotkey, and
+        /// whose key-*up* therefore has to be consumed as well.
+        ///
+        /// Without this the release half leaks: Ctrl+Enter swallows the Enter
+        /// press, then forwards the Enter release, and the host injects a
+        /// KeyUp for a key it never saw go down.
+        hotkey_down: Mutex<BTreeSet<u32>>,
     }
 
     static HOOK_STATE: OnceLock<HookState> = OnceLock::new();
@@ -1002,20 +1009,39 @@ mod windows_impl {
         let active = state.enabled.load(Ordering::SeqCst);
         let passive = state.passive.load(Ordering::SeqCst);
 
+        // The release half of a hotkey, whatever the mode is now: capture
+        // may well have been toggled by the press we swallowed a moment ago,
+        // so this check comes before any mode test.
+        if is_up {
+            let was_hotkey = state
+                .hotkey_down
+                .lock()
+                .map(|mut down| down.remove(&vk))
+                .unwrap_or(false);
+            if was_hotkey {
+                return LRESULT(1);
+            }
+        }
+
         // Hotkeys fire on key-down only, in both capture and passive mode,
         // and never reach the host or the local desktop.
         if (active || passive) && is_down {
             let ctrl = ctrl_is_down();
-            if is_win_toggle_fullscreen(vk, ctrl) {
-                let _ = state.tap_events_tx.send(TapEvent::ToggleFullscreen);
-                return LRESULT(1);
-            }
-            if is_win_toggle_capture(vk, ctrl) {
-                let event = if active {
+            let hotkey = if is_win_toggle_fullscreen(vk, ctrl) {
+                Some(TapEvent::ToggleFullscreen)
+            } else if is_win_toggle_capture(vk, ctrl) {
+                Some(if active {
                     TapEvent::ReleaseCapture
                 } else {
                     TapEvent::EngageCapture
-                };
+                })
+            } else {
+                None
+            };
+            if let Some(event) = hotkey {
+                if let Ok(mut down) = state.hotkey_down.lock() {
+                    down.insert(vk);
+                }
                 let _ = state.tap_events_tx.send(event);
                 return LRESULT(1);
             }
@@ -1101,6 +1127,7 @@ mod windows_impl {
                     outgoing_tx,
                     tap_events_tx,
                     held: Mutex::new(BTreeSet::new()),
+                    hotkey_down: Mutex::new(BTreeSet::new()),
                 })
                 .is_err()
             {

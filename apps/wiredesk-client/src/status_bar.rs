@@ -42,9 +42,9 @@ use std::sync::Arc;
 ///
 /// Bytes-format: percentage only, no KB/B suffix. The status bar is the
 /// glanceable summary; users who want bytes look at the in-app status row.
-// Consumed by the macOS poll_loop and by unit tests on all platforms; dead
-// only in a non-macOS *bin* build (the status bar is a no-op there).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// Consumed by the macOS menu-bar loop, the Windows tray loop, and the unit
+// tests; dead only where neither status area exists.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn format_status_bar_title(
     out_progress: u64,
     out_total: u64,
@@ -61,7 +61,7 @@ pub fn format_status_bar_title(
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn pct(current: u64, total: u64) -> Option<u64> {
     if total == 0 {
         return None;
@@ -73,9 +73,9 @@ fn pct(current: u64, total: u64) -> Option<u64> {
 /// Bundle of progress atomics shared with the status bar polling thread.
 /// All four counters are written by the writer/reader threads (sole
 /// writers per direction); the polling thread only reads.
-// Fields are read by the macOS poll_loop; on other targets `init` ignores
-// the struct, so the fields are never read there.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// Fields are read by the macOS menu-bar loop and the Windows tray loop;
+// elsewhere `init` ignores the struct, so they are never read.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 #[derive(Clone)]
 pub struct StatusBarCounters {
     pub outgoing_progress: Arc<AtomicU64>,
@@ -330,7 +330,7 @@ mod windows_impl {
         DispatchMessageW, GetSystemMetrics, PeekMessageW, PostQuitMessage, RegisterClassW,
         RegisterWindowMessageW, TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR, MSG,
         PM_REMOVE, SM_CXSMICON, SM_CYSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY,
-        WNDCLASSW,
+        WM_QUIT, WNDCLASSW,
     };
 
     use super::{format_status_bar_title, StatusBarCounters, MENU_BAR_ICON_TOOLTIP};
@@ -517,7 +517,17 @@ mod windows_impl {
                 // both the message queue and the stop channel, and blocking
                 // in GetMessageW would starve the latter.
                 let mut msg = MSG::default();
+                let mut quit = false;
                 while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    // Any local process can post WM_DESTROY to a
+                    // message-only window; wnd_proc answers with
+                    // PostQuitMessage. Honouring it here means the loop
+                    // stops and cleans up instead of polling a dead HWND
+                    // for the rest of the session.
+                    if msg.message == WM_QUIT {
+                        quit = true;
+                        break;
+                    }
                     // Explorer restarted and took every tray icon with it.
                     // Re-adding is the documented way back; nothing else
                     // brings the icon home.
@@ -547,6 +557,10 @@ mod windows_impl {
                         log::debug!("status bar: NIM_MODIFY failed (icon removed?)");
                     }
                     last_tip = tip;
+                }
+
+                if quit {
+                    break;
                 }
 
                 match stop_rx.recv_timeout(Duration::from_millis(250)) {

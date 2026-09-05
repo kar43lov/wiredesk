@@ -192,14 +192,24 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
         TRUE
     }
 
-    /// Resolve `\\.\DISPLAY1` into whatever the monitor calls itself.
+    /// Resolve `\\.\DISPLAY1` into a name a human can pick out of a list.
     ///
     /// `EnumDisplayDevicesW` on an adapter name enumerates the monitors
-    /// attached to it; index 0 is the one we want. Returns `None` when the
-    /// call fails or the string is empty, so the caller can fall back to
-    /// the adapter name.
+    /// attached to it; index 0 is the one we want. Its `DeviceString` is
+    /// usually the driver's idea of the model — and on most setups that is
+    /// the literal string "Generic PnP Monitor" for *every* display, which
+    /// would leave the Settings dropdown showing two identical rows for the
+    /// one feature (per-monitor fullscreen) that depends on telling them
+    /// apart. So the adapter's display number goes in as well: "Generic PnP
+    /// Monitor (DISPLAY2)" matches what Windows shows in Display Settings.
+    ///
+    /// Returns `None` when the call fails or both parts are empty, so the
+    /// caller can fall back to the raw adapter path.
     fn monitor_device_name(adapter: &str) -> Option<String> {
         use windows::core::PCWSTR;
+
+        // "\\.\DISPLAY2" → "DISPLAY2"; anything unexpected is left alone.
+        let short = adapter.rsplit('\\').next().unwrap_or(adapter);
 
         let wide: Vec<u16> = adapter.encode_utf16().chain(std::iter::once(0)).collect();
         let mut dd = DISPLAY_DEVICEW {
@@ -207,11 +217,12 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
             ..Default::default()
         };
         let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut dd, 0) };
-        if !ok.as_bool() {
-            return None;
-        }
-        let name = wide_to_string(&dd.DeviceString);
-        (!name.is_empty()).then_some(name)
+        let model = if ok.as_bool() {
+            wide_to_string(&dd.DeviceString)
+        } else {
+            String::new()
+        };
+        Some(compose_monitor_name(&model, short))
     }
 
     let mut raw: Vec<RawMonitor> = Vec::new();
@@ -293,6 +304,24 @@ pub fn order_monitors(mut raw: Vec<RawMonitor>) -> Vec<MonitorInfo> {
             }
         })
         .collect()
+}
+
+/// Join the driver's model string and the adapter's display number into the
+/// name shown in Settings.
+///
+/// Either half may be missing: an empty model leaves just "DISPLAY2", an
+/// empty display number leaves just the model, and with neither the caller
+/// falls back to the raw adapter path.
+///
+/// Pure, so the formatting is testable off Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn compose_monitor_name(model: &str, display: &str) -> String {
+    match (model.trim(), display.trim()) {
+        ("", "") => String::new(),
+        ("", d) => d.to_string(),
+        (m, "") => m.to_string(),
+        (m, d) => format!("{m} ({d})"),
+    }
 }
 
 /// Decode a fixed-size, NUL-padded UTF-16 buffer as Win32 hands them out.
@@ -591,6 +620,32 @@ mod tests {
             primary,
             name: name.to_string(),
         }
+    }
+
+    #[test]
+    fn compose_monitor_name_keeps_both_halves() {
+        // The common case: identical model strings across displays, told
+        // apart by the adapter number Windows itself shows.
+        assert_eq!(
+            compose_monitor_name("Generic PnP Monitor", "DISPLAY2"),
+            "Generic PnP Monitor (DISPLAY2)"
+        );
+    }
+
+    #[test]
+    fn compose_monitor_name_survives_a_missing_half() {
+        assert_eq!(compose_monitor_name("", "DISPLAY1"), "DISPLAY1");
+        assert_eq!(compose_monitor_name("DELL U2720Q", ""), "DELL U2720Q");
+        assert_eq!(compose_monitor_name("  ", " "), "");
+    }
+
+    #[test]
+    fn identical_models_stay_distinguishable() {
+        // Two displays of the same model must not collapse into one label —
+        // picking a monitor in Settings would be a coin flip.
+        let a = compose_monitor_name("Generic PnP Monitor", "DISPLAY1");
+        let b = compose_monitor_name("Generic PnP Monitor", "DISPLAY2");
+        assert_ne!(a, b);
     }
 
     #[test]
