@@ -572,13 +572,14 @@ impl wiredesk_exec_core::ExecTransport for SerialExecTransport {
             .writer
             .lock()
             .map_err(|_| wiredesk_exec_core::ExecError::Transport("mutex poisoned".into()))?;
-        t.send(&Packet::new(
-            Message::ShellInput {
-                data: data.to_vec(),
-            },
-            0,
-        ))
-        .map_err(|e| wiredesk_exec_core::ExecError::Transport(e.to_string()))
+        // Wire-sized pieces under one lock so nothing interleaves — a single
+        // oversize packet is refused by `to_bytes` and the run hangs to
+        // timeout (see `shell_input_packets`).
+        for packet in wiredesk_exec_core::transport::shell_input_packets(data) {
+            t.send(&packet)
+                .map_err(|e| wiredesk_exec_core::ExecError::Transport(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn recv_event(

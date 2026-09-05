@@ -1,0 +1,82 @@
+name: Release
+
+# Builds both halves on their native runners and attaches them to a DRAFT
+# GitHub Release for the pushed tag. The draft is deliberate: nothing goes
+# public until a human reviews the assets and presses Publish. Nothing here
+# is signed or notarized — see the "Prebuilt binaries" note in README.md.
+on:
+  push:
+    tags: ['v*']
+  # Manual runs build the artifacts for inspection but skip the release job.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Build macOS client
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The bundle script does the release build of the client itself; the
+      # `wd` terminal binary is a separate package.
+      - name: Build WireDesk.app and wd
+        run: |
+          ./scripts/build-mac-app.sh
+          cargo build --release -p wiredesk-term
+      - name: Package
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent target/release/WireDesk.app "dist/WireDesk-macos-arm64-${GITHUB_REF_NAME}.zip"
+          cp target/release/wiredesk-term "dist/wd-macos-arm64-${GITHUB_REF_NAME}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows host
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built on Windows so rc.exe embeds the .ico — a cross build from
+      # macOS ships without the app icon.
+      - name: Build wiredesk-host
+        run: cargo build --release -p wiredesk-host
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/wiredesk-host.exe "dist/wiredesk-host-windows-x64-$env:GITHUB_REF_NAME.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*

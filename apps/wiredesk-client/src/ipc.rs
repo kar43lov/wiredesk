@@ -58,14 +58,14 @@ struct IpcExecTransport {
 
 impl ExecTransport for IpcExecTransport {
     fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
-        self.outgoing_tx
-            .send(Packet::new(
-                Message::ShellInput {
-                    data: data.to_vec(),
-                },
-                0,
-            ))
-            .map_err(|_| ExecError::Closed)
+        // Wire-sized pieces: a single oversize packet is refused by the
+        // writer and the run hangs to timeout (see `shell_input_packets`).
+        for packet in wiredesk_exec_core::transport::shell_input_packets(data) {
+            self.outgoing_tx
+                .send(packet)
+                .map_err(|_| ExecError::Closed)?;
+        }
+        Ok(())
     }
 
     fn recv_event(&mut self, timeout: Duration) -> Result<ExecEvent, ExecError> {
@@ -75,6 +75,23 @@ impl ExecTransport for IpcExecTransport {
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ExecError::Closed),
         }
     }
+}
+
+/// How much of a `wd --exec` command line the INFO log keeps. Agent sessions
+/// routinely pass 4–7 KB base64 blobs — logging them whole bloated the file
+/// and copied every DB host, user and query into it. The full text stays in
+/// the caller's own shell history.
+const CMD_LOG_CHARS: usize = 160;
+
+/// Truncate `cmd` for logging on a char boundary (commands carry Cyrillic),
+/// appending the omitted length so a long one is still recognisable.
+fn abbreviate_cmd(cmd: &str) -> String {
+    let total = cmd.chars().count();
+    if total <= CMD_LOG_CHARS {
+        return format!("{cmd:?}");
+    }
+    let head: String = cmd.chars().take(CMD_LOG_CHARS).collect();
+    format!("{head:?}… (+{} chars)", total - CMD_LOG_CHARS)
 }
 
 /// Narrow the socket's directory to 0700. Best-effort: a failure is not
@@ -288,8 +305,8 @@ fn handle_connection(
     link_up: Arc<AtomicBool>,
 ) {
     log::info!(
-        "IPC handler: cmd={:?} ssh={:?} timeout={}s",
-        req.cmd,
+        "IPC handler: cmd={} ssh={:?} timeout={}s",
+        abbreviate_cmd(&req.cmd),
         req.ssh,
         req.timeout_secs
     );
@@ -365,10 +382,12 @@ fn handle_connection(
     };
     let waited = lock_started.elapsed();
     if waited > Duration::from_secs(1) {
-        log::warn!(
-            "IPC handler: waited {:?} for single_inflight (prior wd --exec held it long — likely an --ssh path that exited the remote shell without a matching sentinel; that handler will release on its own timeout)",
-            waited
-        );
+        // Ordinary queueing: the host has one shell slot, and several
+        // agent sessions routinely fire `wd --exec` at once. Three weeks of
+        // logs held ~950 of these, nearly all plain back-to-back runs — so
+        // INFO, not WARN. A genuinely stuck predecessor shows up as its own
+        // "timeout after Ns" line.
+        log::info!("IPC handler: queued {waited:?} behind another wd --exec (one host shell slot)");
     }
 
     // Recheck the link AFTER acquiring the slot (Codex P2 race): a request
@@ -1864,5 +1883,27 @@ mod tests {
             "channel must return to Idle after both exec runs (owner still {:?})",
             current_owner(&owner)
         );
+    }
+
+    #[test]
+    fn abbreviate_cmd_keeps_short_commands_whole() {
+        assert_eq!(abbreviate_cmd("Get-ChildItem"), "\"Get-ChildItem\"");
+    }
+
+    #[test]
+    fn abbreviate_cmd_truncates_long_commands_with_remainder() {
+        let cmd = "x".repeat(CMD_LOG_CHARS + 40);
+        let out = abbreviate_cmd(&cmd);
+        assert!(out.starts_with(&format!("\"{}\"", "x".repeat(CMD_LOG_CHARS))));
+        assert!(out.ends_with("… (+40 chars)"), "got {out}");
+    }
+
+    #[test]
+    fn abbreviate_cmd_cuts_on_char_boundary() {
+        // Cyrillic is two bytes per char; a byte-indexed slice would panic.
+        let cmd = "ж".repeat(CMD_LOG_CHARS + 3);
+        let out = abbreviate_cmd(&cmd);
+        assert!(out.ends_with("… (+3 chars)"), "got {out}");
+        assert_eq!(out.matches('ж').count(), CMD_LOG_CHARS);
     }
 }

@@ -1701,9 +1701,10 @@ impl WireDeskApp {
         ui.add_space(12.0);
         ui.label(
             egui::RichText::new(
-                "\u{26A0} After granting permission, quit and relaunch \
-                 wiredesk-client. The window detects the change but the \
-                 tap won't activate without a fresh process.",
+                "\u{2139} Once the permission is granted this screen goes \
+                 away by itself within a couple of seconds — no relaunch \
+                 needed. Rebuilding the app with ad-hoc signing resets the \
+                 grant; see scripts/make-dev-signing-cert.sh to keep it.",
             )
             .color(COLOR_WARNING),
         );
@@ -2002,6 +2003,14 @@ impl eframe::App for WireDeskApp {
         // hammering the (potentially slow) sync IPC call to SystemServices.
         if self.last_perm_check.elapsed() >= Duration::from_secs(2) {
             self.permission_granted = keyboard_tap::is_permission_granted();
+            // The grant applies to the running process at once; a tap that
+            // was deferred at launch starts here, no relaunch needed.
+            #[cfg(target_os = "macos")]
+            if self.permission_granted {
+                if let Some(tap) = self.tap_handle.as_mut() {
+                    tap.try_start_late();
+                }
+            }
             self.last_perm_check = Instant::now();
         }
 
@@ -2378,6 +2387,17 @@ impl eframe::App for WireDeskApp {
     /// the next launch would restore the *previous* position.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_window_geometry();
+        // Tell the host we are leaving. Without this it only notices the
+        // missing heartbeats 6 s later — until then it keeps whatever
+        // modifiers capture left pressed and shows "connected" in the tray.
+        // On `Disconnect` it releases all keys, kills a leftover shell and
+        // goes back to waiting for HELLO at once.
+        if self.state == ConnectionState::Connected {
+            let _ = self.outgoing_tx.send(Packet::new(Message::Disconnect, 0));
+            // The writer thread drains the channel on its own; give it a
+            // moment before process exit tears the threads down.
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 

@@ -18,7 +18,7 @@
 //! *returns* the receiver when it exits and the supervisor hands it to the
 //! next writer.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -32,6 +32,20 @@ use wiredesk_transport::transport::Transport;
 
 use crate::app::TransportEvent;
 use crate::{clipboard, exec_bridge};
+
+/// Links torn down in a row without ever completing a handshake. The reader
+/// bumps it on a pre-handshake liveness timeout and zeroes it on HelloAck;
+/// the supervisor reads it when it reopens. Both use it to throttle their
+/// log lines: with the host machine off, the pair otherwise wrote a WARN and
+/// an INFO every 6 s — 39 000 lines across three weeks of logs, burying
+/// everything else. Process-wide because there is exactly one supervisor.
+static SILENT_CYCLES: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the `n`-th consecutive silent cycle is logged at full volume:
+/// the first three, then every tenth. Everything in between goes to DEBUG.
+fn silent_cycle_is_loud(n: u32) -> bool {
+    n <= 3 || n.is_multiple_of(10)
+}
 
 /// Host identity + geometry learned from the `HelloAck` handshake. The
 /// interactive-`wd`-over-IPC relay (Task 6/7) needs these to synthesise an
@@ -208,7 +222,13 @@ pub fn spawn_supervisor(
             let reader_t = loop {
                 attempt = attempt.saturating_add(1);
                 let _ = events_tx.send(TransportEvent::Reconnecting { attempt });
-                log::info!("reopening transport attempt={attempt}");
+                // A failed open (attempt > 1) always earns a line; a clean
+                // reopen after a silent cycle follows the throttle.
+                if attempt > 1 || silent_cycle_is_loud(SILENT_CYCLES.load(Ordering::Relaxed)) {
+                    log::info!("reopening transport attempt={attempt}");
+                } else {
+                    log::debug!("reopening transport attempt={attempt}");
+                }
                 match open_fn() {
                     Ok(t) => break t,
                     Err(e) => {
@@ -341,6 +361,17 @@ fn writer_thread(
                     }
                 }
                 if let Err(e) = transport.send(&packet) {
+                    if matches!(e, WireDeskError::Protocol(_)) {
+                        // `send` encodes before it writes, and the only
+                        // send-side Protocol error is `to_bytes` refusing an
+                        // oversize payload — nothing touched the wire. Drop
+                        // that one packet and carry on: tearing the link down
+                        // (the previous behaviour) reset both clipboards and
+                        // reopened the port for a packet that could never be
+                        // sent anyway.
+                        log::error!("dropping unsendable packet: {e}");
+                        continue;
+                    }
                     log::error!("send error: {e}");
                     // Close the IPC gate immediately (Codex iter5 P2): the
                     // reader may still be alive, and waiting for the UI →
@@ -380,12 +411,27 @@ fn writer_thread(
         }
 
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            // Treat a failed heartbeat write like any other send error. On an
-            // idle link the periodic heartbeat is the ONLY write, so swallowing
-            // its error would hide a dead local fd (cable yanked on our side)
+            // Until the handshake completes the periodic tick re-sends HELLO
+            // instead of a heartbeat. A host that started after our first
+            // HELLO — or lost it to line noise — only ever answers a HELLO;
+            // before this the link stayed mute until the reader's 6 s
+            // liveness budget forced a full port reopen. The host
+            // re-handshakes from any state, so a duplicate HELLO racing a
+            // late HelloAck costs one extra HelloAck at most.
+            let tick = if ctx.link_up.load(Ordering::Acquire) {
+                Message::Heartbeat
+            } else {
+                Message::Hello {
+                    version: VERSION,
+                    client_name: ctx.client_name.clone(),
+                }
+            };
+            // Treat a failed tick write like any other send error. On an idle
+            // link the periodic tick is the ONLY write, so swallowing its
+            // error would hide a dead local fd (cable yanked on our side)
             // until the reader happens to notice. Emit Disconnected and hand the
             // receiver back so the supervisor can reopen.
-            if let Err(e) = transport.send(&Packet::new(Message::Heartbeat, 0)) {
+            if let Err(e) = transport.send(&Packet::new(tick, 0)) {
                 log::error!("heartbeat send error: {e}");
                 ctx.link_up.store(false, Ordering::Release);
                 let _ = events_tx.send(TransportEvent::Disconnected(e.to_string()));
@@ -511,6 +557,10 @@ fn reader_loop(
     // budget while `recv()` only times out, the peer is gone — see the
     // timeout arm below.
     let mut last_recv = Instant::now();
+    // Whether this link ever saw a HelloAck. Decides how a liveness timeout
+    // is reported: a lost handshaked link is a WARN every time, a link that
+    // never answered (host machine off) is throttled via SILENT_CYCLES.
+    let mut handshaked = false;
 
     // Cancel-batch state — same role as the writer-side counters: log a
     // single START and a single END line per cancel sweep instead of one
@@ -535,6 +585,11 @@ fn reader_loop(
                         ..
                     } => {
                         log::info!("connected to '{host_name}' ({screen_w}x{screen_h})");
+                        handshaked = true;
+                        let silent = SILENT_CYCLES.swap(0, Ordering::Relaxed);
+                        if silent > 0 {
+                            log::info!("host answered after {silent} silent reopen cycle(s)");
+                        }
                         reset_session_state(&mut incoming_clip);
                         // Cache host identity/geometry for the interactive
                         // relay's synth `HelloAck` (see LinkContext::host_info).
@@ -649,10 +704,25 @@ fn reader_loop(
                     idle_timeout
                 };
                 if last_recv.elapsed() >= limit {
-                    log::warn!(
-                        "host link lost — no packet for {:?} — reopening port",
-                        last_recv.elapsed()
-                    );
+                    if handshaked {
+                        log::warn!(
+                            "host link lost — no packet for {:?} — reopening port",
+                            last_recv.elapsed()
+                        );
+                    } else {
+                        let n = SILENT_CYCLES.fetch_add(1, Ordering::Relaxed) + 1;
+                        if silent_cycle_is_loud(n) {
+                            log::warn!(
+                                "no answer from host for {:?} (silent cycle {n}) — reopening port",
+                                last_recv.elapsed()
+                            );
+                        } else {
+                            log::debug!(
+                                "no answer from host for {:?} (silent cycle {n}) — reopening port",
+                                last_recv.elapsed()
+                            );
+                        }
+                    }
                     reset_session_state(&mut incoming_clip);
                     let _ = events_tx.send(TransportEvent::Disconnected(
                         "host link lost — no heartbeat".into(),
@@ -1396,5 +1466,169 @@ mod tests {
         );
         // Drain the events so the channel isn't dropped mid-send in the reader.
         while events_rx.try_recv().is_ok() {}
+    }
+
+    /// Test transport that records every packet `send()` accepted. Unlike
+    /// `ScriptedTransport` it runs the real `to_bytes` encoder first, so an
+    /// oversize payload fails exactly the way the serial transport fails.
+    struct RecordingTransport {
+        sent: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl Transport for RecordingTransport {
+        fn send(&mut self, packet: &Packet) -> Result<()> {
+            packet.to_bytes()?;
+            self.sent.lock().unwrap().push(packet.message.clone());
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Packet> {
+            thread::sleep(Duration::from_millis(2));
+            Err(WireDeskError::Transport("recv timeout".into()))
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn try_clone(&self) -> Result<Box<dyn Transport>> {
+            Ok(Box::new(RecordingTransport {
+                sent: self.sent.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn silent_cycle_throttle_keeps_first_three_and_every_tenth() {
+        for n in 1..=3 {
+            assert!(silent_cycle_is_loud(n), "cycle {n} must be loud");
+        }
+        for n in 4..=9 {
+            assert!(!silent_cycle_is_loud(n), "cycle {n} must be quiet");
+        }
+        assert!(silent_cycle_is_loud(10));
+        assert!(!silent_cycle_is_loud(11));
+        assert!(silent_cycle_is_loud(20));
+        // Zero (no silent cycle yet) is loud — the very first reopen logs.
+        assert!(silent_cycle_is_loud(0));
+    }
+
+    #[test]
+    fn writer_drops_oversize_packet_without_tearing_the_link_down() {
+        // Regression: a `ShellInput` over MAX_PAYLOAD used to be reported as
+        // a send error, which emitted Disconnected and reopened the port for
+        // a packet that could never be sent.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (events_tx, events_rx) = mpsc::channel();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let transport = Box::new(RecordingTransport { sent: sent.clone() });
+        let shutdown_c = shutdown.clone();
+        let handle = thread::spawn(move || {
+            writer_thread(transport, outgoing_rx, events_tx, shutdown_c, ctx)
+        });
+
+        let oversize = Packet::new(
+            Message::ShellInput {
+                data: vec![0x41; wiredesk_protocol::packet::MAX_PAYLOAD + 1],
+            },
+            0,
+        );
+        outgoing_tx.send(oversize).unwrap();
+        outgoing_tx
+            .send(Packet::new(Message::ShellClose, 0))
+            .unwrap();
+
+        // The packet after the oversize one must still reach the wire.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, Message::ShellClose))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let got = sent.lock().unwrap();
+            assert!(matches!(got.first(), Some(Message::Hello { .. })));
+            assert!(
+                got.iter().any(|m| matches!(m, Message::ShellClose)),
+                "ShellClose never sent — writer stopped after the oversize packet: {got:?}"
+            );
+            assert!(
+                !got.iter().any(|m| matches!(m, Message::ShellInput { .. })),
+                "oversize ShellInput must not be recorded as sent"
+            );
+        }
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no Disconnected event may be emitted for an oversize packet"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn writer_tick_sends_hello_until_handshake_then_heartbeat() {
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let link_up = ctx.link_up.clone();
+        let (events_tx, _events_rx) = mpsc::channel();
+        let (_outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let transport = Box::new(RecordingTransport { sent: sent.clone() });
+        let shutdown_c = shutdown.clone();
+        let handle = thread::spawn(move || {
+            writer_thread(transport, outgoing_rx, events_tx, shutdown_c, ctx)
+        });
+
+        // Wait for the first periodic tick with the link still down.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline && sent.lock().unwrap().len() < 2 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let got = sent.lock().unwrap();
+            assert!(got.len() >= 2, "no periodic tick within 4 s: {got:?}");
+            assert!(
+                matches!(got[1], Message::Hello { .. }),
+                "pre-handshake tick must re-send HELLO, got {:?}",
+                got[1]
+            );
+            assert!(
+                !got.iter().any(|m| matches!(m, Message::Heartbeat)),
+                "no heartbeat may go out before the handshake: {got:?}"
+            );
+        }
+
+        // Handshake done → the next tick is a heartbeat.
+        link_up.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline
+            && !sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, Message::Heartbeat))
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, Message::Heartbeat)),
+            "no heartbeat within 4 s after link_up: {:?}",
+            sent.lock().unwrap()
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 }

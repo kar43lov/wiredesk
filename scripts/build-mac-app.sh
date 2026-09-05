@@ -60,15 +60,30 @@ fi
 # Ensure binary is executable (cargo already does this, but be defensive).
 chmod +x "${APP_BUNDLE}/Contents/MacOS/${BIN_NAME}"
 
-# Ad-hoc codesign so macOS Dock / Launch Services treat the rebuild as a
-# distinct signed bundle. Without it, repeated builds at the same path
-# share a stale Dock-icon cache and the dock falls back to the generic
-# executable icon mid-run (especially after the Accessibility permission
-# prompt re-registers the app). Ad-hoc signing verifies nothing — it just
-# stamps each rebuild with a unique signing identity so caches invalidate
-# correctly.
-echo "==> Ad-hoc codesigning bundle…"
-codesign --force --deep --sign - "${APP_BUNDLE}" 2>&1 | grep -v "replacing existing signature" || true
+# Codesign the bundle. Two reasons: Dock / Launch Services treat each signed
+# rebuild as a distinct bundle (otherwise a stale icon cache leaves the Dock
+# with the generic executable icon mid-run), and macOS keys the Accessibility
+# grant to the code signature.
+#
+# With the default ad-hoc signature ("-") every rebuild gets a fresh cdhash,
+# so the grant is lost and the app lands on the permission screen again. A
+# self-signed "WireDesk Dev" certificate gives a designated requirement that
+# is stable across builds (identifier + certificate), and the grant survives.
+# Create it once with scripts/make-dev-signing-cert.sh; it is picked up here
+# automatically, or point WIREDESK_SIGN_IDENTITY at any other identity.
+SIGN_IDENTITY="${WIREDESK_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]] \
+   && security find-identity -v -p codesigning 2>/dev/null | grep -q '"WireDesk Dev"'; then
+    SIGN_IDENTITY="WireDesk Dev"
+fi
+if [[ -n "$SIGN_IDENTITY" ]]; then
+    echo "==> Codesigning bundle with identity '${SIGN_IDENTITY}'…"
+    codesign --force --deep --sign "$SIGN_IDENTITY" "${APP_BUNDLE}"
+else
+    echo "==> Ad-hoc codesigning bundle (Accessibility grant will not survive this rebuild;"
+    echo "    run scripts/make-dev-signing-cert.sh once to keep it)…"
+    codesign --force --deep --sign - "${APP_BUNDLE}" 2>&1 | grep -v "replacing existing signature" || true
+fi
 
 # Refresh Launch Services registration so Dock + Finder pick up the new
 # bundle metadata immediately rather than next mds reindex.

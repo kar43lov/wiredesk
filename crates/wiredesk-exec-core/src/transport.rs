@@ -4,7 +4,34 @@
 
 use std::time::Duration;
 
+use wiredesk_protocol::message::Message;
+use wiredesk_protocol::packet::{Packet, MAX_PAYLOAD};
+
 use crate::types::{ExecError, ExecEvent};
+
+/// Largest `ShellInput` body one wire packet carries. The message encodes
+/// as the raw bytes and nothing else, so the cap is exactly `MAX_PAYLOAD`.
+pub const MAX_INPUT_CHUNK: usize = MAX_PAYLOAD;
+
+/// Split shell input into wire-sized `ShellInput` packets.
+///
+/// `Packet::to_bytes` refuses a payload over `MAX_PAYLOAD`, and a refused
+/// `ShellInput` never reaches the host — the runner then waits for a
+/// sentinel that cannot arrive and exits 124 after the full timeout. One
+/// week of client logs showed 17 such hangs, every one a base64-wrapped
+/// script of 4.2–7.3 KB. The host feeds the packets to the shell's stdin
+/// in order, so consecutive pieces concatenate transparently; every
+/// `ExecTransport::send_input` must go through here.
+pub fn shell_input_packets(data: &[u8]) -> impl Iterator<Item = Packet> + '_ {
+    data.chunks(MAX_INPUT_CHUNK).map(|chunk| {
+        Packet::new(
+            Message::ShellInput {
+                data: chunk.to_vec(),
+            },
+            0,
+        )
+    })
+}
 
 /// Two-method trait the runner depends on. Implementations decide how
 /// to write input and how to surface incoming `ShellOutput` /
@@ -144,5 +171,66 @@ pub mod mock {
                 Err(ExecError::Closed)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    fn bodies(data: &[u8]) -> Vec<Vec<u8>> {
+        shell_input_packets(data)
+            .map(|p| match p.message {
+                Message::ShellInput { data } => data,
+                other => panic!("expected ShellInput, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn small_input_is_one_packet() {
+        let out = bodies(b"Get-ChildItem\n");
+        assert_eq!(out, vec![b"Get-ChildItem\n".to_vec()]);
+    }
+
+    #[test]
+    fn exactly_max_payload_stays_whole() {
+        let data = vec![0x41; MAX_INPUT_CHUNK];
+        let out = bodies(&data);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), MAX_INPUT_CHUNK);
+    }
+
+    #[test]
+    fn one_byte_over_splits_in_two() {
+        let data = vec![0x41; MAX_INPUT_CHUNK + 1];
+        let out = bodies(&data);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].len(), MAX_INPUT_CHUNK);
+        assert_eq!(out[1].len(), 1);
+    }
+
+    #[test]
+    fn pieces_concatenate_to_the_original_in_order() {
+        // 7 296 bytes — the largest oversize command seen in the logs.
+        let data: Vec<u8> = (0..7296u32).map(|i| (i % 251) as u8).collect();
+        let out = bodies(&data);
+        assert_eq!(out.len(), 2);
+        let joined: Vec<u8> = out.concat();
+        assert_eq!(joined, data);
+    }
+
+    #[test]
+    fn every_piece_encodes_on_the_wire() {
+        // The whole point: no piece may trip `to_bytes`'s payload cap.
+        let data = vec![0x42; 3 * MAX_INPUT_CHUNK + 17];
+        for packet in shell_input_packets(&data) {
+            packet.to_bytes().expect("chunk must fit a wire packet");
+        }
+    }
+
+    #[test]
+    fn empty_input_sends_nothing() {
+        assert!(bodies(b"").is_empty());
     }
 }

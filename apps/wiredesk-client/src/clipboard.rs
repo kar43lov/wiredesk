@@ -841,6 +841,7 @@ pub fn spawn_poll_thread(
     send_images: Arc<AtomicBool>,
     send_text: Arc<AtomicBool>,
     send_files: Arc<AtomicBool>,
+    link_up: Arc<AtomicBool>,
     outgoing_text_in_flight: Arc<AtomicBool>,
     poll_kick_rx: mpsc::Receiver<()>,
     current_outgoing_label: Arc<Mutex<String>>,
@@ -966,6 +967,18 @@ pub fn spawn_poll_thread(
             // Whispr-Flow's Cmd+V until the new clipboard reaches Host.
             outgoing_text_in_flight.store(false, Ordering::Release);
 
+            // Nothing ships before the handshake. With the host machine off
+            // the supervisor reopens the port every 6 s, each teardown
+            // clears the dedup stamps (`ClipboardState::reset`), and the
+            // next tick used to push the whole clipboard into a dead wire
+            // again — thousands of phantom `clipboard.send` lines per day,
+            // plus "chunk dropped (no active offer)" on a host that came
+            // back mid-offer. Detection still runs below so the file
+            // change-counter stays in sync; the HelloAck-time reset
+            // guarantees the current clipboard ships on the first tick
+            // after the link is up.
+            let link_ready = link_up.load(Ordering::Acquire);
+
             // 1) Probe file FIRST, before text. Finder's Cmd+C on a file
             // eventually exposes the filename as plain text on the same
             // pasteboard item, ALONGSIDE the `public.file-url` entry — but
@@ -1005,7 +1018,7 @@ pub fn spawn_poll_thread(
                 // Detection done (counter synced) — only SEND when the
                 // "Send files (Mac → Host)" toggle is on. Default off, so a
                 // plain Cmd+C on a file never leaves the Mac.
-                if !send_files.load(Ordering::Relaxed) {
+                if !send_files.load(Ordering::Relaxed) || !link_ready {
                     break 'file;
                 }
 
@@ -1081,7 +1094,7 @@ pub fn spawn_poll_thread(
             // an alternating text/image clipboard (Whispr Flow + a
             // standing screenshot) doesn't loop. Runtime toggle gates
             // the path entirely.
-            if send_text.load(Ordering::Relaxed) {
+            if send_text.load(Ordering::Relaxed) && link_ready {
                 // Probe text. A non-empty value runs the debounce; anything
                 // else (empty clipboard, or an image/file-only clipboard where
                 // `get_text` errs) must DROP any pending debounce hash —
@@ -1178,7 +1191,7 @@ pub fn spawn_poll_thread(
             // The OS clipboard can carry text + image + file URLs from the
             // same Cmd+C; we don't want a stale image to suppress file sync.
             'image: {
-                if !send_images.load(Ordering::Relaxed) {
+                if !send_images.load(Ordering::Relaxed) || !link_ready {
                     break 'image;
                 }
                 let img = match clip.get_image() {

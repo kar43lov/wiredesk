@@ -15,7 +15,7 @@ wd --exec --compress "<command>"                  # gzip+base64 stdout (5-10x fo
 
 ## Что нужно знать ДО запуска
 
-1. **`wd --exec` и `WireDesk.app` теперь работают параллельно** (Mac, начиная с feat/wd-exec-ipc). GUI на старте поднимает Unix-socket в `~/Library/Application Support/WireDesk/wd-exec.sock`, `wd --exec` коннектится к нему и ходит через тот же serial, который GUI использует для clipboard sync. Если GUI закрыт — `wd --exec` falls back на direct-open serial (поведение idential pre-implementation). **Interactive `wd`** (без `--exec`, PTY-mode bridge для Ghostty/iTerm) **остаётся single-port-owner** — если GUI запущен, interactive `wd` упадёт с busy; закрой GUI на время interactive-сессии.
+1. **`wd --exec` и `WireDesk.app` теперь работают параллельно** (Mac, начиная с feat/wd-exec-ipc). GUI на старте поднимает Unix-socket в `~/Library/Application Support/WireDesk/wd-exec.sock`, `wd --exec` коннектится к нему и ходит через тот же serial, который GUI использует для clipboard sync. Если GUI закрыт — `wd --exec` falls back на direct-open serial (поведение идентично pre-implementation). **Interactive `wd`** (без `--exec`, PTY-mode bridge для Ghostty/iTerm) с 2026-07-03 ходит через тот же сокет — GUI закрывать не нужно; `shell busy` (exit 125) значит, что единственный shell-слот хоста занят другим `wd`.
 2. **Macros в alias не работают с env-prefix.** Для трейса:
    ```bash
    export RUST_LOG=debug
@@ -24,8 +24,8 @@ wd --exec --compress "<command>"                  # gzip+base64 stdout (5-10x fo
    ```
    Или вызывай бинарь напрямую: `RUST_LOG=debug ./target/release/wiredesk-term --exec "..."`.
 3. **Латенси handshake'а** ≈ 1.5–2 сек на каждый `wd --exec` (Hello → ShellOpen → spawn PS). Плюс **+2 сек drain после exit** (`apps/wiredesk-client/src/ipc.rs`, PR #21) — IPC handler держит `single_inflight` пока wire не стихнет, чтобы next request попал на чистый канал. Итого total latency ~3.5-4 сек round-trip на пустом cmd. Для batch'а — собирай команды в одну (`cmd1; cmd2; cmd3` через `--exec`).
-4. **Wire-channel — 115200 baud (~11 KB/s)** — мелкий output ок, гигабайты не качай.
-5. **Лимит команды — 4 KB.** Один `wd --exec "..."` packet'ом — payload до 4096 bytes (bump'нут с 512 в feat/wd-exec-fixes). Типичный ES `_search` с агрегациями (~600 байт) и средние shell-конвейеры умещаются. Длиннее — разбивай на несколько `wd --exec` или пиши скрипт в файл и зови `bash script.sh`.
+4. **Wire-channel — 3 Mbaud на FT232H (~300 KB/s), 115200 на CH340 (~11 KB/s)** — мелкий output ок, гигабайты не качай.
+5. **Длина команды не ограничена пакетом.** `wd` режет ввод на wire-пакеты по 4096 байт сам (с 2026-09-05; раньше команда длиннее 4 KB молча висла до таймаута, а GUI при этом переоткрывал порт). Практический потолок — 16 MB кадра IPC-сокета; но десятки килобайт удобнее положить в файл на host'е и звать скриптом.
 
 ## Примеры
 
@@ -286,6 +286,17 @@ if rc == 0 and probe.strip():
 
 Если bash обязателен — workaround не подтверждён. Redirect в файл (`wd --exec "..." > /tmp/probe.out`) **может** обойти проблему, но это не проверено эмпирически. До root-cause investigation'а — рекомендация однозначно Python orchestrator.
 
+### Q4: `Get-Content` на UTF-8 файлах (host.log и любые логи) отдаёт кракозябры вместо `→` и `—`
+
+Windows PowerShell 5.1 читает файлы в системной ANSI-кодировке (cp1251 на русской системе), а `tracing` пишет `host.log.*` в UTF-8 — многобайтовые символы разъезжаются на выводе (`��' commit`). Кириллица в самих сообщениях страдает так же.
+
+```bash
+wd --exec 'Get-Content "$env:APPDATA\WireDesk\host.log.2026-09-05" -Tail 100 -Encoding UTF8'
+wd --exec 'Select-String -Path "$env:APPDATA\WireDesk\host.log.*" -Pattern "WARN|ERROR" -Encoding UTF8'
+```
+
+`-Encoding UTF8` на `Get-Content` / `Select-String` — и на выходе всё читаемо. В PowerShell 7 дефолт уже UTF-8, там флаг не нужен.
+
 ## Под капотом (если нужно дебажить)
 
 Sentinel framing: `__WD_DONE_<uuid>__<exit_code>`. UUID per call. PS-only:
@@ -338,7 +349,3 @@ Write-Output "__WD_DONE_<uuid>__0"
 **Реальные кейсы (cyrillic в FILE CONTENT, в API responses, в БД-запросах) — работают**, потому что .NET StreamReader / API парсеры читают свои источники с правильным encoding и кладут в `$variable` корректную строку. Через `Out-String` → UTF8.GetBytes → wire — всё ок.
 
 **Workaround если нужен cyrillic literal:** не использовать compress для такой команды (`wd --exec` без `--compress` работает через accidental roundtrip). Или вынести payload в файл и читать через `Get-Content`.
-
-## Memory
-
-Persistent context — в `~/.claude/projects/-Users-pgmac-Data-prjcts-wiredesk/memory/`. Самое полезное: `feedback_serial_terminal_bridge.md`, `project_conpty_followup.md`.

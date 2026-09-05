@@ -133,9 +133,53 @@ pub struct TapHandle {
     outgoing_tx: mpsc::Sender<Packet>,
     #[cfg(target_os = "macos")]
     inner: Option<macos::Inner>,
+    /// Channels the tap thread needs, parked here when the tap could not
+    /// start at launch (no Accessibility yet) so `try_start_late` can spin
+    /// it up once the grant lands. `None` once consumed or when the tap
+    /// started normally.
+    #[cfg(target_os = "macos")]
+    late: Option<LateStart>,
+}
+
+/// Senders a deferred tap start still needs — see `TapHandle::late`.
+#[cfg(target_os = "macos")]
+struct LateStart {
+    tap_events_tx: mpsc::Sender<TapEvent>,
+    synth_tx: mpsc::Sender<SyntheticCombo>,
+    poll_kick_tx: mpsc::Sender<()>,
 }
 
 impl TapHandle {
+    /// macOS: start the tap in place once Accessibility is granted to the
+    /// running process. The permission screen used to demand a relaunch —
+    /// macOS applies the grant immediately, the tap simply had never been
+    /// created. Returns `true` when a tap thread is running (already or
+    /// just now).
+    #[cfg(target_os = "macos")]
+    pub fn try_start_late(&mut self) -> bool {
+        if self.inner.is_some() {
+            return true;
+        }
+        if !is_permission_granted() {
+            return false;
+        }
+        let Some(late) = self.late.take() else {
+            return false;
+        };
+        self.inner = Some(macos::Inner::start(
+            Arc::clone(&self.enabled),
+            Arc::clone(&self.passive),
+            Arc::clone(&self.swap_om_cmd),
+            Arc::clone(&self.prev_flags),
+            self.outgoing_tx.clone(),
+            late.tap_events_tx,
+            late.synth_tx,
+            late.poll_kick_tx,
+        ));
+        log::info!("keyboard_tap: Accessibility granted at runtime — tap started without relaunch");
+        true
+    }
+
     /// Activate the tap — incoming key events are intercepted and forwarded.
     pub fn enable(&self) {
         self.passive.store(false, Ordering::SeqCst);
@@ -237,7 +281,9 @@ pub fn start(
     #[cfg(target_os = "macos")]
     {
         if !is_permission_granted() {
-            log::warn!("keyboard_tap: Accessibility permission not granted — tap will not start");
+            log::warn!(
+                "keyboard_tap: Accessibility permission not granted — tap deferred until it is"
+            );
             return TapHandle {
                 enabled,
                 passive,
@@ -245,6 +291,11 @@ pub fn start(
                 prev_flags,
                 outgoing_tx,
                 inner: None,
+                late: Some(LateStart {
+                    tap_events_tx: _tap_events_tx,
+                    synth_tx,
+                    poll_kick_tx,
+                }),
             };
         }
         let inner = macos::Inner::start(
@@ -264,6 +315,7 @@ pub fn start(
             prev_flags,
             outgoing_tx,
             inner: Some(inner),
+            late: None,
         }
     }
 

@@ -97,6 +97,8 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+**Prebuilt binaries.** Every `v*` tag produces a draft [GitHub Release](https://github.com/kar43lov/wiredesk/releases) with `WireDesk.app` (macOS, Apple Silicon), the `wd` terminal binary and `wiredesk-host.exe` (Windows x64), built by `.github/workflows/release.yml`. They are not signed or notarized: on macOS use right-click → Open on first launch (or `xattr -d com.apple.quarantine WireDesk.app`), on Windows accept the SmartScreen prompt.
+
 ## Run
 
 > First time? Read **[docs/setup.md](docs/setup.md)** — covers wiring, port discovery, Rust install on Windows (incl. how to do it under "Continent" lockdown), and handshake troubleshooting.
@@ -144,7 +146,7 @@ Build the `.app` bundle once:
 # → target/release/WireDesk.app
 ```
 
-Double-click `WireDesk.app` to launch (first time: right-click → Open to bypass Gatekeeper). The Settings panel in chrome-mode (visible when not in capture/fullscreen) shows port/baud/width/height/client name with a Save button — changes write `~/Library/Application Support/WireDesk/config.toml` and require a restart to apply. The window's position and size are remembered in the same file and restored on the next launch (a window whose saved display has since been unplugged is pulled back onto the primary one).
+Double-click `WireDesk.app` to launch (first time: right-click → Open to bypass Gatekeeper). Grant Accessibility when the app asks — the permission screen disappears on its own once the grant lands, no relaunch. macOS ties that grant to the code signature, and the default ad-hoc signature changes on every rebuild; if you rebuild often, run `./scripts/make-dev-signing-cert.sh` once to create a local "WireDesk Dev" signing identity that `build-mac-app.sh` then uses automatically, so the grant survives rebuilds. The Settings panel in chrome-mode (visible when not in capture/fullscreen) shows port/baud/width/height/client name with a Save button — changes write `~/Library/Application Support/WireDesk/config.toml` and require a restart to apply. The window's position and size are remembered in the same file and restored on the next launch (a window whose saved display has since been unplugged is pulled back onto the primary one).
 
 Or run the binary directly for development:
 

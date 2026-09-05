@@ -278,6 +278,7 @@ fn main() {
         send_images.clone(),
         send_text.clone(),
         send_files.clone(),
+        link_up.clone(),
         outgoing_text_in_flight.clone(),
         poll_kick_rx,
         current_outgoing_label.clone(),
