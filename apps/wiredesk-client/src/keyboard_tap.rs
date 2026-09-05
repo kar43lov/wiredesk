@@ -1323,10 +1323,11 @@ mod win_keys_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::keymap::{
-        CG_FLAG_ALT, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_SHIFT, WIN_SCAN_LALT,
-        WIN_SCAN_LCTRL, WIN_SCAN_LSHIFT,
-    };
+    use crate::input::keymap::{CG_FLAG_ALT, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_SHIFT};
+    // Only the macOS-gated `disable_*` tests below compare against Windows
+    // scancodes; on the Windows target the import would be unused.
+    #[cfg(target_os = "macos")]
+    use crate::input::keymap::{WIN_SCAN_LALT, WIN_SCAN_LCTRL, WIN_SCAN_LSHIFT};
     use std::sync::mpsc;
 
     fn make_swap_flag() -> Arc<AtomicBool> {
@@ -1408,6 +1409,10 @@ mod tests {
         let _ = is_permission_granted();
     }
 
+    // `disable()` derives the KeyUps from `prev_flags` (CGEventFlags) only on
+    // macOS; the Windows hook keeps its own held-key set, so these two tests
+    // are macOS-specific (they failed on the Windows CI runner).
+    #[cfg(target_os = "macos")]
     #[test]
     fn disable_emits_keyup_for_held_modifiers() {
         let (out_tx, out_rx) = mpsc::channel();
@@ -1459,6 +1464,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn disable_with_swap_emits_alt_for_held_cmd() {
         // Karabiner-compensation mode: physical Cmd is held → Mac sees

@@ -992,7 +992,15 @@ mod tests {
             ..ClientConfig::default()
         };
         let tc = to_transport_config(&cfg);
-        assert_eq!(tc.transport, "bluetooth");
+        // The BLE fields must be carried on every platform; the transport
+        // itself is forced to serial on Windows (`resolve_transport`), which
+        // is what tripped this test on the Windows CI runner.
+        let expected_transport = if cfg!(target_os = "windows") {
+            "serial"
+        } else {
+            "bluetooth"
+        };
+        assert_eq!(tc.transport, expected_transport);
         assert_eq!(
             tc.bluetooth.service_uuid,
             "11111111-2222-3333-4444-555555555555"
