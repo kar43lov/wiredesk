@@ -28,6 +28,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
 filetime = "0.2"
 
+[build-dependencies]
+embed-manifest = "1"
+winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
 core-foundation = "0.10"

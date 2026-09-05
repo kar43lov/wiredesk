@@ -195,7 +195,7 @@ If a BT mouse / keyboard pairs and works, BT-radio path is open.
 
 ---
 
-## Вынесено из CLAUDE.md 11.08.2026 (рез раздутого контекста)
+## Итог замеров
 
 ## Channel speed upgrade
 

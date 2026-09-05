@@ -17,7 +17,7 @@
 - В терминале нужно быстро отстрелить `wd --exec --ssh prod-box "..."` для триажа.
 - Quit GUI → запустить `wd --exec` → дождаться → перезапустить GUI → восстановить fullscreen + Cmd+Esc engage. Каждый цикл — 30+ секунд.
 
-`docs/wd-exec-usage.md` пункт 1 это явно документирует. `feedback_serial_terminal_bridge.md` (memory) — section 5 «Single-port ownership».
+`docs/wd-exec-usage.md` пункт 1 это явно документирует.
 
 ## Подходы
 

@@ -1,3 +1,11 @@
+// Hide the console window on Windows: this is a GUI app, and a stray
+// console behind the window is both ugly and a way to kill the process by
+// accident (Ctrl+C in a window the user did not know was focused). Logs go
+// to %APPDATA%\WireDesk\client.log via tracing-appender, so nothing is
+// lost. Unconditional rather than release-only, matching the host — mixing
+// windows_subsystem with debug_assertions is finicky in the linker.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod clipboard;
 mod clipboard_files;
@@ -413,19 +421,23 @@ fn main() {
             // fullscreen — presentation options survive the process that set
             // them. Harmless when nothing was hidden.
             mac_window::clear_presentation_options();
-            // Stash the StatusBarHandle inside the egui app via a Box leak
-            // so it lives for the program's lifetime. The handle's only job
-            // is to keep the NSStatusItem alive — once dropped, AppKit
-            // removes the menu bar item.
             let _handle = status_bar::init(creator_status_bar_counters);
-            // On macOS the handle pins the NSStatusItem for the program's
-            // lifetime — leak it so AppKit keeps the menu-bar item alive. On
-            // other targets the handle is an empty no-Drop placeholder, so
-            // there's nothing to keep alive (and `mem::forget` on a non-Drop
-            // type is a no-op clippy rejects under `-D warnings`).
+            // macOS: leak the handle so AppKit keeps the menu-bar item for
+            // the program's lifetime — an NSStatusItem is torn down with the
+            // process anyway.
             #[cfg(target_os = "macos")]
             std::mem::forget(_handle);
-            #[cfg(not(target_os = "macos"))]
+            // Windows: park it in the app instead. The tray handle's Drop
+            // removes the icon; leaking it would leave a ghost icon in the
+            // notification area until the user happens to hover over it.
+            #[cfg(target_os = "windows")]
+            let mut app = app;
+            #[cfg(target_os = "windows")]
+            app.attach_status_bar(_handle);
+            // Anywhere else the handle is an empty no-Drop placeholder, so
+            // there is nothing to keep alive (and `mem::forget` on a non-Drop
+            // type is a no-op clippy rejects under `-D warnings`).
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = _handle;
             Ok(Box::new(app))
         }),

@@ -18,9 +18,13 @@ cargo build --release --workspace
 cargo test -p wiredesk-client                       # все тесты крейта
 cargo test -p wiredesk-client decide_text_send      # тесты с этой подстрокой в имени
 cargo test -p wiredesk-host -- --test-threads=1     # host флакает на parallel runner'е macOS (~50% SIGABRT) — для надёжности
+
+# Windows-код (host И клиент) с мака — clippy проверяет типы, build проверяет линковку:
+cargo clippy -p wiredesk-client --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+cargo build  -p wiredesk-client --target x86_64-pc-windows-gnu    # нужен `brew install mingw-w64`
 ```
 
-Host компилируется и на macOS (с MockInjector), и на Windows (`WindowsInjector` за `cfg(target_os = "windows")` через crate `windows`). На macOS реальный SendInput не вызывается — для dev-цикла без Windows это нормально.
+🔴 **Обе стороны собираются под обе ОС, и правка платформенного кода должна проверяться обеими командами выше.** Host: `WindowsInjector` на Windows, `MockInjector` на macOS (реальный SendInput не зовётся — для dev-цикла нормально). Клиент: полноценные реализации на обеих платформах за фасадами `keyboard_tap` / `status_bar` / `monitor` / `clipboard_files`; `cargo check` на маке НЕ увидит поломку Windows-ветки.
 
 ## Run
 
@@ -51,7 +55,8 @@ Host компилируется и на macOS (с MockInjector), и на Windows
 - PTY-mode только для interactive `wd`, не для `wd --exec` — он остаётся pipe-based (design choice:…
 - PTY-mode только на Windows host'е
 - Параллельный cargo test флакает на macOS для host'-пакета (~50% SIGABRT) — это pre-existing baseline issue…
-- Fullscreen — borderless (не native): Spaces-переход терял окно в WindowServer. Побочно закрыт пункт про меню-бар
+- Fullscreen — borderless (не native): Spaces-переход терял окно в WindowServer. Меню-бар/таскбар перекрываются уровнем окна, а не скрытием Dock (оно было на все дисплеи сразу); уровень снимается при потере фокуса
+- Windows-клиент: `wd`/`wd --exec` только с Mac; BLE недоступен (роль Peripheral занята хостом, принудительный откат на serial); 🔴 нет аналога Secure Input — хук в capture видит и пароли
 
 ## Hardware setup
 
@@ -72,7 +77,7 @@ CH340 USB-to-TTL кабели: красный=VCC (изолировать), си
 
 `docs/briefs/ft232h-upgrade.md` — бриф апгрейда канала (**SHIPPED 2026-05-28** @ 3 Mbaud verified live; см. шапку файла).
 
-`docs/briefs/interactive-wd-via-gui-ipc.md` + `docs/plans/completed/20260703-interactive-wd-via-gui-ipc.md` — interactive `wd` через GUI IPC (**SHIPPED в main 2026-07-03, live-verified**; 730 тестов на момент приёмки; последний direct-serial-путь устранён). Live-приёмка на реальном Mac+Ghostty+Win11: `wd` при открытом GUI подключился через IPC, промпт PowerShell не потерялся, `wd --exec` при активном интерактиве → «shell busy» exit 125. Host не менялся (wire-совместим, переустанавливать не нужно). 3 Codex P2 из `/pg.review` пофикшено (см. memory `feedback_ipc_relay_ordering_races`).
+`docs/briefs/interactive-wd-via-gui-ipc.md` + `docs/plans/completed/20260703-interactive-wd-via-gui-ipc.md` — interactive `wd` через GUI IPC (**SHIPPED в main 2026-07-03, live-verified**; 730 тестов на момент приёмки; последний direct-serial-путь устранён). Live-приёмка на реальном Mac+Ghostty+Win11: `wd` при открытом GUI подключился через IPC, промпт PowerShell не потерялся, `wd --exec` при активном интерактиве → «shell busy» exit 125. Host не менялся (wire-совместим, переустанавливать не нужно). 3 Codex P2 из `/pg.review` пофикшено — все три про порядок операций в двунаправленном socket-релее.
 
 `docs/briefs/daemon-multiplex.md` — SUPERSEDED roadmap-бриф: full `wiredesk-daemon`-extraction больше не нужен — embedded-IPC-мост покрыл и `wd --exec`, и interactive `wd`.
 

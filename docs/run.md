@@ -1,10 +1,9 @@
 # Запуск WireDesk (полная версия)
 
-Вынесено из `CLAUDE.md`; пользовательский вариант — в `README.md`, раздел «Run».
+Все режимы запуска и отладки. Короткая версия — в [`README.md`](../README.md), раздел «Run».
 
 ---
 
-## Вынесено из CLAUDE.md 11.08.2026 (рез раздутого контекста)
 
 ## Run
 
@@ -66,6 +65,7 @@ Logs tee to `/tmp/wiredesk-mac.log` for retrospective analysis.
 - **Window geometry persistence**: outer position + inner size пишутся в `config.toml` (`window_x/y/w/h`, целые points) после того как окно 800 мс стоит на месте, плюс финальный flush в `eframe::App::on_exit` (move + сразу Cmd+Q). При старте `main.rs` отдаёт их в `ViewportBuilder::with_position`/`with_inner_size`. Без этого позиции нет вообще и AppKit кладёт окно на произвольный дисплей каждый запуск. Fullscreen не сэмплится (там outer rect = весь экран), как и промежуток пока `pending_position_restore` двигает окно после выхода из fullscreen. Запись идёт через `config::save_window_geometry`, который **перечитывает файл с диска** и правит только четыре поля — иначе сдвиг окна коммитил бы несохранённые правки из Settings-панели. Через 800 мс после старта — одноразовая проверка `rescue_offscreen_window`: если окно не пересекается ни с одним живым монитором хотя бы на 120×40 pt (закрыли на внешнем дисплее, вернулись без него), оно переезжает на primary.
 - **Dock-icon pinning** (`force_dock_icon_from_bundle` в `main.rs`): winit/eframe иногда оставляют Dock с generic exec-иконкой через ~2с после launch. Загружаем `AppIcon.icns` из bundle через NSBundle/NSImage и зовём `[NSApp setApplicationIconImage:]` + `[NSApp setActivationPolicy:Regular]` из creator-callback'а eframe. Дополнительно `reapply_dock_icon_if_needed` пере-применяет иконку 4× в течение 10с из `update()` — это перебивает любое позднее переписывание системой/winit'ом.
 - **Иконка**: `assets/icon-source.png` (1024×1024) → `Contents/Resources/AppIcon.icns` через `sips` + `iconutil` в build-mac-app.sh. Рисунок — контур монитора со стрелкой курсора на тёмно-зелёной подложке; прежняя белая «W» на синем читалась как Microsoft Word. Тот же исходник кормит Windows-.ico (`scripts/icogen`), а трей-глифы (`assets/tray-*.png`) рисуются отдельно (`scripts/generate-tray-icons.swift`) — на 16 px курсор и контур сливаются, поэтому там упрощённый силуэт.
+- **Windows-клиент**: `.\scripts\build-win-client.ps1` собирает `target\release\wiredesk-client.exe`. Собирать лучше на самой Windows — тогда build.rs вшивает иконку в .exe (нужен rc.exe или windres). С мака проверяется так: `cargo clippy -p wiredesk-client --target x86_64-pc-windows-gnu --all-targets -- -D warnings` для типов и `cargo build -p wiredesk-client --target x86_64-pc-windows-gnu` для реальной линковки (второе требует `brew install mingw-w64`). Настройки и логи — `%APPDATA%\WireDesk\`, первый запуск берёт `COM3`, порт меняется в Settings → Save & Restart. Хоткеи: `Ctrl+Esc` — capture, `Ctrl+Enter` — fullscreen.
 - **Значок в macOS menu bar**: `assets/menubar-icon.png` (36 px = 18 pt @2x), вшит в клиент через `include_bytes!` и ставится как **template**-изображение — AppKit сам красит его чёрным на светлой полосе и белым на тёмной. Рисуется `swift scripts/generate-menubar-icon.swift` из той же геометрии, что и app-иконка, но без подложки и с чуть уменьшенным курсором: в одноцветном силуэте он иначе слипается с рамкой монитора. До 2026-09-04 на этом месте была буква «W».
 - **Info.plist**: `dev.kar43lov.wiredesk`, `LSUIElement=false`, `NSHighResolutionCapable=true`. Gatekeeper при первом запуске — правый-клик → Open
 - Source-иконка можно перерисовать через `swift scripts/generate-icon.swift` (Swift+AppKit, без ImageMagick)

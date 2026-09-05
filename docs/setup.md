@@ -216,7 +216,7 @@ cd ~/Data/prjcts/wiredesk
 
 ## Шаг 9. Терминал в Ghostty/iTerm
 
-**Полностью закрой** `wiredesk-client` / `WireDesk.app` (Cmd+Q) — он держит порт, интерактивный `wd` и GUI взаимоисключающие. ⚠️ Отпустить **Capture Input** («Input: released») **недостаточно** — release отпускает только клавиатуру/мышь, serial-порт держится всё время, пока жив процесс `.app`. Признак «GUI держит порт» — зелёный кружок «Connected to wiredesk-host» + `serial open …: Device or resource busy` при запуске `wd`. Проверить держащий процесс: `lsof /dev/cu.usbserial-XXX`. Если закрывать GUI не хочешь — используй `wd --exec "..."` (ходит через IPC-мост параллельно с GUI, порт не занимает). В Ghostty:
+GUI закрывать **не нужно**: при запущенном `WireDesk.app` и интерактивный `wd`, и `wd --exec` ходят через IPC-релей поверх `wd-exec.sock`, порт не трогают и работают параллельно с capture. Стартовый баннер показывает, каким путём пошло соединение — `interactive via GUI IPC` или `interactive via direct serial` (второе — только когда GUI закрыт). Если `wd` отвечает `shell busy` (exit 125) — единственный shell-слот хоста занят другим `wd`; проверить: `pgrep -fl wiredesk-term`. В Ghostty:
 
 ```bash
 cd ~/Data/prjcts/wiredesk

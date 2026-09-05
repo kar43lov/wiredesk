@@ -349,3 +349,7 @@ Write-Output "__WD_DONE_<uuid>__0"
 **Реальные кейсы (cyrillic в FILE CONTENT, в API responses, в БД-запросах) — работают**, потому что .NET StreamReader / API парсеры читают свои источники с правильным encoding и кладут в `$variable` корректную строку. Через `Out-String` → UTF8.GetBytes → wire — всё ок.
 
 **Workaround если нужен cyrillic literal:** не использовать compress для такой команды (`wd --exec` без `--compress` работает через accidental roundtrip). Или вынести payload в файл и читать через `Get-Content`.
+## Куда смотреть дальше
+
+Разбор устройства канала и его подводных камней — в [`docs/architecture.md`](architecture.md) и [`docs/known-limitations.md`](known-limitations.md).
+

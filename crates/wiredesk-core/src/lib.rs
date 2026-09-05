@@ -1,6 +1,7 @@
 pub mod bluetooth_config;
 pub mod cache_vacuum;
 pub mod error;
+pub mod file_clipboard;
 pub mod storm;
 pub mod types;
 

@@ -268,11 +268,17 @@ pub use imp::{
 ///
 /// Pure counterpart of the math inside [`real_outer_rect`], split out so the
 /// conversion is testable without a live AppKit context.
+// Only the macOS window path calls these; kept unconditional so the
+// round-trip test runs on any host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn appkit_origin_to_winit_y(ns_y: f32, window_height: f32, primary_height: f32) -> f32 {
     primary_height - (ns_y + window_height)
 }
 
 /// Inverse of [`appkit_origin_to_winit_y`]: winit top edge → AppKit bottom edge.
+// Only the macOS window path calls these; kept unconditional so the
+// round-trip test runs on any host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn winit_y_to_appkit_origin(winit_y: f32, window_height: f32, primary_height: f32) -> f32 {
     primary_height - winit_y - window_height
 }

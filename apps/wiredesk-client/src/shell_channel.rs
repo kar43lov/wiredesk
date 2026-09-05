@@ -86,6 +86,10 @@ pub type SharedShellOwner = Arc<Mutex<ChannelState>>;
 
 /// Construct a fresh, `Idle` shared owner. `main.rs` builds one and threads
 /// it into `spawn_ipc_acceptor`, shared by the exec + interactive handlers.
+// The IPC relay that owns the shell channel is macOS-only for now
+// (see ipc.rs); the type stays cross-platform so its tests run
+// everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn new_shared_owner() -> SharedShellOwner {
     Arc::new(Mutex::new(ChannelState::default()))
 }
@@ -105,6 +109,10 @@ pub fn current_owner(owner: &SharedShellOwner) -> ShellOwner {
 /// flag) is registered on the channel. On drop it releases exactly that claim —
 /// including during a panic unwind, so a panicking handler thread never strands
 /// the lock.
+// The IPC relay that owns the shell channel is macOS-only for now
+// (see ipc.rs); the type stays cross-platform so its tests run
+// everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct ShellChannelGuard {
     owner: SharedShellOwner,
     /// Which claim this guard releases on drop: `Exec` decrements the ref-count,
@@ -137,6 +145,10 @@ impl Drop for ShellChannelGuard {
 ///
 /// On success returns a `ShellChannelGuard` that releases exactly this claim on
 /// drop. `try_acquire(Idle)` is meaningless and returns `None`.
+// The IPC relay that owns the shell channel is macOS-only for now
+// (see ipc.rs); the type stays cross-platform so its tests run
+// everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn try_acquire(owner: &SharedShellOwner, kind: ShellOwner) -> Option<ShellChannelGuard> {
     let mut guard = owner.lock().expect("shell owner poisoned");
     match kind {

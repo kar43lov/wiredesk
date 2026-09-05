@@ -36,23 +36,26 @@ jobs:
         # clean main — see docs/known-limitations.md.
         run: cargo test --workspace -- --test-threads=1
 
-  # The Windows-only paths (WindowsInjector, nwg UI, ConPTY, BLE GATT server)
-  # are invisible to a macOS clippy run — cfg-gated code is not even parsed
-  # for lints there. This job is the only thing that lints them.
+  # The Windows-only paths (WindowsInjector, nwg UI, ConPTY, BLE GATT server,
+  # and on the client side the WH_KEYBOARD_LL hook, the tray icon and
+  # EnumDisplayMonitors) are invisible to a macOS clippy run — cfg-gated code
+  # is not even parsed for lints there. This job is the only thing that lints
+  # them.
   windows:
     name: Test & clippy (Windows)
     runs-on: windows-latest
-    timeout-minutes: 30
+    # The client pulls in eframe/wgpu, which is the slow part of this job.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (host + shared crates)
-        run: cargo clippy -p wiredesk-host -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core --all-targets -- -D warnings
-      - name: Test (host + shared crates)
-        run: cargo test -p wiredesk-host -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core
+      - name: Clippy (host + client + shared crates)
+        run: cargo clippy -p wiredesk-host -p wiredesk-client -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core --all-targets -- -D warnings
+      - name: Test (host + client + shared crates)
+        run: cargo test -p wiredesk-host -p wiredesk-client -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core
 
   audit:
     name: cargo audit
