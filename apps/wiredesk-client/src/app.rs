@@ -108,6 +108,16 @@ const FULLSCREEN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 /// with it. A *native* fullscreen (the fallback path when no monitor could
 /// be resolved) is still visible to winit and still worth following: that is
 /// how ⌃⌘F and the green button are noticed.
+/// Should the window sit above the menu bar right now?
+///
+/// Only a focused borderless fullscreen wants that level. Native fullscreen
+/// gets its own Space and manages the menu bar itself, and an unfocused
+/// window must never float above other apps — see [`WireDeskApp::sync_fullscreen_level`].
+/// Pure so the rule is testable without AppKit.
+fn wants_above_menu_bar(fullscreen: bool, native: bool, focused: bool) -> bool {
+    fullscreen && !native && focused
+}
+
 fn decide_fullscreen_sync(ours: bool, reported: bool, native: bool) -> Option<bool> {
     if reported == ours {
         return None;
@@ -237,6 +247,11 @@ pub struct WireDeskApp {
     /// reflected in `viewport().fullscreen`, so only it can be tracked
     /// against the OS — see [`decide_fullscreen_sync`].
     fullscreen_is_native: bool,
+    /// Whether the window currently sits above the menu bar. Set while
+    /// borderless fullscreen has focus and cleared when it loses focus, so a
+    /// background WireDesk never floats over another app's windows — that is
+    /// what makes the display it covers reachable again with Cmd+Tab.
+    above_menu_bar: bool,
     cached_monitors_at: Option<Instant>,
     // Sticky banner shown when an entered fullscreen fell back to "current
     // display" because the saved `preferred_monitor` name doesn't match any
@@ -558,6 +573,7 @@ impl WireDeskApp {
             cached_monitors: Vec::new(),
             cached_monitors_at: None,
             fullscreen_is_native: false,
+            above_menu_bar: false,
             monitor_fallback_msg: None,
             pre_fullscreen_geometry: None,
             fullscreen_cmd_at: None,
@@ -1090,6 +1106,25 @@ impl WireDeskApp {
     /// (`capturing` flag) AND window focus. Tap intercepts only when both
     /// are true; losing focus pauses the tap so Mac apps work normally
     /// without disturbing the user's `capturing` intent.
+    /// Keep the window level in step with focus while in borderless
+    /// fullscreen.
+    ///
+    /// Above the menu bar only while focused. Unfocused, the window drops to
+    /// the normal level so it stops floating over everything else: without
+    /// this, a fullscreen WireDesk on the second display buries whatever was
+    /// already there with no way back to it. Native fullscreen used to give
+    /// its own Space for that; borderless has none, so ordinary window
+    /// ordering has to do the job.
+    fn sync_fullscreen_level(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let want = wants_above_menu_bar(self.fullscreen, self.fullscreen_is_native, focused);
+        if want == self.above_menu_bar {
+            return;
+        }
+        self.above_menu_bar = want;
+        mac_window::set_above_menu_bar(want);
+    }
+
     fn sync_tap_to_focus(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let Some(h) = self.tap_handle.as_ref() else {
@@ -1246,14 +1281,20 @@ impl WireDeskApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        mac_window::set_presentation_hidden(true);
+        // Cover the menu bar by sitting above it, NOT by hiding it: the
+        // presentation-options route also hides the Dock, and it does so on
+        // every display — fullscreen on the second monitor took the Dock
+        // away from the user's main one. Level is per-window.
+        self.above_menu_bar = true;
+        mac_window::set_above_menu_bar(true);
     }
 
     /// Undo [`Self::enter_borderless_fullscreen`] and put the window back.
     fn exit_borderless_fullscreen(&mut self, ctx: &egui::Context) {
         log::info!("fullscreen: leaving borderless");
         self.fullscreen_is_native = false;
-        mac_window::set_presentation_hidden(false);
+        self.above_menu_bar = false;
+        mac_window::set_above_menu_bar(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         // Belt and braces: a native fullscreen entered outside our control
         // (⌃⌘F, the green button while decorations were on) still has to be
@@ -2019,6 +2060,7 @@ impl eframe::App for WireDeskApp {
         // the tap so Mac shortcuts (Cmd+V to paste etc.) work normally on
         // the Mac side. Resumes when window gets focus back.
         self.sync_tap_to_focus(ctx);
+        self.sync_fullscreen_level(ctx);
         self.sync_fullscreen_state(ctx);
         self.drain_pending_position_restore(ctx);
         self.reapply_dock_icon_if_needed();
@@ -2573,6 +2615,24 @@ mod tests {
         for native in [false, true] {
             assert_eq!(decide_fullscreen_sync(true, true, native), None);
             assert_eq!(decide_fullscreen_sync(false, false, native), None);
+        }
+    }
+
+    #[test]
+    fn only_focused_borderless_fullscreen_sits_above_the_menu_bar() {
+        assert!(wants_above_menu_bar(true, false, true));
+        // Unfocused: drop back so Cmd+Tab reveals what the window covers.
+        assert!(!wants_above_menu_bar(true, false, false));
+    }
+
+    #[test]
+    fn windowed_or_native_never_raises_the_level() {
+        for focused in [false, true] {
+            // Windowed — an ordinary window, whatever the focus.
+            assert!(!wants_above_menu_bar(false, false, focused));
+            assert!(!wants_above_menu_bar(false, true, focused));
+            // Native fullscreen manages its own Space and menu bar.
+            assert!(!wants_above_menu_bar(true, true, focused));
         }
     }
 

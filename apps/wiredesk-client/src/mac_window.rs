@@ -192,33 +192,60 @@ mod imp {
         }
     }
 
-    /// Hide (or restore) the menu bar and Dock.
+    /// Lift the window above the menu bar, or put it back at the normal
+    /// level.
     ///
-    /// `NSApplicationPresentationHideMenuBar` (1 << 3) plus
-    /// `NSApplicationPresentationHideDock` (1 << 1). AppKit rejects
-    /// HideMenuBar without HideDock, so the two always travel together.
+    /// This is how borderless fullscreen keeps the menu bar off its display.
+    /// The obvious alternative — `NSApplicationPresentationHideMenuBar |
+    /// HideDock` — is **application-wide, not per-display**: it hides the
+    /// Dock on every screen, so covering a secondary display with WireDesk
+    /// took the Dock away from the user's main one for as long as our window
+    /// stayed key. Window level is a property of this one window, so only
+    /// the display it covers is affected.
     ///
-    /// This is a no-op under native fullscreen — the documented dead end
-    /// behind the "menu bar reveal" limitation — but works for a borderless
-    /// window covering a display, which is how fullscreen is implemented now.
-    pub fn set_presentation_hidden(hidden: bool) {
-        const HIDE_DOCK: usize = 1 << 1;
-        const HIDE_MENU_BAR: usize = 1 << 3;
+    /// `NSMainMenuWindowLevel` is 24; 25 sits just above it and below
+    /// `NSScreenSaverWindowLevel`. Level 0 (`NSNormalWindowLevel`) is what
+    /// every ordinary window uses — a fullscreen window drops back to it
+    /// when it loses focus, so Cmd+Tab still reveals whatever sits under it.
+    pub fn set_above_menu_bar(above: bool) {
+        const NORMAL_LEVEL: isize = 0;
+        const ABOVE_MAIN_MENU_LEVEL: isize = 25;
 
+        unsafe {
+            let win = app_window();
+            if win.is_null() {
+                return;
+            }
+            let level: isize = if above {
+                ABOVE_MAIN_MENU_LEVEL
+            } else {
+                NORMAL_LEVEL
+            };
+            let _: () = msg_send![win, setLevel: level];
+        }
+    }
+
+    /// Restore the default presentation options.
+    ///
+    /// Only needed to undo a state an older build could have left behind:
+    /// until 2026-09-05 fullscreen hid the Dock through
+    /// `setPresentationOptions`, and a crash mid-fullscreen left the user's
+    /// Dock hidden. Called once at startup; harmless when nothing was set.
+    pub fn clear_presentation_options() {
         unsafe {
             let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             if app.is_null() {
                 return;
             }
-            let options: usize = if hidden { HIDE_DOCK | HIDE_MENU_BAR } else { 0 };
-            let _: () = msg_send![app, setPresentationOptions: options];
+            let _: () = msg_send![app, setPresentationOptions: 0usize];
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    pub fn set_presentation_hidden(_hidden: bool) {}
+    pub fn set_above_menu_bar(_above: bool) {}
+    pub fn clear_presentation_options() {}
     pub fn real_outer_rect() -> Option<(f32, f32, f32, f32)> {
         None
     }
@@ -232,7 +259,8 @@ mod imp {
 }
 
 pub use imp::{
-    bring_to_current_space, diagnostics, real_outer_rect, set_outer_rect, set_presentation_hidden,
+    bring_to_current_space, clear_presentation_options, diagnostics, real_outer_rect,
+    set_above_menu_bar, set_outer_rect,
 };
 
 /// Convert an AppKit window origin (y-up, from the bottom of the primary

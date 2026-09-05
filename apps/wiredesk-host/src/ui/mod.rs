@@ -17,7 +17,10 @@ pub mod autostart;
 pub mod single_instance;
 pub mod status_bridge;
 
-#[cfg(windows)]
+// The nwg-driven builders inside are `#[cfg(windows)]`, but the `.ico`
+// frame parser is pure and must be unit-tested on macOS too — it is the
+// thing that decides which image the taskbar gets.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod icons;
 #[cfg(windows)]
 pub mod settings_window;

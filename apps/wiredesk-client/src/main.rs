@@ -409,6 +409,10 @@ fn main() {
             unsafe {
                 force_dock_icon_from_bundle();
             }
+            // Undo a Dock left hidden by an older build that crashed while
+            // fullscreen — presentation options survive the process that set
+            // them. Harmless when nothing was hidden.
+            mac_window::clear_presentation_options();
             // Stash the StatusBarHandle inside the egui app via a Box leak
             // so it lives for the program's lifetime. The handle's only job
             // is to keep the NSStatusItem alive — once dropped, AppKit

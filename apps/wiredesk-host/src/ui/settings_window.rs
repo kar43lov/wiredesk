@@ -18,13 +18,6 @@ use crate::session_thread::SessionStatus;
 use crate::ui::icons::{self, ICON_YELLOW_BYTES};
 use crate::ui::{autostart, format};
 
-// Window icon — title-bar / Alt-Tab. Loaded at runtime from the multi-size
-// .ico asset. This path runs without a windres / RC.exe toolchain (we'd
-// normally embed it as a PE resource for taskbar+Alt+Tab on first paint
-// and a clean Win-explorer .exe icon, but that requires a Windows-side
-// build environment — see plan task 2 fallback note).
-const APP_ICON_BYTES: &[u8] = include_bytes!("../../../../assets/app-icon.ico");
-
 /// All controls owned by the settings window. Stored together so the
 /// caller can wire up event handlers via `Rc<RefCell<SettingsWindow>>`.
 ///
@@ -37,7 +30,11 @@ const APP_ICON_BYTES: &[u8] = include_bytes!("../../../../assets/app-icon.ico");
 #[derive(Default)]
 pub struct SettingsWindow {
     pub window: nwg::Window,
+    /// ICON_SMALL — title bar and Alt+Tab.
     pub window_icon: nwg::Icon,
+    /// ICON_BIG — the taskbar button. Held here only to keep the HICON
+    /// alive; dropping it would leave the taskbar with a dangling handle.
+    pub window_icon_big: nwg::Icon,
     pub layout: nwg::GridLayout,
 
     pub status_icon: nwg::ImageFrame,
@@ -128,8 +125,11 @@ impl SettingsWindow {
                 // bundled `.ico` is malformed — that's a build-time bug we
                 // want to catch loudly the first time it runs, not silently
                 // ship a windowless title-bar to users.
+                // Small icon (title bar, Alt+Tab). The big one for the
+                // taskbar is attached after the window exists — see below.
                 nwg::Icon::builder()
-                    .source_bin(Some(APP_ICON_BYTES))
+                    .source_bin(Some(icons::app_icon_source()))
+                    .size(Some(icons::system_icon_sizes().1))
                     .strict(true)
                     .build(window_icon)
                     .expect("malformed bundled app-icon.ico — rebuild assets");
@@ -151,6 +151,32 @@ impl SettingsWindow {
                     .icon(icon_ref)
                     .flags(nwg::WindowFlags::MAIN_WINDOW)
                     .build(window)?;
+            }
+
+            // Taskbar icon. nwg only ever sets ICON_SMALL, so a 16×16 image
+            // ended up in the taskbar button and rendered visibly smaller
+            // than every other app's. Build the ICON_BIG variant at the size
+            // Windows asks for and attach both explicitly. Both icons are
+            // kept in the struct: their Drop destroys the HICON.
+            {
+                let SettingsWindow {
+                    ref window,
+                    ref mut window_icon_big,
+                    ref window_icon,
+                    ..
+                } = *s;
+                let (big_size, _) = icons::system_icon_sizes();
+                match icons::build_app_icon(big_size) {
+                    Ok(icon) => {
+                        *window_icon_big = icon;
+                        if let Some(hwnd) = window.handle.hwnd() {
+                            icons::apply_window_icons(hwnd as isize, window_icon_big, window_icon);
+                        }
+                    }
+                    // A missing taskbar icon is cosmetic — never a reason to
+                    // refuse to open Settings.
+                    Err(e) => log::warn!("taskbar icon build failed: {e}"),
+                }
             }
 
             // Initial status indicator: yellow (Waiting). The bitmap is
