@@ -84,6 +84,8 @@ remain macOS-only (see [Known limitations](docs/known-limitations.md)).
 
 ## Security model
 
+Reporting process and supported versions: [`SECURITY.md`](SECURITY.md).
+
 **The link is neither authenticated nor encrypted.** The handshake is a plain `Hello`/`HelloAck` exchange carrying a name and a protocol version — there is no pairing code, no shared secret, no challenge. Whoever can talk to the other end of the channel can inject keyboard and mouse input into the Windows session, open a shell on it, and read or write files through the clipboard. That is the whole point of the tool, so treat access to the channel as equivalent to sitting down at the machine.
 
 What that means per transport:
