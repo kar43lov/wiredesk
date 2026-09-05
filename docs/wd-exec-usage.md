@@ -341,4 +341,4 @@ Write-Output "__WD_DONE_<uuid>__0"
 
 ## Memory
 
-Persistent context — в `~/.claude/projects/-Users-pgmac-Data-prjcts-wiredesk/memory/`. Самое полезное: `feedback_serial_terminal_bridge.md`, `project_conpty_followup.md`.
+Разбор устройства канала и его подводных камней — в [`docs/architecture.md`](architecture.md) и [`docs/known-limitations.md`](known-limitations.md).
