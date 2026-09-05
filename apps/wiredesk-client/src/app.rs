@@ -94,6 +94,32 @@ const RESTORE_TOLERANCE: f32 = 24.0;
 /// long, stop treating the mismatch as ours and believe the reported state.
 const FULLSCREEN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Decide what to do when winit's reported fullscreen state disagrees with
+/// ours.
+///
+/// `Some(state)` means "adopt this"; `None` means the disagreement is
+/// expected and must be ignored.
+///
+/// The subtlety is borderless fullscreen. We enter it by removing
+/// decorations and sizing the window to the display — winit is never told
+/// "fullscreen", so `viewport().fullscreen` stays `false` for as long as we
+/// are in it. Treating that as "the user left fullscreen" is what made the
+/// window drop out of fullscreen ~2 s after every Cmd+Enter, taking capture
+/// with it. A *native* fullscreen (the fallback path when no monitor could
+/// be resolved) is still visible to winit and still worth following: that is
+/// how ⌃⌘F and the green button are noticed.
+fn decide_fullscreen_sync(ours: bool, reported: bool, native: bool) -> Option<bool> {
+    if reported == ours {
+        return None;
+    }
+    if ours && !native && !reported {
+        // Borderless: winit reporting "not fullscreen" is the normal state
+        // of affairs, not an event.
+        return None;
+    }
+    Some(reported)
+}
+
 /// A queued attempt to put the window back where it was before fullscreen.
 #[derive(Debug, Clone, Copy)]
 struct PendingRestore {
@@ -206,6 +232,11 @@ pub struct WireDeskApp {
     // plenty for a UI that's already gated behind an open settings panel,
     // and avoids hammering the call at 60 FPS while the panel just sits open.
     cached_monitors: Vec<monitor::MonitorInfo>,
+    /// Whether the current fullscreen is the *native* one (winit-managed)
+    /// rather than our borderless imitation. Only the native kind is
+    /// reflected in `viewport().fullscreen`, so only it can be tracked
+    /// against the OS — see [`decide_fullscreen_sync`].
+    fullscreen_is_native: bool,
     cached_monitors_at: Option<Instant>,
     // Sticky banner shown when an entered fullscreen fell back to "current
     // display" because the saved `preferred_monitor` name doesn't match any
@@ -526,6 +557,7 @@ impl WireDeskApp {
             available_ports: Vec::new(),
             cached_monitors: Vec::new(),
             cached_monitors_at: None,
+            fullscreen_is_native: false,
             monitor_fallback_msg: None,
             pre_fullscreen_geometry: None,
             fullscreen_cmd_at: None,
@@ -1156,7 +1188,14 @@ impl WireDeskApp {
                         Some(m) => {
                             self.enter_borderless_fullscreen(ctx, m.frame.min, m.frame.size())
                         }
-                        None => ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true)),
+                        None => {
+                            // No display could be resolved at all — fall back
+                            // to the native fullscreen, which winit does
+                            // report and which `sync_fullscreen_state` can
+                            // therefore keep track of.
+                            self.fullscreen_is_native = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        }
                     }
                 }
             }
@@ -1198,6 +1237,11 @@ impl WireDeskApp {
         origin: egui::Pos2,
         size: egui::Vec2,
     ) {
+        self.fullscreen_is_native = false;
+        log::info!(
+            "fullscreen: entering borderless at {origin:?} size {size:?} \
+             (winit will keep reporting fullscreen=false — that is expected)"
+        );
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
@@ -1207,6 +1251,8 @@ impl WireDeskApp {
 
     /// Undo [`Self::enter_borderless_fullscreen`] and put the window back.
     fn exit_borderless_fullscreen(&mut self, ctx: &egui::Context) {
+        log::info!("fullscreen: leaving borderless");
+        self.fullscreen_is_native = false;
         mac_window::set_presentation_hidden(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         // Belt and braces: a native fullscreen entered outside our control
@@ -1266,14 +1312,18 @@ impl WireDeskApp {
     /// Without this the exit path never runs at all and the window is simply
     /// abandoned on whichever display the fullscreen was on.
     fn sync_fullscreen_state(&mut self, ctx: &egui::Context) {
-        let Some(actual) = ctx.input(|i| i.viewport().fullscreen) else {
+        let Some(reported) = ctx.input(|i| i.viewport().fullscreen) else {
             return;
         };
-        if actual == self.fullscreen {
-            // Our own command has been confirmed — stop suppressing.
+        let Some(actual) =
+            decide_fullscreen_sync(self.fullscreen, reported, self.fullscreen_is_native)
+        else {
+            // Either the states agree, or the disagreement is the expected
+            // one for borderless. Both mean our own command (if any) has
+            // landed as far as we can tell.
             self.fullscreen_cmd_at = None;
             return;
-        }
+        };
         // A command of ours may still be in flight; winit reports the old
         // state for a frame or two. Only believe a lasting mismatch.
         if let Some(sent) = self.fullscreen_cmd_at {
@@ -1288,6 +1338,7 @@ impl WireDeskApp {
             self.fullscreen
         );
         self.fullscreen = actual;
+        self.fullscreen_is_native = actual;
         if actual {
             // Entered fullscreen without us: the outer rect is already the
             // whole screen, so the in-process snapshot would be useless.
@@ -2471,6 +2522,38 @@ mod tests {
     #[test]
     fn permission_steps_has_four_steps() {
         assert_eq!(permission_steps().len(), 4);
+    }
+
+    #[test]
+    fn borderless_fullscreen_is_not_dropped_by_a_false_report() {
+        // The regression this guards: winit reports `false` for the whole
+        // time we are in a borderless fullscreen, because we never asked it
+        // for a native one. Following that report exits fullscreen — which
+        // is what happened ~2 s after every Cmd+Enter.
+        assert_eq!(decide_fullscreen_sync(true, false, false), None);
+    }
+
+    #[test]
+    fn native_fullscreen_still_follows_the_os() {
+        // Green button / ⌃⌘F / Mission Control leaving a *native*
+        // fullscreen must still be noticed.
+        assert_eq!(decide_fullscreen_sync(true, false, true), Some(false));
+    }
+
+    #[test]
+    fn fullscreen_entered_outside_the_app_is_adopted() {
+        // Whichever kind we think we are in, a reported `true` while we
+        // believe we are windowed means someone else put us there.
+        assert_eq!(decide_fullscreen_sync(false, true, false), Some(true));
+        assert_eq!(decide_fullscreen_sync(false, true, true), Some(true));
+    }
+
+    #[test]
+    fn agreeing_states_are_never_events() {
+        for native in [false, true] {
+            assert_eq!(decide_fullscreen_sync(true, true, native), None);
+            assert_eq!(decide_fullscreen_sync(false, false, native), None);
+        }
     }
 
     fn mon(x: f32, y: f32, w: f32, h: f32) -> monitor::MonitorInfo {
