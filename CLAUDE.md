@@ -25,6 +25,9 @@ cargo build  -p wiredesk-client --target x86_64-pc-windows-gnu    # нужен `
 
 # CI идёт только на push в main и на PR — feature-ветка НЕ линтуется на Windows сама:
 gh workflow run ci.yml --ref <branch>               # и потом `gh run list --branch <branch>`
+
+# Перед ревью крупного диффа — поднять локальный stable до версии CI (`dtolnay/rust-toolchain@stable`):
+rustup update stable    # 11.09.2026 локально был 1.94, CI 1.98 → линт chunks_exact_to_as_chunks упал уже на main
 ```
 
 🔴 **Обе стороны собираются под обе ОС, и правка платформенного кода должна проверяться обеими командами выше.** Host: `WindowsInjector` на Windows, `MockInjector` на macOS (реальный SendInput не зовётся — для dev-цикла нормально). Клиент: полноценные реализации на обеих платформах за фасадами `keyboard_tap` / `status_bar` / `monitor` / `clipboard_files`; `cargo check` на маке НЕ увидит поломку Windows-ветки.
@@ -49,6 +52,7 @@ gh workflow run ci.yml --ref <branch>               # и потом `gh run list
 - Видео — никогда
 - Save+Restart pattern: большинство changes в settings UI требуют перезапуск процесса
 - Mac autostart — не реализован (только manual launch из дока / Spotlight)
+- Автозапуск хоста на Windows работает только от администратора (UIPI режет `SendInput` в окна элевированных приложений), поэтому заводится задачей планировщика `ONLOGON` + `RL HIGHEST`, а не ключом `Run`; 🔴 exe при этом обязан лежать в каталоге, куда обычный пользователь писать не может, иначе автозапуск = локальный EoP
 - Outbound text debounce — ~400ms окно для physical Cmd+V (accepted limitation): debounce задерживает…
 - Outbound text debounce — mixed-format clipboard, image case (accepted limitation): если ОДИН clipboard-item…
 - Тот же race для файлов — FIXED (`main` `bf47aae`, 2026-07-01): Finder-копия файла лениво (200ms–9s…
@@ -60,7 +64,8 @@ gh workflow run ci.yml --ref <branch>               # и потом `gh run list
 - Fullscreen — borderless (не native): Spaces-переход терял окно в WindowServer. Меню-бар/таскбар перекрываются уровнем окна, а не скрытием Dock (оно было на все дисплеи сразу); уровень снимается при потере фокуса
 - Windows-клиент: `wd`/`wd --exec` только с Mac; BLE недоступен (роль Peripheral занята хостом, принудительный откат на serial), RFCOMM работает; 🔴 нет аналога Secure Input — хук в capture видит и пароли
 - RFCOMM (`transport = "rfcomm"`) — живой линк с pairing и шифрованием; канал задаётся вручную на обеих сторонах (SDP-запись хоста с Mac не видна), собранный .app не получает системный запрос на Bluetooth — запускать бинарь из терминала
-- Длинная команда `wd --exec` (>4 КБ) кладётся хостом во временный .ps1 и dot-source-ится: PowerShell разбирает длинную строку за квадратичное время
+- RFCOMM с `keepalive_ms = 0` — хост считает клиента мёртвым после 8 с молчания и отдаёт линк другому устройству (с дефолтным keepalive молчания не бывает)
+- Длинная команда `wd --exec` (>4 КБ) кладётся хостом во временный .ps1 и dot-source-ится: PowerShell разбирает длинную строку за квадратичное время; **текст команды при этом лежит на диске хоста** — секреты в теле команды не передавать
 
 ## Hardware setup
 
