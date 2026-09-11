@@ -68,6 +68,32 @@ enum Phase {
 /// Other `ExecError` variants surface transport-layer failures
 /// verbatim; `ExecError::CompressionFailed` covers decode errors
 /// once the sentinel arrives.
+/// How much of the wire log the timeout error carries.
+///
+/// `format_timeout_diagnostic` prints the last 256 bytes of it, so this is
+/// already thirty times what anyone reads — and unlike an unbounded buffer it
+/// cannot turn `wd --exec "docker logs"` into a copy of the whole output held
+/// in memory beside the stream that is being written out anyway.
+const TIMEOUT_LOG_TAIL: usize = 8 * 1024;
+
+/// Append `text`, keeping at most `cap` bytes of the tail.
+///
+/// Cutting a `String` by byte offset panics unless the offset is a character
+/// boundary, and this buffer is full of multi-byte output by definition — so
+/// the cut walks forward to the next boundary instead of trusting the
+/// arithmetic.
+fn push_bounded_tail(buf: &mut String, text: &str, cap: usize) {
+    buf.push_str(text);
+    if buf.len() <= cap {
+        return;
+    }
+    let want = buf.len() - cap;
+    let cut = (want..=buf.len())
+        .find(|i| buf.is_char_boundary(*i))
+        .unwrap_or(buf.len());
+    buf.drain(..cut);
+}
+
 pub fn run_oneshot<T, F>(
     transport: &mut T,
     cmd: &str,
@@ -164,6 +190,8 @@ where
     }
 
     let mut pending = String::new();
+    // Bytes at the head of `pending` already known to hold no newline.
+    let mut scanned = 0usize;
     let mut full_log = String::new();
     // The wire cuts the shell's output at packet boundaries, which land
     // wherever they land — decoding each chunk on its own would eat any
@@ -182,7 +210,7 @@ where
                 log::trace!("[exec] recv ShellOutput {} bytes", data.len());
                 let text = utf8.push(&data);
                 pending.push_str(&text);
-                full_log.push_str(&text);
+                push_bounded_tail(&mut full_log, &text, TIMEOUT_LOG_TAIL);
             }
             ExecEvent::ShellClosed => {
                 // An acknowledgement for the *previous* command's
@@ -205,7 +233,18 @@ where
 
         // Walk completed lines out of `pending`. Each line is whatever
         // came before the next `\n`, with trailing `\r` stripped.
-        while let Some(nl_idx) = pending.find('\n') {
+        //
+        // The search starts where the last one gave up. Output that carries
+        // no newline for a long stretch — a big base64 blob written with
+        // `-NoNewline`, a binary dump — would otherwise be rescanned from the
+        // front on every packet, which is quadratic in the size of the
+        // output and turns into a hang rather than a slow command.
+        // `scanned` is always `pending.len()` from a previous pass, and
+        // `pending` only ever grows by whole characters (`Utf8Stream`), so
+        // slicing at it cannot land inside one.
+        while let Some(rel) = pending[scanned..].find('\n') {
+            let nl_idx = scanned + rel;
+            scanned = 0;
             let raw_line = pending[..nl_idx].to_string();
             let consume = nl_idx + 1;
             pending.drain(..consume);
@@ -330,6 +369,10 @@ where
             }
         }
 
+        // Everything still in `pending` has been looked at and holds no
+        // newline; the next pass starts after it.
+        scanned = pending.len();
+
         // Remote prompts can arrive WITHOUT a trailing newline (bash/zsh
         // park the cursor right after `$ ` / `# ` / `➜ `). Peek the
         // partial leftover after stripping ANSI escapes.
@@ -340,13 +383,15 @@ where
                 transport.send_input(payload.as_bytes())?;
                 state = OneShotState::AwaitingSentinel;
                 pending.clear();
+                scanned = 0;
             }
         }
     }
 
     // Out of time. Anything the decoder is still holding belongs in the log
     // the error carries — half a character is a better clue than silence.
-    full_log.push_str(&utf8.finish());
+    let tail = utf8.finish();
+    push_bounded_tail(&mut full_log, &tail, TIMEOUT_LOG_TAIL);
     Err(ExecError::Timeout(full_log))
 }
 
@@ -400,6 +445,54 @@ mod tests {
         fn recv_event(&mut self, _timeout: Duration) -> Result<ExecEvent, ExecError> {
             Ok(self.queued.pop_front().unwrap_or(ExecEvent::Idle))
         }
+    }
+
+    /// Output with no newline in it for a long stretch, with the sentinel
+    /// finally glued to its end. Exercises the incremental newline search:
+    /// the scan resumes where it stopped, and a bookkeeping slip there shows
+    /// up as a lost or duplicated prefix rather than as a slow test.
+    #[test]
+    fn a_long_unterminated_run_before_the_sentinel_is_emitted_once() {
+        let body = "x".repeat(50_000);
+        let body_for_host = body.clone();
+
+        let mut host = ScriptedHost::new(move |uuid| {
+            let mut out = vec![format!("__WD_READY_{uuid}__\n").into_bytes()];
+            for piece in body_for_host.as_bytes().chunks(1000) {
+                out.push(piece.to_vec());
+            }
+            out.push(format!("__WD_DONE_{uuid}__0\n").into_bytes());
+            out
+        });
+
+        let mut got = Vec::new();
+        let code = run_oneshot(&mut host, "x", None, 5, false, |c| got.extend_from_slice(c))
+            .expect("run_oneshot");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(got).expect("utf-8"), format!("{body}\n"));
+    }
+
+    #[test]
+    fn the_timeout_log_keeps_the_tail_and_stops_growing() {
+        let mut buf = String::new();
+        for i in 0..1000 {
+            push_bounded_tail(&mut buf, &format!("line {i}\n"), 256);
+            assert!(buf.len() <= 256 + 16, "buffer grew to {}", buf.len());
+        }
+        assert!(buf.ends_with("line 999\n"), "tail lost: {buf:?}");
+        assert!(!buf.contains("line 0\n"), "head should have been dropped");
+    }
+
+    #[test]
+    fn trimming_the_timeout_log_never_cuts_a_character_in_half() {
+        // Every byte of this is part of a multi-byte character, so a cut
+        // computed by arithmetic alone would land inside one and panic.
+        let mut buf = String::new();
+        for _ in 0..200 {
+            push_bounded_tail(&mut buf, "ёжик", 37);
+        }
+        assert!(buf.len() <= 37 + 4);
+        assert!(buf.ends_with("ёжик"));
     }
 
     /// The wire cuts output at packet boundaries that know nothing about
