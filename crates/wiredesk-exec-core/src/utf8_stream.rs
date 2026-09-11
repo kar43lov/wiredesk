@@ -27,12 +27,22 @@ impl Utf8Stream {
 
     /// Decode everything complete in `chunk`, keeping an unfinished
     /// character for the next call.
+    ///
+    /// The common case — nothing held over, which is every chunk that happens
+    /// to end on a character boundary — decodes straight out of `chunk`
+    /// without copying it anywhere first.
     pub fn push(&mut self, chunk: &[u8]) -> String {
+        if self.tail.is_empty() {
+            return self.decode(chunk);
+        }
         let mut buf = std::mem::take(&mut self.tail);
         buf.extend_from_slice(chunk);
+        self.decode(&buf)
+    }
 
-        let mut out = String::with_capacity(buf.len());
-        let mut rest: &[u8] = &buf;
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        let mut rest: &[u8] = bytes;
         loop {
             match std::str::from_utf8(rest) {
                 Ok(s) => {
@@ -41,8 +51,12 @@ impl Utf8Stream {
                 }
                 Err(e) => {
                     let valid = e.valid_up_to();
-                    // Everything before the bad spot is real text.
-                    out.push_str(std::str::from_utf8(&rest[..valid]).unwrap_or_default());
+                    // Everything before the bad spot is real text — and
+                    // `valid_up_to` is exactly the promise that it parses.
+                    match std::str::from_utf8(&rest[..valid]) {
+                        Ok(good) => out.push_str(good),
+                        Err(_) => unreachable!("valid_up_to must parse"),
+                    }
                     match e.error_len() {
                         // A byte that cannot start or continue a character:
                         // replace it and carry on, as lossy decoding would.

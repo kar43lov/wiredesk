@@ -19,10 +19,23 @@
 //!
 //! ## Threading
 //!
-//! `poll_cf_hdrop` and `set_cf_hdrop` both call `OpenClipboard(NULL)` which
-//! synchronises on the global clipboard lock. They must be called from a
-//! single thread per process (the one that polls arboard for text/image) —
-//! the clipboard owner contract requires same-thread use.
+//! `poll_cf_hdrop` and `set_cf_hdrop` both call `OpenClipboard(NULL)`, which
+//! contends for the one global clipboard handle: a second thread inside it at
+//! the same moment gets `ClipboardLocked`, which reads to the user as a paste
+//! that silently did not happen.
+//!
+//! This module does not serialise anything itself, because doing it here
+//! would deadlock the callers that already hold the lock. Each caller picks
+//! one level and stays there:
+//!
+//! - **Windows client** — two threads reach the clipboard (the poll thread
+//!   and the reader thread committing incoming files), so its
+//!   `clipboard_files` wrappers hold `wiredesk_core::clipboard_lock` across
+//!   these calls. Their macOS arms hold the same lock around `NSPasteboard`,
+//!   where concurrent access does not merely fail but aborts the process.
+//! - **Host** — its whole clipboard lives on the session tick loop, one
+//!   thread, so it calls straight in. Move any of it onto another thread and
+//!   that stops being true.
 //!
 //! ## Memory ownership
 //!

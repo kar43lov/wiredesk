@@ -1,12 +1,23 @@
-# Every OS-clipboard call must go through the `locked_*` helpers in
-# apps/*/src/clipboard.rs, which hold `wiredesk_core::clipboard_lock`. Two
-# concurrent pasteboard calls abort the process on macOS — the host suite
-# SIGABRTed on roughly half of its parallel runs because of exactly this.
-# Those four helpers carry `#[allow(clippy::disallowed_methods)]`; they are
-# the only places that may name these methods.
+# Reaching the OS clipboard without holding `wiredesk_core::clipboard_lock`
+# is what made the host suite SIGABRT on roughly half of its parallel runs:
+# two pasteboard calls at the same moment abort the process on macOS, and on
+# Windows they turn into a silently lost paste.
+#
+# The entries below are the call sites a compiler can point at: arboard's four
+# accessors (wrapped by the `locked_*` helpers in apps/*/src/clipboard.rs) and
+# the raw pasteboard handle the file-path side uses. Every blessed wrapper
+# carries `#[allow(clippy::disallowed_methods)]` and takes the lock first.
+#
+# 🔴 What this does NOT cover: the Win32 path in
+# `wiredesk_core::file_clipboard` is plain functions, not methods, so a new
+# caller there is on its own — that module's `## Threading` section says which
+# level holds the lock.
 disallowed-methods = [
     { path = "arboard::Clipboard::get_text", reason = "use locked_get_text — see wiredesk_core::clipboard_lock" },
     { path = "arboard::Clipboard::get_image", reason = "use locked_get_image — see wiredesk_core::clipboard_lock" },
     { path = "arboard::Clipboard::set_text", reason = "use locked_set_text — see wiredesk_core::clipboard_lock" },
     { path = "arboard::Clipboard::set_image", reason = "use locked_set_image — see wiredesk_core::clipboard_lock" },
+    # The file-path side reaches the same pasteboard without going through
+    # arboard, and gets there from the same two threads.
+    { path = "objc2_app_kit::NSPasteboard::generalPasteboard", reason = "hold wiredesk_core::clipboard_lock for the whole pasteboard access — see that module" },
 ]

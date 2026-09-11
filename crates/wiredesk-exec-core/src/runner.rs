@@ -45,29 +45,6 @@ enum Phase {
     Streaming,
 }
 
-/// Drive a single sentinel-bracketed command to completion.
-///
-/// `on_chunk` is called once per emitted line in non-compress mode,
-/// with the trailing `\n` already attached. Pre-sentinel output that
-/// lacks a newline (the "unterminated output" case from
-/// `parse_sentinel_after_unterminated_output`) is recovered as one
-/// final chunk before the runner returns.
-///
-/// In `compress=true` mode the streaming property is intentionally
-/// dropped: post-READY lines (and any pre-sentinel unterminated tail)
-/// are accumulated into a single base64 buffer and decoded on
-/// sentinel-detect. The caller's callback is then invoked **once**
-/// with the decompressed bytes. Trade-off: latency vs throughput;
-/// opt-in via the flag.
-///
-/// Returns `Ok(exit_code)` on success, `Err(ExecError::Timeout(buf))`
-/// if the wall-clock budget elapses without the sentinel — `buf`
-/// carries the raw wire log so the caller can pass it through
-/// `format_timeout_diagnostic`. In compress mode a partial buffer
-/// at timeout is **not** decoded (it would be a fragment, not data).
-/// Other `ExecError` variants surface transport-layer failures
-/// verbatim; `ExecError::CompressionFailed` covers decode errors
-/// once the sentinel arrives.
 /// How much of the wire log the timeout error carries.
 ///
 /// `format_timeout_diagnostic` prints the last 256 bytes of it, so this is
@@ -94,6 +71,30 @@ fn push_bounded_tail(buf: &mut String, text: &str, cap: usize) {
     buf.drain(..cut);
 }
 
+/// Drive a single sentinel-bracketed command to completion.
+///
+/// `on_chunk` is called once per emitted line in non-compress mode,
+/// with the trailing `\n` already attached. Pre-sentinel output that
+/// lacks a newline (the "unterminated output" case from
+/// `parse_sentinel_after_unterminated_output`) is recovered as one
+/// final chunk before the runner returns.
+///
+/// In `compress=true` mode the streaming property is intentionally
+/// dropped: post-READY lines (and any pre-sentinel unterminated tail)
+/// are accumulated into a single base64 buffer and decoded on
+/// sentinel-detect. The caller's callback is then invoked **once**
+/// with the decompressed bytes. Trade-off: latency vs throughput;
+/// opt-in via the flag.
+///
+/// Returns `Ok(exit_code)` on success, `Err(ExecError::Timeout(buf))`
+/// if the wall-clock budget elapses without the sentinel — `buf`
+/// carries the tail of the wire log (`TIMEOUT_LOG_TAIL`, far more than
+/// `format_timeout_diagnostic` prints) so the caller can pass it through
+/// `format_timeout_diagnostic`. In compress mode a partial buffer
+/// at timeout is **not** decoded (it would be a fragment, not data).
+/// Other `ExecError` variants surface transport-layer failures
+/// verbatim; `ExecError::CompressionFailed` covers decode errors
+/// once the sentinel arrives.
 pub fn run_oneshot<T, F>(
     transport: &mut T,
     cmd: &str,
@@ -760,9 +761,9 @@ mod tests {
     }
 
     #[test]
-    fn timeout_returns_err_with_full_log_buffer() {
+    fn timeout_returns_err_with_the_wire_log_tail() {
         // No sentinel ever arrives — runner should hit the wall-clock
-        // budget and return Err(Timeout(buf)) carrying everything we
+        // budget and return Err(Timeout(buf)) carrying the tail of what we
         // sent. Caller (term) will run format_timeout_diagnostic on it.
         let mut t = MockExecTransport::new([
             out("partial output but no sentinel\n"),

@@ -92,6 +92,8 @@ pub enum FileClipboardError {
 /// debug line and return `None`. This is Phase 1 scope (single file only);
 /// see brief `docs/briefs/clipboard-files-multi.md` for the multi-file path.
 #[cfg(target_os = "macos")]
+// Blessed pasteboard access: the lock is taken below, before the first call.
+#[allow(clippy::disallowed_methods)]
 pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
     use objc2_foundation::NSURL;
@@ -199,6 +201,8 @@ pub fn poll_file_url(_last_change_count: &mut i64) -> Option<PathBuf> {
 /// (rare; typically only happens if another process is holding the pasteboard
 /// lock).
 #[cfg(target_os = "macos")]
+// Blessed pasteboard access: the lock is taken below, before the first call.
+#[allow(clippy::disallowed_methods)]
 pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;

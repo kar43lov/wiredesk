@@ -7,7 +7,15 @@
 //! stays as the host's spelling of that API so the call sites in
 //! `clipboard.rs` read the same as before.
 //!
-//! Scope, threading and memory-ownership notes: see the core module.
+//! Scope and memory-ownership notes: see the core module.
+//!
+//! 🔴 **Threading:** the host calls these straight through, without the
+//! `wiredesk_core::clipboard_lock` the client's copy of this module holds.
+//! That is only correct because the host's entire clipboard — arboard and
+//! `CF_HDROP` alike — runs on the session tick loop and nowhere else. Put a
+//! clipboard call on a second thread here (a UI action, a background
+//! prefetch) and it has to take that lock first, or Windows starts answering
+//! `ClipboardLocked` and pastes vanish without an error anyone sees.
 
 // `set_cf_hdrop` and the error type only have callers inside
 // `cfg(windows)` blocks; re-exporting them unconditionally keeps this

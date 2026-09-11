@@ -17,10 +17,11 @@
 //! The same shape runs in production on every reconnect: `reader_loop` builds
 //! an `IncomingClipboard` per link while the poll thread keeps reading.
 //!
-//! Holding this lock is cheap (a clipboard call takes microseconds) and the
-//! contention is between at most three threads, so the guard is taken around
-//! single calls — never around a block that could call back in, which would
-//! deadlock on a non-reentrant `Mutex`.
+//! The guard is taken around single calls — never around a block that could
+//! call back in, which would deadlock on a non-reentrant `Mutex`. A waiting
+//! thread waits for one clipboard call: microseconds for text, milliseconds
+//! for a multi-megabyte image. That is the whole cost, and the alternative to
+//! paying it is the process aborting.
 
 use std::sync::{Mutex, MutexGuard};
 
