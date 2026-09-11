@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use wiredesk_core::error::{Result, WireDeskError};
 use wiredesk_core::storm::{StormCounter, DEFAULT_STORM_THRESHOLD};
 use wiredesk_protocol::message::{Message, VERSION};
-use wiredesk_protocol::packet::Packet;
+use wiredesk_protocol::packet::{Packet, MAX_PAYLOAD};
 use wiredesk_transport::transport::Transport;
 
 use crate::clipboard::{ClipboardSync, ProgressCounters};
@@ -79,6 +79,20 @@ pub struct Session<T: Transport, I: InputInjector> {
     /// (via `note_protocol_error`), reset on each successfully decoded
     /// packet (in `tick`). When it fires, `session_thread` reopens the port.
     storm: StormCounter,
+}
+
+/// Split one read of the shell's output into packets.
+///
+/// The shell reader hands over up to 4096 bytes at a time and the protocol
+/// takes a payload of exactly that, so a full read is one packet. It used to
+/// be cut at 480 — the limit back when `MAX_PAYLOAD` was 512 — and that
+/// literal stayed behind when the limit was raised to 4096, turning every
+/// full read into nine packets instead of one. Nothing was lost by it, but
+/// the busiest path in the project (the output of `wd --exec`) paid nine
+/// transport writes for one read, which is what bulk output over Bluetooth
+/// was actually spending its time on.
+fn split_shell_output(chunk: &[u8]) -> std::slice::Chunks<'_, u8> {
+    chunk.chunks(MAX_PAYLOAD)
 }
 
 impl<T: Transport, I: InputInjector> Session<T, I> {
@@ -346,8 +360,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         }
 
         for chunk in outputs {
-            // Split into max-payload-sized chunks (512 bytes is the protocol limit)
-            for piece in chunk.chunks(480) {
+            for piece in split_shell_output(&chunk) {
                 self.send(Message::ShellOutput {
                     data: piece.to_vec(),
                 })?;
@@ -893,6 +906,41 @@ mod tests {
             "precondition: in-flight reassembly must be active"
         );
         (session, client)
+    }
+
+    #[test]
+    fn one_read_of_shell_output_is_one_packet() {
+        // Regression for a literal that outlived its constant: the cut was
+        // 480 bytes, from the days when `MAX_PAYLOAD` was 512, while the
+        // shell reader hands over 4096 at a time. Every full read went out
+        // as nine packets.
+        assert_eq!(split_shell_output(&[]).count(), 0, "nothing to send");
+        assert_eq!(split_shell_output(&[b'x'; 1]).count(), 1);
+        assert_eq!(
+            split_shell_output(&vec![b'x'; MAX_PAYLOAD]).count(),
+            1,
+            "a full read must fit in one packet"
+        );
+        assert_eq!(
+            split_shell_output(&vec![b'x'; MAX_PAYLOAD + 1]).count(),
+            2,
+            "one byte over must split, not be refused by Packet::to_bytes"
+        );
+        // Every piece has to be acceptable to the protocol.
+        for piece in split_shell_output(&vec![b'x'; MAX_PAYLOAD * 3 + 7]) {
+            assert!(piece.len() <= MAX_PAYLOAD, "piece of {} bytes", piece.len());
+            assert!(
+                Packet::new(
+                    Message::ShellOutput {
+                        data: piece.to_vec()
+                    },
+                    0
+                )
+                .to_bytes()
+                .is_ok(),
+                "protocol refused a piece this function produced"
+            );
+        }
     }
 
     #[test]
