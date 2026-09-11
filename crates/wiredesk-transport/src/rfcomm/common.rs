@@ -212,12 +212,18 @@ mod tests {
             h.fetch_add(1, Ordering::SeqCst);
             true
         });
-        thread::sleep(Duration::from_millis(200));
+        // Ждём события с запасом по дедлайну, а не фиксированный отрезок:
+        // на загруженном CI-раннере keepalive-поток может не получить квант
+        // за те 200 мс, в которые тест укладывался локально.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hits.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(hits.load(Ordering::SeqCst) >= 2, "keepalive never fired");
         ka.stop();
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(300));
         let n = hits.load(Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(300));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             n,
@@ -229,7 +235,10 @@ mod tests {
     fn keepalive_note_write_postpones() {
         let hits = Arc::new(AtomicU32::new(0));
         let h = Arc::clone(&hits);
-        let ka = IdleKeepalive::spawn(Duration::from_millis(80), move || {
+        // Период с большим запасом против шага цикла: пауза планировщика в
+        // сотню миллисекунд между двумя note_write на CI — обычное дело, и с
+        // периодом 80 мс keepalive выстреливал на ровном месте (main, 11.09.2026).
+        let ka = IdleKeepalive::spawn(Duration::from_secs(2), move || {
             h.fetch_add(1, Ordering::SeqCst);
             true
         });
