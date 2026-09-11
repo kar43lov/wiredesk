@@ -376,10 +376,10 @@ fixed rather than things that are missing.
 | `wiredesk-host` (Windows agent) | 179 |
 | `wiredesk-exec-core` (shared `wd --exec` runner) | 119 |
 | `wiredesk-protocol` (framing, COBS, CRC-16) | 88 |
-| `wiredesk-transport` (serial, BLE, RFCOMM, port detection) | 65 |
+| `wiredesk-transport` (serial, BLE, RFCOMM, port detection) | 78 |
 | `wiredesk-term` (`wd` CLI) | 50 |
 | `wiredesk-core` (shared types, clipboard files) | 31 |
-| **Total** | **889** |
+| **Total** | **902** |
 
 Plus 6 ignored tests: five need a live Windows session, one a real OS
 clipboard. `cargo test --workspace` runs clean in parallel on both platforms —
