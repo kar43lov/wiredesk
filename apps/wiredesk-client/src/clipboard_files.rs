@@ -96,9 +96,15 @@ pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
     use objc2_foundation::NSURL;
 
+    // Held for the whole inspection: the poll thread and the reader thread
+    // both reach the general pasteboard, and two concurrent calls abort the
+    // process on macOS (`wiredesk_core::clipboard_lock` carries the
+    // measurement). Off-main-thread is fine; *concurrent* is not.
+    let _guard = wiredesk_core::clipboard_lock::hold();
+
     // SAFETY: `generalPasteboard` is callable off the main thread per Apple
-    // docs (NSPasteboard is thread-safe at the API surface). Returned
-    // `Retained<NSPasteboard>` lives for the scope of this call only.
+    // docs. Returned `Retained<NSPasteboard>` lives for the scope of this
+    // call only.
     let pb = unsafe { NSPasteboard::generalPasteboard() };
     let current = unsafe { pb.changeCount() } as i64;
     if current == *last_change_count {
@@ -165,6 +171,10 @@ pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
 /// shared counter type, and a wrap merely costs one extra probe.
 #[cfg(target_os = "windows")]
 pub fn poll_file_url(last_change_count: &mut i64) -> Option<PathBuf> {
+    // `poll_cf_hdrop` opens the one global Win32 clipboard; the reader thread
+    // may be writing into it at the same moment — see `set_file_url` below.
+    let _guard = wiredesk_core::clipboard_lock::hold();
+
     let current = wiredesk_core::file_clipboard::current_clipboard_seq() as i64;
     if current == *last_change_count {
         return None;
@@ -202,6 +212,11 @@ pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
         return Err(FileClipboardError::BadPath(path.display().to_string()));
     }
 
+    // clearContents and writeObjects must not be split by another thread's
+    // read, and no pasteboard call may run beside them at all — see
+    // `wiredesk_core::clipboard_lock`.
+    let _guard = wiredesk_core::clipboard_lock::hold();
+
     // SAFETY: `generalPasteboard`, `clearContents`, and `writeObjects` are
     // all safe to call off the main thread per NSPasteboard's docs. NSString
     // / NSURL construction is pure FFI without side effects.
@@ -233,6 +248,11 @@ pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
 #[cfg(target_os = "windows")]
 pub fn set_file_url(path: &Path) -> Result<(), FileClipboardError> {
     use wiredesk_core::file_clipboard::FileClipboardError as CoreError;
+
+    // Same reason as the macOS arm, different failure: the Win32 clipboard is
+    // one global handle, so a poll on the reader thread holding it turns this
+    // write into `ClipboardLocked` — a silently dropped paste.
+    let _guard = wiredesk_core::clipboard_lock::hold();
 
     wiredesk_core::file_clipboard::set_cf_hdrop(path).map_err(|e| match e {
         CoreError::BadPath(p) => FileClipboardError::BadPath(p),

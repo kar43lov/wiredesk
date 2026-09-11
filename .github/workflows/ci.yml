@@ -31,10 +31,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        # Single-threaded on purpose: the host package SIGABRTs on roughly
-        # half the parallel runs on macOS. Pre-existing, reproduces on a
-        # clean main — see docs/known-limitations.md.
-        run: cargo test --workspace -- --test-threads=1
+        # Parallel again since 2026-09-11. The host package used to SIGABRT on
+        # roughly half the runs here: three `session::tests` each opened a real
+        # system clipboard, and two concurrent pasteboard calls abort the
+        # process on macOS. Unit tests no longer touch the OS clipboard, and
+        # the calls that remain are serialised — `wiredesk_core::clipboard_lock`.
+        run: cargo test --workspace
 
   # The Windows-only paths (WindowsInjector, nwg UI, ConPTY, BLE GATT server,
   # and on the client side the WH_KEYBOARD_LL hook, the tray icon and

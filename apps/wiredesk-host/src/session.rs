@@ -143,7 +143,12 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             shell: None,
             warm: None,
             warm_enabled: true,
+            // Unit tests get a clipboard with no OS backend: see
+            // `ClipboardSync::new_for_test_with`.
+            #[cfg(not(test))]
             clipboard: ClipboardSync::with_counters_and_toggles(counters, receive_files),
+            #[cfg(test)]
+            clipboard: ClipboardSync::new_for_test_with(counters, receive_files),
             client_name: None,
             storm: StormCounter::new(DEFAULT_STORM_THRESHOLD),
         }

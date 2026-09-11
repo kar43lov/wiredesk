@@ -1,0 +1,12 @@
+# Every OS-clipboard call must go through the `locked_*` helpers in
+# apps/*/src/clipboard.rs, which hold `wiredesk_core::clipboard_lock`. Two
+# concurrent pasteboard calls abort the process on macOS — the host suite
+# SIGABRTed on roughly half of its parallel runs because of exactly this.
+# Those four helpers carry `#[allow(clippy::disallowed_methods)]`; they are
+# the only places that may name these methods.
+disallowed-methods = [
+    { path = "arboard::Clipboard::get_text", reason = "use locked_get_text — see wiredesk_core::clipboard_lock" },
+    { path = "arboard::Clipboard::get_image", reason = "use locked_get_image — see wiredesk_core::clipboard_lock" },
+    { path = "arboard::Clipboard::set_text", reason = "use locked_set_text — see wiredesk_core::clipboard_lock" },
+    { path = "arboard::Clipboard::set_image", reason = "use locked_set_image — see wiredesk_core::clipboard_lock" },
+]

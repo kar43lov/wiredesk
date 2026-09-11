@@ -24,6 +24,43 @@ use wiredesk_protocol::message::{Message, FORMAT_FILE, FORMAT_PNG_IMAGE, FORMAT_
 
 use crate::clipboard_files;
 
+/// The only four places that touch the OS clipboard.
+///
+/// Every one of them takes the process-wide lock from
+/// [`wiredesk_core::clipboard_lock`] first: the client polls the clipboard on
+/// one thread and commits incoming payloads on another, and two concurrent
+/// pasteboard calls abort the process on macOS (see that module for the
+/// measurement). Routing every call through these helpers is what keeps a new
+/// call site from quietly skipping the lock.
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_get_text(clip: &mut arboard::Clipboard) -> Result<String, arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.get_text()
+}
+
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_get_image(
+    clip: &mut arboard::Clipboard,
+) -> Result<arboard::ImageData<'static>, arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.get_image()
+}
+
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_set_text(clip: &mut arboard::Clipboard, text: String) -> Result<(), arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.set_text(text)
+}
+
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_set_image(
+    clip: &mut arboard::Clipboard,
+    img: arboard::ImageData<'_>,
+) -> Result<(), arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.set_image(img)
+}
+
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Per-chunk byte cap. Bumped 256 → 1024 with the BLE transport: u16
 /// chunk index gives 65535 max chunks, so chunk size sets the upper
@@ -382,7 +419,7 @@ fn build_offer_and_chunks(format: u8, payload: &[u8]) -> Vec<Message> {
 /// poll() probe precedence: text takes priority, then image, then file.
 fn stamp_initial(clip: Option<&mut arboard::Clipboard>) -> LastKind {
     if let Some(clip) = clip {
-        if let Ok(text) = clip.get_text() {
+        if let Ok(text) = locked_get_text(clip) {
             if !text.is_empty() {
                 log::info!(
                     "clipboard: pre-stamped existing text ({} bytes) — not sending on startup",
@@ -391,7 +428,7 @@ fn stamp_initial(clip: Option<&mut arboard::Clipboard>) -> LastKind {
                 return LastKind::Text(hash_text(&text));
             }
         }
-        if let Ok(img) = clip.get_image() {
+        if let Ok(img) = locked_get_image(clip) {
             log::info!(
                 "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
                 img.width,
@@ -608,6 +645,31 @@ impl ClipboardSync {
         }
     }
 
+    /// Test constructor that keeps the production counters and toggle but
+    /// leaves `clip` empty.
+    ///
+    /// `Session::new` builds its `ClipboardSync` through this, so no unit test
+    /// ever reaches the real system clipboard. That is not only hygiene — it
+    /// was the whole `wiredesk-host` suite's flake: three `session::tests`
+    /// each opened a clipboard and read it, libtest ran them on separate
+    /// threads, and concurrent pasteboard reads abort the process on macOS
+    /// (`wiredesk_core::clipboard_lock`). Reading the developer's actual
+    /// clipboard from a unit test is the other half of the reason.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with(
+        counters: ProgressCounters,
+        receive_files: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            incoming_progress: counters.incoming_progress,
+            incoming_total: counters.incoming_total,
+            outgoing_progress: counters.outgoing_progress,
+            outgoing_total: counters.outgoing_total,
+            receive_files,
+            ..Self::new_for_test()
+        }
+    }
+
     /// Test-only: redirect file commits to a caller-provided directory so
     /// tempdir-backed tests don't pollute the real `%TEMP%\WireDesk`. Mirror
     /// of the Mac client's `IncomingClipboard::set_cache_dir_override`.
@@ -710,7 +772,7 @@ impl ClipboardSync {
         // probe in the same tick would need LastKind split into
         // independent text and image hashes — deferred. See ignored
         // test `host_c3_rich_selection_image_dropped`.
-        match clip.get_text() {
+        match locked_get_text(clip) {
             Ok(text) if !text.is_empty() => {
                 let hash = hash_text(&text);
                 if matches!(self.last, LastKind::Text(h) if h == hash) {
@@ -756,7 +818,7 @@ impl ClipboardSync {
         // suppress a fresh file sync. Mirror of the Mac side's `'image:`
         // refactor in Task 6b.
         'image: {
-            let img = match clip.get_image() {
+            let img = match locked_get_image(clip) {
                 Ok(i) => i,
                 Err(_) => break 'image, // not an image
             };
@@ -1183,7 +1245,7 @@ impl ClipboardSync {
                 // re-send instead of suppressing forever.
                 let mut wrote_ok = self.clip.is_none(); // no backend (tests) → ok
                 if let Some(clip) = self.clip.as_mut() {
-                    match clip.set_text(text.clone()) {
+                    match locked_set_text(clip, text.clone()) {
                         Ok(()) => {
                             log::debug!("clipboard: wrote {} bytes from client", text.len());
                             wrote_ok = true;
@@ -1224,7 +1286,7 @@ impl ClipboardSync {
         // Codex iter3 E3: write OS clipboard FIRST, mark hash on success.
         let mut wrote_ok = self.clip.is_none();
         if let Some(clip) = self.clip.as_mut() {
-            match clip.set_image(img) {
+            match locked_set_image(clip, img) {
                 Ok(()) => {
                     log::debug!(
                         "clipboard: wrote image from client ({} encoded bytes)",
@@ -1420,6 +1482,43 @@ pub fn run_startup_vacuum(older_than: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reproduces the crash the `locked_*` helpers exist to prevent, and is
+    /// ignored because it needs a real window server and reads the machine's
+    /// actual clipboard (it never writes).
+    ///
+    /// Run it with `cargo test -p wiredesk-host -- --ignored
+    /// concurrent_clipboard_reads`. Through the helpers it passes; take the
+    /// `_guard` line out of `locked_get_text` and the process dies every time
+    /// — 3 runs of 3 by SIGSEGV inside `objc_msgSend`, and in other shapes by
+    /// SIGABRT with `fatal runtime error: Rust cannot catch foreign
+    /// exceptions` (measured 2026-09-11, macOS 15, arboard 3.6.1, the newest
+    /// release). That is the shape the client runs in production: the poll
+    /// thread holds a clipboard and reads it while every reconnect builds a
+    /// fresh `IncomingClipboard` on the reader thread.
+    #[test]
+    #[ignore = "needs a real OS clipboard; reads the developer's actual clipboard"]
+    fn concurrent_clipboard_reads_do_not_abort_the_process() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let Ok(mut clip) = arboard::Clipboard::new() else {
+                return;
+            };
+            while !stop_reader.load(Ordering::Relaxed) {
+                let _ = locked_get_text(&mut clip);
+            }
+        });
+
+        for _ in 0..400 {
+            if let Ok(mut clip) = arboard::Clipboard::new() {
+                let _ = locked_get_text(&mut clip);
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader thread panicked");
+    }
 
     /// Build a synthetic 4×4 RGBA buffer with deterministic content.
     fn synthetic_rgba_4x4() -> arboard::ImageData<'static> {
