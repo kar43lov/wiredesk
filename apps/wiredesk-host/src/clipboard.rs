@@ -62,12 +62,20 @@ fn locked_set_image(
 }
 
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// Per-chunk byte cap. Bumped 256 → 1024 with the BLE transport: u16
-/// chunk index gives 65535 max chunks, so chunk size sets the upper
-/// bound on any single transfer (1024 × 65535 ≈ 64 MB cap). Each chunk
-/// still fits in `MAX_PAYLOAD = 4096`. Text uses smaller chunks
-/// implicitly because text caps at 256 KB anyway.
-pub const CHUNK_SIZE: usize = 1024;
+/// Per-chunk byte cap: everything a `ClipChunk` can carry.
+///
+/// The payload of that message is the 2-byte chunk index followed by the
+/// data, so the data fills `MAX_PAYLOAD` minus those two bytes. It was 1024
+/// — a number chosen when the chunk had to fit a much smaller payload, and
+/// left behind when `MAX_PAYLOAD` grew to 4096; a megabyte image went as
+/// 1024 packets where 257 would do. Computed here rather than written out,
+/// because that is exactly how 1024 came to be wrong.
+///
+/// The index is a `u16`, so chunk size also sets the ceiling on a single
+/// transfer: 4094 × 65535 ≈ 256 MB, comfortably past the 20 MB file cap.
+/// Chunking is a sender-side decision — the peer reassembles by index and
+/// the offer's total length — so the two sides need not agree on it.
+pub const CHUNK_SIZE: usize = wiredesk_protocol::packet::MAX_PAYLOAD - 2;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // text cap
 /// Codex iter2 D3: Session::tick() blocks on `transport.send` for every
 /// message returned by `poll()` before reaching `transport.recv()`. A 1 MB
@@ -1482,6 +1490,40 @@ pub fn run_startup_vacuum(older_than: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunk size is derived from the protocol limit, so the derivation
+    /// has to stay true: one full chunk must encode, one byte more must not.
+    #[test]
+    fn a_full_chunk_is_the_largest_a_clip_chunk_can_carry() {
+        use wiredesk_protocol::packet::{Packet, MAX_PAYLOAD};
+        let full = Packet::new(
+            Message::ClipChunk {
+                index: 0,
+                data: vec![0xAB; CHUNK_SIZE],
+            },
+            0,
+        );
+        assert!(
+            full.to_bytes().is_ok(),
+            "a full chunk must fit the protocol"
+        );
+        let over = Packet::new(
+            Message::ClipChunk {
+                index: 0,
+                data: vec![0xAB; CHUNK_SIZE + 1],
+            },
+            0,
+        );
+        assert!(
+            over.to_bytes().is_err(),
+            "CHUNK_SIZE must be the largest that fits, not merely a safe one"
+        );
+        assert_eq!(
+            CHUNK_SIZE,
+            MAX_PAYLOAD - 2,
+            "index takes the other two bytes"
+        );
+    }
 
     /// Reproduces the crash the `locked_*` helpers exist to prevent, and is
     /// ignored because it needs a real window server and reads the machine's
