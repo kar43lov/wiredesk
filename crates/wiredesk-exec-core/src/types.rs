@@ -25,6 +25,10 @@ pub enum ExecEvent {
     /// Host shell terminated with this exit code (rare in `--exec` flow,
     /// the sentinel usually fires first; see PR #11 for context).
     ShellExit(i32),
+    /// Host confirmed the shell we asked it to close is gone. Carries no
+    /// status: it is an acknowledgement, not a result, and the runner
+    /// ignores it - a late one belongs to the *previous* command.
+    ShellClosed,
     /// Host emitted a `Message::Error` packet — typically benign log
     /// noise the runner records but doesn't act on.
     HostError(String),

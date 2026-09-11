@@ -216,21 +216,25 @@ impl SettingsWindow {
                 .flags(nwg::FrameFlags::VISIBLE | nwg::FrameFlags::BORDER)
                 .build(&mut s.connection_frame)?;
 
-            // Transport selector — picks between USB-Serial null-modem
-            // and Bluetooth LE GATT. Save+Restart applies the change.
-            // Bluetooth-specific tuning (peer name, MTU, service UUID,
-            // reconnect attempts) lives in config.toml under
-            // [bluetooth] — they rarely need editing day-to-day.
+            // Transport selector — USB-Serial null-modem, Bluetooth LE
+            // GATT or Bluetooth Classic (RFCOMM). Save+Restart applies the
+            // change. Bluetooth-specific tuning (peer name, MTU, service
+            // UUID, channel) lives in config.toml under [bluetooth] /
+            // [rfcomm] — it rarely needs editing day-to-day.
             nwg::Label::builder()
                 .text("Transport:")
                 .h_align(nwg::HTextAlign::Right)
                 .parent(&s.connection_frame)
                 .build(&mut s.transport_label)?;
-            let transport_options = vec!["USB-Serial".to_string(), "Bluetooth LE".to_string()];
-            let transport_idx = if config.transport == "bluetooth" {
-                Some(1usize)
-            } else {
-                Some(0usize)
+            let transport_options = vec![
+                "USB-Serial".to_string(),
+                "Bluetooth LE".to_string(),
+                "Bluetooth Classic (RFCOMM)".to_string(),
+            ];
+            let transport_idx = match config.transport.as_str() {
+                "bluetooth" => Some(1usize),
+                "rfcomm" => Some(2usize),
+                _ => Some(0usize),
             };
             nwg::ComboBox::builder()
                 .collection(transport_options)
@@ -355,8 +359,11 @@ impl SettingsWindow {
             } else {
                 nwg::CheckBoxState::Unchecked
             };
+            // The label names the privilege level on purpose: an autostart
+            // that comes up unelevated cannot click elevated windows, and
+            // that is precisely why this box went unticked for months.
             nwg::CheckBox::builder()
-                .text("Run on startup")
+                .text("Run on startup (as admin)")
                 .check_state(initial_check)
                 .parent(&s.system_frame)
                 .build(&mut s.autostart_check)?;
@@ -569,6 +576,7 @@ impl SettingsWindow {
         let receive_files = self.receive_files_check.check_state() == nwg::CheckBoxState::Checked;
         let transport = match self.transport_combo.selection() {
             Some(1) => "bluetooth".to_string(),
+            Some(2) => "rfcomm".to_string(),
             _ => "serial".to_string(),
         };
         Ok(HostConfig {
@@ -583,6 +591,7 @@ impl SettingsWindow {
             host_name: base.host_name.clone(),
             transport_fallback: base.transport_fallback.clone(),
             bluetooth: base.bluetooth.clone(),
+            rfcomm: base.rfcomm.clone(),
         })
     }
 

@@ -1,4 +1,172 @@
-# Bluetooth LE Transport (Plan C)
+# Bluetooth Transports
+
+Two Bluetooth options exist. **Use `transport = "rfcomm"`** (Bluetooth
+Classic, this section); the BLE transport further down is kept for
+reference and as a fallback where Classic RFCOMM is unavailable.
+
+## Bluetooth Classic (RFCOMM / SPP) — recommended
+
+> **Status 2026-09-11:** implemented on both sides, static checks green on
+> macOS and Windows (cross-compiled). **Live-verified only with probes** —
+> a Swift IOBluetooth client on the Mac against a Winsock `AF_BTH`
+> listener on the Win11 host, i.e. the exact API calls the transport
+> makes, but not yet the built `wiredesk-host.exe` / `WireDesk.app`
+> pair. First live run: rebuild the host on the Windows machine, flip both
+> configs, watch for `opened transport: rfcomm-…` in both logs.
+
+Measured on the reference pair (Mac M4 ↔ Win11 with Intel Wireless-AC 8265,
+Bluetooth 4.2), 256 KB each way, pattern-checked:
+
+| Metric                       | RFCOMM (probe)   | BLE (shipped)  | CH340 serial | FT232H @ 3 Mbaud |
+|------------------------------|------------------|----------------|--------------|------------------|
+| Throughput Win → Mac         | **~122 KB/s**    | ~4–5 KB/s      | ~11 KB/s     | ~300 KB/s        |
+| Throughput Mac → Win         | **~124–129 KB/s**| ~4–5 KB/s      | ~11 KB/s     | ~300 KB/s        |
+| Round-trip, 16-byte message  | p50 **10 ms**, p90 24 ms | —      | ~1 ms        | ~1 ms            |
+| First packet after 1 s idle  | 21 ms            | —              | —            | —                |
+| First packet after 3 s idle  | 82 ms (sniff mode) | —            | —            | —                |
+| Connect time                 | ~0.4 s           | scan + connect | instant      | instant          |
+
+Why Classic wins on this hardware: the host adapter is Bluetooth 4.2, so
+BLE has no 2M PHY and is paced per connection event through two high-level
+GATT stacks (WinRT notifications, CoreBluetooth writes), while Classic EDR
+streams 2–3 Mbit/s ACL packets with credit-based flow control. The 1 MB
+clipboard image that takes ~4 minutes on BLE takes ~9 s here.
+
+### How it works
+
+- **Host (Windows) = server.** `RfcommTransport` (`rfcomm/win.rs`) opens a
+  Winsock `AF_BTH` / `BTHPROTO_RFCOMM` socket, binds a channel (OS-picked
+  unless `rfcomm.channel` is set), publishes an SDP record under
+  `rfcomm.service_uuid` with `WSASetService`, and accepts one client. The
+  session thread sees `"recv timeout"` until someone connects — the same
+  idle behaviour as an unplugged serial port. A client hanging up surfaces
+  as a transport error, which the existing reopen loop handles (re-listen,
+  re-publish, backoff).
+- **Client (macOS) = client.** `rfcomm/mac.rs` on IOBluetooth: SDP query
+  of the host (`rfcomm.peer_address`, or every paired device, computers
+  first) → `getServiceRecordForUUID` → RFCOMM channel → async open →
+  stream. IOBluetooth delivers every callback on the **main run loop**, so
+  the transport signals worker threads through condvars and, if `open()`
+  happens to run on the main thread before the app loop is up, pumps
+  `CFRunLoopRunInMode` itself. (Sync open from a worker thread fails;
+  async open and `writeSync` from workers are fine — probed 2026-09-11.)
+- **Client (Windows)** is an ordinary Winsock RFCOMM client: SDP lookup via
+  `WSALookupService` (`lpszContext = "(XX:XX:…)"`), `connect` with timeout.
+  Unlike BLE, nothing collides with the host's role, so a Windows client
+  works over Bluetooth. `rfcomm.peer_address` is required there.
+- **Framing** is the serial COBS stream (`crates/wiredesk-transport/src/framing.rs`),
+  so the wire is byte-identical to the cable and a lone `0x00` is a legal
+  empty frame. The transport sends one every `rfcomm.keepalive_ms` (500) of
+  silence to keep the ACL link out of sniff mode — that is what turns the
+  82 ms first-packet latency into ~10 ms for mouse and keyboard.
+- **Security:** the listener sets `SO_BTH_AUTHENTICATE` + `SO_BTH_ENCRYPT`
+  (`rfcomm.require_encryption = true`), so Windows only accepts a paired,
+  encrypted peer — the RFCOMM counterpart of the BLE `EncryptionRequired`.
+
+### Setup
+
+1. Pair the two machines once (System Settings → Bluetooth on the Mac,
+   Settings → Bluetooth & devices on Win11). Pairing keys live in the OS.
+2. Win11: Settings window → Transport → **Bluetooth Classic (RFCOMM)** →
+   Save & Restart (or `transport = "rfcomm"` in `%APPDATA%\WireDesk\config.toml`).
+   Host log: `RFCOMM: listening on channel N, SDP record … published` and
+   `opened transport: rfcomm-server`.
+3. Mac: Settings → Transport → **Bluetooth Classic (RFCOMM)**. Optionally
+   fill *Host address* (`A0:B1:C2:D3:E4:F5` style — with several paired
+   computers this skips the SDP round on each). Save & Restart. Client log:
+   `RFCOMM: connected to <host name> [A0:B1:C2:D3:E4:F5], mtu 666`.
+
+```toml
+transport = "rfcomm"
+
+[rfcomm]
+service_uuid = "3d2df5cf-4f32-40c5-ab30-f1ccd6925b60"  # must match on both peers
+peer_address = ""          # client: host BT address, empty = any paired computer
+channel = 20               # fixed channel, same on both; 0 = SDP (macOS cannot read it)
+connect_timeout_secs = 15
+keepalive_ms = 500         # 0 = off
+require_encryption = true  # host: SO_BTH_AUTHENTICATE + SO_BTH_ENCRYPT
+```
+
+### Live status (2026-09-11)
+
+The first real run (Mac M4 / macOS 26 ↔ Win11, Intel 8265) only linked
+with **both sides on `channel = 20`**, which is why 20 is now the default.
+SDP does not work from this Mac at all: `performSDPQuery(_:uuids:)` never
+calls its delegate back, and the plain `performSDPQuery(_:)` returns in
+0 ms from a cache filled at pairing time — twelve stock records (CDP,
+A2DP, AVRCP, Device ID), none of them ours, whichever channel the host
+binds. So the client never learns the SDP-assigned number and the fixed
+channel is the supported path; `channel = 0` stays in the config for a
+peer whose SDP server does answer.
+
+**Pairing and encryption hold.** The host runs with the shipped default
+`require_encryption = true` (`SO_BTH_AUTHENTICATE` + `SO_BTH_ENCRYPT` on
+the listening socket) and the Mac connects through it, so the earlier
+connect timeout was the channel, not the secure-link options.
+
+**Measured on the real apps (2026-09-11, after the two fixes below):**
+
+| Path | Time |
+|---|---|
+| `wd --exec` round trip, trivial command | 0.8 s |
+| 48 KB command, Mac to host | 3.1 s |
+| 200 KB command, Mac to host | 4.5 s |
+| 1 MB of output, host to Mac | 15.9 s |
+
+Two things had to change to get there. `recv` polls every 10 ms rather
+than 250, because the host only forwards shell output and clipboard
+chunks between `recv` calls, so that interval paced the whole link (24
+KB/s at 250 ms). And the Windows reader no longer sets `SO_RCVTIMEO`:
+under load the Bluetooth provider answers a timed `recv` with
+`ERROR_IO_PENDING` (997) instead of `WSAETIMEDOUT`, which the host took
+for a fatal error and dropped the link on, every ~80 s of a large
+transfer. A dedicated reader thread now blocks in `recv` with no timeout
+and hands bytes over through a condvar.
+
+The remaining cost of a large `wd --exec` is not the radio at all -
+see the PowerShell note in `docs/wd-exec-usage.md`.
+
+**The bundled `WireDesk.app` still does not get the Bluetooth prompt.**
+It no longer hangs: `request_bluetooth_permission` (called from the
+eframe creator callback, i.e. on the main thread with AppKit already
+running) asks for the grant, and `ensure_bluetooth_authorized` fails the
+open immediately instead of blocking inside
+`IOBluetoothCoreBluetoothCoordinator`, so the link falls back to serial
+and retries. But macOS shows no prompt for this bundle and writes no row
+to `TCC.db`, with or without `tccutil reset BluetoothAlways
+dev.kar43lov.wiredesk`, and with or without a `scanForPeripherals` call
+to wake CoreBluetooth. Until that is understood, run the client binary
+from a terminal:
+
+```bash
+target/release/WireDesk.app/Contents/MacOS/wiredesk-client
+```
+
+which inherits the terminal's own Bluetooth grant and connects in ~0.6 s.
+
+### Troubleshooting
+
+- **`no SDP record for service …`** — the host is not running with
+  `transport = "rfcomm"`, or its SDP publish failed (host log `SDP register:
+  WSA error …`). Escape hatch: set the same `channel = 20` on both sides;
+  the client then skips SDP. Live 2026-09-11 this was the only way the
+  Mac found the host at all — see *Live status* above.
+- **`no Bluetooth device with address …`** — the address is not in the
+  Mac's paired list. Pair first; leave `peer_address` empty to search.
+- **Connect refused with `require_encryption`** — the pairing is stale on
+  one side. Remove the device on both machines and pair again.
+- **Mouse feels laggy after pauses** — `keepalive_ms` is 0. The default 500
+  keeps the link awake.
+- **Do not use the OS "Bluetooth serial port" COM ports / `/dev/cu.Bluetooth-Incoming-Port`.**
+  Probed 2026-09-11: the Mac's incoming SPP tty receives fine (110 KB/s)
+  but never transmits (1 KB buffer fills, then `EIO`), and Windows' legacy
+  incoming COM port does not publish an SDP record the Mac can see. The
+  transport talks to the RFCOMM APIs directly for exactly this reason.
+
+---
+
+## Bluetooth LE Transport (Plan C) — legacy fallback
 
 > **Status 2026-05-07:** infrastructure shipped end-to-end, but **the
 > performance goal was not met on the tested hardware**. Live testing
@@ -36,11 +204,14 @@ Mac M4 + Win11 reference setup, contrary to the brief's
 - ATT MTU isn't verified to actually negotiate up to 247 — could be
   much lower on this hardware combo.
 
-Realistic positioning: BLE is a **no-cable fallback** when serial is
-unavailable. For day-to-day use, keep `transport = "serial"`. For a
-real speed-up, wait on FT232H (Plan A) or a future tuning pass on
-the BLE crate (try `bluest` instead of `btleplug`, manual Connection
-Parameter Update Request, ATT MTU instrumentation).
+Realistic positioning: BLE is a **last-resort fallback**. For a no-cable
+link use `transport = "rfcomm"` (Bluetooth Classic, ~25× faster on the
+same radios — see the top of this document); for the fastest link, FT232H
+(Plan A). Root causes on this pair, established 2026-09-11: the host's
+Intel 8265 is Bluetooth 4.2 (no 2M PHY), the connection interval is
+chosen by macOS and cannot be requested from a WinRT peripheral, and
+WinRT `NotifyValueAsync` completes per notification — none of which a
+tuning pass on the crate can change.
 
 ## One-time pairing
 

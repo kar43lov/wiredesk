@@ -1,5 +1,5 @@
-//! Transport factory — picks `SerialTransport` or `BluetoothLeTransport`
-//! based on a runtime config string. Runs an optional fallback if the
+//! Transport factory — picks `SerialTransport`, `BluetoothLeTransport` or
+//! `RfcommTransport` based on a runtime config string. Runs an optional fallback if the
 //! primary transport fails to open. Lives in `wiredesk-transport` so both
 //! `wiredesk-host` and `wiredesk-client` can share it without duplicating
 //! the logic.
@@ -7,6 +7,7 @@
 use wiredesk_core::error::{Result, WireDeskError};
 
 use crate::bluetooth::{BluetoothFactoryConfig, BluetoothLeTransport};
+use crate::rfcomm::{RfcommFactoryConfig, RfcommTransport};
 use crate::serial::SerialTransport;
 use crate::transport::Transport;
 
@@ -30,10 +31,11 @@ pub struct TransportConfig {
     pub transport: String,
     pub serial: SerialFactoryConfig,
     pub bluetooth: BluetoothFactoryConfig,
+    pub rfcomm: RfcommFactoryConfig,
     pub fallback: Option<String>,
 }
 
-/// Open the configured transport. On `transport == "bluetooth"` failure and
+/// Open the configured transport. On `"bluetooth"` / `"rfcomm"` failure and
 /// `fallback == Some("serial")`, log a warning and try the serial path. The
 /// caller (apps' main.rs) is responsible for surfacing the final error if
 /// both attempts fail.
@@ -43,29 +45,53 @@ pub fn open_transport(cfg: &TransportConfig) -> Result<Box<dyn Transport>> {
             let t = SerialTransport::open(&cfg.serial.port, cfg.serial.baud)?;
             Ok(Box::new(t))
         }
-        "bluetooth" => match BluetoothLeTransport::open(&cfg.bluetooth) {
-            Ok(t) => Ok(Box::new(t)),
-            Err(primary_err) => {
-                if cfg.fallback.as_deref() == Some("serial") {
-                    log::warn!(
-                        "bluetooth transport failed ({primary_err}); falling back to serial"
-                    );
-                    let t = SerialTransport::open(&cfg.serial.port, cfg.serial.baud)?;
-                    Ok(Box::new(t))
-                } else {
-                    Err(primary_err)
-                }
-            }
-        },
+        "bluetooth" => {
+            with_serial_fallback(cfg, "bluetooth", BluetoothLeTransport::open(&cfg.bluetooth))
+        }
+        "rfcomm" => with_serial_fallback(cfg, "rfcomm", RfcommTransport::open(&cfg.rfcomm)),
         other => Err(WireDeskError::Transport(format!(
-            "unknown transport '{other}' (expected 'serial' or 'bluetooth')"
+            "unknown transport '{other}' (expected 'serial', 'bluetooth' or 'rfcomm')"
         ))),
+    }
+}
+
+/// Box a successfully opened primary transport, or — when the config names
+/// `"serial"` as the fallback — open the serial port instead of failing.
+fn with_serial_fallback<T: Transport + 'static>(
+    cfg: &TransportConfig,
+    label: &str,
+    primary: Result<T>,
+) -> Result<Box<dyn Transport>> {
+    match primary {
+        Ok(t) => Ok(Box::new(t)),
+        Err(primary_err) => {
+            if cfg.fallback.as_deref() == Some("serial") {
+                log::warn!("{label} transport failed ({primary_err}); falling back to serial");
+                let t = SerialTransport::open(&cfg.serial.port, cfg.serial.baud)?;
+                Ok(Box::new(t))
+            } else {
+                Err(primary_err)
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rfcomm::RfcommRole;
+
+    fn rfcomm_cfg() -> RfcommFactoryConfig {
+        RfcommFactoryConfig {
+            service_uuid: "00000000-0000-4000-8000-000000000002".to_string(),
+            peer_address: "00:00:00:00:00:00".to_string(),
+            channel: 0,
+            connect_timeout_secs: 1,
+            keepalive_ms: 0,
+            require_encryption: true,
+            role: RfcommRole::Connect,
+        }
+    }
 
     fn bt_cfg() -> BluetoothFactoryConfig {
         // Definitely-not-our-real-service UUID — keeps tests deterministic
@@ -103,6 +129,7 @@ mod tests {
             transport: "ftdi".to_string(),
             serial: serial_cfg_invalid(),
             bluetooth: bt_cfg(),
+            rfcomm: rfcomm_cfg(),
             fallback: None,
         };
         let err = expect_err(open_transport(&cfg));
@@ -121,6 +148,7 @@ mod tests {
             transport: "".to_string(),
             serial: serial_cfg_invalid(),
             bluetooth: bt_cfg(),
+            rfcomm: rfcomm_cfg(),
             fallback: None,
         };
         let err = expect_err(open_transport(&cfg));
@@ -137,6 +165,7 @@ mod tests {
             transport: "serial".to_string(),
             serial: serial_cfg_invalid(),
             bluetooth: bt_cfg(),
+            rfcomm: rfcomm_cfg(),
             fallback: None,
         };
         let err = expect_err(open_transport(&cfg));
@@ -172,6 +201,7 @@ mod tests {
             transport: "bluetooth".to_string(),
             serial: serial_cfg_invalid(),
             bluetooth: bt_cfg(),
+            rfcomm: rfcomm_cfg(),
             fallback: None,
         };
         let err = expect_err(open_transport(&cfg));
@@ -200,6 +230,7 @@ mod tests {
             transport: "bluetooth".to_string(),
             serial: serial_cfg_invalid(),
             bluetooth: bt_cfg(),
+            rfcomm: rfcomm_cfg(),
             fallback: Some("serial".to_string()),
         };
         let err = expect_err(open_transport(&cfg));
@@ -223,6 +254,7 @@ mod tests {
             transport: "bluetooth".to_string(),
             serial: serial_cfg_invalid(),
             bluetooth: bt_cfg(),
+            rfcomm: rfcomm_cfg(),
             fallback: Some("ftdi".to_string()),
         };
         let err = expect_err(open_transport(&cfg));

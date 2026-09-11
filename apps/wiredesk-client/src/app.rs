@@ -685,15 +685,16 @@ impl WireDeskApp {
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Connection").strong());
 
-                // Transport selector — picks between USB-Serial null-modem
-                // and the Bluetooth LE Central. Changes take effect after
-                // Save+Restart (no live transport switch — Save+Restart
+                // Transport selector — USB-Serial null-modem, Bluetooth LE
+                // Central or Bluetooth Classic (RFCOMM). Changes take effect
+                // after Save+Restart (no live transport switch — Save+Restart
                 // pattern, matches the rest of the panel).
                 ui.horizontal(|ui| {
                     ui.label("Transport:");
                     egui::ComboBox::from_id_salt("settings_transport")
                         .selected_text(match cfg.transport.as_str() {
                             "bluetooth" => "Bluetooth LE",
+                            "rfcomm" => "Bluetooth Classic (RFCOMM)",
                             _ => "USB-Serial",
                         })
                         .show_ui(ui, |ui| {
@@ -711,8 +712,60 @@ impl WireDeskApp {
                                 cfg.transport = "bluetooth".to_string();
                                 dirty = true;
                             }
+                            if ui
+                                .selectable_label(
+                                    cfg.transport == "rfcomm",
+                                    "Bluetooth Classic (RFCOMM)",
+                                )
+                                .clicked()
+                            {
+                                cfg.transport = "rfcomm".to_string();
+                                dirty = true;
+                            }
                         });
                 });
+
+                if cfg.transport == "rfcomm" {
+                    // Bluetooth Classic — host address (empty = any paired
+                    // computer that publishes the WireDesk service) and the
+                    // RFCOMM channel (0 = look it up over SDP). service_uuid
+                    // and keepalive stay in config.toml.
+                    ui.horizontal(|ui| {
+                        ui.label("Host address:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut cfg.rfcomm.peer_address)
+                                    .desired_width(220.0)
+                                    .hint_text("empty = any paired computer"),
+                            )
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Channel (same on both, 0 = SDP):");
+                        let mut ch_str = cfg.rfcomm.channel.to_string();
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut ch_str).desired_width(60.0))
+                            .changed()
+                        {
+                            if let Ok(v) = ch_str.parse::<u8>() {
+                                if v <= 30 {
+                                    cfg.rfcomm.channel = v;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Pair Mac↔Win11 once via System Settings → Bluetooth, and run the host with transport = \"rfcomm\". ~120 KB/s, ~10 ms round-trip. Channel 0 would ask the host SDP server for the number, which macOS cannot read, so keep the fixed default.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                }
 
                 if cfg.transport == "bluetooth" {
                     // Bluetooth LE — minimal UX: show peer name and
@@ -2217,6 +2270,13 @@ impl eframe::App for WireDeskApp {
                             self.pending_config.bluetooth.peer_name.clone()
                         };
                         ui.label(format!("Bluetooth: {peer}"));
+                    } else if self.pending_config.transport == "rfcomm" {
+                        let peer = if self.pending_config.rfcomm.peer_address.is_empty() {
+                            "(any paired host)".to_string()
+                        } else {
+                            self.pending_config.rfcomm.peer_address.clone()
+                        };
+                        ui.label(format!("Bluetooth Classic: {peer}"));
                     } else {
                         ui.label(format!("Serial: {}", self.runtime_serial_port));
                     }

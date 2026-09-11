@@ -9,6 +9,29 @@ use flate2::read::GzDecoder;
 
 use crate::types::{ExecError, ShellKind};
 
+/// Close a PowerShell payload that spans more than one line.
+///
+/// PowerShell's console host reads stdin the way it reads a keyboard: an
+/// unfinished construct puts it into continuation mode (the `>>` prompt),
+/// and it stays there until it sees an **empty line** - closing the braces
+/// is not enough. Fed through a pipe, a multi-line `wd --exec` therefore
+/// used to sit in that buffer forever: no output, no sentinel, and the run
+/// ended at its timeout (live probe 2026-09-11 on Win11: the same payload
+/// executed the moment a blank line followed it and produced nothing at
+/// all without one).
+///
+/// Only for payloads that actually contain a line break. A single-line one
+/// executes on its own newline, and an extra blank line there would just
+/// make PowerShell echo one more prompt.
+fn terminate_multiline_ps(payload: String) -> String {
+    if payload.trim_end_matches('\n').contains('\n') {
+        let mut p = payload;
+        p.push('\n');
+        return p;
+    }
+    payload
+}
+
 /// Build the `<command>; <emit-sentinel>` payload for the runner.
 ///
 /// PowerShell variant:
@@ -41,9 +64,15 @@ pub fn format_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) -> String {
         // stream, returns control, and the catch block never fires —
         // `$LASTEXITCODE` stays 0 → `--exec` returns 0 for an
         // obviously-failed command (the original AC2a regression).
-        ShellKind::PowerShell => format!(
-            "$LASTEXITCODE=0; $ErrorActionPreference='Stop'; try {{ {cmd} }} catch {{ $LASTEXITCODE=1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
-        ),
+        //
+        // The READY marker in front is the same sandwich the Bash and the
+        // `--compress` paths use, and it is what lets the caller stop
+        // waiting out a quiet window before it sends this line: anything
+        // the shell printed before READY is pre-command noise by
+        // definition, so it can be dropped on sight instead of timed out.
+        ShellKind::PowerShell => terminate_multiline_ps(format!(
+            "$LASTEXITCODE=0; $ErrorActionPreference='Stop'; Write-Output \"__WD_READY_{uuid}__\"; try {{ {cmd} }} catch {{ $LASTEXITCODE=1 }}; \"__WD_DONE_{uuid}__$LASTEXITCODE\"\n"
+        )),
         // Bash sandwich: READY marker BEFORE the command and DONE
         // sentinel AFTER. READY is the lower-bound that lets
         // clean_stdout slice off MOTD / SSH banner / prompt fragments.
@@ -218,6 +247,16 @@ pub fn is_powershell_prompt(line: &str) -> bool {
     s.ends_with('>')
 }
 
+/// `true` when `line` is a PowerShell *continuation* prompt - the `>>` the
+/// console host prints for every line of a construct it has not finished
+/// reading, and for the blank line that finally closes it.
+///
+/// These carry the echo of our own payload, so they only ever appear ahead
+/// of the READY marker, and only the pre-READY filter uses this.
+pub fn is_powershell_continuation(line: &str) -> bool {
+    line.trim_end_matches('\r').starts_with(">>")
+}
+
 /// `true` when `line` looks like a remote shell prompt (the kind that
 /// follows a successful `ssh -tt` hop). Recognises the common endings:
 /// `$ ` (plain bash), `# ` (root bash), and Starship's `➜` glyph.
@@ -260,7 +299,7 @@ pub fn format_compressed_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) 
         ShellKind::Bash => format!(
             "echo __WD_READY_{uuid}__; {{ {cmd} 2>&1; printf \"__WD_RC__%s__\\n\" \"$?\"; }} | gzip -c | base64; echo; echo \"__WD_DONE_{uuid}__0\"\n"
         ),
-        ShellKind::PowerShell => format!(
+        ShellKind::PowerShell => terminate_multiline_ps(format!(
             "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
              Write-Output \"__WD_READY_{uuid}__\"; \
              $LASTEXITCODE=0; $ErrorActionPreference='Stop'; \
@@ -272,7 +311,7 @@ pub fn format_compressed_command(uuid: &uuid::Uuid, kind: ShellKind, cmd: &str) 
              $gz.Write($bytes, 0, $bytes.Length); $gz.Close(); \
              Write-Output ([Convert]::ToBase64String($ms.ToArray())); \
              Write-Output \"__WD_DONE_{uuid}__0\"\n"
-        ),
+        )),
     }
 }
 
@@ -354,6 +393,16 @@ pub fn decode_compressed_stream(input: &str) -> Result<Vec<u8>, ExecError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn continuation_prompts_are_recognised() {
+        assert!(is_powershell_continuation(">> "));
+        assert!(is_powershell_continuation(">> echo two }"));
+        assert!(is_powershell_continuation(">>\r"));
+        assert!(!is_powershell_continuation("PS C:\\Users\\User>"));
+        assert!(!is_powershell_continuation("ordinary output"));
+        assert!(!is_powershell_continuation("  >> indented is not a prompt"));
+    }
     use super::*;
     use crate::types::ShellKind;
 
@@ -489,6 +538,44 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_powershell_payload_ends_with_a_blank_line() {
+        // PowerShell's console host stays in continuation mode until it
+        // sees an empty line, so without this the payload sits in its
+        // input buffer and the run dies at its timeout with no output.
+        let uuid = uuid::Uuid::nil();
+        let single = format_command(&uuid, ShellKind::PowerShell, "echo hi");
+        assert!(
+            single.ends_with("\"\n"),
+            "single line ends on its own newline: {single:?}"
+        );
+        assert!(
+            !single.ends_with("\n\n"),
+            "and gains no blank line: {single:?}"
+        );
+
+        let multi = format_command(&uuid, ShellKind::PowerShell, "echo one\necho two");
+        assert!(
+            multi.ends_with("\n\n"),
+            "multi-line must be closed by a blank line: {multi:?}"
+        );
+
+        // Same rule in --compress mode, where the wrapper is one long line
+        // until the user's own command breaks it.
+        let c_single = format_compressed_command(&uuid, ShellKind::PowerShell, "echo hi");
+        assert!(!c_single.ends_with("\n\n"));
+        let c_multi = format_compressed_command(&uuid, ShellKind::PowerShell, "echo one\necho two");
+        assert!(c_multi.ends_with("\n\n"));
+
+        // Bash needs nothing of the kind - a blank line there is just an
+        // extra prompt.
+        let b = format_command(&uuid, ShellKind::Bash, "echo one\necho two");
+        assert!(
+            !b.ends_with("\n\n"),
+            "bash payload must be left alone: {b:?}"
+        );
+    }
+
+    #[test]
     fn format_command_preserves_inline_json_quotes_powershell() {
         // Probe (2026-05-05, brief wd-exec-payload-quoting):
         // Real prod-symptom — ES `_search` with nested bool/filter
@@ -507,14 +594,14 @@ mod tests {
 
         let cmd_quote_count = cmd.matches('"').count();
         let out_quote_count = out.matches('"').count();
-        // format_command adds exactly 2 quotes for the sentinel emit
-        // (`"__WD_DONE_<uuid>__$LASTEXITCODE"`); everything else must
-        // be a verbatim copy of the user cmd.
+        // format_command adds exactly 4 quotes of its own: two around the
+        // READY marker and two around the sentinel emit. Everything else
+        // must be a verbatim copy of the user cmd.
         assert_eq!(
             out_quote_count - cmd_quote_count,
-            2,
+            4,
             "format_command must preserve every `\"` from the user cmd verbatim, \
-             only adding 2 for the sentinel emit. cmd={cmd:?} out={out:?}"
+             only adding 2 for READY and 2 for the sentinel emit. cmd={cmd:?} out={out:?}"
         );
         assert!(
             out.contains(cmd),

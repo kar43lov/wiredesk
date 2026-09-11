@@ -430,19 +430,24 @@ fn handle_connection(
         return;
     }
 
-    // Drain the PS startup banner so it doesn't pollute the runner's
-    // stdout. Win11 host emits the banner + initial prompt within
-    // ~100–300 ms of ShellOpen; we drain for 500 ms to be safe. Each
-    // drained event is silently discarded — the runner's phase tracker
-    // would have to filter them anyway, and the PS-only path now
-    // streams from the first event so any leftover noise would leak.
-    let drain_until = std::time::Instant::now() + Duration::from_millis(500);
-    while let Some(remaining) = drain_until.checked_duration_since(std::time::Instant::now()) {
-        match event_rx.recv_timeout(remaining) {
-            Ok(_ev) => continue,
-            Err(_) => break,
-        }
-    }
+    // Throw away anything already queued from before this handler existed,
+    // then send the command immediately. Each drained event is silently
+    // discarded.
+    //
+    // This step used to *wait*: a flat 500 ms on every `wd --exec`, later a
+    // 120 ms quiet window, and that wait was most of what a command cost -
+    // measured live 2026-09-11, the shell plus the command itself came to
+    // ~170 ms, so the pause was the largest single item in the budget.
+    //
+    // Waiting is unnecessary because the payload marks its own beginning.
+    // Every wrapper `format_command` builds now opens with the READY
+    // marker, and the runner drops every line up to it, so PowerShell
+    // startup noise and a stray prompt are discarded by construction
+    // rather than by having been timed out first. Ordering is safe too:
+    // `ShellOpen` and `ShellInput` travel the same ordered stream and the
+    // host spawns the shell inside the `ShellOpen` arm, so the input can
+    // never arrive at a host that has no shell yet.
+    while let Ok(_ev) = event_rx.try_recv() {}
 
     let mut transport = IpcExecTransport {
         outgoing_tx: outgoing_tx.clone(),
@@ -491,6 +496,7 @@ fn handle_connection(
     // Final terminal frame on the original stream. Client may have
     // already disconnected — that's fine, we still complete cleanly
     // so the inflight guard unlocks.
+    let sentinel_seen = result.is_ok();
     let final_frame = match result {
         Ok(code) => {
             log::info!("IPC handler: exit code {code}");
@@ -539,12 +545,27 @@ fn handle_connection(
     // subsequent `wd --exec` failed timeout until we manually waited
     // through that window.
     //
-    // Strategy: poll for events with a 2 s idle deadline. Each event
-    // received resets the deadline; ShellExit short-circuits. If no event
-    // for 2 s straight, we treat the wire as quiet and return. Hard cap
-    // at SHELL_KILL_GRACE_MAX so a host that never emits ShellExit can't
-    // hold the next client hostage indefinitely.
-    const POST_RUN_IDLE: Duration = Duration::from_secs(2);
+    // Strategy: poll for events with an idle deadline. Each event received
+    // resets the deadline; ShellExit short-circuits. Once nothing has
+    // arrived for a whole deadline we treat the wire as quiet and return.
+    // Hard cap at SHELL_KILL_GRACE_MAX so a host that never emits ShellExit
+    // can't hold the next client hostage indefinitely.
+    //
+    // The deadline depends on how the run ended, because that is what says
+    // whether leftovers are plausible. A run that reached its sentinel is
+    // done by construction - the sentinel is the last thing the payload
+    // prints - so the only thing that can still arrive is a prompt
+    // fragment, and a short wait settles it. A run that timed out or died
+    // on a transport error is the dangerous one (the 407 KB case above),
+    // and keeps the full budget.
+    //
+    // This is pure latency for anything scripted, so it is worth keeping
+    // short: a successful run used to pay the whole 2 s and the next command
+    // queued behind it (`queued 2.0s behind another wd --exec` in the client
+    // log). Since 2026-09-11 the host answers `ShellClose` with a
+    // `ShellExit`, so the usual outcome is one round trip and the idle
+    // budget below is only the fallback for a host that predates that.
+    let post_run_idle = post_run_idle(sentinel_seen);
     const SHELL_KILL_GRACE_MAX: Duration = Duration::from_secs(30);
     let drain_started = std::time::Instant::now();
     let mut drained_events: u32 = 0;
@@ -557,8 +578,12 @@ fn handle_connection(
             );
             break;
         }
-        match transport.rx.recv_timeout(POST_RUN_IDLE) {
-            Ok(wiredesk_exec_core::ExecEvent::ShellExit(_)) => {
+        match transport.rx.recv_timeout(post_run_idle) {
+            // The acknowledgement we are actually waiting for. A real
+            // `ShellExit` also ends the wait: the shell died on its own and
+            // there is nothing left to come.
+            Ok(wiredesk_exec_core::ExecEvent::ShellClosed)
+            | Ok(wiredesk_exec_core::ExecEvent::ShellExit(_)) => {
                 got_exit = true;
                 break;
             }
@@ -571,11 +596,29 @@ fn handle_connection(
     }
     if drained_events > 0 || got_exit {
         log::info!(
-            "IPC: post-cleanup drain: events_drained={} shell_exit={} elapsed={:?}",
+            "IPC: post-cleanup drain: events_drained={} shell_exit={} idle_budget={:?} elapsed={:?}",
             drained_events,
             got_exit,
+            post_run_idle,
             drain_started.elapsed()
         );
+    }
+}
+
+/// Idle budget the post-run drain waits out before declaring the wire
+/// quiet. See the call site for why the two cases differ.
+fn post_run_idle(sentinel_seen: bool) -> Duration {
+    if sentinel_seen {
+        // Only reached against a host that doesn't answer `ShellClose`;
+        // a current one short-circuits this on its `ShellClosed`. Long enough
+        // to swallow a trailing prompt fragment on a link whose worst
+        // measured packet latency is ~85 ms (Bluetooth Classic, 2026-09-11),
+        // short enough not to be felt between commands. Late leftovers are
+        // not lost either way: the next command drains its own quiet window
+        // before it starts.
+        Duration::from_millis(150)
+    } else {
+        Duration::from_secs(2)
     }
 }
 
@@ -851,6 +894,11 @@ fn handle_interactive_connection(
                 }
                 break;
             }
+            // Acknowledgement of somebody's `ShellClose` - possibly this
+            // session's own teardown, possibly a leftover from an earlier
+            // one. Either way it says nothing about the shell this relay is
+            // streaming, so it is not forwarded and does not end the loop.
+            Ok(ExecEvent::ShellClosed) => {}
             Ok(ExecEvent::HostError(msg)) => {
                 // A host shell error on the interactive path is terminal: the
                 // only `Message::Error`s the reader fans in here are shell-open
@@ -896,6 +944,17 @@ fn handle_interactive_connection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_finished_run_does_not_hold_the_next_command_for_two_seconds() {
+        // The host never answers ShellClose, so this budget is paid in
+        // full on every successful run and the next wd --exec queues
+        // behind it. A run that reached its sentinel has nothing left to
+        // emit; only a failed one might still be streaming.
+        assert!(post_run_idle(true) <= Duration::from_millis(300));
+        assert!(post_run_idle(true) >= Duration::from_millis(100));
+        assert_eq!(post_run_idle(false), Duration::from_secs(2));
+    }
+
     use super::*;
     use std::os::unix::net::UnixStream;
     use wiredesk_exec_core::ipc::{read_request, write_connect, write_request, IpcRequest};
@@ -1048,13 +1107,18 @@ mod tests {
             let end = after.find("__").unwrap();
             let uuid = &after[..end];
 
-            // Stage: prompt → output → sentinel.
+            // Stage: prompt → READY → output → sentinel. The prompt is
+            // there to be dropped: the runner stays muted until READY.
             let stage = |slot: &ExecEventSlot, ev: ExecEvent| {
                 if let Some(tx) = slot.lock().unwrap().as_ref() {
                     let _ = tx.send(ev);
                 }
             };
             stage(&stage_slot, ExecEvent::ShellOutput(b"PS C:\\>\n".to_vec()));
+            stage(
+                &stage_slot,
+                ExecEvent::ShellOutput(format!("__WD_READY_{uuid}__\n").into_bytes()),
+            );
             stage(&stage_slot, ExecEvent::ShellOutput(b"hi\n".to_vec()));
             stage(
                 &stage_slot,
@@ -1825,6 +1889,11 @@ mod tests {
                     }
                 };
                 stage(ExecEvent::ShellOutput(b"PS C:\\>\n".to_vec()));
+                // READY opens every wrapper the runner builds, and the
+                // sentinel is only honoured after it.
+                stage(ExecEvent::ShellOutput(
+                    format!("__WD_READY_{uuid}__\n").into_bytes(),
+                ));
                 stage(ExecEvent::ShellOutput(b"hi\n".to_vec()));
                 stage(ExecEvent::ShellOutput(
                     format!("__WD_DONE_{uuid}__0\n").into_bytes(),

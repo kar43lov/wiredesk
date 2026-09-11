@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 wiredesk-core.workspace = true
 wiredesk-protocol.workspace = true
+uuid.workspace = true
 wiredesk-transport.workspace = true
 thiserror.workspace = true
 log.workspace = true

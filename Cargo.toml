@@ -38,6 +38,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 async-trait = "0.1"
 futures = "0.3"
 
+# Bluetooth Classic (RFCOMM) transport — Winsock AF_BTH on Windows, IOBluetooth on macOS
+socket2 = "0.6"
+objc2-io-bluetooth = "0.3"
+objc2-core-foundation = "0.3"
+
 # Windows API bindings — union of features used by host (Win32 input/registry/threading),
 # client (display enumeration, per-monitor DPI, low-level keyboard hook, tray icon)
 # and transport (Devices_Bluetooth_* for BLE Peripheral GATT server). Cargo unifies
@@ -56,6 +61,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_Networking_WinSock",
+    "Win32_Devices_Bluetooth",
+    "Win32_System_Com",
     "Devices_Bluetooth",
     "Devices_Bluetooth_GenericAttributeProfile",
     "Devices_Bluetooth_Advertisement",

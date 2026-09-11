@@ -29,7 +29,7 @@ You have two computers side by side. One runs Windows with security software ("C
 
 ## Solution
 
-WireDesk sends keyboard/mouse input and clipboard data over either a **USB-Serial null-modem** (default; ~11 KB/s on CH340 @ 115200, or **up to ~300 KB/s on FT232H @ 3 Mbaud** — verified live, only the `baud` setting changes) or a **Bluetooth LE** link (live-measured ~4-5 KB/s — slower than serial, kept as a no-cable fallback; see [`docs/bluetooth-transport.md`](docs/bluetooth-transport.md)). Video comes separately through an HDMI capture card viewed in QuickTime or VLC.
+WireDesk sends keyboard/mouse input and clipboard data over either a **USB-Serial null-modem** (default; ~11 KB/s on CH340 @ 115200, or **up to ~300 KB/s on FT232H @ 3 Mbaud** — verified live, only the `baud` setting changes) or **Bluetooth** — **Bluetooth Classic / RFCOMM** (`transport = "rfcomm"`, ~120 KB/s each way and ~10 ms round-trip, live-verified on the reference pair) or the older **Bluetooth LE** link (~4-5 KB/s, kept as a fallback); see [`docs/bluetooth-transport.md`](docs/bluetooth-transport.md). Video comes separately through an HDMI capture card viewed in QuickTime or VLC.
 
 ```
 Host (Windows 11)                       Client (macOS or Windows)
@@ -92,6 +92,7 @@ What that means per transport:
 
 - **Serial (default).** Trust rests on physical access to the cable. Someone who can reach the null-modem wiring could already reach the keyboard, so this is an acceptable trade — but it does mean an unattended machine with the cable exposed is an unattended machine, full stop.
 - **Bluetooth LE (opt-in).** Radio range replaces cable reach, so the missing application-level authentication has to be made up at the link layer: the GATT characteristics are published as `EncryptionRequired`, which makes Windows insist the peers pair before any data flows. Until 2026-09 they were `Plain`, and the RX characteristic — the inbound direction, the one carrying input events and shell input — had no protection level at all, so anything in range that knew the service UUID (a constant in this repository) could drive the host. Set `bluetooth.require_encryption = false` in `config.toml` to get the old behaviour back where pairing is impractical; the host logs a warning when you do. Peer matching is still by service UUID alone (`peer_name` is advisory), so it is the encryption, not the name, that identifies who you are talking to.
+- **Bluetooth Classic / RFCOMM (opt-in).** Same idea, one layer down: the host’s listening socket sets `SO_BTH_AUTHENTICATE` and `SO_BTH_ENCRYPT`, so Windows accepts only a paired peer over an encrypted ACL link — verified live 2026-09-11. `rfcomm.require_encryption = false` lifts that (logged as a warning). Pairing is what identifies the peer: the service UUID is a constant in this repository, and the channel number is configuration.
 
 Files arriving over the clipboard are written into a cache directory (`~/Library/Caches/WireDesk/`, `%TEMP%\WireDesk\`) with the basename sanitized against path traversal and NTFS device names, so a hostile peer cannot choose where they land — but it can still place arbitrary bytes there, and the receiving side then points the OS clipboard at them.
 
@@ -226,7 +227,7 @@ Differences from the Mac client, all of them consequences of the platform:
 | Toggle fullscreen | `Cmd+Enter` | `Ctrl+Enter` |
 | Status area | menu bar item, progress shown as text | tray icon, progress shown in the tooltip |
 | Files on the clipboard | `NSPasteboard` file URL | `CF_HDROP` |
-| Transport | serial or BLE | serial only |
+| Transport | serial, BLE or RFCOMM | serial or RFCOMM (no BLE) |
 | `wd` / `wd --exec` | yes | not yet |
 
 Settings and logs live in `%APPDATA%\WireDesk\` — same layout as the host,
@@ -354,7 +355,7 @@ Default baud rate 115200 (~11 KB/s on CH340) — rock-solid for mouse+keyboard (
 crates/
   wiredesk-core        — error types, shared types, CF_HDROP file clipboard (shared by host and Windows client)
   wiredesk-protocol    — packet format, messages, COBS, CRC-16
-  wiredesk-transport   — Transport trait, SerialTransport, MockTransport, detect (USB VID classification, shared by host's Detect button and `wd`'s auto-resolve)
+  wiredesk-transport   — Transport trait, SerialTransport, BluetoothLeTransport, RfcommTransport (+ shared COBS stream framing), MockTransport, detect (USB VID classification, shared by host's Detect button and `wd`'s auto-resolve)
   wiredesk-exec-core   — shared sentinel-runner + ExecTransport trait for `wd --exec` (used by term and client)
 apps/
   wiredesk-host        — Windows agent (Session + InputInjector + shell subprocess)
@@ -371,14 +372,14 @@ fixed rather than things that are missing.
 
 | Component | Tests |
 |---|--:|
-| `wiredesk-client` (GUI, input, clipboard) | 356 |
-| `wiredesk-host` (Windows agent) | 151 |
-| `wiredesk-exec-core` (shared `wd --exec` runner) | 100 |
+| `wiredesk-client` (GUI, input, clipboard) | 357 |
+| `wiredesk-host` (Windows agent) | 178 |
+| `wiredesk-exec-core` (shared `wd --exec` runner) | 107 |
 | `wiredesk-protocol` (framing, COBS, CRC-16) | 88 |
-| `wiredesk-transport` (serial, BLE, port detection) | 51 |
+| `wiredesk-transport` (serial, BLE, RFCOMM, port detection) | 65 |
 | `wiredesk-term` (`wd` CLI) | 50 |
-| `wiredesk-core` (shared types, clipboard files) | 25 |
-| **Total** | **821** |
+| `wiredesk-core` (shared types, clipboard files) | 29 |
+| **Total** | **874** |
 
 Plus 5 ignored tests that need a live Windows session. On macOS run the suite
 with `cargo test --workspace -- --test-threads=1` — the host package has a
@@ -392,7 +393,8 @@ pre-existing flake on the parallel runner.
 | Serial transport, auto-recovery from a frame-error storm | Stable |
 | `wd` / `wd --exec` shell over the same link (macOS) | Stable |
 | Windows client | New — builds, lints and links; awaiting live use |
-| Bluetooth LE transport | Works, but slower than serial; kept as a no-cable fallback |
+| Bluetooth Classic (RFCOMM) transport | Live-verified Mac ↔ Win11 on a fixed channel with pairing required; SDP lookup does not work from macOS |
+| Bluetooth LE transport | Works, but slower than serial; kept as a fallback |
 | Multi-file clipboard, directories, video | Out of scope by design |
 
 ## License

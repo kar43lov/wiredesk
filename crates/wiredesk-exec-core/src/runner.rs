@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::helpers::{
     decode_compressed_stream, extract_compressed_rc, format_command, format_compressed_command,
-    is_powershell_prompt, is_remote_prompt, parse_ready, parse_sentinel, strip_ansi,
+    is_powershell_continuation, is_powershell_prompt, is_remote_prompt, parse_ready,
+    parse_sentinel, strip_ansi,
 };
 use crate::transport::ExecTransport;
 use crate::types::{ExecError, ExecEvent, OneShotState, ShellKind};
@@ -26,15 +27,20 @@ use crate::types::{ExecError, ExecEvent, OneShotState, ShellKind};
 /// plenty of resolution against a 90 s budget.
 const RECV_TICK: Duration = Duration::from_millis(100);
 
-/// Phase tracker for the line stream. `Mute` skips noise that
-/// precedes the user command's actual output (host MOTD, SSH banner,
-/// `ssh -tt` warning, host prompt line). `Streaming` emits each
-/// completed non-echo line through the caller's callback. The
-/// transition trigger is the READY marker (Bash/--ssh path) or the
-/// host shell prompt (PowerShell pipe-mode).
+/// Phase tracker for the line stream. Both muted phases end at the READY
+/// marker; they differ in what they do with the lines before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    /// Drop everything until READY. For `--ssh`, where the pre-command
+    /// traffic is a login banner and the remote's echo of our own payload.
     Mute,
+    /// Drop only what is recognisably pre-command noise - a shell prompt
+    /// or a blank line - and pass the rest through. For pipe mode, where
+    /// the command's own stderr can reach the queue ahead of the READY the
+    /// wrapper wrote to stdout, because the host reads the two streams on
+    /// separate threads.
+    MuteNoise,
+    /// Emit every completed non-echo line through the caller's callback.
     Streaming,
 }
 
@@ -99,36 +105,50 @@ where
         OneShotState::AwaitingSentinel
     };
 
-    // Phase initial: SSH path keeps Mute until READY (we know there
-    // will be MOTD + ssh-tt echoes to drop). PS pipe-mode goes
-    // straight into Streaming because PS doesn't echo stdin and
-    // the only pre-cmd noise *might* be a stray prompt line — which
-    // we then opportunistically swallow once we see one (matches
-    // pre-rewrite `clean_stdout` `unwrap_or(0)` fallback).
+    // Every wrapper `format_command` / `format_compressed_command` builds
+    // now opens with the READY marker, on both shells and in both modes,
+    // so the lower bound of real output is a marker rather than a guess.
+    //
+    // How strictly that is applied depends on what is upstream. Over
+    // `--ssh` everything before READY is known noise - MOTD, the remote's
+    // own echo of our payload - and dropping all of it is the point.
+    //
+    // In plain pipe mode it cannot be: the host reads the shell's stdout
+    // and stderr on two separate threads into one queue, so a line the
+    // *command* wrote to stderr can overtake the READY the wrapper wrote
+    // to stdout a moment earlier. Dropping everything pre-READY would
+    // silently eat it. Only the noise that path actually produces gets
+    // dropped there - a prompt, a blank line - and anything else is
+    // passed through.
     let mut phase = if ssh.is_some() {
         Phase::Mute
     } else {
-        Phase::Streaming
+        Phase::MuteNoise
     };
 
     let prefix = format!("__WD_DONE_{uuid}__");
     let done_echo = format!("__WD_DONE_{uuid}__$");
-    let done_zero_echo = format!("__WD_DONE_{uuid}__0");
     let ready_echo = format!("__WD_READY_{uuid}__");
-    // Stdin-echo filter: drop the literal echoes that the remote shell
-    // emits in `ssh -tt` mode (echoing our READY emitter and DONE
-    // formatter back at us). Compress wrappers use a hardcoded `__0`
-    // sentinel rather than `$rc`/`$LASTEXITCODE`, so we look for the
-    // unique compress-only fragments (`gzip -c | base64` for bash,
-    // `[Console]::OutputEncoding` for PS) anchored by the READY uuid
-    // marker — the b64 payload itself can never plausibly match those.
-    let is_echo_line = |s: &str| {
-        s.contains(&done_echo)
-            || (s.contains("echo ") && s.contains(&ready_echo))
-            || (s.contains(&ready_echo) && s.contains(&done_zero_echo))
-            || (s.contains(&ready_echo) && s.contains("gzip -c | base64"))
-            || (s.contains(&ready_echo) && s.contains("[Console]::OutputEncoding"))
-    };
+    // Stdin-echo filter: drop the literal echoes of our own payload that a
+    // shell mirrors back at us - `ssh -tt` does it for the remote command,
+    // and PowerShell does it for every line it reads from a redirected
+    // stdin, prompt and all.
+    //
+    // Two signatures, and between them they cover every wrapper:
+    //  - the unexpanded sentinel formatter (`__WD_DONE_<uuid>__$…`), which
+    //    only ever appears in the source of the line, never in its output;
+    //  - the READY marker *inside a longer line*. The expanded marker
+    //    stands alone on its own line by construction, so a line that
+    //    carries it together with anything else is the source being echoed
+    //    back. This is what catches the first line of a PowerShell payload,
+    //    which arrives glued to the prompt (`PS C:\…> $LASTEXITCODE=0; …`)
+    //    and, before 2026-09-11, was only recognised when the user's own
+    //    command happened to contain the word `echo`.
+    //
+    // The uuid is fresh per run, so neither signature can be produced by
+    // the command's own output.
+    let is_echo_line =
+        |s: &str| s.contains(&done_echo) || (s.contains(&ready_echo) && s.trim() != ready_echo);
 
     /// In compress mode, the wire stream between READY and DONE must
     /// be pure base64 (with whitespace tolerated). Anything else is
@@ -158,6 +178,13 @@ where
                 log::trace!("[exec] recv ShellOutput {} bytes", data.len());
                 pending.push_str(&text);
                 full_log.push_str(&text);
+            }
+            ExecEvent::ShellClosed => {
+                // An acknowledgement for the *previous* command's
+                // `ShellClose`, arriving after that run's drain gave up.
+                // Nothing to do with this one.
+                log::debug!("[exec] ignoring a late ShellClose acknowledgement");
+                continue;
             }
             ExecEvent::ShellExit(code) => {
                 log::debug!("[exec] recv ShellExit code={code} — host shell died");
@@ -198,15 +225,21 @@ where
                     // `cmd; echo "__WD_DONE_..."` does that whenever
                     // <cmd>'s last byte isn't a newline).
                     //
-                    // BUT: skip parse_sentinel on the echo'd cmd line
-                    // itself. In compress mode the wrapper carries a
-                    // hardcoded `__WD_DONE_<uuid>__0` literal in its
-                    // source — when ssh -tt echoes our input back,
-                    // parse_sentinel would match the literal and we'd
-                    // return Ok(0) before the real cmd has even run.
-                    // is_echo_line catches both bash and PS compress
-                    // cmd echoes via anchor-pair signatures.
-                    if !is_echo_line(line) {
+                    // BUT only once READY has been seen. Both markers come
+                    // out of the same payload and READY is printed first,
+                    // so a sentinel appearing ahead of it cannot be the
+                    // real one — it is the shell echoing our own source
+                    // back, where the sentinel sits as a literal. That
+                    // happens in `--compress` (a hardcoded `__0` sentinel
+                    // rather than an expanded variable) and over
+                    // `ssh -tt`, and it used to be caught by looking for
+                    // both markers on one line — which stops working the
+                    // moment the payload spans several lines, because then
+                    // each marker is echoed on a line of its own.
+                    //
+                    // `is_echo_line` still guards the rest: an echo can
+                    // also arrive *after* READY on paths that mirror input.
+                    if phase == Phase::Streaming && !is_echo_line(line) {
                         if let Some(code) = parse_sentinel(line, &uuid) {
                             if let Some(pos) = line.rfind(&prefix) {
                                 if pos > 0 {
@@ -240,28 +273,30 @@ where
                         }
                     } // close the !is_echo_line guard around parse_sentinel
 
-                    // Compress mode: PS path emits the READY line as
-                    // regular output (we go straight to Streaming on
-                    // PS, no Mute phase). Drop it explicitly so it
-                    // doesn't poison the base64 buffer. Bash path
-                    // already drops READY via the Mute→Streaming
-                    // transition below — no double-handling.
-                    if compress && parse_ready(line, &uuid) {
-                        if phase == Phase::Mute {
-                            phase = Phase::Streaming;
-                        }
-                        // Drop the READY line itself in either phase.
+                    // READY is the runner's own marker in every wrapper
+                    // (PS and Bash, plain and `--compress`), so it is
+                    // dropped unconditionally: on the PS path we are
+                    // already Streaming and it would otherwise be printed
+                    // as output or poison the base64 buffer; on the Bash
+                    // path it is the Mute→Streaming trigger below.
+                    if parse_ready(line, &uuid) {
+                        phase = Phase::Streaming;
+                        // Drop the READY line itself in every phase.
                     } else if phase == Phase::Mute {
-                        // Mute → Streaming on READY (Bash/--ssh path).
-                        // We don't trigger on prompt here because the
-                        // SSH path's READY is the canonical lower bound;
-                        // a stale prompt earlier would belong in the
-                        // pre-READY noise we want to drop.
-                        if parse_ready(line, &uuid) {
-                            phase = Phase::Streaming;
-                            // Drop the READY line itself.
-                        }
-                        // else: still Mute, drop the line.
+                        // Still waiting for READY, and everything ahead of
+                        // it here is known noise: MOTD, the remote's echo
+                        // of our payload. Drop it.
+                    } else if phase == Phase::MuteNoise
+                        && (line.trim().is_empty()
+                            || is_powershell_prompt(line)
+                            || is_powershell_continuation(line)
+                            || is_remote_prompt(line))
+                    {
+                        // Pre-READY, and it looks like the prompt a re-used
+                        // warm shell left behind. That is the only noise
+                        // this path produces; anything else falls through
+                        // and is emitted, because it may be the command's
+                        // own stderr arriving early.
                     } else if (is_powershell_prompt(line) || is_remote_prompt(line))
                         && !is_echo_line(line)
                     {
@@ -417,6 +452,7 @@ mod tests {
                     let scripted = vec![
                         out("Some pre-prompt noise\n"),
                         out("PS C:\\Users\\User>\n"),
+                        out(&format!("__WD_READY_{uuid}__\n")),
                         out("actual line 1\n"),
                         out("actual line 2\n"),
                         out(&format!("__WD_DONE_{uuid}__0\n")),
@@ -446,18 +482,13 @@ mod tests {
 
         assert_eq!(code, 0);
         let s = String::from_utf8(emitted).unwrap();
-        // PS path streams from start; the prompt line is swallowed
-        // mid-stream (matches pre-rewrite clean_stdout `rposition` on
-        // the last prompt). Pre-prompt noise comes through — same as
-        // the old `unwrap_or(0)` lower-bound when no prompt was found
-        // *before* it. Slight semantic shift vs the old clean_stdout
-        // behaviour that took `rposition` (last prompt) and dropped
-        // everything before — accepted because live PS pipe-mode
-        // doesn't actually emit pre-prompt noise; the test is purely
-        // synthetic.
+        // Pipe mode drops the prompt ahead of READY and keeps the rest:
+        // a line that is not recognisable noise may be the command's own
+        // stderr, which the host can deliver ahead of stdout because it
+        // reads the two streams on separate threads.
         assert_eq!(
             s, "Some pre-prompt noise\nactual line 1\nactual line 2\n",
-            "PS path streams from start; only the prompt line is swallowed"
+            "the prompt goes, anything else survives"
         );
     }
 
@@ -555,6 +586,224 @@ mod tests {
     }
 
     #[test]
+    fn a_late_close_acknowledgement_does_not_become_this_commands_exit_code() {
+        // The host answers every `ShellClose` with `ShellClosed`. One that
+        // arrives after the previous run's drain gave up lands in this
+        // run's stream, and it must not be read as a result - it carries
+        // no status precisely so that it cannot be.
+        struct LateAck {
+            outbox: Vec<Vec<u8>>,
+            staged: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for LateAck {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                if !self.staged {
+                    self.staged = true;
+                    let uuid = expected_payload_uuid(&self.outbox);
+                    self.queue.push_back(ExecEvent::ShellClosed);
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out("real output\n"));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+
+        let mut t = LateAck {
+            outbox: Vec::new(),
+            staged: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "echo hi", None, 5, false, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .unwrap();
+        assert_eq!(code, 0, "the run must finish on its own sentinel");
+        assert_eq!(String::from_utf8(emitted).unwrap(), "real output\n");
+    }
+
+    #[test]
+    fn a_sentinel_echoed_before_ready_is_not_the_real_one() {
+        // A multi-line `--compress` payload is echoed line by line, and its
+        // last source line carries the hardcoded `__WD_DONE_<uuid>__0`
+        // while READY sits on the first. Matching that echo ends the run
+        // before the command has produced anything: rc 0, no output.
+        struct SplitEcho {
+            outbox: Vec<Vec<u8>>,
+            staged: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for SplitEcho {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                if !self.staged {
+                    self.staged = true;
+                    let uuid = expected_payload_uuid(&self.outbox);
+                    // Echo of the tail of our own source: sentinel literal,
+                    // no READY anywhere on the line.
+                    self.queue
+                        .push_back(out(&format!(">> Write-Output \"__WD_DONE_{uuid}__0\"\n")));
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out("real output\n"));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = SplitEcho {
+            outbox: Vec::new(),
+            staged: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "whatever", None, 5, false, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(emitted).unwrap(),
+            "real output\n",
+            "the run must end on the real sentinel, after the real output"
+        );
+    }
+
+    #[test]
+    fn the_echo_of_our_own_first_line_never_reaches_the_caller() {
+        // PowerShell mirrors every line it reads from a redirected stdin,
+        // and the first one comes glued to its prompt. It carries the READY
+        // marker inside a longer line, which is what identifies it - the
+        // expanded marker stands alone. Until 2026-09-11 the filter looked
+        // for the word `echo` instead, so this leaked for any command that
+        // did not happen to contain it.
+        struct EchoesInput {
+            outbox: Vec<Vec<u8>>,
+            staged: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for EchoesInput {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                if !self.staged {
+                    self.staged = true;
+                    let uuid = expected_payload_uuid(&self.outbox);
+                    let payload = String::from_utf8_lossy(&self.outbox[0]).to_string();
+                    let first = payload.lines().next().unwrap_or_default().to_string();
+                    // Prompt + the payload's own first line, as PowerShell
+                    // prints it.
+                    self.queue
+                        .push_back(out(&format!("PS C:\\Users\\User> {first}\n")));
+                    self.queue.push_back(out(">> \n"));
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out("in\n"));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = EchoesInput {
+            outbox: Vec::new(),
+            staged: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        // A command with no `echo` in it anywhere.
+        let code = run_oneshot(&mut t, "if ($true) {\n  \"in\"\n}", None, 5, false, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(emitted).unwrap(), "in\n");
+    }
+
+    #[test]
+    fn stderr_arriving_before_ready_is_not_swallowed() {
+        // The host reads the shell's stdout and stderr on two threads into
+        // one queue, so a line the command wrote to stderr can overtake the
+        // READY the wrapper wrote to stdout. Dropping everything pre-READY
+        // would eat it; only recognisable noise may be dropped here.
+        struct EarlyStderr {
+            outbox: Vec<Vec<u8>>,
+            staged: bool,
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for EarlyStderr {
+            fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+                self.outbox.push(data.to_vec());
+                if !self.staged {
+                    self.staged = true;
+                    let uuid = expected_payload_uuid(&self.outbox);
+                    self.queue.push_back(out("PS C:\\Users\\User>\n"));
+                    self.queue.push_back(out("\n"));
+                    self.queue.push_back(out("warning: something went wrong\n"));
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
+                    self.queue.push_back(out("result\n"));
+                    self.queue.push_back(out(&format!("__WD_DONE_{uuid}__0\n")));
+                }
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = EarlyStderr {
+            outbox: Vec::new(),
+            staged: false,
+            queue: std::collections::VecDeque::new(),
+        };
+        let mut emitted = Vec::new();
+        let code = run_oneshot(&mut t, "something", None, 5, false, |c| {
+            emitted.extend_from_slice(c);
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(emitted).unwrap(),
+            "warning: something went wrong\nresult\n",
+            "the prompt and the blank line go, the command's own line stays"
+        );
+    }
+
+    #[test]
+    fn a_shell_that_really_dies_still_ends_the_run() {
+        // The guard above must not swallow a genuine shell death - including
+        // `exit -1`, which used to collide with the acknowledgement when it
+        // was spelled as an exit code.
+        struct Dies {
+            queue: std::collections::VecDeque<ExecEvent>,
+        }
+        impl ExecTransport for Dies {
+            fn send_input(&mut self, _data: &[u8]) -> Result<(), ExecError> {
+                self.queue.push_back(ExecEvent::ShellExit(-1));
+                Ok(())
+            }
+            fn recv_event(&mut self, _t: Duration) -> Result<ExecEvent, ExecError> {
+                Ok(self.queue.pop_front().unwrap_or(ExecEvent::Idle))
+            }
+        }
+        let mut t = Dies {
+            queue: std::collections::VecDeque::new(),
+        };
+        let code = run_oneshot(&mut t, "boom", None, 5, false, |_| {}).unwrap();
+        assert_eq!(
+            code, -1,
+            "`exit -1` is a real status, not an acknowledgement"
+        );
+    }
+
+    #[test]
     fn nonzero_exit_propagates_through_callback() {
         struct UuidEcho {
             outbox: Vec<Vec<u8>>,
@@ -567,9 +816,10 @@ mod tests {
                 if !self.staged {
                     self.staged = true;
                     let uuid = expected_payload_uuid(&self.outbox);
-                    // Prompt line first — flips runner from Mute to
+                    // READY first — flips the runner from Mute to
                     // Streaming so the next line reaches the callback.
                     self.queue.push_back(out("PS C:\\>\n"));
+                    self.queue.push_back(out(&format!("__WD_READY_{uuid}__\n")));
                     self.queue.push_back(out("err: nope\n"));
                     self.queue.push_back(out(&format!("__WD_DONE_{uuid}__7\n")));
                 }

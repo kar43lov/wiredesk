@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
-use wiredesk_core::BluetoothConfig;
+use wiredesk_core::{BluetoothConfig, RfcommConfig};
 use wiredesk_transport::bluetooth::BluetoothFactoryConfig;
+use wiredesk_transport::rfcomm::{RfcommFactoryConfig, RfcommRole};
 use wiredesk_transport::{SerialFactoryConfig, TransportConfig};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -32,7 +33,8 @@ pub struct HostConfig {
 
     /// Which transport to open on startup. `"serial"` (default) keeps the
     /// existing behaviour. `"bluetooth"` opens the BLE Peripheral GATT
-    /// server and ignores the serial fields.
+    /// server, `"rfcomm"` publishes the Bluetooth Classic (SPP) service;
+    /// both ignore the serial fields.
     #[serde(default = "default_transport")]
     pub transport: String,
 
@@ -45,6 +47,10 @@ pub struct HostConfig {
     /// Bluetooth-specific settings. Used only when `transport == "bluetooth"`.
     #[serde(default)]
     pub bluetooth: BluetoothConfig,
+
+    /// Bluetooth Classic (RFCOMM) settings. Used only when `transport == "rfcomm"`.
+    #[serde(default)]
+    pub rfcomm: RfcommConfig,
 }
 
 fn default_transport() -> String {
@@ -71,6 +77,7 @@ impl Default for HostConfig {
             receive_files: true,
             transport: default_transport(),
             transport_fallback: None,
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig::default(),
         }
     }
@@ -188,6 +195,16 @@ pub fn to_transport_config(cfg: &HostConfig) -> TransportConfig {
             reconnect_max_attempts: cfg.bluetooth.reconnect_max_attempts,
             require_encryption: cfg.bluetooth.require_encryption,
         },
+        rfcomm: RfcommFactoryConfig {
+            service_uuid: cfg.rfcomm.service_uuid.clone(),
+            peer_address: cfg.rfcomm.peer_address.clone(),
+            channel: cfg.rfcomm.channel,
+            connect_timeout_secs: cfg.rfcomm.connect_timeout_secs,
+            keepalive_ms: cfg.rfcomm.keepalive_ms,
+            require_encryption: cfg.rfcomm.require_encryption,
+            // The host publishes the service and waits for the client.
+            role: RfcommRole::Listen,
+        },
         fallback: cfg.transport_fallback.clone(),
     }
 }
@@ -226,6 +243,7 @@ mod tests {
             receive_files: true,
             transport: "serial".to_string(),
             transport_fallback: None,
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig::default(),
         };
         let dir = tempdir().unwrap();
@@ -240,6 +258,7 @@ mod tests {
         let cfg = HostConfig {
             transport: "bluetooth".to_string(),
             transport_fallback: Some("serial".to_string()),
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig {
                 service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 peer_name: "TestHost".to_string(),
@@ -334,6 +353,7 @@ mod tests {
             receive_files: true,
             transport: "serial".to_string(),
             transport_fallback: None,
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig::default(),
         }
     }
@@ -487,6 +507,7 @@ mod tests {
         let cfg = HostConfig {
             transport: "bluetooth".to_string(),
             transport_fallback: Some("serial".to_string()),
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig {
                 service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 peer_name: "TestHost".to_string(),

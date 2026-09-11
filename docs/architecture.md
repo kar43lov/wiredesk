@@ -100,9 +100,36 @@ Packet: `[magic "WD"][type][flags][seq:u16][len:u16][payload][crc16]`, COBS-fram
 
 ---
 
-## Bluetooth LE Transport (Plan C)
+## Bluetooth Classic Transport (RFCOMM)
 
-Альтернатива USB-Serial — BLE GATT между Mac (Central) и Win11 (Peripheral). Опционально, выбирается через `transport = "bluetooth"` в config.toml. Throughput ~30-100 KB/s, ×3-9 vs CH340. См. user-facing guide [`docs/bluetooth-transport.md`](bluetooth-transport.md). Module map:
+Основной Bluetooth-режим — `transport = "rfcomm"`. Замер пробами 2026-09-11 на эталонной паре: ~120 KB/s в обе стороны, RTT 10 мс (BLE на тех же радио — 4–5 KB/s). Разбор — [`docs/bluetooth-transport.md`](bluetooth-transport.md). Module map:
+
+```
+crates/wiredesk-transport/src/framing.rs   — COBS-стрим SerialTransport'а как переиспользуемый
+                                             FrameReader/encode_frame (блочное чтение, resync на
+                                             oversize; одиночный 0x00 = пустой кадр = keepalive)
+crates/wiredesk-transport/src/rfcomm/
+  mod.rs      — RfcommFactoryConfig + RfcommRole {Listen, Connect} + cfg-fenced re-exports
+  common.rs   — parse/format BT-адреса, RecvState (partial-frame timeout), IdleKeepalive
+                (поток шлёт 0x00 после keepalive_ms тишины — держит ACL-линк вне sniff-mode)
+  mac.rs      — клиент на IOBluetooth (objc2-io-bluetooth 0.3): SDP query → channel →
+                openRFCOMMChannelAsync; delegate (define_class!) складывает байты в очередь,
+                recv() её вычитывает. Все колбэки IOBluetooth приходят на main run loop —
+                ожидание через condvar, а на main-потоке — через CFRunLoopRunInMode.
+  win.rs      — Winsock AF_BTH/BTHPROTO_RFCOMM через socket2: Listen (хост) — bind, listen,
+                SDP-запись через WSASetServiceW, accept внутри recv(); Connect (Windows-клиент) —
+                WSALookupServiceBeginW/NextW по UUID хоста, connect_timeout. SO_BTH_AUTHENTICATE
+                + SO_BTH_ENCRYPT на listener'е (require_encryption).
+  stub.rs     — Linux.
+```
+
+Роли: хост всегда сервер, клиент всегда клиент — в отличие от BLE, Windows-клиент работает. `try_clone` — write-only handle (как у BLE); на Windows writer и keepalive получают собственный дубликат сокета через `Socket::try_clone`, чтобы блокирующее чтение не держало запись. `recv()` возвращает `"recv timeout"` каждые 10 мс без данных (`RECV_POLL`, как у serial) — session-loop'ы обеих сторон на это рассчитаны (heartbeat, liveness), и этот же интервал задаёт темп исходящего потока: хост отдаёт вывод shell'а и clipboard только между вызовами `recv`.
+
+**Config** (`wiredesk-core::RfcommConfig`): service_uuid, peer_address, channel (0 = SDP), connect_timeout_secs, keepalive_ms, require_encryption.
+
+## Bluetooth LE Transport (Plan C) — fallback
+
+Старшая альтернатива — BLE GATT между Mac (Central) и Win11 (Peripheral). Выбирается через `transport = "bluetooth"`. Живьём 4–5 KB/s (медленнее CH340): адаптер хоста BT 4.2 без 2M PHY, интервал соединения задаёт macOS, WinRT-notify идёт по одному на событие — крейтом это не лечится. См. user-facing guide [`docs/bluetooth-transport.md`](bluetooth-transport.md). Module map:
 
 ```
 crates/wiredesk-transport/src/bluetooth/
@@ -141,7 +168,7 @@ crates/wiredesk-transport/src/bluetooth/
 
 **try_clone — write-only split**: BLE не позволяет открыть второй connection к peer'у. Cloned handle share'ит `Arc<Inner>` но `is_owner=false` → `recv()` returns Err. Client'ская `main.rs` после Tasks 8/9 переключена на `reader_transport = open_transport(...)` (original, recv-capable) + `writer_transport = reader_transport.try_clone()?` (clone, write-only OK для send'ов).
 
-**Factory** (`crates/wiredesk-transport/src/factory.rs`): `open_transport(&TransportConfig)` switch'ит между `SerialTransport::open` и `BluetoothLeTransport::open`. На BLE failure + `transport_fallback = "serial"` — log::warn + retry serial. Unrecognised fallback strings ignored (no recurse).
+**Factory** (`crates/wiredesk-transport/src/factory.rs`): `open_transport(&TransportConfig)` switch'ит между `SerialTransport::open`, `BluetoothLeTransport::open` и `RfcommTransport::open`. На BLE/RFCOMM failure + `transport_fallback = "serial"` — log::warn + retry serial. Unrecognised fallback strings ignored (no recurse).
 
 **Config** (`wiredesk-core::BluetoothConfig`): single source of truth для shared fields (service_uuid, peer_name, mtu, connect_timeout_secs, reconnect_max_attempts, require_encryption) — гарантирует идентичность между host и client.
 
@@ -170,7 +197,7 @@ crates/wiredesk-transport/src/bluetooth/
 - **File commit pipeline (receive side).** `unpack_first_chunk(payload)` → `(name, content)` → `sanitize_basename(name)` strips path components, `..` segments, Windows drive letters, Windows-reserved chars (`<>:"|?*`) и NUL → `_`, prefixes NTFS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`) `_`. Empty → `clipboard.bin` fallback. Write в `dirs::cache_dir()/WireDesk` (Mac — `~/Library/Caches/WireDesk/`) или `%TEMP%\WireDesk\` (Win), затем `set_file_url`/`set_cf_hdrop` FFI на OS clipboard. **CRITICAL:** dedup-стамп (`set_file(hash)`/`LastKind::File(hash)`) применяется только если FFI succeeded — иначе bidirectional re-emit loop (OS clipboard not actually replaced). `in_flight_file_path` slot tracking + `reset()` cleanup на abort/disconnect — partial file не остаётся.
 - **Cache vacuum.** Startup hook `run_startup_vacuum(Duration::from_secs(24 * 3600))` (обе стороны) — вычищает файлы старше 24h из cache dir через `wiredesk_core::cache_vacuum::vacuum_cache_dir`. Non-fatal: missing dir → Ok(0); per-file errors → log warn + continue.
 - **Settings → Clipboard panel:** 6 независимых runtime-toggle через `Arc<AtomicBool>` — `send_images`, `receive_images`, `send_text`, `receive_text`, `receive_files`, `send_files` (последний — opt-in, default OFF). Mac — без рестарта (Arc.store() прямо из egui checkbox). Win — Save+Restart pattern (Arc читается из HostConfig при boot; respawn нужен для apply). Полезно для apps вроде Whispr Flow / Maccy которые часто пишут в clipboard.
-- **Платформенные слои клиента:** один и тот же `wiredesk-client` собирается под macOS и Windows; всё, что упирается в ОС, спрятано за фасадом с реализацией на каждую платформу — `keyboard_tap` (CGEventTap ↔ `WH_KEYBOARD_LL`), `status_bar` (`NSStatusItem` ↔ `Shell_NotifyIconW`), `monitor` (`NSScreen` ↔ `EnumDisplayMonitors` + `GetDpiForMonitor`), `clipboard_files` (`NSPasteboard` ↔ `CF_HDROP` из `wiredesk-core::file_clipboard`), `mac_window` (AppKit-геометрия; на Windows — no-op, там позицией управляет winit). Общий код — UI, протокол, clipboard-логика, транспорт — платформы не различает. Windows-специфика поведения: хоткеи `Ctrl+Esc` / `Ctrl+Enter` вместо `Cmd+…`, прогресс в tooltip вместо текста рядом с иконкой, borderless-fullscreen поднимает уровень окна (иначе панель задач остаётся поверх), BLE недоступен (роль Peripheral занята хостом).
+- **Платформенные слои клиента:** один и тот же `wiredesk-client` собирается под macOS и Windows; всё, что упирается в ОС, спрятано за фасадом с реализацией на каждую платформу — `keyboard_tap` (CGEventTap ↔ `WH_KEYBOARD_LL`), `status_bar` (`NSStatusItem` ↔ `Shell_NotifyIconW`), `monitor` (`NSScreen` ↔ `EnumDisplayMonitors` + `GetDpiForMonitor`), `clipboard_files` (`NSPasteboard` ↔ `CF_HDROP` из `wiredesk-core::file_clipboard`), `mac_window` (AppKit-геометрия; на Windows — no-op, там позицией управляет winit). Общий код — UI, протокол, clipboard-логика, транспорт — платформы не различает. Windows-специфика поведения: хоткеи `Ctrl+Esc` / `Ctrl+Enter` вместо `Cmd+…`, прогресс в tooltip вместо текста рядом с иконкой, borderless-fullscreen поднимает уровень окна (иначе панель задач остаётся поверх), BLE недоступен (роль Peripheral занята хостом) — но `transport = "rfcomm"` работает: Windows-клиент там обычный Winsock-клиент (нужен `rfcomm.peer_address`).
 - **Status UI на Mac:** (1) `format_progress("Sending clipboard", cur, total)` или `format_progress("Sending file 'X.pdf'", cur, total)` (через `current_outgoing_label` Arc<Mutex<String>> slot) рендерится как `egui::ProgressBar` с inline текстом — в chrome panel И в capture banner (для fullscreen где menu bar скрыт macOS). (2) `NSStatusItem` справа от часов через `objc2-app-kit::NSStatusBar::systemStatusBar` + `dispatch_async_f` на main queue. Idle: только глиф (монохромный template-PNG `assets/menubar-icon.png` — AppKit сам красит его под светлую/тёмную тему), active: глиф + «↑43%» / «↓67%». Click handler — TODO (custom NSObject subclass через `objc2::declare_class!` нужен).
 - **Tray balloon notification (Win)** при oversize file/image: `SessionStatus::Notification(String)` slot в `StatusState` — отдельно от persistent `Connected/Waiting/Disconnected`, не overwrites tray icon color и settings status row. Surface через `nwg::TrayNotification::show(msg, title, WARNING_ICON|LARGE_ICON, None)`.
 - **Tray double-click → Settings (Win):** nwg 1.0.13 не имеет нативного double-click event для tray. Workaround: `OnMousePress(MousePressLeftUp)` + `Cell<Option<Instant>>` tracking previous up — два up в окне 500ms = double-click.

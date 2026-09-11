@@ -1,7 +1,9 @@
 pub mod bluetooth;
 pub mod detect;
 pub mod factory;
+pub mod framing;
 pub mod mock;
+pub mod rfcomm;
 pub mod serial;
 pub mod transport;
 
@@ -11,3 +13,4 @@ pub use detect::{
     WCH_VID,
 };
 pub use factory::{open_transport, SerialFactoryConfig, TransportConfig};
+pub use rfcomm::{RfcommFactoryConfig, RfcommRole, RfcommTransport};
