@@ -20,6 +20,7 @@ use crate::helpers::{
 };
 use crate::transport::ExecTransport;
 use crate::types::{ExecError, ExecEvent, OneShotState, ShellKind};
+use crate::utf8_stream::Utf8Stream;
 
 /// How long each `recv_event` call may park. Smaller = more frequent
 /// timeout-budget re-checks, larger = fewer wakeups. 100 ms matches
@@ -164,6 +165,10 @@ where
 
     let mut pending = String::new();
     let mut full_log = String::new();
+    // The wire cuts the shell's output at packet boundaries, which land
+    // wherever they land — decoding each chunk on its own would eat any
+    // character sitting on the seam. See `utf8_stream`.
+    let mut utf8 = Utf8Stream::new();
     // In compress mode, post-READY lines accumulate into a single base64
     // buffer that's decoded once the sentinel arrives. In non-compress
     // mode this stays empty and the streaming callback is used directly.
@@ -174,8 +179,8 @@ where
     while started.elapsed() < max_wait {
         match transport.recv_event(RECV_TICK)? {
             ExecEvent::ShellOutput(data) => {
-                let text = String::from_utf8_lossy(&data);
                 log::trace!("[exec] recv ShellOutput {} bytes", data.len());
+                let text = utf8.push(&data);
                 pending.push_str(&text);
                 full_log.push_str(&text);
             }
@@ -339,6 +344,9 @@ where
         }
     }
 
+    // Out of time. Anything the decoder is still holding belongs in the log
+    // the error carries — half a character is a better clue than silence.
+    full_log.push_str(&utf8.finish());
     Err(ExecError::Timeout(full_log))
 }
 
@@ -346,6 +354,105 @@ where
 mod tests {
     use super::*;
     use crate::transport::mock::MockExecTransport;
+
+    /// A host that answers the payload instead of replaying a fixed script.
+    ///
+    /// The runner mints a fresh uuid per call, so a canned sentinel can never
+    /// match; this reads the uuid back out of the wrapper the runner just
+    /// sent and builds the reply from it. `chunks` decides how the reply is
+    /// cut on the wire — which is the whole point for the UTF-8 test.
+    /// uuid -> the wire chunks the host answers with.
+    type ReplyFn = Box<dyn Fn(&str) -> Vec<Vec<u8>>>;
+
+    struct ScriptedHost {
+        queued: std::collections::VecDeque<ExecEvent>,
+        reply: ReplyFn,
+    }
+
+    impl ScriptedHost {
+        fn new(reply: impl Fn(&str) -> Vec<Vec<u8>> + 'static) -> Self {
+            Self {
+                queued: std::collections::VecDeque::new(),
+                reply: Box::new(reply),
+            }
+        }
+    }
+
+    /// Pull the uuid out of `__WD_READY_<uuid>__` in the payload.
+    fn uuid_of(payload: &str) -> String {
+        let start =
+            payload.find("__WD_READY_").expect("payload carries READY") + "__WD_READY_".len();
+        let rest = &payload[start..];
+        let end = rest.find("__").expect("READY marker is terminated");
+        rest[..end].to_string()
+    }
+
+    impl ExecTransport for ScriptedHost {
+        fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+            let payload = String::from_utf8_lossy(data);
+            let uuid = uuid_of(&payload);
+            for chunk in (self.reply)(&uuid) {
+                self.queued.push_back(ExecEvent::ShellOutput(chunk));
+            }
+            Ok(())
+        }
+
+        fn recv_event(&mut self, _timeout: Duration) -> Result<ExecEvent, ExecError> {
+            Ok(self.queued.pop_front().unwrap_or(ExecEvent::Idle))
+        }
+    }
+
+    /// The wire cuts output at packet boundaries that know nothing about
+    /// character boundaries. Before `Utf8Stream` each chunk was decoded on
+    /// its own, so a Cyrillic letter landing on the seam turned into two
+    /// replacement characters — the long-standing "bytes go missing in long
+    /// Cyrillic output" report, which `--compress` hid because base64 is
+    /// ASCII.
+    #[test]
+    fn a_character_split_across_two_packets_arrives_whole() {
+        let line = "Отчёт готов, ошибок нет";
+        let cut = "Отчёт готов, о".len() + 1; // one byte into "ш"
+        let expected = format!("{line}\n");
+
+        let mut host = ScriptedHost::new(move |uuid| {
+            let head = format!("__WD_READY_{uuid}__\n");
+            let tail = format!("\n__WD_DONE_{uuid}__0\n");
+            let body = line.as_bytes();
+            vec![
+                head.into_bytes(),
+                body[..cut].to_vec(),
+                body[cut..].to_vec(),
+                tail.into_bytes(),
+            ]
+        });
+
+        let mut got = Vec::new();
+        let code = run_oneshot(&mut host, "x", None, 5, false, |c| got.extend_from_slice(c))
+            .expect("run_oneshot");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(got).expect("valid utf-8"), expected);
+    }
+
+    /// Same seam, but one byte at a time — the pathological case for a
+    /// decoder that keeps state.
+    #[test]
+    fn output_delivered_byte_by_byte_still_arrives_whole() {
+        let line = "щётка ёж 漢字 🙂";
+        let expected = format!("{line}\n");
+
+        let mut host = ScriptedHost::new(move |uuid| {
+            let mut out = vec![format!("__WD_READY_{uuid}__\n").into_bytes()];
+            out.extend(line.as_bytes().iter().map(|b| vec![*b]));
+            out.push(format!("\n__WD_DONE_{uuid}__0\n").into_bytes());
+            out
+        });
+
+        let mut got = Vec::new();
+        let code = run_oneshot(&mut host, "x", None, 5, false, |c| got.extend_from_slice(c))
+            .expect("run_oneshot");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(got).expect("valid utf-8"), expected);
+    }
 
     /// Helper: build an `ExecEvent::ShellOutput` from a `&str` slice.
     fn out(s: &str) -> ExecEvent {
