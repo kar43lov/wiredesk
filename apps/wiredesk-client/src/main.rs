@@ -107,6 +107,15 @@ fn main() {
 
     let transport_cfg = config::to_transport_config(&cfg);
 
+    // macOS only asks for the Bluetooth privacy grant when a running app
+    // creates a CBCentralManager; a worker thread that touches IOBluetooth
+    // before `NSApplicationMain` gets no prompt and hangs instead. Compute
+    // the flag here and fire the request from the eframe creator callback,
+    // which runs on the main thread with the app already up.
+    #[cfg(target_os = "macos")]
+    let wants_bluetooth =
+        transport_cfg.transport == "rfcomm" || transport_cfg.fallback.as_deref() == Some("rfcomm");
+
     // Channels go up first so we can ship a Disconnected event into the
     // UI on transport-open failure without crashing the process. The
     // user *needs* the Settings panel reachable to switch transports
@@ -406,6 +415,13 @@ fn main() {
             // registered loader at runtime — without this call the heading
             // image just renders as an "unable to load image" placeholder.
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Ask for Bluetooth now that AppKit is running (see
+            // `wants_bluetooth` above). No-op once the user has answered,
+            // and on any transport that does not need the radio.
+            #[cfg(target_os = "macos")]
+            if wants_bluetooth {
+                wiredesk_transport::rfcomm::request_bluetooth_permission();
+            }
             // winit/eframe's NSApp init can leave the Dock with a generic
             // exec icon a couple seconds after launch even when the bundle's
             // AppIcon.icns is correct. Force-loading the bundle icon and

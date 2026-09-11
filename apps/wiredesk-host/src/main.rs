@@ -53,6 +53,27 @@ pub struct Args {
     transport: String,
 }
 
+/// Bring the `Run` key in line with `run_on_startup`. Only ever *adds* or
+/// *corrects* the entry — removal stays with the Settings checkbox, which
+/// treats an externally-set key as authoritative.
+fn reconcile_autostart(want: bool) {
+    let expected = match ui::autostart::expected_command() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("autostart: cannot resolve own path: {e}");
+            return;
+        }
+    };
+    let stored = ui::autostart::stored_command();
+    if !ui::autostart::needs_refresh(want, stored.as_deref(), &expected) {
+        return;
+    }
+    match ui::autostart::enable() {
+        Ok(()) => log::info!("autostart: Run key set to {expected}"),
+        Err(e) => log::warn!("autostart: could not set Run key: {e}"),
+    }
+}
+
 fn main() {
     let _log_guard = match logging::init_logging() {
         Ok(g) => {
@@ -126,11 +147,23 @@ fn main() {
     log::info!("serial: {} @ {} baud", cfg.port, cfg.baud);
     log::info!("screen: {}x{}", cfg.width, cfg.height);
 
+    // Autostart used to reach the registry only through the Settings
+    // window's Save button, so a `run_on_startup = true` that arrived any
+    // other way — a hand-edited config.toml, a config copied from another
+    // machine — never actually survived a reboot. Reconcile it here, and
+    // rewrite the value when the executable has moved since it was
+    // registered.
+    reconcile_autostart(cfg.run_on_startup);
+
     // Cache vacuum: clear stale inbound-file cache entries older than 24h.
     // Runs synchronously before the session thread spawns — a file-paste
     // landing within the first poll tick never races a half-finished
     // vacuum on the same directory.
     clipboard::run_startup_vacuum(std::time::Duration::from_secs(24 * 3600));
+    // Same idea for the temporary scripts long `wd --exec` payloads travel
+    // in: an hour is far longer than any of them is meant to live, so
+    // anything older belongs to a host that is no longer running.
+    shell::vacuum_stale_spills(std::time::Duration::from_secs(3600));
 
     let (status_tx, status_rx) = mpsc::channel();
 

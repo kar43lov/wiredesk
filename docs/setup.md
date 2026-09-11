@@ -153,7 +153,7 @@ Release-сборка стартует фоновым tray-приложением
 
 Чтобы изменить порт/разрешение через UI вместо CLI: правый клик в трее → **Show Settings…** → меняй поля → **Save** → перезапусти процесс через **Quit** + autorelaunch (если включён startup) или повторный запуск из Explorer. Settings пишутся в `%APPDATA%\WireDesk\config.toml`.
 
-Чтобы host автоматически стартовал при логине Windows: в Settings включи **Run on startup** → Save. WireDesk пропишет себя в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (без admin-прав, только для текущего юзера).
+Чтобы host автоматически стартовал при логине Windows: запусти host **от администратора**, в Settings включи **Run on startup (as admin)** → Save. WireDesk заведёт задачу планировщика `WireDesk Host` (`ONLOGON`, `RunLevel = HighestAvailable`, `InteractiveToken`) — она поднимает host с полным токеном, в твоей сессии и без запроса UAC. Права нужны именно для этого: неэлевированный host не может кликать по окнам приложений, запущенных от администратора (Windows запрещает `SendInput` «вверх» по уровню целостности), и выглядит наполовину сломанным. Если задачу завести не удалось (host стартовал без прав), WireDesk откатится на `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` и напишет warning в лог — автозапуск будет, но с тем самым ограничением. Снять — тот же чекбокс: он удаляет и задачу, и ключ.
 
 **Потом Client (Mac):**
 

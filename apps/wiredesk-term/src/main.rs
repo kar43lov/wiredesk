@@ -1473,8 +1473,12 @@ mod tests {
             assert!(cmd.contains("Get-ChildItem"), "cmd payload: {cmd:?}");
             assert!(cmd.contains("__WD_DONE_"));
             assert!(cmd.contains("$LASTEXITCODE"));
-            host.emit_chunk("file1\r\nfile2\r\n");
             let uuid = extract_uuid_from_payload(&cmd);
+            // Every wrapper opens with READY, and the sentinel only counts
+            // after it - a sentinel seen earlier is the shell echoing our
+            // own source back.
+            host.emit_chunk(&format!("__WD_READY_{uuid}__\r\n"));
+            host.emit_chunk("file1\r\nfile2\r\n");
             host.emit_chunk(&format!("__WD_DONE_{uuid}__0\r\n"));
         });
 
@@ -1552,6 +1556,7 @@ mod tests {
         let host_thread = thread::spawn(move || {
             let cmd = host.recv_shell_input(Duration::from_secs(2)).expect("cmd");
             let uuid = extract_uuid_from_payload(&cmd);
+            host.emit_chunk(&format!("__WD_READY_{uuid}__\r\n"));
             host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
         });
 

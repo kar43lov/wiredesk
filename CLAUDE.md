@@ -22,6 +22,9 @@ cargo test -p wiredesk-host -- --test-threads=1     # host флакает на p
 # Windows-код (host И клиент) с мака — clippy проверяет типы, build проверяет линковку:
 cargo clippy -p wiredesk-client --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 cargo build  -p wiredesk-client --target x86_64-pc-windows-gnu    # нужен `brew install mingw-w64`
+
+# CI идёт только на push в main и на PR — feature-ветка НЕ линтуется на Windows сама:
+gh workflow run ci.yml --ref <branch>               # и потом `gh run list --branch <branch>`
 ```
 
 🔴 **Обе стороны собираются под обе ОС, и правка платформенного кода должна проверяться обеими командами выше.** Host: `WindowsInjector` на Windows, `MockInjector` на macOS (реальный SendInput не зовётся — для dev-цикла нормально). Клиент: полноценные реализации на обеих платформах за фасадами `keyboard_tap` / `status_bar` / `monitor` / `clipboard_files`; `cargo check` на маке НЕ увидит поломку Windows-ветки.
@@ -52,11 +55,12 @@ cargo build  -p wiredesk-client --target x86_64-pc-windows-gnu    # нужен `
 - Code signing / нотарификация .app — не делается
 - Single-instance на Win'е: при втором запуске exe — открывается Settings существующего процесса (через named…
 - App icon в .exe embed'ится только при сборке на Windows (rc.exe / windres needed)
-- PTY-mode только для interactive `wd`, не для `wd --exec` — он остаётся pipe-based (design choice:…
-- PTY-mode только на Windows host'е
+- PTY-mode — только на Windows-host'е и только для интерактивного `wd`; `wd --exec` остаётся pipe-based (design choice)
 - Параллельный cargo test флакает на macOS для host'-пакета (~50% SIGABRT) — это pre-existing baseline issue…
 - Fullscreen — borderless (не native): Spaces-переход терял окно в WindowServer. Меню-бар/таскбар перекрываются уровнем окна, а не скрытием Dock (оно было на все дисплеи сразу); уровень снимается при потере фокуса
-- Windows-клиент: `wd`/`wd --exec` только с Mac; BLE недоступен (роль Peripheral занята хостом, принудительный откат на serial); 🔴 нет аналога Secure Input — хук в capture видит и пароли
+- Windows-клиент: `wd`/`wd --exec` только с Mac; BLE недоступен (роль Peripheral занята хостом, принудительный откат на serial), RFCOMM работает; 🔴 нет аналога Secure Input — хук в capture видит и пароли
+- RFCOMM (`transport = "rfcomm"`) — живой линк с pairing и шифрованием; канал задаётся вручную на обеих сторонах (SDP-запись хоста с Mac не видна), собранный .app не получает системный запрос на Bluetooth — запускать бинарь из терминала
+- Длинная команда `wd --exec` (>4 КБ) кладётся хостом во временный .ps1 и dot-source-ится: PowerShell разбирает длинную строку за квадратичное время
 
 ## Hardware setup
 
@@ -69,7 +73,7 @@ CH340 USB-to-TTL кабели: красный=VCC (изолировать), си
 
 ## Channel speed upgrade
 
-Разбор апгрейда канала (варианты транспорта, замеры, что выбрано) — `docs/bluetooth-transport.md`.
+Разбор апгрейда канала (варианты транспорта, замеры, что выбрано) — `docs/bluetooth-transport.md`. Bluetooth: `transport = "rfcomm"` (Classic, ~120 KB/s) — основной; `"bluetooth"` (BLE, 4–5 KB/s) — fallback.
 
 ## Plan
 

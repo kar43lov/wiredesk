@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
-use wiredesk_core::BluetoothConfig;
+use wiredesk_core::{BluetoothConfig, RfcommConfig};
 use wiredesk_transport::bluetooth::BluetoothFactoryConfig;
+use wiredesk_transport::rfcomm::{RfcommFactoryConfig, RfcommRole};
 use wiredesk_transport::{SerialFactoryConfig, TransportConfig};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -120,6 +121,8 @@ pub struct ClientConfig {
     /// Which transport to open on startup. `"serial"` (default) uses the
     /// existing USB-Serial path. `"bluetooth"` opens the BLE Central and
     /// scans for a peer matching `bluetooth.peer_name` / `bluetooth.service_uuid`.
+    /// `"rfcomm"` connects to the host's Bluetooth Classic (SPP) service —
+    /// ~25× the BLE throughput, see `docs/bluetooth-transport.md`.
     #[serde(default = "default_transport")]
     pub transport: String,
 
@@ -132,6 +135,10 @@ pub struct ClientConfig {
     /// Bluetooth-specific settings. Used only when `transport == "bluetooth"`.
     #[serde(default)]
     pub bluetooth: BluetoothConfig,
+
+    /// Bluetooth Classic (RFCOMM) settings. Used only when `transport == "rfcomm"`.
+    #[serde(default)]
+    pub rfcomm: RfcommConfig,
 }
 
 fn default_true() -> bool {
@@ -208,6 +215,7 @@ impl Default for ClientConfig {
             window_h: None,
             transport: default_transport(),
             transport_fallback: None,
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig::default(),
         }
     }
@@ -385,8 +393,9 @@ fn from_user(src: Option<ValueSource>) -> bool {
 /// and two peripherals never connect: `open()` succeeds, nothing links up,
 /// and the failure is silent.
 ///
-/// So we downgrade to serial and say why. Returns the transport name plus an
-/// optional message for the log.
+/// So we downgrade to serial and say why. `"rfcomm"` has no such problem —
+/// a Windows client is an ordinary Winsock RFCOMM client — and passes
+/// through. Returns the transport name plus an optional message for the log.
 ///
 /// Pure, and takes the platform as an argument, so both branches are testable
 /// on any host.
@@ -421,6 +430,16 @@ pub fn to_transport_config(cfg: &ClientConfig) -> TransportConfig {
             connect_timeout_secs: cfg.bluetooth.connect_timeout_secs,
             reconnect_max_attempts: cfg.bluetooth.reconnect_max_attempts,
             require_encryption: cfg.bluetooth.require_encryption,
+        },
+        rfcomm: RfcommFactoryConfig {
+            service_uuid: cfg.rfcomm.service_uuid.clone(),
+            peer_address: cfg.rfcomm.peer_address.clone(),
+            channel: cfg.rfcomm.channel,
+            connect_timeout_secs: cfg.rfcomm.connect_timeout_secs,
+            keepalive_ms: cfg.rfcomm.keepalive_ms,
+            require_encryption: cfg.rfcomm.require_encryption,
+            // The client finds the host's service and connects to it.
+            role: RfcommRole::Connect,
         },
         fallback: cfg.transport_fallback.clone(),
     }
@@ -525,6 +544,7 @@ mod tests {
             window_h: None,
             transport: "serial".to_string(),
             transport_fallback: None,
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig::default(),
         };
         let dir = tempdir().unwrap();
@@ -539,6 +559,7 @@ mod tests {
         let cfg = ClientConfig {
             transport: "bluetooth".to_string(),
             transport_fallback: Some("serial".to_string()),
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig {
                 service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 peer_name: "TestHost".to_string(),
@@ -812,6 +833,7 @@ mod tests {
             window_h: None,
             transport: "serial".to_string(),
             transport_fallback: None,
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig::default(),
         }
     }
@@ -981,6 +1003,7 @@ mod tests {
         let cfg = ClientConfig {
             transport: "bluetooth".to_string(),
             transport_fallback: Some("serial".to_string()),
+            rfcomm: RfcommConfig::default(),
             bluetooth: BluetoothConfig {
                 service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 peer_name: "TestHost".to_string(),

@@ -10,7 +10,7 @@ use wiredesk_transport::transport::Transport;
 
 use crate::clipboard::{ClipboardSync, ProgressCounters};
 use crate::injector::InputInjector;
-use crate::shell::{ShellEvent, ShellProcess};
+use crate::shell::{shell_argv, ShellEvent, ShellProcess};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// Heartbeat timeout while the link is idle. 3 missed heartbeats — fast
@@ -56,6 +56,22 @@ pub struct Session<T: Transport, I: InputInjector> {
     screen_w: u16,
     screen_h: u16,
     shell: Option<ShellProcess>,
+    /// A shell started ahead of time, waiting to be handed to the next
+    /// `ShellOpen`, together with the argv it was started with.
+    ///
+    /// PowerShell needs ~210 ms from `CreateProcess` to answering its first
+    /// line of stdin (measured on the Win11 host, 2026-09-11), and a
+    /// `wd --exec` is one open, one line and one close - so that warm-up
+    /// was the single largest item in a command's latency, larger than the
+    /// wire and the command itself put together. Starting the next shell
+    /// the moment the previous one is handed over moves the warm-up into
+    /// the gap between commands, where nobody is waiting for it.
+    warm: Option<(Vec<String>, ShellProcess)>,
+    /// Whether to pre-warm at all. Off in the unit-test fixtures: they
+    /// handshake dozens of times and every one of those would otherwise
+    /// leave an interactive `/bin/bash` behind on the dev machine. The
+    /// dedicated warm-shell test turns it back on.
+    warm_enabled: bool,
     clipboard: ClipboardSync,
     /// Latest client display name reported via Hello (None until handshake).
     client_name: Option<String>,
@@ -72,7 +88,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// the overlay sees the same atomics.
     #[cfg(test)]
     pub fn new(transport: T, injector: I, host_name: String, screen_w: u16, screen_h: u16) -> Self {
-        Self::with_counters_and_toggles(
+        let mut s = Self::with_counters_and_toggles(
             transport,
             injector,
             host_name,
@@ -80,7 +96,20 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_h,
             ProgressCounters::default(),
             Arc::new(AtomicBool::new(true)),
-        )
+        );
+        s.warm_enabled = false;
+        s
+    }
+
+    /// Opt back into pre-warming for the one test that exercises it.
+    #[cfg(test)]
+    pub fn enable_warm_shell(&mut self) {
+        self.warm_enabled = true;
+    }
+
+    #[cfg(test)]
+    pub fn has_warm_shell(&self) -> bool {
+        self.warm.is_some()
     }
 
     /// Full ctor: progress counters plus a `receive_files` runtime toggle
@@ -112,6 +141,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_w,
             screen_h,
             shell: None,
+            warm: None,
+            warm_enabled: true,
             clipboard: ClipboardSync::with_counters_and_toggles(counters, receive_files),
             client_name: None,
             storm: StormCounter::new(DEFAULT_STORM_THRESHOLD),
@@ -213,6 +244,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             log::warn!("heartbeat timeout — disconnecting");
             self.injector.release_all()?;
             self.shell_kill();
+            self.warm_kill();
             self.clipboard.reset();
             self.state = SessionState::WaitingForHello;
             self.client_name = None;
@@ -339,6 +371,50 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         }
     }
 
+    /// Hand over the pre-warmed shell when it is the one being asked for,
+    /// otherwise start a fresh one. A warm shell that doesn't match is
+    /// kept, not discarded: the mismatch is a one-off `ShellOpen` for
+    /// `cmd`, and the next `wd --exec` will want PowerShell again.
+    ///
+    /// Anything the warm shell buffered while it sat idle is dropped on
+    /// the way out. PowerShell in pipe mode prints nothing before its
+    /// first input, but a shell that has been waiting has had time to
+    /// print something unexpected, and that would otherwise arrive in
+    /// front of the command's own output.
+    fn take_warm_or_spawn(&mut self, requested: &str) -> Result<ShellProcess> {
+        let want = shell_argv(requested);
+        if self.warm.as_ref().is_some_and(|(argv, _)| *argv == want) {
+            let (_, proc) = self.warm.take().expect("checked just above");
+            let dropped = proc.drain_pending();
+            log::info!("opening shell '{requested}' (pre-warmed, {dropped} stale chunks dropped)");
+            return Ok(proc);
+        }
+        log::info!("opening shell '{requested}'");
+        ShellProcess::spawn(requested, None)
+    }
+
+    /// Start the shell the next `ShellOpen` will most likely ask for. Only
+    /// ever the default one - a request for anything else is rare enough
+    /// that guessing would just leave a stray process around.
+    fn warm_up(&mut self) {
+        if !self.warm_enabled || self.warm.is_some() {
+            return;
+        }
+        match ShellProcess::spawn("", None) {
+            Ok(proc) => self.warm = Some((shell_argv(""), proc)),
+            // Not fatal: the next `ShellOpen` simply spawns its own.
+            Err(e) => log::warn!("could not pre-warm a shell: {e}"),
+        }
+    }
+
+    /// Kill the pre-warmed shell. Called when the client goes away - an
+    /// idle PowerShell should not outlive the link that would have used it.
+    fn warm_kill(&mut self) {
+        if let Some((_, mut proc)) = self.warm.take() {
+            proc.kill();
+        }
+    }
+
     fn handle_packet(&mut self, packet: Packet) -> Result<()> {
         match (&self.state, &packet.message) {
             (
@@ -367,6 +443,10 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.state = SessionState::Connected;
                 self.last_heartbeat_recv = Instant::now();
                 log::info!("connected (screen: {}x{})", self.screen_w, self.screen_h);
+                // Have a shell ready before the first `wd --exec` asks for
+                // one; without this the very first command still pays the
+                // full PowerShell warm-up.
+                self.warm_up();
             }
 
             (SessionState::Connected, Message::Heartbeat) => {
@@ -451,9 +531,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                         msg: "shell already open".into(),
                     })?;
                 } else {
-                    log::info!("opening shell '{shell}'");
-                    match ShellProcess::spawn(shell, None) {
-                        Ok(proc) => self.shell = Some(proc),
+                    match self.take_warm_or_spawn(shell) {
+                        Ok(proc) => {
+                            self.shell = Some(proc);
+                            // Start the next one now, so its warm-up runs
+                            // while this command is still being typed, sent
+                            // and executed.
+                            self.warm_up();
+                        }
                         Err(e) => {
                             log::error!("failed to spawn shell: {e}");
                             self.send(Message::Error {
@@ -512,16 +597,31 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 // which then makes the *next* ShellOpen fail with
                 // "shell already open". Force-kill after the close so
                 // the slot is always free when the client re-opens.
+                let had_shell = self.shell.is_some();
                 if let Some(sh) = self.shell.as_ref() {
                     sh.close();
                 }
                 self.shell_kill();
+                // Answer the close. The client holds its exec slot until the
+                // wire goes quiet, and with nothing coming back that meant
+                // waiting out a fixed idle window on every single command -
+                // 150 ms of pure latency between back-to-back `wd --exec`
+                // runs. One packet turns that into one round trip.
+                //
+                // Only when a shell was actually here: if it had already
+                // exited on its own, `tick` has sent a `ShellExit` with the
+                // real status, and an acknowledgement on top of it would be
+                // one more packet nobody is waiting for.
+                if had_shell {
+                    self.send(Message::ShellClosed)?;
+                }
             }
 
             (SessionState::Connected, Message::Disconnect) => {
                 log::info!("client disconnected");
                 self.injector.release_all()?;
                 self.shell_kill();
+                self.warm_kill();
                 self.clipboard.reset();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
@@ -561,6 +661,54 @@ mod tests {
         let injector = MockInjector::default();
         let session = Session::new(host_transport, injector, "test-host".into(), 1920, 1080);
         (session, client_transport)
+    }
+
+    #[test]
+    fn a_warm_shell_is_ready_before_the_first_command_and_refilled_after_it() {
+        // PowerShell needs ~210 ms from spawn to reading its first line of
+        // stdin, and a `wd --exec` is open-write-close - so the shell has
+        // to exist before the command arrives, or that warm-up lands in
+        // the user's latency.
+        let (mut session, mut client) = setup();
+        session.enable_warm_shell();
+        assert!(!session.has_warm_shell(), "nothing spawned before a client");
+
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: 1,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        let _ack = client.recv().unwrap();
+        assert!(
+            session.has_warm_shell(),
+            "the handshake must leave a shell warming up"
+        );
+
+        client
+            .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: String::new(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(session.has_shell(), "the warm shell was handed over");
+        assert!(
+            session.has_warm_shell(),
+            "and the next one started right away"
+        );
+
+        // The client going away must not leave an idle shell behind.
+        client.send(&Packet::new(Message::Disconnect, 2)).unwrap();
+        session.tick().unwrap();
+        assert!(!session.has_shell());
+        assert!(!session.has_warm_shell(), "no shell outlives the link");
     }
 
     #[test]

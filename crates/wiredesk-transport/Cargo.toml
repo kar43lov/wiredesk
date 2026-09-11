@@ -18,6 +18,25 @@ uuid = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 btleplug = { workspace = true }
+# RFCOMM client on IOBluetooth (objc2 0.6 line — independent of the client
+# app's objc2 0.5 bindings, both coexist in the lock).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSThread", "NSObject"] }
+# CoreBluetooth only for the TCC authorization check/prompt before the first
+# IOBluetooth call (objc2 0.5 line — the version btleplug already pulls in).
+objc2-core-bluetooth = { version = "0.2", features = ["CBManager", "CBCentralManager", "CBUUID"] }
+objc2_05 = { package = "objc2", version = "0.5" }
+objc2-core-foundation = { workspace = true, features = ["CFRunLoop", "CFDate"] }
+objc2-io-bluetooth = { workspace = true, features = [
+    "Bluetooth",
+    "IOBluetoothObject",
+    "IOBluetoothDevice",
+    "IOBluetoothRFCOMMChannel",
+    "IOBluetoothSDPServiceRecord",
+    "IOBluetoothSDPUUID",
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
+# RFCOMM server/client over Winsock AF_BTH sockets.
+socket2 = { workspace = true }

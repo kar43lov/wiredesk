@@ -56,6 +56,16 @@ pub enum MessageType {
     /// pipe-mode). Sent by the client whenever its terminal
     /// dimensions change.
     PtyResize = 0x46,
+    /// Host acknowledges a `ShellClose`: the shell slot is free again.
+    ///
+    /// Its own opcode rather than a `ShellExit` with a reserved code,
+    /// because there is no code to reserve - `exit -1` is a thing a command
+    /// can legitimately do, and the host reports `-1` itself when a killed
+    /// process has no numeric status. The client releases its exec slot as
+    /// soon as the wire goes quiet, so an acknowledgement delayed past that
+    /// window lands in the *next* command's stream; only a message that
+    /// cannot be confused with an exit status makes that harmless.
+    ShellClosed = 0x47,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -84,6 +94,7 @@ impl TryFrom<u8> for MessageType {
             0x44 => Ok(Self::ShellExit),
             0x45 => Ok(Self::ShellOpenPty),
             0x46 => Ok(Self::PtyResize),
+            0x47 => Ok(Self::ShellClosed),
             _ => Err(WireDeskError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -158,6 +169,8 @@ pub enum Message {
         data: Vec<u8>,
     }, // bytes from shell stdout/stderr
     ShellClose,
+    /// Host: the shell asked for by `ShellClose` is gone, the slot is free.
+    ShellClosed,
     ShellExit {
         code: i32,
     },
@@ -197,6 +210,7 @@ impl Message {
             Self::ShellInput { .. } => MessageType::ShellInput,
             Self::ShellOutput { .. } => MessageType::ShellOutput,
             Self::ShellClose => MessageType::ShellClose,
+            Self::ShellClosed => MessageType::ShellClosed,
             Self::ShellExit { .. } => MessageType::ShellExit,
             Self::ShellOpenPty { .. } => MessageType::ShellOpenPty,
             Self::PtyResize { .. } => MessageType::PtyResize,
@@ -265,7 +279,7 @@ impl Message {
             Self::ClipDecline { format } => {
                 buf.push(*format);
             }
-            Self::Heartbeat | Self::Disconnect | Self::ShellClose => {}
+            Self::Heartbeat | Self::Disconnect | Self::ShellClose | Self::ShellClosed => {}
             Self::Error { code, msg } => {
                 buf.extend_from_slice(&code.to_le_bytes());
                 write_string(&mut buf, msg, 256);
@@ -399,6 +413,7 @@ impl Message {
                 data: payload.to_vec(),
             }),
             MessageType::ShellClose => Ok(Self::ShellClose),
+            MessageType::ShellClosed => Ok(Self::ShellClosed),
             MessageType::ShellExit => {
                 ensure_min_len(payload, 4)?;
                 let code = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -658,6 +673,7 @@ mod tests {
     #[test]
     fn roundtrip_shell_close() {
         roundtrip(&Message::ShellClose);
+        roundtrip(&Message::ShellClosed);
     }
 
     #[test]
@@ -684,6 +700,10 @@ mod tests {
             MessageType::ShellOpenPty
         );
         assert_eq!(MessageType::try_from(0x46).unwrap(), MessageType::PtyResize);
+        assert_eq!(
+            MessageType::try_from(0x47).unwrap(),
+            MessageType::ShellClosed
+        );
     }
 
     #[test]
