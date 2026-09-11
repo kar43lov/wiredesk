@@ -201,8 +201,10 @@ fn console_text(stderr: &[u8], stdout: &[u8]) -> String {
 fn decode_console(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         return String::from_utf16_lossy(&units);
     }
@@ -372,8 +374,10 @@ fn run_value() -> Option<String> {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn decode_reg_sz(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_le_bytes(c))
         .take_while(|&u| u != 0)
         .collect();
     String::from_utf16_lossy(&units)
