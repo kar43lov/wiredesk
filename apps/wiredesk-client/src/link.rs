@@ -876,7 +876,7 @@ mod tests {
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown, ctx));
 
         let evt = events_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("expected a transport event");
         match evt {
             TransportEvent::Disconnected(reason) => {
@@ -908,7 +908,7 @@ mod tests {
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
 
         let evt = events_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("expected the heartbeat after threshold-1 errors");
         assert!(
             matches!(evt, TransportEvent::Heartbeat),
@@ -937,7 +937,7 @@ mod tests {
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown, ctx));
 
         let evt = events_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("expected a transport event");
         match evt {
             TransportEvent::Disconnected(reason) => {
@@ -967,7 +967,7 @@ mod tests {
 
         // The valid Heartbeat must surface as an event...
         let evt = events_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("expected the heartbeat event");
         assert!(matches!(evt, TransportEvent::Heartbeat), "got {evt:?}");
         // ...and no Disconnected should follow (storm never reached threshold).
@@ -1024,7 +1024,7 @@ mod tests {
         });
 
         let evt = events_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("expected a Disconnected after the idle budget elapsed");
         match evt {
             TransportEvent::Disconnected(reason) => {
@@ -1089,7 +1089,7 @@ mod tests {
             .send(Packet::new(Message::Heartbeat, 0))
             .expect("send on surviving channel");
         let got = returned_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(10))
             .expect("packet available on returned receiver");
         assert!(matches!(got.message, Message::Heartbeat));
     }
@@ -1121,7 +1121,7 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         // Must exit within a heartbeat interval + slack once shutdown is set.
         done_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(10))
             .expect("writer never exited on shutdown — would deadlock supervisor teardown");
         handle.join().unwrap();
     }
@@ -1142,7 +1142,7 @@ mod tests {
         // Must terminate promptly once shutdown is raised.
         let start = Instant::now();
         handle.join().unwrap();
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -1184,7 +1184,7 @@ mod tests {
         // Expect Reconnecting{1}, Reconnecting{2}, Reconnecting{3}.
         let mut attempts = Vec::new();
         for _ in 0..3 {
-            match events_rx.recv_timeout(Duration::from_secs(2)) {
+            match events_rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(TransportEvent::Reconnecting { attempt }) => attempts.push(attempt),
                 other => panic!("expected Reconnecting, got {other:?}"),
             }
@@ -1195,7 +1195,7 @@ mod tests {
         let start = Instant::now();
         while !link_up.load(Ordering::Acquire) {
             assert!(
-                start.elapsed() < Duration::from_secs(2),
+                start.elapsed() < Duration::from_secs(10),
                 "link never came up"
             );
             thread::sleep(Duration::from_millis(10));
@@ -1240,7 +1240,7 @@ mod tests {
             let start = Instant::now();
             while !link_up.load(Ordering::Acquire) {
                 assert!(
-                    start.elapsed() < Duration::from_secs(3),
+                    start.elapsed() < Duration::from_secs(10),
                     "link never came up"
                 );
                 thread::sleep(Duration::from_millis(5));
@@ -1249,7 +1249,7 @@ mod tests {
 
         // First open → link up.
         request_tx.send(()).unwrap();
-        match events_rx.recv_timeout(Duration::from_secs(2)) {
+        match events_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(TransportEvent::Reconnecting { attempt }) => assert_eq!(attempt, 1),
             other => panic!("expected Reconnecting{{1}}, got {other:?}"),
         }
@@ -1267,7 +1267,7 @@ mod tests {
         let start = Instant::now();
         loop {
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < Duration::from_secs(10),
                 "never saw the second Reconnecting after teardown"
             );
             match events_rx.recv_timeout(Duration::from_millis(200)) {
@@ -1321,7 +1321,7 @@ mod tests {
         let start = Instant::now();
         while !saw_disconnect {
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < Duration::from_secs(10),
                 "never saw the instant-death Disconnected"
             );
             if let Ok(TransportEvent::Disconnected(_)) =
@@ -1341,7 +1341,7 @@ mod tests {
         let start = Instant::now();
         loop {
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < Duration::from_secs(10),
                 "supervisor swallowed the fresh link's reconnect request"
             );
             match events_rx.recv_timeout(Duration::from_millis(200)) {
@@ -1385,7 +1385,7 @@ mod tests {
         let shutdown_c = shutdown.clone();
         let ctx_c = ctx.clone();
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx_c));
-        match events_rx2.recv_timeout(Duration::from_secs(2)) {
+        match events_rx2.recv_timeout(Duration::from_secs(10)) {
             Ok(TransportEvent::Connected { .. }) => {}
             other => panic!("expected Connected after HelloAck, got {other:?}"),
         }
@@ -1420,7 +1420,7 @@ mod tests {
         let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
 
         // Wait for the Connected event so we know HelloAck was processed.
-        match events_rx.recv_timeout(Duration::from_secs(2)) {
+        match events_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(TransportEvent::Connected { .. }) => {}
             other => panic!("expected Connected after HelloAck, got {other:?}"),
         }

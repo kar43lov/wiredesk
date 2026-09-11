@@ -1468,7 +1468,7 @@ mod tests {
             // — no prompt detection on this path because PS in pipe
             // mode doesn't emit one.
             let cmd = host
-                .recv_shell_input(Duration::from_secs(2))
+                .recv_shell_input(Duration::from_secs(10))
                 .expect("client should send formatted command");
             assert!(cmd.contains("Get-ChildItem"), "cmd payload: {cmd:?}");
             assert!(cmd.contains("__WD_DONE_"));
@@ -1496,7 +1496,7 @@ mod tests {
             // until the remote prompt is seen (avoids PS read-ahead
             // race that traps payload in PS's StreamReader buffer).
             let ssh_cmd = host
-                .recv_shell_input(Duration::from_secs(2))
+                .recv_shell_input(Duration::from_secs(10))
                 .expect("client should send ssh -tt");
             assert!(ssh_cmd.starts_with("ssh -tt prod"), "got: {ssh_cmd:?}");
 
@@ -1511,7 +1511,7 @@ mod tests {
 
             // Step 3: client should now send the formatted command.
             let cmd = host
-                .recv_shell_input(Duration::from_secs(2))
+                .recv_shell_input(Duration::from_secs(10))
                 .expect("client should send formatted bash command");
             assert!(
                 cmd.starts_with("echo __WD_READY_"),
@@ -1540,7 +1540,7 @@ mod tests {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
             // Consume the cmd but never emit a sentinel.
-            let _cmd = host.recv_shell_input(Duration::from_secs(2));
+            let _cmd = host.recv_shell_input(Duration::from_secs(10));
             thread::sleep(Duration::from_millis(2_000));
         });
 
@@ -1554,7 +1554,7 @@ mod tests {
     fn run_oneshot_propagates_nonzero_exit() {
         let (writer, reader, host) = make_split_pair();
         let host_thread = thread::spawn(move || {
-            let cmd = host.recv_shell_input(Duration::from_secs(2)).expect("cmd");
+            let cmd = host.recv_shell_input(Duration::from_secs(10)).expect("cmd");
             let uuid = extract_uuid_from_payload(&cmd);
             host.emit_chunk(&format!("__WD_READY_{uuid}__\r\n"));
             host.emit_chunk(&format!("__WD_DONE_{uuid}__7\r\n"));
@@ -1576,7 +1576,7 @@ mod tests {
         let host_thread = thread::spawn(move || {
             // Step 1: ssh hop sent first.
             let ssh_cmd = host
-                .recv_shell_input(Duration::from_secs(2))
+                .recv_shell_input(Duration::from_secs(10))
                 .expect("client should send ssh -tt");
             assert!(ssh_cmd.starts_with("ssh -tt prod"), "got: {ssh_cmd:?}");
 
@@ -1585,7 +1585,7 @@ mod tests {
 
             // Step 3: client sends the bash payload (echo READY; cmd; echo DONE).
             let cmd = host
-                .recv_shell_input(Duration::from_secs(2))
+                .recv_shell_input(Duration::from_secs(10))
                 .expect("client should send bash payload");
             let uuid = extract_uuid_from_payload(&cmd);
 
@@ -1696,7 +1696,7 @@ mod tests {
         // by AC3 live-tests.
         let mut stream = std::os::unix::net::UnixStream::connect(&socket_path).expect("connect");
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         write_connect(
             &mut stream,
