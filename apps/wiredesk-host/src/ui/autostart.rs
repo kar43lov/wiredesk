@@ -62,6 +62,10 @@ pub fn needs_refresh(want: bool, stored: Option<&str>, expected: &str) -> bool {
 pub fn enable() -> std::io::Result<()> {
     match create_logon_task() {
         Ok(()) => {
+            // Which of the two got armed is the first thing anyone asks when
+            // autostart misbehaves, and it cannot be read off Task Manager:
+            // its Startup tab lists the Run key only, never a logon task.
+            log::info!("autostart: elevated logon task '{TASK_NAME}' registered");
             // Only one of the two may be armed, or the host starts twice at
             // logon. The single-instance mutex turns the second start into
             // "open Settings", which is not what anyone wants at boot.
@@ -78,7 +82,9 @@ pub fn enable() -> std::io::Result<()> {
         // at random. Report the failure instead, so the Settings window
         // says so and the user knows to relaunch as administrator.
         Err(e) if stored_task_present() => Err(std::io::Error::other(format!(
-            "a 'WireDesk Host' logon task is already registered and could not be              updated ({e}). Run WireDesk as administrator and save again, or              delete the task in Task Scheduler."
+            "a 'WireDesk Host' logon task is already registered and could not be \
+             updated ({e}). Run WireDesk as administrator and save again, or \
+             delete the task in Task Scheduler."
         ))),
         Err(e) => {
             log::warn!(

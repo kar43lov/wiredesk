@@ -463,10 +463,25 @@ pub fn format_progress(action: &str, current: u64, total: u64) -> Option<String>
     }
 }
 
-/// Compute fill ratio for a clipboard progress bar.
+/// Stop labels in a Host-picture overlay from being selectable.
 ///
-/// Returns `Some(ratio)` in 0.0..=1.0 when a transfer is active (`total > 0`),
-/// or `None` when idle. Overshoot is clamped to 1.0.
+/// `Area::interactable(false)` is not enough, and `capture_progress_overlay`
+/// does not even set it: that flag only softens the *area's* own sense and
+/// makes `Areas::layer_id_at` skip the layer. Widget hit-testing
+/// (`hit_test` in `Context::begin_pass`) walks every layer that registered
+/// widgets, and `Area::content_ui` builds an ordinary `Ui` — only the
+/// separate `enabled` flag disables one. So each `ui.label` still takes
+/// `Sense::click_and_drag()` while `style.interaction.selectable_labels` is
+/// on, which is the egui default, and a drag over the Host picture paints a
+/// blue text selection instead of reaching the Host. Reported live
+/// 2026-09-12. With selection off a `Label` falls back to `Sense::hover()`.
+///
+/// Buttons are unaffected — this is why the Cancel button in the progress
+/// overlay keeps working.
+fn disable_label_selection(ui: &mut egui::Ui) {
+    ui.style_mut().interaction.selectable_labels = false;
+}
+
 /// Render a progress bar with an inline Cancel button on its right.
 /// Clicking the button flips `cancel_flag` to true; the writer/reader
 /// thread observes the flag and drops the in-flight clipboard packets,
@@ -511,6 +526,10 @@ fn render_progress_row(
     });
 }
 
+/// Compute fill ratio for a clipboard progress bar.
+///
+/// Returns `Some(ratio)` in 0.0..=1.0 when a transfer is active (`total > 0`),
+/// or `None` when idle. Overshoot is clamped to 1.0.
 pub fn progress_ratio(current: u64, total: u64) -> Option<f32> {
     if total == 0 {
         return None;
@@ -1373,6 +1392,15 @@ impl WireDeskApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        // Dropping the frame does NOT drop `NSWindowStyleMask::Resizable`,
+        // and macOS keeps offering edge-drag resizing on a borderless window
+        // — with no visible frame the only hint is the cursor turning into
+        // an up-down arrow. So pushing the pointer to the top of the Host
+        // screen grabs our own top edge instead of reaching the Host's first
+        // row, and dragging down shrinks the window out of fullscreen; after
+        // that the Host's top row sits behind the Mac menu bar and cannot be
+        // reached at all. Reported live with photos on 2026-09-12.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         // Cover the menu bar (macOS) / taskbar (Windows) by sitting above
         // it. The shell keeps its bar over an ordinary window even when that
@@ -1386,6 +1414,9 @@ impl WireDeskApp {
         log::info!("fullscreen: leaving borderless");
         self.fullscreen_is_native = false;
         self.set_window_above(ctx, false);
+        // Pair with the resize lock in `enter_borderless_fullscreen` — the
+        // frame comes back on the next line and has to be draggable again.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         // Belt and braces: a native fullscreen entered outside our control
         // (⌃⌘F, the green button while decorations were on) still has to be
@@ -1889,6 +1920,7 @@ impl WireDeskApp {
             .interactable(false)
             .fixed_pos(screen_rect.min)
             .show(ctx, |ui| {
+                disable_label_selection(ui);
                 ui.set_width(screen_rect.width());
                 egui::Frame::group(ui.style())
                     .fill(banner_fill)
@@ -1931,6 +1963,7 @@ impl WireDeskApp {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
             .show(ctx, |ui| {
+                disable_label_selection(ui);
                 ui.set_max_width((screen_rect.width() - 32.0).max(200.0));
                 if let (Some(ratio), Some(text)) = (
                     progress_ratio(out_cur, out_tot),
@@ -1983,6 +2016,7 @@ impl WireDeskApp {
             .interactable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
+                disable_label_selection(ui);
                 ui.set_max_width(560.0);
                 ui.vertical_centered(|ui| {
                     ui.heading("WireDesk — input forwarded to Host");
