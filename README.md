@@ -372,18 +372,19 @@ fixed rather than things that are missing.
 
 | Component | Tests |
 |---|--:|
-| `wiredesk-client` (GUI, input, clipboard) | 357 |
-| `wiredesk-host` (Windows agent) | 178 |
-| `wiredesk-exec-core` (shared `wd --exec` runner) | 107 |
+| `wiredesk-client` (GUI, input, clipboard) | 358 |
+| `wiredesk-host` (Windows agent) | 180 |
+| `wiredesk-exec-core` (shared `wd --exec` runner) | 119 |
 | `wiredesk-protocol` (framing, COBS, CRC-16) | 88 |
-| `wiredesk-transport` (serial, BLE, RFCOMM, port detection) | 65 |
+| `wiredesk-transport` (serial, BLE, RFCOMM, port detection) | 78 |
 | `wiredesk-term` (`wd` CLI) | 50 |
-| `wiredesk-core` (shared types, clipboard files) | 29 |
-| **Total** | **874** |
+| `wiredesk-core` (shared types, clipboard files) | 31 |
+| **Total** | **904** |
 
-Plus 5 ignored tests that need a live Windows session. On macOS run the suite
-with `cargo test --workspace -- --test-threads=1` — the host package has a
-pre-existing flake on the parallel runner.
+Plus 6 ignored tests: five need a live Windows session, one a real OS
+clipboard. `cargo test --workspace` runs clean in parallel on both platforms —
+the macOS host-package flake was fixed on 2026-09-11 (unit tests no longer open
+the system clipboard, and the calls that remain are serialised).
 
 **Maturity by area:**
 

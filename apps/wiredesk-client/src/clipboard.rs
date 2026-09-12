@@ -23,11 +23,57 @@ use wiredesk_protocol::packet::Packet;
 use crate::app::TransportEvent;
 use crate::clipboard_files;
 
+/// The only four places in this module that touch the OS clipboard.
+///
+/// Each takes the process-wide lock from [`wiredesk_core::clipboard_lock`]
+/// first. The poll thread reads the clipboard while the reader thread commits
+/// what the host sent, and on macOS two pasteboard calls at the same time
+/// abort the process — see that module for the measurement. File paths go
+/// through `clipboard_files`, which takes the same lock.
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_get_text(clip: &mut arboard::Clipboard) -> Result<String, arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.get_text()
+}
+
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_get_image(
+    clip: &mut arboard::Clipboard,
+) -> Result<arboard::ImageData<'static>, arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.get_image()
+}
+
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_set_text(clip: &mut arboard::Clipboard, text: String) -> Result<(), arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.set_text(text)
+}
+
+#[allow(clippy::disallowed_methods)] // the blessed call site
+fn locked_set_image(
+    clip: &mut arboard::Clipboard,
+    img: arboard::ImageData<'_>,
+) -> Result<(), arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    clip.set_image(img)
+}
+
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Per-chunk byte cap. Bumped 256 → 1024 alongside the host-side
-/// constant so a 20 MB image fits within the u16 chunk-index space
-/// (1024 × 65535 ≈ 64 MB). Each chunk stays well under MAX_PAYLOAD = 4096.
-const CHUNK_SIZE: usize = 1024;
+/// Per-chunk byte cap: everything a `ClipChunk` can carry.
+///
+/// The payload of that message is the 2-byte chunk index followed by the
+/// data, so the data fills `MAX_PAYLOAD` minus those two bytes. It was 1024
+/// — a number chosen when the chunk had to fit a much smaller payload, and
+/// left behind when `MAX_PAYLOAD` grew to 4096; a megabyte image went as
+/// 1024 packets where 257 would do. Computed here rather than written out,
+/// because that is exactly how 1024 came to be wrong.
+///
+/// The index is a `u16`, so chunk size also sets the ceiling on a single
+/// transfer: 4094 × 65535 ≈ 256 MB, comfortably past the 20 MB file cap.
+/// Chunking is a sender-side decision — the peer reassembles by index and
+/// the offer's total length — so the two sides need not agree on it.
+const CHUNK_SIZE: usize = wiredesk_protocol::packet::MAX_PAYLOAD - 2;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024; // 256 KB cap for text
 /// Maximum encoded PNG size we will push to the peer. Larger payloads are
 /// dropped with a warning (and a UI toast wired up in Task 7b). The cap is
@@ -865,7 +911,7 @@ pub fn spawn_poll_thread(
         // runtime poll path). Stamp BOTH text and image — the OS
         // clipboard can hold both (NSPasteboard supports multiple types
         // for one copy).
-        if let Ok(text) = clip.get_text() {
+        if let Ok(text) = locked_get_text(&mut clip) {
             if !text.is_empty() {
                 state.set_text(hash_text(&text));
                 log::info!(
@@ -874,7 +920,7 @@ pub fn spawn_poll_thread(
                 );
             }
         }
-        if let Ok(img) = clip.get_image() {
+        if let Ok(img) = locked_get_image(&mut clip) {
             state.set_image(hash_bytes(&img.bytes));
             log::info!(
                 "clipboard: pre-stamped existing image ({}x{}) — not sending on startup",
@@ -1101,7 +1147,7 @@ pub fn spawn_poll_thread(
                 // otherwise a stale pending survives the non-text interlude
                 // and a later re-copy of the same text would match it and ship
                 // on its first sighting, skipping the stability gate.
-                match clip.get_text() {
+                match locked_get_text(&mut clip) {
                     Ok(text) if !text.is_empty() => {
                         let hash = hash_text(&text);
                         // Race guard (see comment above the file probe): a
@@ -1194,7 +1240,7 @@ pub fn spawn_poll_thread(
                 if !send_images.load(Ordering::Relaxed) || !link_ready {
                     break 'image;
                 }
-                let img = match clip.get_image() {
+                let img = match locked_get_image(&mut clip) {
                     Ok(i) => i,
                     Err(_) => break 'image, // not an image
                 };
@@ -1637,7 +1683,7 @@ impl IncomingClipboard {
                 // Leaving last unchanged lets poll detect any real change.
                 let mut wrote_ok = self.clip.is_none(); // no backend → treat as "ours"
                 if let Some(clip) = self.clip.as_mut() {
-                    match clip.set_text(text.clone()) {
+                    match locked_set_text(clip, text.clone()) {
                         Ok(()) => {
                             log::debug!("clipboard: wrote {} bytes from host", text.len());
                             wrote_ok = true;
@@ -1806,7 +1852,7 @@ impl IncomingClipboard {
         // stale content and we'd loop forever silently.
         let mut wrote_ok = self.clip.is_none(); // no backend (tests) → ok
         if let Some(clip) = self.clip.as_mut() {
-            match clip.set_image(img) {
+            match locked_set_image(clip, img) {
                 Ok(()) => {
                     log::debug!(
                         "clipboard: wrote image from host ({} encoded bytes)",
@@ -1868,6 +1914,40 @@ pub fn run_startup_vacuum(older_than: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunk size is derived from the protocol limit, so the derivation
+    /// has to stay true: one full chunk must encode, one byte more must not.
+    #[test]
+    fn a_full_chunk_is_the_largest_a_clip_chunk_can_carry() {
+        use wiredesk_protocol::packet::{Packet, MAX_PAYLOAD};
+        let full = Packet::new(
+            Message::ClipChunk {
+                index: 0,
+                data: vec![0xAB; CHUNK_SIZE],
+            },
+            0,
+        );
+        assert!(
+            full.to_bytes().is_ok(),
+            "a full chunk must fit the protocol"
+        );
+        let over = Packet::new(
+            Message::ClipChunk {
+                index: 0,
+                data: vec![0xAB; CHUNK_SIZE + 1],
+            },
+            0,
+        );
+        assert!(
+            over.to_bytes().is_err(),
+            "CHUNK_SIZE must be the largest that fits, not merely a safe one"
+        );
+        assert_eq!(
+            CHUNK_SIZE,
+            MAX_PAYLOAD - 2,
+            "index takes the other two bytes"
+        );
+    }
 
     // --- decide_text_send (copy-on-select debounce) ---
 

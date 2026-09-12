@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod runner;
 pub mod transport;
 pub mod types;
+pub mod utf8_stream;
 
 pub use helpers::{
     clean_stdout, format_command, format_timeout_diagnostic, is_powershell_prompt,

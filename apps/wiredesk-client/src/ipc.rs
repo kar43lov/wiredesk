@@ -1091,7 +1091,7 @@ mod tests {
             // we land on the ShellInput carrying the sentinel marker.
             let payload = loop {
                 let pkt = outgoing_rx
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(Duration::from_secs(10))
                     .expect("runner should send packets");
                 if let Message::ShellInput { data } = pkt.message {
                     let s = String::from_utf8_lossy(&data).to_string();
@@ -1191,7 +1191,7 @@ mod tests {
         // Bound the read so a regression (lock acquired before the link check)
         // fails the test instead of hanging it.
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let req = IpcRequest {
             cmd: "echo hi".into(),
@@ -1317,7 +1317,10 @@ mod tests {
     /// so before originating ShellOpenPty, but the handler runs on its own
     /// thread so we poll to avoid a race in the staging tests).
     fn wait_slot_installed(slot: &ExecEventSlot) {
-        for _ in 0..400 {
+        // 10 s of 5 ms steps. The handler installs the slot in microseconds
+        // on an idle machine; the budget is for a loaded CI runner, where a
+        // thread can simply not be scheduled for a second or two.
+        for _ in 0..2000 {
             if slot.lock().unwrap().is_some() {
                 return;
             }
@@ -1357,7 +1360,7 @@ mod tests {
     fn interactive_hello_synth_ack_and_forwards_input() {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
@@ -1401,7 +1404,7 @@ mod tests {
         // Only after the HelloAck does the relay originate the single ShellOpenPty
         // — the term sends none.
         let first = outgoing_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("relay must originate ShellOpenPty after handshake");
         match first.message {
             Message::ShellOpenPty { shell, cols, rows } => {
@@ -1433,7 +1436,7 @@ mod tests {
 
         // Next wire packet is ShellInput — Hello + Heartbeat were NOT forwarded.
         match outgoing_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("forwarded ShellInput")
             .message
         {
@@ -1442,7 +1445,7 @@ mod tests {
         }
         assert!(matches!(
             outgoing_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("forwarded PtyResize")
                 .message,
             Message::PtyResize { cols: 80, rows: 24 }
@@ -1465,7 +1468,7 @@ mod tests {
         // Teardown: single host-side ShellClose + owner released.
         assert!(matches!(
             outgoing_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("teardown ShellClose")
                 .message,
             Message::ShellClose
@@ -1477,7 +1480,7 @@ mod tests {
     fn interactive_refused_when_link_down() {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
@@ -1526,7 +1529,7 @@ mod tests {
     fn interactive_refused_when_host_info_empty() {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
@@ -1576,7 +1579,7 @@ mod tests {
     fn interactive_refused_when_channel_busy() {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
@@ -1618,7 +1621,7 @@ mod tests {
     fn interactive_link_down_midsession_sends_disconnect() {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
@@ -1648,7 +1651,7 @@ mod tests {
         let _ = client_handshake(&mut client);
         assert!(matches!(
             outgoing_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("ShellOpenPty")
                 .message,
             Message::ShellOpenPty { .. }
@@ -1675,7 +1678,7 @@ mod tests {
         // every later `wd` is refused "shell busy" indefinitely.
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
         let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
@@ -1703,7 +1706,7 @@ mod tests {
         let _ = client_handshake(&mut client);
         assert!(matches!(
             outgoing_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("ShellOpenPty")
                 .message,
             Message::ShellOpenPty { .. }
@@ -1728,7 +1731,7 @@ mod tests {
         // ...and the relay tears down: single host-side ShellClose + owner freed.
         assert!(matches!(
             outgoing_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("teardown ShellClose after host error")
                 .message,
             Message::ShellClose
@@ -1777,7 +1780,7 @@ mod tests {
 
         let mut client = UnixStream::connect(&socket).expect("connect");
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let req = IpcRequest {
             cmd: "echo hi".into(),

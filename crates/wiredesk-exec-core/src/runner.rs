@@ -20,6 +20,7 @@ use crate::helpers::{
 };
 use crate::transport::ExecTransport;
 use crate::types::{ExecError, ExecEvent, OneShotState, ShellKind};
+use crate::utf8_stream::Utf8Stream;
 
 /// How long each `recv_event` call may park. Smaller = more frequent
 /// timeout-budget re-checks, larger = fewer wakeups. 100 ms matches
@@ -44,6 +45,32 @@ enum Phase {
     Streaming,
 }
 
+/// How much of the wire log the timeout error carries.
+///
+/// `format_timeout_diagnostic` prints the last 256 bytes of it, so this is
+/// already thirty times what anyone reads — and unlike an unbounded buffer it
+/// cannot turn `wd --exec "docker logs"` into a copy of the whole output held
+/// in memory beside the stream that is being written out anyway.
+const TIMEOUT_LOG_TAIL: usize = 8 * 1024;
+
+/// Append `text`, keeping at most `cap` bytes of the tail.
+///
+/// Cutting a `String` by byte offset panics unless the offset is a character
+/// boundary, and this buffer is full of multi-byte output by definition — so
+/// the cut walks forward to the next boundary instead of trusting the
+/// arithmetic.
+fn push_bounded_tail(buf: &mut String, text: &str, cap: usize) {
+    buf.push_str(text);
+    if buf.len() <= cap {
+        return;
+    }
+    let want = buf.len() - cap;
+    let cut = (want..=buf.len())
+        .find(|i| buf.is_char_boundary(*i))
+        .unwrap_or(buf.len());
+    buf.drain(..cut);
+}
+
 /// Drive a single sentinel-bracketed command to completion.
 ///
 /// `on_chunk` is called once per emitted line in non-compress mode,
@@ -61,7 +88,8 @@ enum Phase {
 ///
 /// Returns `Ok(exit_code)` on success, `Err(ExecError::Timeout(buf))`
 /// if the wall-clock budget elapses without the sentinel — `buf`
-/// carries the raw wire log so the caller can pass it through
+/// carries the tail of the wire log (`TIMEOUT_LOG_TAIL`, far more than
+/// `format_timeout_diagnostic` prints) so the caller can pass it through
 /// `format_timeout_diagnostic`. In compress mode a partial buffer
 /// at timeout is **not** decoded (it would be a fragment, not data).
 /// Other `ExecError` variants surface transport-layer failures
@@ -163,7 +191,13 @@ where
     }
 
     let mut pending = String::new();
+    // Bytes at the head of `pending` already known to hold no newline.
+    let mut scanned = 0usize;
     let mut full_log = String::new();
+    // The wire cuts the shell's output at packet boundaries, which land
+    // wherever they land — decoding each chunk on its own would eat any
+    // character sitting on the seam. See `utf8_stream`.
+    let mut utf8 = Utf8Stream::new();
     // In compress mode, post-READY lines accumulate into a single base64
     // buffer that's decoded once the sentinel arrives. In non-compress
     // mode this stays empty and the streaming callback is used directly.
@@ -174,10 +208,10 @@ where
     while started.elapsed() < max_wait {
         match transport.recv_event(RECV_TICK)? {
             ExecEvent::ShellOutput(data) => {
-                let text = String::from_utf8_lossy(&data);
                 log::trace!("[exec] recv ShellOutput {} bytes", data.len());
+                let text = utf8.push(&data);
                 pending.push_str(&text);
-                full_log.push_str(&text);
+                push_bounded_tail(&mut full_log, &text, TIMEOUT_LOG_TAIL);
             }
             ExecEvent::ShellClosed => {
                 // An acknowledgement for the *previous* command's
@@ -200,7 +234,18 @@ where
 
         // Walk completed lines out of `pending`. Each line is whatever
         // came before the next `\n`, with trailing `\r` stripped.
-        while let Some(nl_idx) = pending.find('\n') {
+        //
+        // The search starts where the last one gave up. Output that carries
+        // no newline for a long stretch — a big base64 blob written with
+        // `-NoNewline`, a binary dump — would otherwise be rescanned from the
+        // front on every packet, which is quadratic in the size of the
+        // output and turns into a hang rather than a slow command.
+        // `scanned` is always `pending.len()` from a previous pass, and
+        // `pending` only ever grows by whole characters (`Utf8Stream`), so
+        // slicing at it cannot land inside one.
+        while let Some(rel) = pending[scanned..].find('\n') {
+            let nl_idx = scanned + rel;
+            scanned = 0;
             let raw_line = pending[..nl_idx].to_string();
             let consume = nl_idx + 1;
             pending.drain(..consume);
@@ -325,6 +370,10 @@ where
             }
         }
 
+        // Everything still in `pending` has been looked at and holds no
+        // newline; the next pass starts after it.
+        scanned = pending.len();
+
         // Remote prompts can arrive WITHOUT a trailing newline (bash/zsh
         // park the cursor right after `$ ` / `# ` / `➜ `). Peek the
         // partial leftover after stripping ANSI escapes.
@@ -335,10 +384,15 @@ where
                 transport.send_input(payload.as_bytes())?;
                 state = OneShotState::AwaitingSentinel;
                 pending.clear();
+                scanned = 0;
             }
         }
     }
 
+    // Out of time. Anything the decoder is still holding belongs in the log
+    // the error carries — half a character is a better clue than silence.
+    let tail = utf8.finish();
+    push_bounded_tail(&mut full_log, &tail, TIMEOUT_LOG_TAIL);
     Err(ExecError::Timeout(full_log))
 }
 
@@ -346,6 +400,153 @@ where
 mod tests {
     use super::*;
     use crate::transport::mock::MockExecTransport;
+
+    /// A host that answers the payload instead of replaying a fixed script.
+    ///
+    /// The runner mints a fresh uuid per call, so a canned sentinel can never
+    /// match; this reads the uuid back out of the wrapper the runner just
+    /// sent and builds the reply from it. `chunks` decides how the reply is
+    /// cut on the wire — which is the whole point for the UTF-8 test.
+    /// uuid -> the wire chunks the host answers with.
+    type ReplyFn = Box<dyn Fn(&str) -> Vec<Vec<u8>>>;
+
+    struct ScriptedHost {
+        queued: std::collections::VecDeque<ExecEvent>,
+        reply: ReplyFn,
+    }
+
+    impl ScriptedHost {
+        fn new(reply: impl Fn(&str) -> Vec<Vec<u8>> + 'static) -> Self {
+            Self {
+                queued: std::collections::VecDeque::new(),
+                reply: Box::new(reply),
+            }
+        }
+    }
+
+    /// Pull the uuid out of `__WD_READY_<uuid>__` in the payload.
+    fn uuid_of(payload: &str) -> String {
+        let start =
+            payload.find("__WD_READY_").expect("payload carries READY") + "__WD_READY_".len();
+        let rest = &payload[start..];
+        let end = rest.find("__").expect("READY marker is terminated");
+        rest[..end].to_string()
+    }
+
+    impl ExecTransport for ScriptedHost {
+        fn send_input(&mut self, data: &[u8]) -> Result<(), ExecError> {
+            let payload = String::from_utf8_lossy(data);
+            let uuid = uuid_of(&payload);
+            for chunk in (self.reply)(&uuid) {
+                self.queued.push_back(ExecEvent::ShellOutput(chunk));
+            }
+            Ok(())
+        }
+
+        fn recv_event(&mut self, _timeout: Duration) -> Result<ExecEvent, ExecError> {
+            Ok(self.queued.pop_front().unwrap_or(ExecEvent::Idle))
+        }
+    }
+
+    /// Output with no newline in it for a long stretch, with the sentinel
+    /// finally glued to its end. Exercises the incremental newline search:
+    /// the scan resumes where it stopped, and a bookkeeping slip there shows
+    /// up as a lost or duplicated prefix rather than as a slow test.
+    #[test]
+    fn a_long_unterminated_run_before_the_sentinel_is_emitted_once() {
+        let body = "x".repeat(50_000);
+        let body_for_host = body.clone();
+
+        let mut host = ScriptedHost::new(move |uuid| {
+            let mut out = vec![format!("__WD_READY_{uuid}__\n").into_bytes()];
+            for piece in body_for_host.as_bytes().chunks(1000) {
+                out.push(piece.to_vec());
+            }
+            out.push(format!("__WD_DONE_{uuid}__0\n").into_bytes());
+            out
+        });
+
+        let mut got = Vec::new();
+        let code = run_oneshot(&mut host, "x", None, 5, false, |c| got.extend_from_slice(c))
+            .expect("run_oneshot");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(got).expect("utf-8"), format!("{body}\n"));
+    }
+
+    #[test]
+    fn the_timeout_log_keeps_the_tail_and_stops_growing() {
+        let mut buf = String::new();
+        for i in 0..1000 {
+            push_bounded_tail(&mut buf, &format!("line {i}\n"), 256);
+            assert!(buf.len() <= 256 + 16, "buffer grew to {}", buf.len());
+        }
+        assert!(buf.ends_with("line 999\n"), "tail lost: {buf:?}");
+        assert!(!buf.contains("line 0\n"), "head should have been dropped");
+    }
+
+    #[test]
+    fn trimming_the_timeout_log_never_cuts_a_character_in_half() {
+        // Every byte of this is part of a multi-byte character, so a cut
+        // computed by arithmetic alone would land inside one and panic.
+        let mut buf = String::new();
+        for _ in 0..200 {
+            push_bounded_tail(&mut buf, "ёжик", 37);
+        }
+        assert!(buf.len() <= 37 + 4);
+        assert!(buf.ends_with("ёжик"));
+    }
+
+    /// The wire cuts output at packet boundaries that know nothing about
+    /// character boundaries. Before `Utf8Stream` each chunk was decoded on
+    /// its own, so a Cyrillic letter landing on the seam turned into two
+    /// replacement characters — the long-standing "bytes go missing in long
+    /// Cyrillic output" report, which `--compress` hid because base64 is
+    /// ASCII.
+    #[test]
+    fn a_character_split_across_two_packets_arrives_whole() {
+        let line = "Отчёт готов, ошибок нет";
+        let cut = "Отчёт готов, о".len() + 1; // one byte into "ш"
+        let expected = format!("{line}\n");
+
+        let mut host = ScriptedHost::new(move |uuid| {
+            let head = format!("__WD_READY_{uuid}__\n");
+            let tail = format!("\n__WD_DONE_{uuid}__0\n");
+            let body = line.as_bytes();
+            vec![
+                head.into_bytes(),
+                body[..cut].to_vec(),
+                body[cut..].to_vec(),
+                tail.into_bytes(),
+            ]
+        });
+
+        let mut got = Vec::new();
+        let code = run_oneshot(&mut host, "x", None, 5, false, |c| got.extend_from_slice(c))
+            .expect("run_oneshot");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(got).expect("valid utf-8"), expected);
+    }
+
+    /// Same seam, but one byte at a time — the pathological case for a
+    /// decoder that keeps state.
+    #[test]
+    fn output_delivered_byte_by_byte_still_arrives_whole() {
+        let line = "щётка ёж 漢字 🙂";
+        let expected = format!("{line}\n");
+
+        let mut host = ScriptedHost::new(move |uuid| {
+            let mut out = vec![format!("__WD_READY_{uuid}__\n").into_bytes()];
+            out.extend(line.as_bytes().iter().map(|b| vec![*b]));
+            out.push(format!("\n__WD_DONE_{uuid}__0\n").into_bytes());
+            out
+        });
+
+        let mut got = Vec::new();
+        let code = run_oneshot(&mut host, "x", None, 5, false, |c| got.extend_from_slice(c))
+            .expect("run_oneshot");
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(got).expect("valid utf-8"), expected);
+    }
 
     /// Helper: build an `ExecEvent::ShellOutput` from a `&str` slice.
     fn out(s: &str) -> ExecEvent {
@@ -560,9 +761,9 @@ mod tests {
     }
 
     #[test]
-    fn timeout_returns_err_with_full_log_buffer() {
+    fn timeout_returns_err_with_the_wire_log_tail() {
         // No sentinel ever arrives — runner should hit the wall-clock
-        // budget and return Err(Timeout(buf)) carrying everything we
+        // budget and return Err(Timeout(buf)) carrying the tail of what we
         // sent. Caller (term) will run format_timeout_diagnostic on it.
         let mut t = MockExecTransport::new([
             out("partial output but no sentinel\n"),

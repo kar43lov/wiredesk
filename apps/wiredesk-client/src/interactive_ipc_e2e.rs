@@ -88,13 +88,13 @@ impl FakeGui {
 
     fn connect(&self) -> UnixStream {
         let c = UnixStream::connect(&self.socket).expect("connect");
-        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         c
     }
 
     fn recv_wire(&self) -> Message {
         self.outgoing_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("relay should forward a packet to the wire")
             .message
     }

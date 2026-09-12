@@ -17,7 +17,6 @@ cargo build --release --workspace
 # Один крейт / один тест по имени (substring-фильтр):
 cargo test -p wiredesk-client                       # все тесты крейта
 cargo test -p wiredesk-client decide_text_send      # тесты с этой подстрокой в имени
-cargo test -p wiredesk-host -- --test-threads=1     # host флакает на parallel runner'е macOS (~50% SIGABRT) — для надёжности
 
 # Windows-код (host И клиент) с мака — clippy проверяет типы, build проверяет линковку:
 cargo clippy -p wiredesk-client --target x86_64-pc-windows-gnu --all-targets -- -D warnings
@@ -60,7 +59,7 @@ rustup update stable    # 11.09.2026 локально был 1.94, CI 1.98 → �
 - Single-instance на Win'е: при втором запуске exe — открывается Settings существующего процесса (через named…
 - App icon в .exe embed'ится только при сборке на Windows (rc.exe / windres needed)
 - PTY-mode — только на Windows-host'е и только для интерактивного `wd`; `wd --exec` остаётся pipe-based (design choice)
-- Параллельный cargo test флакает на macOS для host'-пакета (~50% SIGABRT) — это pre-existing baseline issue…
+- 🔴 Любой вызов буфера обмена ОС идёт через `locked_*`-хелперы (лок `wiredesk_core::clipboard_lock`): два одновременных обращения к `NSPasteboard` роняют процесс, и юнит-тесты системный буфер не трогают вовсе. Прямой вызов `arboard` ловит `clippy.toml`
 - Fullscreen — borderless (не native): Spaces-переход терял окно в WindowServer. Меню-бар/таскбар перекрываются уровнем окна, а не скрытием Dock (оно было на все дисплеи сразу); уровень снимается при потере фокуса
 - Windows-клиент: `wd`/`wd --exec` только с Mac; BLE недоступен (роль Peripheral занята хостом, принудительный откат на serial), RFCOMM работает; 🔴 нет аналога Secure Input — хук в capture видит и пароли
 - RFCOMM (`transport = "rfcomm"`) — живой линк с pairing и шифрованием; канал задаётся вручную на обеих сторонах (SDP-запись хоста с Mac не видна), собранный .app не получает системный запрос на Bluetooth — запускать бинарь из терминала
