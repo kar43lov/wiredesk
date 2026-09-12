@@ -23,13 +23,14 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use wiredesk_exec_core::ipc::{
-    read_packet_frame, write_connect, write_packet_frame, IpcConnect, IpcInteractiveOpen,
+    read_packet_frame, read_response, write_connect, write_packet_frame, IpcConnect,
+    IpcInteractiveOpen, IpcRequest, IpcResponse,
 };
 use wiredesk_exec_core::ExecEvent;
-use wiredesk_protocol::message::Message;
+use wiredesk_protocol::message::{Message, HOST_PROTO_VERSION};
 use wiredesk_protocol::packet::Packet;
 
-use crate::exec_bridge::ExecEventSlot;
+use crate::exec_bridge::{ExecEventSlot, ShellSlots};
 use crate::ipc::spawn_ipc_acceptor;
 use crate::link::{HostInfo, SharedHostInfo};
 use crate::shell_channel::{
@@ -38,37 +39,50 @@ use crate::shell_channel::{
 
 /// Shared wiring for a fake-GUI: the acceptor's dependencies plus the mock
 /// `outgoing_rx` (captures packets the relay forwards to the "wire") and the
-/// installed `exec_slot` (drivable host shell-event source).
+/// installed shell slots (drivable host shell-event sources).
 struct FakeGui {
     _tmp: TempDir,
     socket: PathBuf,
     outgoing_rx: mpsc::Receiver<Packet>,
-    exec_slot: ExecEventSlot,
+    slots: ShellSlots,
     owner: SharedShellOwner,
 }
 
 impl FakeGui {
-    /// Bind a temp socket and spawn the real acceptor against fresh mocks,
-    /// with a populated host-info cache (win-host, 2560x1440) and `link_up`.
+    /// A fake GUI talking to a host that predates the dedicated pty slot —
+    /// the contract every test here was originally written against.
     fn spawn() -> Self {
+        Self::spawn_with_proto(1)
+    }
+
+    /// A fake GUI talking to a host that has both shell slots.
+    fn spawn_dual() -> Self {
+        Self::spawn_with_proto(HOST_PROTO_VERSION)
+    }
+
+    /// Bind a temp socket and spawn the real acceptor against fresh mocks,
+    /// with a populated host-info cache (win-host, 2560x1440, announcing the
+    /// given protocol generation) and `link_up`.
+    fn spawn_with_proto(proto_version: u8) -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let socket = tmp.path().join("wd-exec.sock");
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info: SharedHostInfo = Arc::new(Mutex::new(Some(HostInfo {
             host_name: "win-host".into(),
             screen_w: 2560,
             screen_h: 1440,
+            proto_version,
         })));
         let link_up = Arc::new(AtomicBool::new(true));
 
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
-            exec_slot.clone(),
+            slots.clone(),
             owner.clone(),
             inflight,
             host_info,
@@ -81,8 +95,39 @@ impl FakeGui {
             _tmp: tmp,
             socket,
             outgoing_rx,
-            exec_slot,
+            slots,
             owner,
+        }
+    }
+
+    /// Open an interactive session and drive it through the handshake and the
+    /// host-side open, returning the client socket. Asserts that the open went
+    /// out on the opcode this host generation expects.
+    fn open_interactive(&self, expect_dual: bool) -> UnixStream {
+        let mut c = self.connect();
+        write_connect(
+            &mut c,
+            &IpcConnect::Interactive(IpcInteractiveOpen {
+                shell: "pwsh".into(),
+                cols: 80,
+                rows: 24,
+            }),
+        )
+        .unwrap();
+        let _ = client_handshake(&mut c);
+        match (expect_dual, self.recv_wire()) {
+            (true, Message::PtyOpen { .. }) | (false, Message::ShellOpenPty { .. }) => {}
+            (dual, other) => panic!("wrong open opcode for dual={dual}: {other:?}"),
+        }
+        c
+    }
+
+    /// The slot the interactive relay installs against this host generation.
+    fn console_slot(&self, dual: bool) -> &ExecEventSlot {
+        if dual {
+            &self.slots.pty
+        } else {
+            &self.slots.exec
         }
     }
 
@@ -237,13 +282,13 @@ fn e2e_interactive_round_trip_through_acceptor() {
     ));
 
     // Staged host ShellOutput echoes back to the socket, then ShellExit.
-    wait_slot_installed(&gui.exec_slot);
-    stage_event(&gui.exec_slot, ExecEvent::ShellOutput(b"hi\r\n".to_vec()));
+    wait_slot_installed(&gui.slots.exec);
+    stage_event(&gui.slots.exec, ExecEvent::ShellOutput(b"hi\r\n".to_vec()));
     match read_packet_frame(&mut client).expect("ShellOutput").message {
         Message::ShellOutput { data } => assert_eq!(data, b"hi\r\n"),
         other => panic!("expected ShellOutput, got {other:?}"),
     }
-    stage_event(&gui.exec_slot, ExecEvent::ShellExit(0));
+    stage_event(&gui.slots.exec, ExecEvent::ShellExit(0));
     assert!(matches!(
         read_packet_frame(&mut client).expect("ShellExit").message,
         Message::ShellExit { code: 0 }
@@ -327,8 +372,8 @@ fn e2e_channel_reusable_after_teardown() {
     .unwrap();
     let _ = client_handshake(&mut c1);
     assert!(matches!(gui.recv_wire(), Message::ShellOpenPty { .. }));
-    wait_slot_installed(&gui.exec_slot);
-    stage_event(&gui.exec_slot, ExecEvent::ShellExit(0));
+    wait_slot_installed(&gui.slots.exec);
+    stage_event(&gui.slots.exec, ExecEvent::ShellExit(0));
     // read the ShellExit the relay forwards, then teardown ShellClose.
     assert!(matches!(
         read_packet_frame(&mut c1).expect("ShellExit").message,
@@ -354,12 +399,243 @@ fn e2e_channel_reusable_after_teardown() {
 
     // Sanity: the second session really owns it — a competing acquire fails.
     assert!(
-        try_acquire(&gui.owner, ShellOwner::Exec).is_none(),
+        try_acquire(&gui.owner, ShellOwner::Exec, false).is_none(),
         "second session must exclusively hold the channel"
     );
 
     // Clean teardown.
     write_packet_frame(&mut c2, &Packet::new(Message::Disconnect, 0)).unwrap();
     assert!(matches!(gui.recv_wire(), Message::ShellClose));
+    wait_owner_idle(&gui.owner);
+}
+
+/// Pull the run's UUID out of the payload the runner put on the wire, so the
+/// test can answer with a sentinel the runner will actually accept.
+fn uuid_from_payload(payload: &str) -> String {
+    let marker = "__WD_DONE_";
+    let start = payload.find(marker).expect("payload carries a sentinel") + marker.len();
+    let after = &payload[start..];
+    let end = after.find("__").expect("sentinel is terminated");
+    after[..end].to_string()
+}
+
+/// Stage the four host-side events one `wd --exec` run expects: a prompt to be
+/// dropped, the READY marker, the output, and the sentinel.
+fn stage_exec_run(slot: &ExecEventSlot, uuid: &str) {
+    stage_event(slot, ExecEvent::ShellOutput(b"PS C:\\>\n".to_vec()));
+    stage_event(
+        slot,
+        ExecEvent::ShellOutput(format!("__WD_READY_{uuid}__\n").into_bytes()),
+    );
+    stage_event(slot, ExecEvent::ShellOutput(b"hi\n".to_vec()));
+    stage_event(
+        slot,
+        ExecEvent::ShellOutput(format!("__WD_DONE_{uuid}__0\n").into_bytes()),
+    );
+}
+
+/// Connect as `wd --exec` and run to completion on a background thread,
+/// returning (exit code, stdout).
+fn spawn_exec_client(socket: PathBuf) -> thread::JoinHandle<(i32, Vec<u8>)> {
+    thread::spawn(move || {
+        let mut c = UnixStream::connect(&socket).expect("connect exec");
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write_connect(
+            &mut c,
+            &IpcConnect::Exec(IpcRequest {
+                cmd: "echo hi".into(),
+                ssh: None,
+                timeout_secs: 5,
+                compress: false,
+            }),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        loop {
+            match read_response(&mut c).expect("exec response") {
+                IpcResponse::Stdout(b) => out.extend_from_slice(&b),
+                IpcResponse::Exit(code) => break (code, out),
+                IpcResponse::Error(m) => panic!("exec handler error: {m}"),
+                IpcResponse::TransportUnavailable(m) => {
+                    panic!("exec refused unexpectedly: {m}")
+                }
+            }
+        }
+    })
+}
+
+/// The feature itself, end to end: an agent's `wd --exec` runs to completion
+/// while the owner sits in an interactive console. On a legacy host this is
+/// exactly the case that got refused with exit 125.
+#[test]
+fn e2e_interactive_and_exec_run_concurrently_on_a_dual_host() {
+    let gui = FakeGui::spawn_dual();
+
+    let mut console = gui.open_interactive(true);
+    assert_eq!(current_owner(&gui.owner), ShellOwner::Interactive);
+
+    let exec_client = spawn_exec_client(gui.socket.clone());
+
+    // The exec run takes the other slot: `ShellOpen`, then its payload. The
+    // console's keystrokes would be `PtyInput`, so nothing here can be
+    // confused for them.
+    assert!(matches!(gui.recv_wire(), Message::ShellOpen { .. }));
+    let payload = loop {
+        match gui.recv_wire() {
+            Message::ShellInput { data } => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                if text.contains("__WD_DONE_") {
+                    break text;
+                }
+            }
+            other => panic!("unexpected packet while waiting for the payload: {other:?}"),
+        }
+    };
+
+    wait_slot_installed(&gui.slots.exec);
+    stage_exec_run(&gui.slots.exec, &uuid_from_payload(&payload));
+
+    let (code, out) = exec_client.join().expect("exec client thread");
+    assert_eq!(code, 0, "exec must succeed alongside a live console");
+    assert!(
+        String::from_utf8_lossy(&out).contains("hi"),
+        "stdout: {out:?}"
+    );
+    // The finished run closes its own slot on its own opcode.
+    assert!(matches!(gui.recv_wire(), Message::ShellClose));
+
+    // And the console is untouched by all of that: host output addressed to
+    // the pty slot still reaches it.
+    stage_event(
+        gui.console_slot(true),
+        ExecEvent::ShellOutput(b"prompt>".to_vec()),
+    );
+    match read_packet_frame(&mut console)
+        .expect("console still live")
+        .message
+    {
+        Message::ShellOutput { data } => assert_eq!(data, b"prompt>"),
+        other => panic!("expected console output, got {other:?}"),
+    }
+
+    // Teardown closes the pty slot, not the exec one.
+    write_packet_frame(&mut console, &Packet::new(Message::Disconnect, 0)).unwrap();
+    assert!(matches!(gui.recv_wire(), Message::PtyClose));
+    wait_owner_idle(&gui.owner);
+}
+
+/// The compatibility half, pinned explicitly: against a host with one shell
+/// slot the old refusal must still happen. Without this, rolling the Mac side
+/// back to a legacy host could quietly start double-booking that slot.
+#[test]
+fn e2e_exec_is_refused_while_a_legacy_host_console_is_open() {
+    let gui = FakeGui::spawn();
+    let mut console = gui.open_interactive(false);
+
+    let mut c = UnixStream::connect(&gui.socket).expect("connect exec");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write_connect(
+        &mut c,
+        &IpcConnect::Exec(IpcRequest {
+            cmd: "echo hi".into(),
+            ssh: None,
+            timeout_secs: 5,
+            compress: false,
+        }),
+    )
+    .unwrap();
+    match read_response(&mut c).expect("refusal frame") {
+        IpcResponse::TransportUnavailable(m) => {
+            assert!(m.contains("busy"), "msg: {m}")
+        }
+        other => panic!("expected a transport-class refusal, got {other:?}"),
+    }
+    // Nothing of the refused run reached the wire.
+    assert!(
+        gui.outgoing_rx.try_recv().is_err(),
+        "a refused exec must not queue any packet"
+    );
+
+    write_packet_frame(&mut console, &Packet::new(Message::Disconnect, 0)).unwrap();
+    assert!(matches!(gui.recv_wire(), Message::ShellClose));
+    wait_owner_idle(&gui.owner);
+}
+
+/// One console at a time, on a dual host too — there is still exactly one pty
+/// slot on the other end.
+#[test]
+fn e2e_second_interactive_connect_is_busy_on_a_dual_host() {
+    let gui = FakeGui::spawn_dual();
+    let mut c1 = gui.open_interactive(true);
+
+    let mut c2 = gui.connect();
+    write_connect(
+        &mut c2,
+        &IpcConnect::Interactive(IpcInteractiveOpen {
+            shell: "pwsh".into(),
+            cols: 80,
+            rows: 24,
+        }),
+    )
+    .unwrap();
+    match read_packet_frame(&mut c2).expect("busy frame").message {
+        Message::Error { msg, .. } => assert!(msg.contains("busy"), "msg: {msg}"),
+        other => panic!("expected 'shell busy' Error, got {other:?}"),
+    }
+
+    write_packet_frame(&mut c1, &Packet::new(Message::Disconnect, 0)).unwrap();
+    assert!(matches!(gui.recv_wire(), Message::PtyClose));
+    assert!(
+        gui.outgoing_rx.try_recv().is_err(),
+        "the refused console must not queue any packet on the wire"
+    );
+    wait_owner_idle(&gui.owner);
+}
+
+/// A dual host re-addresses the term's stdin: the term itself is unchanged and
+/// still sends `ShellInput`, but what reaches the wire must be `PtyInput`, or
+/// the host would type the owner's keystrokes into the exec slot.
+#[test]
+fn e2e_console_stdin_is_readdressed_on_a_dual_host() {
+    let gui = FakeGui::spawn_dual();
+    let mut console = gui.open_interactive(true);
+
+    write_packet_frame(
+        &mut console,
+        &Packet::new(
+            Message::ShellInput {
+                data: b"echo hi\r".to_vec(),
+            },
+            0,
+        ),
+    )
+    .unwrap();
+    write_packet_frame(
+        &mut console,
+        &Packet::new(
+            Message::PtyResize {
+                cols: 100,
+                rows: 30,
+            },
+            0,
+        ),
+    )
+    .unwrap();
+
+    match gui.recv_wire() {
+        Message::PtyInput { data } => assert_eq!(data, b"echo hi\r"),
+        other => panic!("console stdin must travel as PtyInput, got {other:?}"),
+    }
+    // PtyResize is shared by both generations and goes through untouched.
+    assert!(matches!(
+        gui.recv_wire(),
+        Message::PtyResize {
+            cols: 100,
+            rows: 30
+        }
+    ));
+
+    write_packet_frame(&mut console, &Packet::new(Message::Disconnect, 0)).unwrap();
+    assert!(matches!(gui.recv_wire(), Message::PtyClose));
     wait_owner_idle(&gui.owner);
 }

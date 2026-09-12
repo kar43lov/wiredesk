@@ -26,7 +26,10 @@ use std::time::{Duration, Instant};
 
 use wiredesk_core::error::WireDeskError;
 use wiredesk_core::storm::{StormCounter, DEFAULT_STORM_THRESHOLD};
-use wiredesk_protocol::message::{Message, VERSION};
+use wiredesk_protocol::message::{
+    pty_slot_supported, Message, ERR_PTY_BUSY, ERR_PTY_SPAWN, ERR_SHELL_BUSY, ERR_SHELL_SPAWN,
+    VERSION,
+};
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
 
@@ -57,6 +60,11 @@ pub struct HostInfo {
     pub host_name: String,
     pub screen_w: u32,
     pub screen_h: u32,
+    /// What the host put in `HelloAck.version` — its protocol *generation*,
+    /// not the `Hello` version (see `wiredesk_protocol::HOST_PROTO_VERSION`).
+    /// The IPC handlers read it through `pty_slot_supported` to decide
+    /// whether the dedicated pty slot exists on the other end.
+    pub proto_version: u8,
 }
 
 /// Shared host-info cache. `None` until the first `HelloAck`; set back to
@@ -83,7 +91,7 @@ pub struct LinkContext {
     pub receive_files: Arc<AtomicBool>,
     pub incoming_cancel: Arc<AtomicBool>,
     pub outgoing_cancel: Arc<AtomicBool>,
-    pub exec_slot: exec_bridge::ExecEventSlot,
+    pub shell_slots: exec_bridge::ShellSlots,
     pub current_outgoing_label: Arc<std::sync::Mutex<String>>,
     /// Reader's clone of `outgoing_tx` — used to send `ClipDecline` back to
     /// the host when an incoming offer is rejected.
@@ -192,6 +200,7 @@ pub fn spawn_supervisor(
             if let Ok(mut hi) = ctx.host_info.lock() {
                 *hi = None;
             }
+            ctx.shell_slots.forget_host_generation();
             if let Some(h) = handles.take() {
                 // Raise the shared shutdown flag so BOTH threads exit even if
                 // their transport never errors on its own — the writer's
@@ -454,16 +463,15 @@ const RECV_TIMEOUT_IDLE: Duration = Duration::from_secs(6);
 /// `HEARTBEAT_TIMEOUT_BUSY`.
 const RECV_TIMEOUT_BUSY: Duration = Duration::from_secs(30);
 
-/// True while a clipboard transfer is in flight (either direction) or a shell
-/// session is open — the wire is busy and the peer's heartbeats may be delayed,
-/// so the reader picks the looser [`RECV_TIMEOUT_BUSY`] budget.
+/// True while a clipboard transfer is in flight (either direction) or either
+/// shell slot is open — the wire is busy and the peer's heartbeats may be
+/// delayed, so the reader picks the looser [`RECV_TIMEOUT_BUSY`] budget.
 fn transfer_in_flight(ctx: &LinkContext) -> bool {
     let outgoing =
         ctx.outgoing_total.load(Ordering::Relaxed) > ctx.outgoing_progress.load(Ordering::Relaxed);
     let incoming =
         ctx.incoming_total.load(Ordering::Relaxed) > ctx.incoming_progress.load(Ordering::Relaxed);
-    let shell = ctx.exec_slot.lock().map(|g| g.is_some()).unwrap_or(false);
-    outgoing || incoming || shell
+    outgoing || incoming || ctx.shell_slots.any_installed()
 }
 
 /// Sole reader of the serial port. Translates incoming packets to UI events.
@@ -484,6 +492,7 @@ fn reader_thread(
 ) {
     let link_up = ctx.link_up.clone();
     let host_info = ctx.host_info.clone();
+    let shell_slots = ctx.shell_slots.clone();
     reader_loop(
         transport,
         events_tx,
@@ -501,6 +510,10 @@ fn reader_thread(
     if let Ok(mut hi) = host_info.lock() {
         *hi = None;
     }
+    // Same lock-step for the routing fallback: the next host may be built
+    // differently, and until its `HelloAck` arrives the strict mode is the
+    // only safe assumption (see `exec_bridge::route`).
+    shell_slots.forget_host_generation();
     link_up.store(false, Ordering::Release);
 }
 
@@ -516,7 +529,7 @@ fn reader_loop(
     busy_timeout: Duration,
 ) {
     let outgoing_tx = ctx.reader_outgoing_tx.clone();
-    let exec_slot = ctx.exec_slot.clone();
+    let shell_slots = ctx.shell_slots.clone();
     let clipboard_state = ctx.clipboard_state.clone();
     let outgoing_progress = ctx.outgoing_progress.clone();
     let outgoing_total = ctx.outgoing_total.clone();
@@ -579,12 +592,14 @@ fn reader_loop(
                 last_recv = Instant::now();
                 match p.message {
                     Message::HelloAck {
+                        version,
                         host_name,
                         screen_w,
                         screen_h,
-                        ..
                     } => {
-                        log::info!("connected to '{host_name}' ({screen_w}x{screen_h})");
+                        log::info!(
+                            "connected to '{host_name}' ({screen_w}x{screen_h}, proto v{version})"
+                        );
                         handshaked = true;
                         let silent = SILENT_CYCLES.swap(0, Ordering::Relaxed);
                         if silent > 0 {
@@ -600,7 +615,22 @@ fn reader_loop(
                                 host_name: host_name.clone(),
                                 screen_w: screen_w.into(),
                                 screen_h: screen_h.into(),
+                                proto_version: version,
                             });
+                        }
+                        // A host without the dedicated pty slot streams its
+                        // console on the `Shell*` opcodes, so routing needs
+                        // the fallback (see `exec_bridge::route`). Armed here
+                        // and cleared on every link-down, so "we don't know
+                        // yet" is the strict mode.
+                        ctx.shell_slots
+                            .legacy_fallback
+                            .store(!pty_slot_supported(version), Ordering::Relaxed);
+                        if !pty_slot_supported(version) {
+                            log::info!(
+                                "host speaks protocol v{version} — one shell slot, \
+                                 interactive `wd` and `wd --exec` stay mutually exclusive"
+                            );
                         }
                         // Handshake complete — the link is now usable; open
                         // the IPC gate (see LinkContext::link_up).
@@ -652,30 +682,72 @@ fn reader_loop(
                         }
                         incoming_clip.on_chunk(index, data);
                     }
-                    // Shell output/exit/errors are consumed only by the exec &
-                    // interactive-IPC paths via the `exec_slot` fan-out. The GUI
-                    // shell-panel was removed (interactive `wd` runs over the
-                    // socket relay), so there is no `TransportEvent::Shell*`
-                    // consumer left — we broadcast to the slot and stop there.
+                    // Shell traffic is consumed only by the exec &
+                    // interactive-IPC paths via the `shell_slots` fan-out. The
+                    // GUI shell-panel was removed (interactive `wd` runs over
+                    // the socket relay), so there is no `TransportEvent::Shell*`
+                    // consumer left — we route to a slot and stop there. The
+                    // opcode alone says which one.
                     Message::ShellOutput { data } => {
-                        exec_bridge::broadcast_exec_event(
-                            &exec_slot,
+                        exec_bridge::route(
+                            &shell_slots,
+                            exec_bridge::SlotKind::Exec,
                             wiredesk_exec_core::ExecEvent::ShellOutput(data),
                         );
                     }
                     Message::ShellExit { code } => {
-                        exec_bridge::broadcast_exec_event(
-                            &exec_slot,
+                        exec_bridge::route(
+                            &shell_slots,
+                            exec_bridge::SlotKind::Exec,
+                            wiredesk_exec_core::ExecEvent::ShellExit(code),
+                        );
+                    }
+                    // The host's answer to a `ShellClose`. Without this arm
+                    // the opcode fell through to `ignored message` and the
+                    // exec handler's post-run drain never saw it — so every
+                    // `wd --exec` waited out its full idle budget instead of
+                    // the single round trip the acknowledgement exists for.
+                    Message::ShellClosed => {
+                        exec_bridge::route(
+                            &shell_slots,
+                            exec_bridge::SlotKind::Exec,
+                            wiredesk_exec_core::ExecEvent::ShellClosed,
+                        );
+                    }
+                    Message::PtyOutput { data } => {
+                        exec_bridge::route(
+                            &shell_slots,
+                            exec_bridge::SlotKind::Pty,
+                            wiredesk_exec_core::ExecEvent::ShellOutput(data),
+                        );
+                    }
+                    Message::PtyExit { code } => {
+                        exec_bridge::route(
+                            &shell_slots,
+                            exec_bridge::SlotKind::Pty,
                             wiredesk_exec_core::ExecEvent::ShellExit(code),
                         );
                     }
                     Message::Error { code, msg } => {
                         log::warn!("error from host: code={code} msg={msg}");
-                        if msg.contains("shell") {
-                            exec_bridge::broadcast_exec_event(
-                                &exec_slot,
+                        // By code, not by text: which consumer an error belongs
+                        // to is protocol, and matching on the wording would
+                        // break the moment someone rephrased a message.
+                        match code {
+                            ERR_SHELL_BUSY | ERR_SHELL_SPAWN => exec_bridge::route(
+                                &shell_slots,
+                                exec_bridge::SlotKind::Exec,
                                 wiredesk_exec_core::ExecEvent::HostError(msg),
-                            );
+                            ),
+                            ERR_PTY_BUSY | ERR_PTY_SPAWN => exec_bridge::route(
+                                &shell_slots,
+                                exec_bridge::SlotKind::Pty,
+                                wiredesk_exec_core::ExecEvent::HostError(msg),
+                            ),
+                            // Anything else (version mismatch, future codes)
+                            // belongs to no shell consumer — the log line above
+                            // is the whole handling.
+                            _ => {}
                         }
                     }
                     Message::Disconnect => {
@@ -759,9 +831,12 @@ fn reader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec_bridge::ExecSlotGuard;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use wiredesk_core::error::Result;
+    use wiredesk_exec_core::ExecEvent;
+    use wiredesk_protocol::message::{ERR_VERSION, HOST_PROTO_VERSION};
 
     /// What a scripted `recv()` should do next.
     enum Step {
@@ -837,7 +912,7 @@ mod tests {
             receive_files: Arc::new(AtomicBool::new(true)),
             incoming_cancel: Arc::new(AtomicBool::new(false)),
             outgoing_cancel: Arc::new(AtomicBool::new(false)),
-            exec_slot: Arc::new(std::sync::Mutex::new(None)),
+            shell_slots: exec_bridge::ShellSlots::new(),
             current_outgoing_label: Arc::new(std::sync::Mutex::new(String::new())),
             reader_outgoing_tx: tx,
             link_up: Arc::new(AtomicBool::new(false)),
@@ -1430,12 +1505,190 @@ mod tests {
                 host_name: "test-host".into(),
                 screen_w: 100,
                 screen_h: 100,
+                proto_version: VERSION,
             }),
             "host_info must be cached from the HelloAck"
         );
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+    }
+
+    /// Install a consumer on one slot and hand back its receiver plus the
+    /// guard that keeps it installed.
+    fn install(slot: &exec_bridge::ExecEventSlot) -> (mpsc::Receiver<ExecEvent>, ExecSlotGuard) {
+        let (tx, rx) = mpsc::channel::<ExecEvent>();
+        let guard = ExecSlotGuard::install(slot, tx);
+        (rx, guard)
+    }
+
+    #[test]
+    fn reader_routes_shell_traffic_by_opcode() {
+        // The reader is the only thing that decides which consumer gets what,
+        // and it decides from the opcode alone. Getting this wrong would put
+        // `wd --exec` output on the owner's screen, or the owner's console
+        // output into an agent's stdout.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (exec_rx, _eg) = install(&ctx.shell_slots.exec);
+        let (pty_rx, _pg) = install(&ctx.shell_slots.pty);
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let script = vec![
+            Step::Valid(hello_ack()),
+            Step::Valid(Packet::new(
+                Message::ShellOutput {
+                    data: b"exec".to_vec(),
+                },
+                1,
+            )),
+            Step::Valid(Packet::new(
+                Message::PtyOutput {
+                    data: b"console".to_vec(),
+                },
+                2,
+            )),
+            Step::Valid(Packet::new(Message::PtyExit { code: 3 }, 3)),
+            Step::Valid(Packet::new(Message::ShellExit { code: 4 }, 4)),
+            Step::Valid(Packet::new(Message::ShellClosed, 5)),
+        ];
+        let transport = Box::new(ScriptedTransport::new(script, true));
+        let shutdown_c = shutdown.clone();
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
+
+        assert_eq!(
+            exec_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::ShellOutput(b"exec".to_vec())
+        );
+        assert_eq!(
+            pty_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::ShellOutput(b"console".to_vec())
+        );
+        assert_eq!(
+            pty_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::ShellExit(3),
+            "PtyExit must reach the console, not exec"
+        );
+        assert_eq!(
+            exec_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::ShellExit(4)
+        );
+        assert_eq!(
+            exec_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::ShellClosed,
+            "the close acknowledgement is what ends the exec drain in one \
+             round trip; without it every command pays the full idle budget"
+        );
+        // Neither consumer saw anything meant for the other.
+        assert!(exec_rx.try_recv().is_err());
+        assert!(pty_rx.try_recv().is_err());
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+        drop(events_rx);
+    }
+
+    #[test]
+    fn reader_routes_host_errors_by_code() {
+        // Which consumer an error belongs to is protocol, not prose: the exec
+        // codes go to exec, the pty codes to the console, and a code that
+        // belongs to neither (a version mismatch) is only logged.
+        let (ctx, _reader_outgoing_rx) = test_ctx();
+        let (exec_rx, _eg) = install(&ctx.shell_slots.exec);
+        let (pty_rx, _pg) = install(&ctx.shell_slots.pty);
+        let (events_tx, events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let err = |code: u16, msg: &str, seq: u16| {
+            Step::Valid(Packet::new(
+                Message::Error {
+                    code,
+                    msg: msg.into(),
+                },
+                seq,
+            ))
+        };
+        let script = vec![
+            Step::Valid(hello_ack()),
+            err(ERR_VERSION, "unsupported version", 1),
+            err(ERR_PTY_BUSY, "pty shell already open", 2),
+            err(ERR_SHELL_BUSY, "shell already open", 3),
+        ];
+        let transport = Box::new(ScriptedTransport::new(script, true));
+        let shutdown_c = shutdown.clone();
+        let handle = thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
+
+        assert_eq!(
+            pty_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::HostError("pty shell already open".into())
+        );
+        assert_eq!(
+            exec_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ExecEvent::HostError("shell already open".into()),
+            "the version error must not have been delivered to anyone"
+        );
+        assert!(exec_rx.try_recv().is_err());
+        assert!(pty_rx.try_recv().is_err());
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+        drop(events_rx);
+    }
+
+    #[test]
+    fn reader_arms_the_legacy_fallback_only_for_an_old_host() {
+        // The fallback is what lets a legacy host's console receive its output
+        // on the exec opcodes — and it is exactly what must stay off against a
+        // host that has both slots (see `exec_bridge::route`).
+        for (announced, want_fallback) in [(1u8, true), (HOST_PROTO_VERSION, false)] {
+            let (ctx, _reader_outgoing_rx) = test_ctx();
+            let slots = ctx.shell_slots.clone();
+            let host_info = ctx.host_info.clone();
+            let (events_tx, events_rx) = mpsc::channel();
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            let ack = Packet::new(
+                Message::HelloAck {
+                    version: announced,
+                    host_name: "test-host".into(),
+                    screen_w: 100,
+                    screen_h: 100,
+                },
+                0,
+            );
+            let transport = Box::new(ScriptedTransport::new(vec![Step::Valid(ack)], true));
+            let shutdown_c = shutdown.clone();
+            let handle =
+                thread::spawn(move || reader_thread(transport, events_tx, shutdown_c, ctx));
+
+            match events_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(TransportEvent::Connected { .. }) => {}
+                other => panic!("expected Connected, got {other:?}"),
+            }
+            assert_eq!(
+                slots.legacy_fallback.load(Ordering::Relaxed),
+                want_fallback,
+                "host announced v{announced}"
+            );
+            assert_eq!(
+                host_info.lock().unwrap().as_ref().unwrap().proto_version,
+                announced,
+                "the generation must be cached for the IPC handlers"
+            );
+
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+            // The reader's exit path must put the fallback back to strict, in
+            // lock-step with the host-info cache: the next host may be built
+            // differently, and "we don't know yet" must never read as "the old
+            // host" — that is the mode where a stray exec event can reach a
+            // console.
+            assert!(
+                !slots.legacy_fallback.load(Ordering::Relaxed),
+                "link-down must forget the host generation (announced v{announced})"
+            );
+            drop(events_rx);
+        }
     }
 
     #[test]

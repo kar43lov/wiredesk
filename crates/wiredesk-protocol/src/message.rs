@@ -1,7 +1,50 @@
 use wiredesk_core::error::{Result, WireDeskError};
 
-/// Protocol version
+/// Protocol version carried in `Hello`. **Frozen at 1 on purpose:** the host
+/// rejects a `Hello` whose version is not exactly this, so bumping it would
+/// make every new client unusable against a host that has not been rebuilt
+/// yet — and the host lives on a Windows box that is updated by hand.
+/// Capability negotiation goes the other way instead, through
+/// [`HOST_PROTO_VERSION`] in `HelloAck`.
 pub const VERSION: u8 = 1;
+
+/// Protocol generation the host announces in `HelloAck.version`. The client
+/// reads it to decide which opcodes it may use:
+///
+/// * `1` — one shell slot; PTY opens through `ShellOpenPty` and excludes
+///   `wd --exec` (the behaviour shipped until 2026-09-12).
+/// * `2` — separate exec and pty slots; PTY opens through
+///   [`MessageType::PtyOpen`] and runs alongside `wd --exec`.
+///
+/// A host never has to understand a *newer* client: a client that sees `1`
+/// speaks nothing but the pre-existing opcodes.
+pub const HOST_PROTO_VERSION: u8 = 2;
+
+/// Whether a host announcing `host_version` has the dedicated pty slot, i.e.
+/// whether `PtyOpen`/`PtyInput`/`PtyClose` may be put on the wire at all.
+/// Anything below [`HOST_PROTO_VERSION`] gets the legacy single-slot path.
+pub fn pty_slot_supported(host_version: u8) -> bool {
+    host_version >= HOST_PROTO_VERSION
+}
+
+/// `Message::Error { code, .. }` values the host sends. Kept as named
+/// constants because the client now routes an error to the exec or the pty
+/// consumer *by code* — matching on the message text would break the moment
+/// someone reworded it.
+///
+/// Codes 1-3 predate the pty slot and keep their meaning; a legacy PTY opened
+/// with `ShellOpenPty` still reports 2/3, so an old client sees exactly what
+/// it saw before.
+pub const ERR_VERSION: u16 = 1;
+/// The exec slot (or a legacy PTY holding the whole host) is already taken.
+pub const ERR_SHELL_BUSY: u16 = 2;
+/// The exec slot's shell could not be spawned.
+pub const ERR_SHELL_SPAWN: u16 = 3;
+/// The dedicated pty slot is already taken (`PtyOpen` only).
+pub const ERR_PTY_BUSY: u16 = 4;
+/// The pty slot's shell could not be spawned (`PtyOpen` only) — including
+/// "PTY-mode shell is only supported on Windows host" on a Mac dev host.
+pub const ERR_PTY_SPAWN: u16 = 5;
 
 /// Clipboard payload formats for `Message::ClipOffer { format, .. }`.
 ///
@@ -66,6 +109,26 @@ pub enum MessageType {
     /// window lands in the *next* command's stream; only a message that
     /// cannot be confused with an exit status makes that harmless.
     ShellClosed = 0x47,
+    /// Open a PTY-backed shell in the host's **dedicated pty slot**, leaving
+    /// the exec slot free for a concurrent `wd --exec`. Wire layout is the
+    /// same as [`MessageType::ShellOpenPty`]:
+    /// `[cols u16 LE][rows u16 LE][shell-string with length prefix]`.
+    ///
+    /// `ShellOpenPty` (0x45) stays as the *legacy* PTY open: a host that gets
+    /// it treats the whole shell side as exclusive, exactly as before. That is
+    /// what keeps a client older than this opcode working against a new host.
+    PtyOpen = 0x48,
+    /// Bytes for the pty slot's stdin. `ShellInput` (0x41) keeps addressing
+    /// the exec slot.
+    PtyInput = 0x49,
+    /// Bytes from the pty slot's output. Mirror of `ShellOutput` (0x42).
+    PtyOutput = 0x4A,
+    /// Close the pty slot. Unlike `ShellClose` (0x43) nothing is sent back:
+    /// the interactive relay already discards `ShellClosed`, and its teardown
+    /// never waits for one.
+    PtyClose = 0x4B,
+    /// The pty slot's shell terminated. Mirror of `ShellExit` (0x44).
+    PtyExit = 0x4C,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -95,6 +158,11 @@ impl TryFrom<u8> for MessageType {
             0x45 => Ok(Self::ShellOpenPty),
             0x46 => Ok(Self::PtyResize),
             0x47 => Ok(Self::ShellClosed),
+            0x48 => Ok(Self::PtyOpen),
+            0x49 => Ok(Self::PtyInput),
+            0x4A => Ok(Self::PtyOutput),
+            0x4B => Ok(Self::PtyClose),
+            0x4C => Ok(Self::PtyExit),
             _ => Err(WireDeskError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -187,6 +255,27 @@ pub enum Message {
         cols: u16,
         rows: u16,
     },
+    /// Open the host's dedicated pty slot. Same wire layout as
+    /// `ShellOpenPty`; see [`MessageType::PtyOpen`] for why both exist.
+    PtyOpen {
+        shell: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Bytes to write to the pty slot's stdin.
+    PtyInput {
+        data: Vec<u8>,
+    },
+    /// Bytes read from the pty slot's output.
+    PtyOutput {
+        data: Vec<u8>,
+    },
+    /// Close the pty slot. Nothing is sent back.
+    PtyClose,
+    /// The pty slot's shell terminated with this status.
+    PtyExit {
+        code: i32,
+    },
 }
 
 impl Message {
@@ -214,6 +303,11 @@ impl Message {
             Self::ShellExit { .. } => MessageType::ShellExit,
             Self::ShellOpenPty { .. } => MessageType::ShellOpenPty,
             Self::PtyResize { .. } => MessageType::PtyResize,
+            Self::PtyOpen { .. } => MessageType::PtyOpen,
+            Self::PtyInput { .. } => MessageType::PtyInput,
+            Self::PtyOutput { .. } => MessageType::PtyOutput,
+            Self::PtyClose => MessageType::PtyClose,
+            Self::PtyExit { .. } => MessageType::PtyExit,
         }
     }
 
@@ -279,7 +373,11 @@ impl Message {
             Self::ClipDecline { format } => {
                 buf.push(*format);
             }
-            Self::Heartbeat | Self::Disconnect | Self::ShellClose | Self::ShellClosed => {}
+            Self::Heartbeat
+            | Self::Disconnect
+            | Self::ShellClose
+            | Self::ShellClosed
+            | Self::PtyClose => {}
             Self::Error { code, msg } => {
                 buf.extend_from_slice(&code.to_le_bytes());
                 write_string(&mut buf, msg, 256);
@@ -287,13 +385,16 @@ impl Message {
             Self::ShellOpen { shell } => {
                 write_string(&mut buf, shell, 32);
             }
-            Self::ShellInput { data } | Self::ShellOutput { data } => {
+            Self::ShellInput { data }
+            | Self::ShellOutput { data }
+            | Self::PtyInput { data }
+            | Self::PtyOutput { data } => {
                 buf.extend_from_slice(data);
             }
-            Self::ShellExit { code } => {
+            Self::ShellExit { code } | Self::PtyExit { code } => {
                 buf.extend_from_slice(&code.to_le_bytes());
             }
-            Self::ShellOpenPty { shell, cols, rows } => {
+            Self::ShellOpenPty { shell, cols, rows } | Self::PtyOpen { shell, cols, rows } => {
                 buf.extend_from_slice(&cols.to_le_bytes());
                 buf.extend_from_slice(&rows.to_le_bytes());
                 write_string(&mut buf, shell, 32);
@@ -425,6 +526,25 @@ impl Message {
                 let rows = u16::from_le_bytes([payload[2], payload[3]]);
                 let shell = read_string(&payload[4..])?;
                 Ok(Self::ShellOpenPty { shell, cols, rows })
+            }
+            MessageType::PtyOpen => {
+                ensure_min_len(payload, 4)?;
+                let cols = u16::from_le_bytes([payload[0], payload[1]]);
+                let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                let shell = read_string(&payload[4..])?;
+                Ok(Self::PtyOpen { shell, cols, rows })
+            }
+            MessageType::PtyInput => Ok(Self::PtyInput {
+                data: payload.to_vec(),
+            }),
+            MessageType::PtyOutput => Ok(Self::PtyOutput {
+                data: payload.to_vec(),
+            }),
+            MessageType::PtyClose => Ok(Self::PtyClose),
+            MessageType::PtyExit => {
+                ensure_min_len(payload, 4)?;
+                let code = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Self::PtyExit { code })
             }
             MessageType::PtyResize => {
                 if payload.len() != 4 {
@@ -704,6 +824,14 @@ mod tests {
             MessageType::try_from(0x47).unwrap(),
             MessageType::ShellClosed
         );
+        assert_eq!(MessageType::try_from(0x48).unwrap(), MessageType::PtyOpen);
+        assert_eq!(MessageType::try_from(0x49).unwrap(), MessageType::PtyInput);
+        assert_eq!(MessageType::try_from(0x4A).unwrap(), MessageType::PtyOutput);
+        assert_eq!(MessageType::try_from(0x4B).unwrap(), MessageType::PtyClose);
+        assert_eq!(MessageType::try_from(0x4C).unwrap(), MessageType::PtyExit);
+        // One past the last assigned opcode must stay unknown, or a future
+        // addition would be silently swallowed by an old peer.
+        assert!(MessageType::try_from(0x4D).is_err());
     }
 
     #[test]
@@ -769,5 +897,112 @@ mod tests {
         // 3 bytes (one byte too few).
         let r = Message::deserialize(MessageType::PtyResize, &[0x50, 0x00, 0x18]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn roundtrip_pty_slot_messages() {
+        roundtrip(&Message::PtyOpen {
+            shell: "pwsh".into(),
+            cols: 120,
+            rows: 40,
+        });
+        // Empty shell = "host default", same convention as ShellOpen.
+        roundtrip(&Message::PtyOpen {
+            shell: String::new(),
+            cols: 80,
+            rows: 24,
+        });
+        roundtrip(&Message::PtyInput { data: Vec::new() });
+        roundtrip(&Message::PtyInput {
+            data: b"echo hi\r".to_vec(),
+        });
+        roundtrip(&Message::PtyOutput { data: Vec::new() });
+        roundtrip(&Message::PtyOutput {
+            data: vec![0xFFu8; crate::packet::MAX_PAYLOAD],
+        });
+        roundtrip(&Message::PtyClose);
+        roundtrip(&Message::PtyExit { code: 0 });
+        roundtrip(&Message::PtyExit { code: 130 });
+        // -1 is what the host reports for a killed process with no numeric
+        // status, so the sign has to survive the trip.
+        roundtrip(&Message::PtyExit { code: -1 });
+    }
+
+    #[test]
+    fn pty_open_is_wire_identical_to_shell_open_pty() {
+        // The two opcodes differ only in which host slot they address. If
+        // their payloads ever drift, a host could parse one as the other and
+        // silently mis-size the terminal.
+        let legacy = Message::ShellOpenPty {
+            shell: "powershell".into(),
+            cols: 200,
+            rows: 51,
+        };
+        let dual = Message::PtyOpen {
+            shell: "powershell".into(),
+            cols: 200,
+            rows: 51,
+        };
+        assert_eq!(legacy.serialize(), dual.serialize());
+        assert_eq!(
+            Message::ShellExit { code: -7 }.serialize(),
+            Message::PtyExit { code: -7 }.serialize()
+        );
+        assert_eq!(
+            Message::ShellInput {
+                data: b"x".to_vec()
+            }
+            .serialize(),
+            Message::PtyInput {
+                data: b"x".to_vec()
+            }
+            .serialize()
+        );
+        assert!(Message::PtyClose.serialize().is_empty());
+    }
+
+    #[test]
+    fn pty_slot_payload_length_errors() {
+        // PtyOpen needs cols+rows before the string, like ShellOpenPty.
+        assert!(Message::deserialize(MessageType::PtyOpen, &[0x40, 0x00, 0x18]).is_err());
+        assert!(Message::deserialize(MessageType::PtyOpen, &[0x40, 0x00, 0x18, 0x00]).is_err());
+        // PtyExit needs a full i32.
+        assert!(Message::deserialize(MessageType::PtyExit, &[0x00, 0x00, 0x00]).is_err());
+        assert_eq!(
+            Message::deserialize(MessageType::PtyExit, &[0xFF, 0xFF, 0xFF, 0xFF]).unwrap(),
+            Message::PtyExit { code: -1 }
+        );
+    }
+
+    #[test]
+    fn pty_slot_support_is_decided_by_the_host_version() {
+        // A host that predates the pty slot must never see the new opcodes.
+        assert!(!pty_slot_supported(0));
+        assert!(!pty_slot_supported(1));
+        assert!(pty_slot_supported(HOST_PROTO_VERSION));
+        // A future host stays compatible — the check is a floor, not equality.
+        assert!(pty_slot_supported(HOST_PROTO_VERSION + 1));
+        // `Hello` stays pinned; bumping it would lock new clients out of an
+        // un-rebuilt host (see the VERSION doc comment).
+        assert_eq!(VERSION, 1);
+    }
+
+    #[test]
+    fn new_messages_do_not_ask_for_an_ack() {
+        // ACK_REQUIRED is clipboard-only; a shell/pty frame that asked for one
+        // would sit in the sender's retry path forever.
+        for m in [
+            Message::PtyOpen {
+                shell: String::new(),
+                cols: 80,
+                rows: 24,
+            },
+            Message::PtyInput { data: vec![1] },
+            Message::PtyOutput { data: vec![1] },
+            Message::PtyClose,
+            Message::PtyExit { code: 0 },
+        ] {
+            assert!(!m.needs_ack(), "{m:?} must not require an ack");
+        }
     }
 }

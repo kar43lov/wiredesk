@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 
 use wiredesk_core::error::{Result, WireDeskError};
 use wiredesk_core::storm::{StormCounter, DEFAULT_STORM_THRESHOLD};
-use wiredesk_protocol::message::{Message, VERSION};
+use wiredesk_protocol::message::{
+    Message, ERR_PTY_BUSY, ERR_PTY_SPAWN, ERR_SHELL_BUSY, ERR_SHELL_SPAWN, HOST_PROTO_VERSION,
+    VERSION,
+};
 use wiredesk_protocol::packet::{Packet, MAX_PAYLOAD};
 use wiredesk_transport::transport::Transport;
 
@@ -37,6 +40,76 @@ fn heartbeat_timeout_for(clipboard_busy: bool, shell_open: bool) -> Duration {
     }
 }
 
+/// How many output chunks one shell slot may put on the wire per tick.
+///
+/// `transport.send` blocks and `tick` does not call `recv` while it is
+/// sending, so a full budget is dead air for everything else on the link. A
+/// chunk is up to `MAX_PAYLOAD` (4 KB), so this is 64 KB per tick — ~218 ms on
+/// the 3 Mbaud serial link, ~533 ms on RFCOMM, seconds on BLE.
+const PUMP_BUDGET: usize = 16;
+
+/// The exec slot's budget while an interactive PTY is also open.
+///
+/// A `wd --exec` dumping hundreds of KB (a live case: a 407 KB Elasticsearch
+/// `_search`) would otherwise hold the wire for its whole burst and freeze the
+/// owner's console. A quarter budget caps one blocking stretch at ~55 ms
+/// (serial) / ~136 ms (RFCOMM) and still leaves exec far more throughput than
+/// anything but a bulk dump needs.
+const PUMP_BUDGET_EXEC_SHARED: usize = 4;
+
+/// Pure helper — the exec slot's per-tick chunk budget. Extracted so the
+/// yield-to-the-console rule can be unit-tested without spawning shells.
+///
+/// With no PTY open this is the pre-two-slot number, so a lone `wd --exec`
+/// streams at exactly the rate it always did.
+fn exec_pump_budget(pty_open: bool) -> usize {
+    if pty_open {
+        PUMP_BUDGET_EXEC_SHARED
+    } else {
+        PUMP_BUDGET
+    }
+}
+
+/// Which of the host's two shell slots something belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellSlot {
+    /// `wd --exec` — pipe-mode, one command at a time, fed by the warm shell.
+    Exec,
+    /// Interactive `wd` — PTY-mode, lives for minutes with a human watching.
+    Pty,
+}
+
+impl ShellSlot {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Pty => "pty",
+        }
+    }
+}
+
+/// The order `pump_shell_events` visits the slots in.
+///
+/// PTY first, deliberately: it carries a human's keystroke echo, where a few
+/// hundred ms of added delay is the difference between a usable console and an
+/// unusable one, and it is never the slot producing hundreds of KB.
+fn pump_order() -> [ShellSlot; 2] {
+    [ShellSlot::Pty, ShellSlot::Exec]
+}
+
+/// The host's PTY slot plus how the client opened it.
+struct PtySlot {
+    proc: ShellProcess,
+    /// `true` when opened with the pre-2026-09-12 `ShellOpenPty` opcode.
+    ///
+    /// A legacy PTY speaks the old `ShellInput`/`ShellOutput`/`ShellExit`/
+    /// `ShellClose` opcodes and takes the whole shell side exclusively,
+    /// because the client that opened it has no idea a second slot exists —
+    /// it would mis-route anything the exec slot sent back. A PTY opened with
+    /// `PtyOpen` speaks the `Pty*` opcodes and coexists with `wd --exec`.
+    legacy: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum SessionState {
@@ -55,7 +128,11 @@ pub struct Session<T: Transport, I: InputInjector> {
     host_name: String,
     screen_w: u16,
     screen_h: u16,
-    shell: Option<ShellProcess>,
+    /// Pipe-mode shell driving `wd --exec`. Fed by [`Self::warm`].
+    exec: Option<ShellProcess>,
+    /// PTY-mode shell driving interactive `wd`. Independent of [`Self::exec`]
+    /// unless it was opened the legacy way — see [`PtySlot::legacy`].
+    pty: Option<PtySlot>,
     /// A shell started ahead of time, waiting to be handed to the next
     /// `ShellOpen`, together with the argv it was started with.
     ///
@@ -154,7 +231,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             host_name,
             screen_w,
             screen_h,
-            shell: None,
+            exec: None,
+            pty: None,
             warm: None,
             warm_enabled: true,
             // Unit tests get a clipboard with no OS backend: see
@@ -195,8 +273,27 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
     #[cfg(test)]
     #[allow(dead_code)] // consumed by tests that are themselves platform-gated
-    pub fn has_shell(&self) -> bool {
-        self.shell.is_some()
+    pub fn has_exec_shell(&self) -> bool {
+        self.exec.is_some()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn has_pty_shell(&self) -> bool {
+        self.pty.is_some()
+    }
+
+    /// Test-only: park a pipe-mode process in the PTY slot.
+    ///
+    /// A real PTY needs ConPTY, so `ShellProcess::spawn(.., Some(..))` only
+    /// works on Windows and the Mac test runs can't open one. Routing,
+    /// opcode selection and teardown are slot-shaped, not backend-shaped, so
+    /// a pipe child stands in for the PTY and lets all of that be covered
+    /// where the tests actually run.
+    #[cfg(test)]
+    pub fn inject_pty_for_test(&mut self, legacy: bool, shell: &str) {
+        let proc = ShellProcess::spawn(shell, None).expect("test shell");
+        self.pty = Some(PtySlot { proc, legacy });
     }
 
     /// Test-only: rewind `last_heartbeat_recv` so the next tick() sees the
@@ -225,12 +322,16 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     ///    query (~24 KB JSON response). With the busy budget (30s) plus
     ///    the natural prefix of MOTD / ssh hop the channel survives.
     ///
-    /// `self.shell.is_some()` is the simplest signal — true between
-    /// `ShellOpen` and `ShellClose`. Worst case if the shell is genuinely
-    /// idle (e.g., user opened a shell and walked away), we wait 30s
-    /// instead of 6s before tearing down. Acceptable.
+    /// "Either slot is open" is the simplest signal — true between an open
+    /// and its close. Worst case if the shell is genuinely idle (e.g., user
+    /// opened a console and walked away), we wait 30s instead of 6s before
+    /// tearing down. Acceptable — and an interactive `wd` is precisely the
+    /// case where a long silence is normal.
     fn heartbeat_timeout(&self) -> Duration {
-        heartbeat_timeout_for(self.clipboard.transfer_in_flight(), self.shell.is_some())
+        heartbeat_timeout_for(
+            self.clipboard.transfer_in_flight(),
+            self.exec.is_some() || self.pty.is_some(),
+        )
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -262,7 +363,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         {
             log::warn!("heartbeat timeout — disconnecting");
             self.injector.release_all()?;
-            self.shell_kill();
+            self.kill_all_shells();
             self.warm_kill();
             self.clipboard.reset();
             self.state = SessionState::WaitingForHello;
@@ -333,20 +434,37 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         self.injector
     }
 
-    /// Drain any stdout/stderr from running shell into outbound packets.
-    /// Also detects shell exit and notifies the client.
+    /// Drain stdout/stderr from both shell slots into outbound packets, and
+    /// notify the client when either shell exits. See [`pump_order`] for why
+    /// the console goes first and [`exec_pump_budget`] for what `wd --exec`
+    /// gives up while it is open.
     fn pump_shell_events(&mut self) -> Result<()> {
-        if self.shell.is_none() {
-            return Ok(());
+        for slot in pump_order() {
+            self.pump_slot(slot)?;
         }
+        Ok(())
+    }
 
-        // Up to N events per tick to avoid starving recv()
-        const MAX_PER_TICK: usize = 16;
+    /// One slot's share of a tick: drain up to its budget of events, ship them
+    /// on the opcodes that slot speaks, and report an exit.
+    fn pump_slot(&mut self, slot: ShellSlot) -> Result<()> {
+        let budget = match slot {
+            ShellSlot::Pty => PUMP_BUDGET,
+            ShellSlot::Exec => exec_pump_budget(self.pty.is_some()),
+        };
+
         let mut outputs: Vec<Vec<u8>> = Vec::new();
         let mut exit_code: Option<i32> = None;
 
-        if let Some(sh) = self.shell.as_ref() {
-            for _ in 0..MAX_PER_TICK {
+        {
+            let proc = match slot {
+                ShellSlot::Exec => self.exec.as_ref(),
+                ShellSlot::Pty => self.pty.as_ref().map(|p| &p.proc),
+            };
+            let Some(sh) = proc else {
+                return Ok(());
+            };
+            for _ in 0..budget {
                 match sh.events_rx.try_recv() {
                     Ok(ShellEvent::Output(data)) => outputs.push(data),
                     Ok(ShellEvent::Exit(code)) => {
@@ -359,34 +477,68 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
         }
 
+        // Which opcodes this slot answers on. The exec slot always uses the
+        // originals; a PTY uses them only when it was opened the legacy way,
+        // because that client knows no others. Decided before the slot can be
+        // cleared below.
+        let legacy_opcodes = match slot {
+            ShellSlot::Exec => true,
+            ShellSlot::Pty => self.pty.as_ref().is_some_and(|p| p.legacy),
+        };
+
         for chunk in outputs {
             for piece in split_shell_output(&chunk) {
-                self.send(Message::ShellOutput {
-                    data: piece.to_vec(),
+                let data = piece.to_vec();
+                self.send(if legacy_opcodes {
+                    Message::ShellOutput { data }
+                } else {
+                    Message::PtyOutput { data }
                 })?;
             }
         }
 
         // Detect process exit even if we didn't get an Exit event
         if exit_code.is_none() {
-            if let Some(sh) = self.shell.as_mut() {
-                exit_code = sh.try_exit_code();
-            }
+            exit_code = match slot {
+                ShellSlot::Exec => self.exec.as_mut().and_then(|sh| sh.try_exit_code()),
+                ShellSlot::Pty => self.pty.as_mut().and_then(|p| p.proc.try_exit_code()),
+            };
         }
 
         if let Some(code) = exit_code {
-            log::info!("shell exited with code {code}");
-            self.shell = None;
-            self.send(Message::ShellExit { code })?;
+            log::info!("{} shell exited with code {code}", slot.name());
+            match slot {
+                ShellSlot::Exec => self.exec = None,
+                ShellSlot::Pty => self.pty = None,
+            }
+            self.send(if legacy_opcodes {
+                Message::ShellExit { code }
+            } else {
+                Message::PtyExit { code }
+            })?;
         }
 
         Ok(())
     }
 
-    fn shell_kill(&mut self) {
-        if let Some(mut sh) = self.shell.take() {
+    fn exec_kill(&mut self) {
+        if let Some(mut sh) = self.exec.take() {
             sh.kill();
         }
+    }
+
+    fn pty_kill(&mut self) {
+        if let Some(mut slot) = self.pty.take() {
+            slot.proc.kill();
+        }
+    }
+
+    /// Kill whatever runs in either slot. Every teardown path — disconnect,
+    /// re-handshake, heartbeat timeout — goes through here: the client that
+    /// owned these shells is gone, and neither slot may outlive it.
+    fn kill_all_shells(&mut self) {
+        self.exec_kill();
+        self.pty_kill();
     }
 
     /// Hand over the pre-warmed shell when it is the one being asked for,
@@ -452,8 +604,10 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 }
                 log::info!("HELLO from '{client_name}' v{version}");
                 self.client_name = Some(client_name.clone());
+                // Announce the generation, not the `Hello` version: this is
+                // how the client learns whether it may use the pty slot.
                 self.send(Message::HelloAck {
-                    version: VERSION,
+                    version: HOST_PROTO_VERSION,
                     host_name: self.host_name.clone(),
                     screen_w: self.screen_w,
                     screen_h: self.screen_h,
@@ -542,16 +696,18 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
 
             (SessionState::Connected, Message::ShellOpen { shell }) => {
-                if self.shell.is_some() {
-                    log::warn!("ShellOpen received but a shell is already running");
+                // A legacy PTY holds the whole shell side: its client predates
+                // the second slot and would mis-read anything exec sent back.
+                if self.exec.is_some() || self.pty.as_ref().is_some_and(|p| p.legacy) {
+                    log::warn!("ShellOpen received but the exec slot is already taken");
                     self.send(Message::Error {
-                        code: 2,
+                        code: ERR_SHELL_BUSY,
                         msg: "shell already open".into(),
                     })?;
                 } else {
                     match self.take_warm_or_spawn(shell) {
                         Ok(proc) => {
-                            self.shell = Some(proc);
+                            self.exec = Some(proc);
                             // Start the next one now, so its warm-up runs
                             // while this command is still being typed, sent
                             // and executed.
@@ -560,7 +716,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                         Err(e) => {
                             log::error!("failed to spawn shell: {e}");
                             self.send(Message::Error {
-                                code: 3,
+                                code: ERR_SHELL_SPAWN,
                                 msg: format!("shell spawn: {e}"),
                             })?;
                         }
@@ -569,20 +725,52 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
 
             (SessionState::Connected, Message::ShellOpenPty { shell, cols, rows }) => {
-                if self.shell.is_some() {
+                // The *legacy* open: this client speaks the pre-two-slot
+                // protocol, so it gets the pre-two-slot behaviour — one shell
+                // for the whole host, original opcodes in both directions.
+                if self.pty.is_some() || self.exec.is_some() {
                     log::warn!("ShellOpenPty received but a shell is already running");
                     self.send(Message::Error {
-                        code: 2,
+                        code: ERR_SHELL_BUSY,
                         msg: "shell already open".into(),
                     })?;
                 } else {
-                    log::info!("opening pty shell '{shell}' ({cols}x{rows})");
+                    log::info!("opening pty shell '{shell}' ({cols}x{rows}, legacy=true)");
                     match ShellProcess::spawn(shell, Some((*cols, *rows))) {
-                        Ok(proc) => self.shell = Some(proc),
+                        Ok(proc) => self.pty = Some(PtySlot { proc, legacy: true }),
                         Err(e) => {
                             log::error!("failed to spawn pty shell: {e}");
                             self.send(Message::Error {
-                                code: 3,
+                                code: ERR_SHELL_SPAWN,
+                                msg: format!("pty shell spawn: {e}"),
+                            })?;
+                        }
+                    }
+                }
+            }
+
+            (SessionState::Connected, Message::PtyOpen { shell, cols, rows }) => {
+                // The dedicated slot: an open exec shell is none of its
+                // business, which is the whole point of the second slot.
+                if self.pty.is_some() {
+                    log::warn!("PtyOpen received but the pty slot is already taken");
+                    self.send(Message::Error {
+                        code: ERR_PTY_BUSY,
+                        msg: "pty shell already open".into(),
+                    })?;
+                } else {
+                    log::info!("opening pty shell '{shell}' ({cols}x{rows}, legacy=false)");
+                    match ShellProcess::spawn(shell, Some((*cols, *rows))) {
+                        Ok(proc) => {
+                            self.pty = Some(PtySlot {
+                                proc,
+                                legacy: false,
+                            })
+                        }
+                        Err(e) => {
+                            log::error!("failed to spawn pty shell: {e}");
+                            self.send(Message::Error {
+                                code: ERR_PTY_SPAWN,
                                 msg: format!("pty shell spawn: {e}"),
                             })?;
                         }
@@ -591,18 +779,50 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
 
             (SessionState::Connected, Message::PtyResize { cols, rows }) => {
-                if let Some(sh) = self.shell.as_ref() {
-                    sh.resize(*cols, *rows);
+                // Both kinds of PTY resize the same way — the opcode predates
+                // the split and stayed shared.
+                if let Some(slot) = self.pty.as_ref() {
+                    slot.proc.resize(*cols, *rows);
                 }
-                // No shell open → silently ignore. Pre-spawn resize is
+                // No pty open → silently ignore. Pre-spawn resize is
                 // a benign race when client computes initial size in
-                // parallel with ShellOpenPty.
+                // parallel with the open.
             }
 
             (SessionState::Connected, Message::ShellInput { data }) => {
-                if let Some(sh) = self.shell.as_ref() {
-                    if !sh.write(data.clone()) {
-                        log::warn!("shell stdin writer is gone");
+                // Addresses the exec slot. With no exec shell it falls through
+                // to a *legacy* PTY — the only shell such a client can have
+                // open. It must never fall through to a `PtyOpen` PTY: that
+                // client has `PtyInput` for it, so a `ShellInput` arriving
+                // here is a stray from an older stream, and feeding it to a
+                // live console would type someone else's keystrokes into it.
+                let target = if self.exec.is_some() {
+                    self.exec.as_ref()
+                } else {
+                    self.pty.as_ref().filter(|p| p.legacy).map(|p| &p.proc)
+                };
+                match target {
+                    Some(sh) => {
+                        if !sh.write(data.clone()) {
+                            log::warn!("shell stdin writer is gone");
+                        }
+                    }
+                    None => log::warn!("ShellInput with no exec shell to take it — dropped"),
+                }
+            }
+
+            (SessionState::Connected, Message::PtyInput { data }) => {
+                match self.pty.as_ref().filter(|p| !p.legacy) {
+                    Some(slot) => {
+                        if !slot.proc.write(data.clone()) {
+                            log::warn!("pty stdin writer is gone");
+                        }
+                    }
+                    // Either nothing is open, or the open PTY is a legacy one
+                    // whose client speaks `ShellInput`. Both mean this frame
+                    // has no owner.
+                    None => {
+                        log::warn!("PtyInput with no dedicated pty shell to take it — dropped")
                     }
                 }
             }
@@ -615,11 +835,24 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 // which then makes the *next* ShellOpen fail with
                 // "shell already open". Force-kill after the close so
                 // the slot is always free when the client re-opens.
-                let had_shell = self.shell.is_some();
-                if let Some(sh) = self.shell.as_ref() {
-                    sh.close();
-                }
-                self.shell_kill();
+                //
+                // Routing mirrors `ShellInput`: the exec slot first, a legacy
+                // PTY second, never a `PtyOpen` one.
+                let had_shell = if self.exec.is_some() {
+                    if let Some(sh) = self.exec.as_ref() {
+                        sh.close();
+                    }
+                    self.exec_kill();
+                    true
+                } else if self.pty.as_ref().is_some_and(|p| p.legacy) {
+                    if let Some(slot) = self.pty.as_ref() {
+                        slot.proc.close();
+                    }
+                    self.pty_kill();
+                    true
+                } else {
+                    false
+                };
                 // Answer the close. The client holds its exec slot until the
                 // wire goes quiet, and with nothing coming back that meant
                 // waiting out a fixed idle window on every single command -
@@ -635,10 +868,26 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 }
             }
 
+            (SessionState::Connected, Message::PtyClose) => {
+                // No acknowledgement, unlike `ShellClose`. `PtyClose` only
+                // comes from the interactive relay's teardown, which does not
+                // wait for one (it discards `ShellClosed` too); answering
+                // would just drop a stray packet into whatever the exec slot
+                // is streaming at that moment.
+                if self.pty.as_ref().is_some_and(|p| !p.legacy) {
+                    if let Some(slot) = self.pty.as_ref() {
+                        slot.proc.close();
+                    }
+                    self.pty_kill();
+                } else {
+                    log::warn!("PtyClose with no dedicated pty shell open — ignored");
+                }
+            }
+
             (SessionState::Connected, Message::Disconnect) => {
                 log::info!("client disconnected");
                 self.injector.release_all()?;
-                self.shell_kill();
+                self.kill_all_shells();
                 self.warm_kill();
                 self.clipboard.reset();
                 self.state = SessionState::WaitingForHello;
@@ -654,7 +903,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 // exited too fast for heartbeat-timeout to fire).
                 self.injector.release_all().ok();
                 self.clipboard.reset();
-                self.shell_kill();
+                self.kill_all_shells();
                 self.state = SessionState::WaitingForHello;
                 self.client_name = None;
                 self.handle_packet(packet)?;
@@ -679,6 +928,57 @@ mod tests {
         let injector = MockInjector::default();
         let session = Session::new(host_transport, injector, "test-host".into(), 1920, 1080);
         (session, client_transport)
+    }
+
+    /// Hello → HelloAck, leaving the session `Connected` so a test can reach
+    /// the shell arms. Drops the ack; tests that care read it themselves.
+    fn connect(session: &mut Session<MockTransport, MockInjector>, client: &mut MockTransport) {
+        client
+            .send(&Packet::new(
+                Message::Hello {
+                    version: VERSION,
+                    client_name: "test".into(),
+                },
+                0,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        let _ack = client.recv().unwrap();
+    }
+
+    /// Drive the session until a packet the predicate accepts comes back, or
+    /// give up and return `None` — which is how a test asserts that something
+    /// must *not* arrive without hanging the runner.
+    ///
+    /// Every pump feeds the session a heartbeat first: `MockTransport::recv`
+    /// blocks and `tick` always reaches it, so a tick with nothing to consume
+    /// would never return. A heartbeat is the cheapest packet that changes
+    /// nothing else. The loop also gives a real child process time to echo —
+    /// output arrives on a reader thread, not synchronously.
+    fn pump_until(
+        session: &mut Session<MockTransport, MockInjector>,
+        client: &mut MockTransport,
+        mut want: impl FnMut(&Message) -> bool,
+    ) -> Option<Message> {
+        for i in 0..25u16 {
+            client
+                .send(&Packet::new(Message::Heartbeat, 1000 + i))
+                .unwrap();
+            session.tick().unwrap();
+            while let Some(p) = client.recv_timeout(Duration::from_millis(20)) {
+                if want(&p.message) {
+                    return Some(p.message);
+                }
+            }
+        }
+        None
+    }
+
+    /// Only the echo tests below look at output opcodes, and those are
+    /// Unix-only — see `ECHO_SHELL`.
+    #[cfg(not(target_os = "windows"))]
+    fn is_output(m: &Message) -> bool {
+        matches!(m, Message::ShellOutput { .. } | Message::PtyOutput { .. })
     }
 
     #[test]
@@ -716,7 +1016,7 @@ mod tests {
             ))
             .unwrap();
         session.tick().unwrap();
-        assert!(session.has_shell(), "the warm shell was handed over");
+        assert!(session.has_exec_shell(), "the warm shell was handed over");
         assert!(
             session.has_warm_shell(),
             "and the next one started right away"
@@ -725,7 +1025,7 @@ mod tests {
         // The client going away must not leave an idle shell behind.
         client.send(&Packet::new(Message::Disconnect, 2)).unwrap();
         session.tick().unwrap();
-        assert!(!session.has_shell());
+        assert!(!session.has_exec_shell());
         assert!(!session.has_warm_shell(), "no shell outlives the link");
     }
 
@@ -1058,30 +1358,191 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn shell_open_pty_on_non_windows_returns_error_to_client() {
-        // PTY-backed shell is Windows-only. A Mac/Linux host must
-        // surface the spawn error back to the client through the
-        // existing Message::Error path — silent fallback to pipe-mode
-        // would mask a misconfigured deployment.
+    fn pty_spawn_failure_reports_the_code_that_matches_the_opcode() {
+        // PTY-backed shell is Windows-only. A Mac/Linux host must surface the
+        // spawn error back to the client through Message::Error — a silent
+        // fallback to pipe-mode would mask a misconfigured deployment.
+        //
+        // The code differs by opcode, and that is the point: a legacy client
+        // only knows 2/3, so `ShellOpenPty` keeps answering 3, while the
+        // dedicated `PtyOpen` answers 5 so the new client can route the error
+        // to its pty consumer instead of the exec one.
+        for (open, want_code) in [
+            (
+                Message::ShellOpenPty {
+                    shell: "/bin/sh".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+                ERR_SHELL_SPAWN,
+            ),
+            (
+                Message::PtyOpen {
+                    shell: "/bin/sh".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+                ERR_PTY_SPAWN,
+            ),
+        ] {
+            let (mut session, mut client) = setup();
+            connect(&mut session, &mut client);
+            assert!(!session.has_pty_shell());
+
+            client.send(&Packet::new(open.clone(), 1)).unwrap();
+            session.tick().unwrap();
+
+            assert!(
+                !session.has_pty_shell(),
+                "non-Windows host must refuse PTY shell ({open:?})"
+            );
+
+            match pump_until(&mut session, &mut client, |m| {
+                matches!(m, Message::Error { .. })
+            }) {
+                Some(Message::Error { code, msg }) => {
+                    assert_eq!(code, want_code, "wrong code for {open:?}: {msg}");
+                }
+                other => panic!("expected Message::Error for {open:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hello_ack_announces_the_protocol_generation() {
+        // This field is how the client learns the pty slot exists. Answering
+        // with the `Hello` version instead would pin every client to the
+        // legacy single-slot path forever.
         let (mut session, mut client) = setup();
         client
             .send(&Packet::new(
                 Message::Hello {
-                    version: 1,
+                    version: VERSION,
                     client_name: "test".into(),
                 },
                 0,
             ))
             .unwrap();
         session.tick().unwrap();
-        let _ack = client.recv().unwrap();
+        match client.recv().unwrap().message {
+            Message::HelloAck { version, .. } => assert_eq!(version, HOST_PROTO_VERSION),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
 
-        assert!(!session.has_shell());
+    #[test]
+    fn exec_and_dedicated_pty_coexist_and_close_independently() {
+        // The whole point of the split: `wd --exec` opens while an
+        // interactive console is live, and neither close touches the other.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+
+        session.inject_pty_for_test(false, "");
+        assert!(session.has_pty_shell());
 
         client
             .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: String::new(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(
+            session.has_exec_shell(),
+            "a dedicated pty must not block ShellOpen"
+        );
+        assert!(session.has_pty_shell(), "and must survive it");
+
+        // Closing exec leaves the console alone.
+        client.send(&Packet::new(Message::ShellClose, 2)).unwrap();
+        session.tick().unwrap();
+        assert!(!session.has_exec_shell());
+        assert!(session.has_pty_shell(), "ShellClose must not kill the pty");
+        assert!(
+            pump_until(&mut session, &mut client, |m| matches!(
+                m,
+                Message::ShellClosed
+            ))
+            .is_some(),
+            "exec close still gets its acknowledgement"
+        );
+
+        // And PtyClose takes down only the console.
+        client.send(&Packet::new(Message::PtyClose, 3)).unwrap();
+        session.tick().unwrap();
+        assert!(!session.has_pty_shell());
+    }
+
+    #[test]
+    fn legacy_pty_still_takes_the_whole_shell_side() {
+        // A client that opened with `ShellOpenPty` has no second consumer, so
+        // it must keep seeing the old exclusive behaviour in both directions.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(true, "");
+
+        client
+            .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: String::new(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(!session.has_exec_shell(), "legacy pty must refuse exec");
+        match pump_until(&mut session, &mut client, |m| {
+            matches!(m, Message::Error { .. })
+        }) {
+            Some(Message::Error { code, .. }) => assert_eq!(code, ERR_SHELL_BUSY),
+            other => panic!("expected busy Error, got {other:?}"),
+        }
+
+        // The reverse: an open exec slot refuses a legacy pty open.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        client
+            .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: String::new(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(session.has_exec_shell());
+        client
+            .send(&Packet::new(
                 Message::ShellOpenPty {
-                    shell: "/bin/sh".into(),
+                    shell: String::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+                2,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(!session.has_pty_shell());
+        match pump_until(&mut session, &mut client, |m| {
+            matches!(m, Message::Error { .. })
+        }) {
+            Some(Message::Error { code, .. }) => assert_eq!(code, ERR_SHELL_BUSY),
+            other => panic!("expected busy Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_pty_open_is_refused_with_its_own_code() {
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(false, "");
+
+        client
+            .send(&Packet::new(
+                Message::PtyOpen {
+                    shell: String::new(),
                     cols: 80,
                     rows: 24,
                 },
@@ -1090,29 +1551,322 @@ mod tests {
             .unwrap();
         session.tick().unwrap();
 
+        match pump_until(&mut session, &mut client, |m| {
+            matches!(m, Message::Error { .. })
+        }) {
+            // A distinct code, not ERR_SHELL_BUSY: the client routes this to
+            // its interactive consumer, and 2 belongs to the exec one.
+            Some(Message::Error { code, .. }) => assert_eq!(code, ERR_PTY_BUSY),
+            other => panic!("expected pty-busy Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_close_closes_a_legacy_pty_but_never_a_dedicated_one() {
+        // `ShellClose` is the exec slot's opcode. A legacy pty answers it
+        // because its client has nothing else; a dedicated one must not, or
+        // a finishing `wd --exec` would hang up the owner's console.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(true, "");
+        client.send(&Packet::new(Message::ShellClose, 1)).unwrap();
+        session.tick().unwrap();
+        assert!(!session.has_pty_shell(), "legacy pty closes on ShellClose");
         assert!(
-            !session.has_shell(),
-            "non-Windows host must refuse PTY shell"
+            pump_until(&mut session, &mut client, |m| matches!(
+                m,
+                Message::ShellClosed
+            ))
+            .is_some(),
+            "and is acknowledged"
         );
 
-        // Host should have sent an Error packet — drain heartbeats /
-        // other messages, but expect at least one Error.
-        let mut saw_error = false;
-        for _ in 0..8 {
-            match client.recv() {
-                Ok(p) => {
-                    if matches!(p.message, Message::Error { .. }) {
-                        saw_error = true;
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(false, "");
+        client.send(&Packet::new(Message::ShellClose, 1)).unwrap();
+        session.tick().unwrap();
         assert!(
-            saw_error,
-            "expected Message::Error from non-Windows pty-spawn"
+            session.has_pty_shell(),
+            "a dedicated pty must ignore ShellClose"
         );
+        assert!(
+            pump_until(&mut session, &mut client, |m| matches!(
+                m,
+                Message::ShellClosed
+            ))
+            .is_none(),
+            "and nothing is acknowledged — there was no exec shell to close"
+        );
+    }
+
+    #[test]
+    fn pty_close_never_touches_the_exec_slot() {
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        client
+            .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: String::new(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(session.has_exec_shell());
+
+        client.send(&Packet::new(Message::PtyClose, 2)).unwrap();
+        session.tick().unwrap();
+        assert!(
+            session.has_exec_shell(),
+            "PtyClose with no pty open must leave exec alone"
+        );
+    }
+
+    #[test]
+    fn pump_visits_the_console_first_and_throttles_exec_beside_it() {
+        // Order and budget are the whole latency story: `transport.send`
+        // blocks and `tick` doesn't call `recv` while it runs, so whoever
+        // goes first — and how much it may ship — is what the person typing
+        // in the console actually feels.
+        assert_eq!(pump_order(), [ShellSlot::Pty, ShellSlot::Exec]);
+        // Alone, exec streams at exactly the pre-split rate.
+        assert_eq!(exec_pump_budget(false), PUMP_BUDGET);
+        // Beside a console it yields.
+        assert!(exec_pump_budget(true) < PUMP_BUDGET);
+        assert_eq!(exec_pump_budget(true), PUMP_BUDGET_EXEC_SHARED);
+    }
+
+    #[test]
+    fn either_open_slot_buys_the_busy_heartbeat_budget() {
+        // An interactive `wd` is exactly the case where minutes of silence are
+        // normal; the strict idle budget would tear the link down under it.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        assert_eq!(session.heartbeat_timeout(), HEARTBEAT_TIMEOUT_IDLE);
+
+        session.inject_pty_for_test(false, "");
+        assert_eq!(session.heartbeat_timeout(), HEARTBEAT_TIMEOUT_BUSY);
+
+        session.pty_kill();
+        assert_eq!(session.heartbeat_timeout(), HEARTBEAT_TIMEOUT_IDLE);
+
+        client
+            .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: String::new(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert_eq!(session.heartbeat_timeout(), HEARTBEAT_TIMEOUT_BUSY);
+    }
+
+    #[test]
+    fn every_teardown_path_clears_both_slots() {
+        // Disconnect, re-handshake and heartbeat timeout all mean "the client
+        // that owned these shells is gone". Leaving either behind would bounce
+        // the next client's open off a slot nobody can reach.
+        for teardown in ["disconnect", "re-hello", "heartbeat"] {
+            let (mut session, mut client) = setup();
+            connect(&mut session, &mut client);
+            client
+                .send(&Packet::new(
+                    Message::ShellOpen {
+                        shell: String::new(),
+                    },
+                    1,
+                ))
+                .unwrap();
+            session.tick().unwrap();
+            session.inject_pty_for_test(false, "");
+            assert!(session.has_exec_shell() && session.has_pty_shell());
+
+            match teardown {
+                "disconnect" => {
+                    client.send(&Packet::new(Message::Disconnect, 2)).unwrap();
+                    session.tick().unwrap();
+                }
+                "re-hello" => {
+                    client
+                        .send(&Packet::new(
+                            Message::Hello {
+                                version: VERSION,
+                                client_name: "test2".into(),
+                            },
+                            2,
+                        ))
+                        .unwrap();
+                    session.tick().unwrap();
+                }
+                _ => {
+                    session.force_heartbeat_timeout();
+                    client.send(&Packet::new(Message::Heartbeat, 2)).unwrap();
+                    session.tick().unwrap();
+                }
+            }
+
+            assert!(!session.has_exec_shell(), "{teardown} left an exec shell");
+            assert!(!session.has_pty_shell(), "{teardown} left a pty shell");
+        }
+    }
+
+    /// `/bin/cat` echoes stdin to stdout and prints nothing of its own, so a
+    /// test can assert on exactly the bytes it wrote — and it is unbuffered on
+    /// macOS, so the echo comes back inside a tick rather than at exit.
+    /// Windows has no equivalent one-word command, and a real PTY can't be
+    /// opened on a Mac anyway (see `Backend::Pty`), so these live here.
+    #[cfg(not(target_os = "windows"))]
+    const ECHO_SHELL: &str = "/bin/cat";
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn the_two_slots_never_borrow_each_other_opcodes() {
+        // The heart of the split: an exec command and an interactive console
+        // running at the same time, each answering on its own opcodes. Mixing
+        // them up would deliver `wd --exec` output into the owner's terminal
+        // (or the owner's keystrokes into the agent's stdout).
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+
+        session.inject_pty_for_test(false, ECHO_SHELL);
+        client
+            .send(&Packet::new(
+                Message::ShellOpen {
+                    shell: ECHO_SHELL.into(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(session.has_exec_shell() && session.has_pty_shell());
+
+        client
+            .send(&Packet::new(
+                Message::ShellInput {
+                    data: b"from-exec\n".to_vec(),
+                },
+                2,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        match pump_until(&mut session, &mut client, is_output) {
+            Some(Message::ShellOutput { data }) => {
+                assert_eq!(data, b"from-exec\n", "exec output on exec opcodes");
+            }
+            other => panic!("expected ShellOutput from the exec slot, got {other:?}"),
+        }
+
+        client
+            .send(&Packet::new(
+                Message::PtyInput {
+                    data: b"from-pty\n".to_vec(),
+                },
+                3,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        match pump_until(&mut session, &mut client, is_output) {
+            Some(Message::PtyOutput { data }) => {
+                assert_eq!(data, b"from-pty\n", "console output on pty opcodes");
+            }
+            other => panic!("expected PtyOutput from the pty slot, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_legacy_pty_answers_on_the_original_opcodes() {
+        // The compatibility half: a client that opened with `ShellOpenPty`
+        // knows nothing about `PtyInput`/`PtyOutput`, so its console has to
+        // keep speaking `ShellInput`/`ShellOutput` in both directions.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(true, ECHO_SHELL);
+
+        client
+            .send(&Packet::new(
+                Message::ShellInput {
+                    data: b"legacy\n".to_vec(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        match pump_until(&mut session, &mut client, is_output) {
+            Some(Message::ShellOutput { data }) => assert_eq!(data, b"legacy\n"),
+            other => panic!("expected ShellOutput from a legacy pty, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn input_meant_for_the_other_slot_is_dropped_not_delivered() {
+        // Both directions of the mismatch. The dangerous one is `ShellInput`
+        // reaching a dedicated pty: a stray frame from an older stream would
+        // be typed straight into a live console. The other way round is
+        // harmless but equally wrong, and both must end as a dropped frame
+        // rather than a delivery.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(false, ECHO_SHELL);
+        client
+            .send(&Packet::new(
+                Message::ShellInput {
+                    data: b"stray\n".to_vec(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(
+            pump_until(&mut session, &mut client, is_output).is_none(),
+            "ShellInput must never reach a dedicated pty"
+        );
+
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(true, ECHO_SHELL);
+        client
+            .send(&Packet::new(
+                Message::PtyInput {
+                    data: b"stray\n".to_vec(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(
+            pump_until(&mut session, &mut client, is_output).is_none(),
+            "PtyInput must never reach a legacy pty"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn shell_input_still_reaches_a_legacy_pty_when_exec_is_empty() {
+        // The fallback that keeps an old client working: with no exec shell
+        // open, its `ShellInput` is meant for the console it opened with
+        // `ShellOpenPty`.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(true, ECHO_SHELL);
+        assert!(!session.has_exec_shell());
+
+        client
+            .send(&Packet::new(
+                Message::ShellInput {
+                    data: b"typed\n".to_vec(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        match pump_until(&mut session, &mut client, is_output) {
+            Some(Message::ShellOutput { data }) => assert_eq!(data, b"typed\n"),
+            other => panic!("expected the legacy console to get it, got {other:?}"),
+        }
     }
 
     #[test]
