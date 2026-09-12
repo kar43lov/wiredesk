@@ -228,7 +228,11 @@ cd ~/Data/prjcts/wiredesk
 
 ## Шаг 9. Терминал в Ghostty/iTerm
 
-GUI закрывать **не нужно**: при запущенном `WireDesk.app` и интерактивный `wd`, и `wd --exec` ходят через IPC-релей поверх `wd-exec.sock`, порт не трогают и работают параллельно с capture. Стартовый баннер показывает, каким путём пошло соединение — `interactive via GUI IPC` или `interactive via direct serial` (второе — только когда GUI закрыт). Если `wd` отвечает `shell busy` (exit 125) — единственный shell-слот хоста занят другим `wd`; проверить: `pgrep -fl wiredesk-term`. В Ghostty:
+GUI закрывать **не нужно**: при запущенном `WireDesk.app` и интерактивный `wd`, и `wd --exec` ходят через IPC-релей поверх `wd-exec.sock`, порт не трогают и работают параллельно с capture. Стартовый баннер показывает, каким путём пошло соединение — `interactive via GUI IPC` или `interactive via direct serial` (второе — только когда GUI закрыт).
+
+Интерактивный `wd` и `wd --exec` с 2026-09-12 работают **одновременно**: у хоста два shell-слота. Отказ `shell busy` остался ровно для двух случаев — уже открыт второй интерактивный `wd` (слот-то один, проверить `pgrep -fl wiredesk-term`), либо хост ещё не пересобран после этой правки и живёт на одном слоте. Что именно, видно в `client.log` по строке `connected to '<host>' (… proto vN)`: `v1` — старый хост.
+
+В Ghostty:
 
 ```bash
 cd ~/Data/prjcts/wiredesk
@@ -269,6 +273,18 @@ cargo build --release -p wiredesk-host
 .\target\release\wiredesk-host.exe
 ```
 
+🔴 **`git fetch` вместо `git pull` выглядит как успешное обновление.** Fetch печатает строку вида `95c58d4..fec0136  main -> origin/main` — двигается только remote-tracking ссылка, рабочее дерево остаётся где было. Следом `cargo build --release` честно отвечает `Finished "release" profile ... in 6.40s` — ему нечего пересобирать, и это неотличимо от успешной сборки. Проверено живьём 12.09.2026: хост отставал на шесть коммитов, а вывод обеих команд выглядел зелёным. Вторая причина того же симптома — грязное рабочее дерево: `git pull` отказывается трогать изменённые файлы, так что перед ним — `git status --short`, и если не пусто, `git stash push -u -m <пометка>`.
+
 ⚠️ С момента остановки и до запуска канал мёртв — `wd` и `wd --exec` с Мака не работают, так что все три шага делаются на самой Windows-машине, а не через `wd --exec`.
+
+Проверка после сборки — три факта, а не ощущение «вроде обновил». Эти три команды уже можно гнать с Мака через `wd --exec` — канал к этому моменту живой:
+
+```powershell
+git log --oneline -1            # должен совпасть с origin/main
+Get-Item target\release\wiredesk-host.exe | Select-Object LastWriteTime
+Get-Process wiredesk-host | Select-Object StartTime,Path
+```
+
+Время запуска процесса обязано быть позже времени файла: совпадение HEAD само по себе не значит, что крутится новый бинарь. Размер `.exe` при этом может не измениться вовсе (секции PE выровнены), так что сравнивать размеры бесполезно. Если надо убедиться в конкретной правке — искать её строку в бинаре: `Select-String -Path <exe> -Pattern '<текст>' -Encoding ascii -List`.
 
 ⚠️ **Смена `assets/` требует пересборки host'а, даже если Rust-код не трогали:** `assets/tray-*.png` и `assets/app-icon.ico` попадают в бинарь через `include_bytes!`, а иконка `.exe` — через ресурс-секцию (только при сборке на Windows, см. [known-limitations](known-limitations.md)). Explorer может продолжать показывать старую иконку из своего кеша — `ie4uinit.exe -show`.

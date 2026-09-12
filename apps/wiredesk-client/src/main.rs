@@ -182,11 +182,11 @@ fn main() {
     let outgoing_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let incoming_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Shell-event broadcast slot for the IPC handler (Task 6). None until a
-    // `wd --exec` connection arrives; the reader thread checks it on every
-    // shell event and fans out a parallel copy when set. Shared (Arc) with
-    // every reader spawned across reconnects via LinkContext.
-    let exec_slot: exec_bridge::ExecEventSlot = Arc::new(std::sync::Mutex::new(None));
+    // Shell-event endpoints for the IPC handlers: one for `wd --exec`, one for
+    // an interactive `wd` console, both empty until such a connection arrives.
+    // The reader routes each shell packet to one of them by opcode. Shared
+    // (Arc inside) with every reader spawned across reconnects via LinkContext.
+    let shell_slots = exec_bridge::ShellSlots::new();
 
     // Shared host-info cache: populated by the reader on `HelloAck`, cleared
     // on link-down. The interactive-`wd`-over-IPC relay (Task 6/7) reads it to
@@ -201,10 +201,11 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         let ipc_outgoing_tx = outgoing_tx.clone();
-        let ipc_slot = exec_slot.clone();
-        // Shared single-owner lock for the host's one shell slot. The exec and
-        // interactive handlers fail-fast cross-kind against it (see
-        // shell_channel); exec-vs-exec FIFO stays nested under `single_inflight`.
+        let ipc_slots = shell_slots.clone();
+        // Shared owner lock for the host's shell slots. Against a host with the
+        // dedicated pty slot the two kinds coexist; against an older one they
+        // fail-fast cross-kind, as they always did (see shell_channel).
+        // exec-vs-exec FIFO stays nested under `single_inflight`.
         let shell_owner = shell_channel::new_shared_owner();
         let single_inflight: Arc<std::sync::Mutex<()>> = Arc::new(std::sync::Mutex::new(()));
         let ipc_host_info = host_info.clone();
@@ -213,7 +214,7 @@ fn main() {
         ipc::spawn_ipc_acceptor(
             socket_path,
             ipc_outgoing_tx,
-            ipc_slot,
+            ipc_slots,
             shell_owner,
             single_inflight,
             ipc_host_info,
@@ -222,7 +223,7 @@ fn main() {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = &exec_slot; // suppress unused on non-Mac
+        let _ = &shell_slots; // suppress unused on non-Mac
     }
 
     // LinkContext bundles every shared value the reader/writer threads need
@@ -239,7 +240,7 @@ fn main() {
         receive_files: receive_files.clone(),
         incoming_cancel: incoming_cancel.clone(),
         outgoing_cancel: outgoing_cancel.clone(),
-        exec_slot: exec_slot.clone(),
+        shell_slots: shell_slots.clone(),
         current_outgoing_label: current_outgoing_label.clone(),
         reader_outgoing_tx: outgoing_tx.clone(),
         link_up: link_up.clone(),

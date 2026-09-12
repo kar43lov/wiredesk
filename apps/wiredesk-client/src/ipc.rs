@@ -38,10 +38,10 @@ use wiredesk_exec_core::{
     },
     ExecError, ExecEvent, ExecTransport,
 };
-use wiredesk_protocol::message::Message;
+use wiredesk_protocol::message::{pty_slot_supported, Message};
 use wiredesk_protocol::packet::Packet;
 
-use crate::exec_bridge::{ExecEventSlot, ExecSlotGuard};
+use crate::exec_bridge::{ExecSlotGuard, ShellSlots};
 use crate::link::SharedHostInfo;
 use crate::shell_channel::{try_acquire, SharedShellOwner, ShellOwner};
 
@@ -128,7 +128,7 @@ const MAX_ACCEPT_ERRORS: u32 = 10;
 pub fn spawn_ipc_acceptor(
     socket_path: PathBuf,
     outgoing_tx: mpsc::Sender<Packet>,
-    exec_slot: ExecEventSlot,
+    slots: ShellSlots,
     shell_owner: SharedShellOwner,
     single_inflight: Arc<Mutex<()>>,
     host_info: SharedHostInfo,
@@ -196,7 +196,7 @@ pub fn spawn_ipc_acceptor(
                     consecutive_accept_errors = 0;
                     log::info!("IPC connection accepted");
                     let outgoing_tx = outgoing_tx.clone();
-                    let exec_slot = exec_slot.clone();
+                    let slots = slots.clone();
                     let shell_owner = shell_owner.clone();
                     let single_inflight = single_inflight.clone();
                     let host_info = host_info.clone();
@@ -205,7 +205,7 @@ pub fn spawn_ipc_acceptor(
                         dispatch_connection(
                             stream,
                             outgoing_tx,
-                            exec_slot,
+                            slots,
                             shell_owner,
                             single_inflight,
                             host_info,
@@ -251,7 +251,7 @@ pub fn spawn_ipc_acceptor(
 fn dispatch_connection(
     mut stream: UnixStream,
     outgoing_tx: mpsc::Sender<Packet>,
-    exec_slot: ExecEventSlot,
+    slots: ShellSlots,
     shell_owner: SharedShellOwner,
     single_inflight: Arc<Mutex<()>>,
     host_info: SharedHostInfo,
@@ -269,16 +269,17 @@ fn dispatch_connection(
             stream,
             req,
             outgoing_tx,
-            exec_slot,
+            slots,
             shell_owner,
             single_inflight,
+            host_info,
             link_up,
         ),
         IpcConnect::Interactive(open) => handle_interactive_connection(
             stream,
             open,
             outgoing_tx,
-            exec_slot,
+            slots,
             shell_owner,
             host_info,
             link_up,
@@ -299,9 +300,10 @@ fn handle_connection(
     mut stream: UnixStream,
     req: IpcRequest,
     outgoing_tx: mpsc::Sender<Packet>,
-    exec_slot: ExecEventSlot,
+    slots: ShellSlots,
     shell_owner: SharedShellOwner,
     single_inflight: Arc<Mutex<()>>,
+    host_info: SharedHostInfo,
     link_up: Arc<AtomicBool>,
 ) {
     log::info!(
@@ -332,13 +334,15 @@ fn handle_connection(
     // (Codex P2). Exec claims stack (ref-counted), so a queued exec is counted
     // as "exec present" for the whole time it waits — an interactive session
     // can't slip into the A→B handoff window and force a false "shell busy" on
-    // the already-queued exec. Fails fast only if an interactive `wd` session
-    // holds the channel (term maps the transport-class frame → exit 125).
+    // the already-queued exec. Against a host with the dedicated pty slot a
+    // live console doesn't block this at all; against an older one it fails
+    // fast (term maps the transport-class frame → exit 125).
     // Declared BEFORE `_inflight_guard` so on return the inflight mutex releases
     // first (waking the next queued exec, which already holds its own Exec ref)
     // and only then does this exec's ref drop — the count never dips to 0 across
     // the handoff.
-    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Exec) {
+    let dual = host_supports_pty_slot(&host_info);
+    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Exec, dual) {
         Some(g) => g,
         None => {
             log::info!("IPC handler: shell channel held by interactive session — refusing exec");
@@ -408,7 +412,7 @@ fn handle_connection(
     // ShellOutput / ShellExit / shell-Error into here via the slot
     // guard; runner pulls them as `ExecEvent`s.
     let (event_tx, event_rx) = mpsc::channel::<ExecEvent>();
-    let _slot_guard = ExecSlotGuard::install(&exec_slot, event_tx);
+    let _slot_guard = ExecSlotGuard::install(&slots.exec, event_tx);
 
     // Open a fresh pipe-mode shell on the host. Standalone term does
     // this in `run()` before calling run_oneshot; in IPC mode the
@@ -622,6 +626,21 @@ fn post_run_idle(sentinel_seen: bool) -> Duration {
     }
 }
 
+/// Whether the connected host has the dedicated pty slot, i.e. whether the
+/// `Pty*` opcodes may go on the wire and the two shell kinds may run at once.
+///
+/// Read **once per connection**, after the link/host-info gate, and held for
+/// the whole session: a reconnect to a differently-built host mid-session would
+/// otherwise flip the opcodes under a live PTY. No host info (not handshook
+/// yet) reads as `false` — the strict, always-safe answer.
+fn host_supports_pty_slot(host_info: &SharedHostInfo) -> bool {
+    host_info
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|hi| pty_slot_supported(hi.proto_version)))
+        .unwrap_or(false)
+}
+
 /// Protocol version echoed in the synthesised `HelloAck`. The term ignores
 /// the version field on receive (`link.rs` HelloAck arm binds `..`), so this
 /// is informational — kept at 1 to match the host's real handshake.
@@ -706,15 +725,36 @@ fn handle_interactive_connection(
     mut stream: UnixStream,
     open: IpcInteractiveOpen,
     outgoing_tx: mpsc::Sender<Packet>,
-    exec_slot: ExecEventSlot,
+    slots: ShellSlots,
     shell_owner: SharedShellOwner,
     host_info: SharedHostInfo,
     link_up: Arc<AtomicBool>,
 ) {
-    // 1. Claim the host's single shell slot exclusively. Busy (exec or another
-    //    interactive session in flight) → fail-fast terminal frame + close. No
-    //    queuing: a minutes-long interactive session must never block Claude.
-    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Interactive) {
+    // 1. Refuse if the link is mid-reconnect or we never handshook (empty
+    //    host-info cache): we can't synth an accurate HelloAck and any open
+    //    we'd queue would block against a dead wire.
+    //
+    //    This runs before the channel claim, because the claim's own answer
+    //    now depends on the host generation — which is exactly what the
+    //    host-info cache holds. Claiming first would mean claiming under a
+    //    guess and releasing it a line later anyway.
+    let host_info_ready = host_info.lock().map(|g| g.is_some()).unwrap_or(false);
+    if !link_up.load(Ordering::Relaxed) || !host_info_ready {
+        log::info!("IPC interactive: link down or host-info empty — refusing");
+        let mut s = stream;
+        let _ = write_packet_frame(&mut s, &relay_error_packet("host link not ready"));
+        return;
+    }
+
+    // 2. Which dialect this host speaks, fixed for the whole session.
+    let dual = host_supports_pty_slot(&host_info);
+
+    // 3. Claim the console. A second interactive session always loses — there
+    //    is one pty slot on the host either way. Against a legacy host a
+    //    running `wd --exec` also blocks it, since there is only the one slot
+    //    over there. Fail-fast terminal frame + close; no queuing, because a
+    //    minutes-long console must never sit behind anything.
+    let _owner_guard = match try_acquire(&shell_owner, ShellOwner::Interactive, dual) {
         Some(g) => g,
         None => {
             log::info!("IPC interactive: shell channel busy — refusing");
@@ -724,22 +764,12 @@ fn handle_interactive_connection(
         }
     };
 
-    // 2. Refuse if the link is mid-reconnect or we never handshook (empty
-    //    host-info cache): we can't synth an accurate HelloAck and any
-    //    ShellOpenPty we'd queue would block against a dead wire.
-    let host_info_ready = host_info.lock().map(|g| g.is_some()).unwrap_or(false);
-    if !link_up.load(Ordering::Relaxed) || !host_info_ready {
-        log::info!("IPC interactive: link down or host-info empty — refusing");
-        let mut s = stream;
-        let _ = write_packet_frame(&mut s, &relay_error_packet("host link not ready"));
-        return;
-    }
-
-    // 3. Private mpsc for the duration of the session; reader_thread fans host
-    //    ShellOutput / ShellExit / HostError into it via the slot guard. Installed
-    //    before the PTY opens so no host startup output is missed.
+    // 4. Private mpsc for the duration of the session; the reader fans this
+    //    console's output into it via the slot guard. Installed before the PTY
+    //    opens so no host startup output is missed. Which slot depends on the
+    //    dialect: a dual host answers on `Pty*`, a legacy one on `Shell*`.
     let (event_tx, event_rx) = mpsc::channel::<ExecEvent>();
-    let _slot_guard = ExecSlotGuard::install(&exec_slot, event_tx);
+    let _slot_guard = ExecSlotGuard::install(if dual { &slots.pty } else { &slots.exec }, event_tx);
 
     // 4. Synchronous handshake BEFORE opening the PTY (Codex P2): read the term's
     //    Hello and answer with a synth HelloAck from the cached host-info. Opening
@@ -777,18 +807,28 @@ fn handle_interactive_connection(
     // it via socket shutdown, not a timeout).
     let _ = stream.set_read_timeout(None);
 
-    // 5. NOW originate the single ShellOpenPty — any host output arrives strictly
+    // 6. NOW originate the single open — any host output arrives strictly
     //    after the HelloAck (the term does NOT send its own; plan-review
     //    Important #2). cols/rows come from the term's terminal::size().
-    if let Err(e) = outgoing_tx.send(Packet::new(
+    //
+    //    `PtyOpen` takes the host's dedicated slot and leaves `wd --exec`
+    //    alone; `ShellOpenPty` is the legacy open a pre-two-slot host
+    //    understands, and it takes the whole shell side over there.
+    let open_msg = if dual {
+        Message::PtyOpen {
+            shell: open.shell.clone(),
+            cols: open.cols,
+            rows: open.rows,
+        }
+    } else {
         Message::ShellOpenPty {
             shell: open.shell.clone(),
             cols: open.cols,
             rows: open.rows,
-        },
-        0,
-    )) {
-        log::warn!("IPC interactive: ShellOpenPty send failed: {e}; aborting");
+        }
+    };
+    if let Err(e) = outgoing_tx.send(Packet::new(open_msg, 0)) {
+        log::warn!("IPC interactive: open send failed: {e}; aborting");
         return;
     }
 
@@ -825,33 +865,60 @@ fn handle_interactive_connection(
     let reader = {
         let r_stop = stop.clone();
         let r_outgoing = outgoing_tx.clone();
+        let r_dual = dual;
         let mut rs = read_stream;
         thread::spawn(move || {
             while !r_stop.load(Ordering::Relaxed) {
                 match read_packet_frame(&mut rs) {
-                    Ok(pkt) => match pkt.message {
-                        // Hello was already answered synchronously before the PTY
-                        // opened; GUI owns heartbeat — drop both.
-                        Message::Hello { .. } | Message::Heartbeat => {}
-                        Message::ShellClose | Message::Disconnect => {
-                            r_stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        // clippy 1.98 wants this folded into a match guard, but
-                        // the guard would have to move `pkt` into `send`, which
-                        // match guards cannot do (E0382). The lint's own
-                        // suggestion does not compile — verified 2026-09-04.
-                        #[allow(clippy::collapsible_match)]
-                        Message::ShellInput { .. } | Message::PtyResize { .. } => {
-                            if r_outgoing.send(pkt).is_err() {
+                    // The term speaks one dialect — the pre-two-slot one — and
+                    // never learns otherwise (it is unchanged by this feature).
+                    // Against a dual host its stdin is re-addressed here, so
+                    // the console's keystrokes ride `PtyInput` and can never be
+                    // confused with an exec run's `ShellInput`. `PtyResize` is
+                    // shared by both generations and goes as-is.
+                    Ok(pkt) => {
+                        let pkt = if r_dual {
+                            let seq = pkt.seq;
+                            match pkt.message {
+                                Message::ShellInput { data } => {
+                                    Packet::new(Message::PtyInput { data }, seq)
+                                }
+                                // Rebuilt rather than forwarded, but with the
+                                // same seq — nothing downstream reads it, and
+                                // an altered one would only confuse a log.
+                                message => Packet::new(message, seq),
+                            }
+                        } else {
+                            // Legacy path untouched: the term's packet goes to
+                            // the wire exactly as it arrived, as it always did.
+                            pkt
+                        };
+                        match pkt.message {
+                            // Hello was already answered synchronously before the PTY
+                            // opened; GUI owns heartbeat — drop both.
+                            Message::Hello { .. } | Message::Heartbeat => {}
+                            Message::ShellClose | Message::Disconnect => {
                                 r_stop.store(true, Ordering::Relaxed);
                                 break;
                             }
+                            // clippy 1.98 wants this folded into a match guard, but
+                            // the guard would have to move `pkt` into `send`, which
+                            // match guards cannot do (E0382). The lint's own
+                            // suggestion does not compile — verified 2026-09-04.
+                            #[allow(clippy::collapsible_match)]
+                            Message::ShellInput { .. }
+                            | Message::PtyInput { .. }
+                            | Message::PtyResize { .. } => {
+                                if r_outgoing.send(pkt).is_err() {
+                                    r_stop.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            // Any other message type from the term is unexpected on
+                            // the interactive path — ignore rather than forward.
+                            _ => {}
                         }
-                        // Any other message type from the term is unexpected on
-                        // the interactive path — ignore rather than forward.
-                        _ => {}
-                    },
+                    }
                     // EOF / socket shutdown / decode error — term is gone.
                     Err(_) => {
                         r_stop.store(true, Ordering::Relaxed);
@@ -936,8 +1003,16 @@ fn handle_interactive_connection(
         let _ = w.shutdown(std::net::Shutdown::Both);
     }
     let _ = reader.join();
-    if let Err(e) = outgoing_tx.send(Packet::new(Message::ShellClose, 0)) {
-        log::warn!("IPC interactive: ShellClose send failed on teardown: {e}");
+    // Close the slot this session actually holds. `PtyClose` is unacknowledged
+    // by design — nothing below waits for one, and an ack would only land in
+    // the middle of whatever `wd --exec` is streaming.
+    let close_msg = if dual {
+        Message::PtyClose
+    } else {
+        Message::ShellClose
+    };
+    if let Err(e) = outgoing_tx.send(Packet::new(close_msg, 0)) {
+        log::warn!("IPC interactive: close send failed on teardown: {e}");
     }
     // `_owner_guard` (→ Idle) and `_slot_guard` (→ None) drop here.
 }
@@ -1052,7 +1127,7 @@ mod tests {
         narrow_socket_dir(&tmp.path().join("does-not-exist"));
     }
 
-    /// stage events directly into `exec_slot` and let the handler's
+    /// stage events directly into the exec slot and let the handler's
     /// runner consume them.
     #[test]
     fn handler_round_trip_via_unix_socket() {
@@ -1062,7 +1137,7 @@ mod tests {
         let socket = tmp.path().join("wd-exec.sock");
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info = populated_host_info();
@@ -1071,7 +1146,7 @@ mod tests {
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
-            exec_slot.clone(),
+            slots.clone(),
             owner,
             inflight,
             host_info,
@@ -1084,7 +1159,7 @@ mod tests {
         // Stage host-side events on a separate thread that fires after
         // the runner has sent its payload (we observe the outgoing_rx
         // channel for the ShellInput packet, then push events).
-        let stage_slot = exec_slot.clone();
+        let stage_slot = slots.exec.clone();
         let stage_thread = thread::spawn(move || {
             // Handler now sends ShellOpen first, then payload (a
             // ShellInput) — drain ShellOpen and keep reading until
@@ -1164,7 +1239,7 @@ mod tests {
         let socket = tmp.path().join("wd-exec.sock");
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info = populated_host_info();
@@ -1179,7 +1254,7 @@ mod tests {
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
-            exec_slot,
+            slots,
             owner,
             inflight.clone(),
             host_info,
@@ -1231,14 +1306,14 @@ mod tests {
         let socket = blocker.join("wd-exec.sock");
 
         let (tx, _rx) = mpsc::channel::<Packet>();
-        let slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info: SharedHostInfo = Arc::new(Mutex::new(None));
         let link_up = Arc::new(AtomicBool::new(true));
 
         // Must not panic.
-        spawn_ipc_acceptor(socket, tx, slot, owner, inflight, host_info, link_up);
+        spawn_ipc_acceptor(socket, tx, slots, owner, inflight, host_info, link_up);
     }
 
     #[test]
@@ -1251,7 +1326,7 @@ mod tests {
         assert!(socket.exists(), "stale file present");
 
         let (tx, _rx) = mpsc::channel::<Packet>();
-        let slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info: SharedHostInfo = Arc::new(Mutex::new(None));
@@ -1259,7 +1334,7 @@ mod tests {
         spawn_ipc_acceptor(
             socket.clone(),
             tx,
-            slot,
+            slots,
             owner,
             inflight,
             host_info,
@@ -1302,15 +1377,31 @@ mod tests {
 
     // ---- Interactive relay (Task 6) -------------------------------------
 
+    use crate::exec_bridge::ExecEventSlot;
     use crate::link::{HostInfo, SharedHostInfo};
     use crate::shell_channel::{current_owner, new_shared_owner};
+    use wiredesk_protocol::message::HOST_PROTO_VERSION;
 
-    fn populated_host_info() -> SharedHostInfo {
+    /// Host-info cache as the reader would leave it, for a host announcing
+    /// `proto_version`.
+    fn host_info_v(proto_version: u8) -> SharedHostInfo {
         Arc::new(Mutex::new(Some(HostInfo {
             host_name: "win-host".into(),
             screen_w: 2560,
             screen_h: 1440,
+            proto_version,
         })))
+    }
+
+    /// The pre-two-slot host. Default for the tests that predate the split, so
+    /// they keep pinning the old contract exactly as they did.
+    fn populated_host_info() -> SharedHostInfo {
+        host_info_v(1)
+    }
+
+    /// A host with the dedicated pty slot.
+    fn dual_host_info() -> SharedHostInfo {
+        host_info_v(HOST_PROTO_VERSION)
     }
 
     /// Spin until the interactive handler has installed its exec slot (it does
@@ -1364,7 +1455,7 @@ mod tests {
             .unwrap();
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(true));
@@ -1375,7 +1466,7 @@ mod tests {
             rows: 30,
         };
         let (h_slot, h_owner, h_hi, h_link) = (
-            exec_slot.clone(),
+            slots.clone(),
             owner.clone(),
             host_info.clone(),
             link_up.clone(),
@@ -1452,13 +1543,13 @@ mod tests {
         ));
 
         // Staged host ShellOutput / ShellExit reach the socket.
-        wait_slot_installed(&exec_slot);
-        stage_event(&exec_slot, ExecEvent::ShellOutput(b"hi\n".to_vec()));
+        wait_slot_installed(&slots.exec);
+        stage_event(&slots.exec, ExecEvent::ShellOutput(b"hi\n".to_vec()));
         match read_packet_frame(&mut client).expect("ShellOutput").message {
             Message::ShellOutput { data } => assert_eq!(data, b"hi\n"),
             other => panic!("expected ShellOutput, got {other:?}"),
         }
-        stage_event(&exec_slot, ExecEvent::ShellExit(0));
+        stage_event(&slots.exec, ExecEvent::ShellExit(0));
         assert!(matches!(
             read_packet_frame(&mut client).expect("ShellExit").message,
             Message::ShellExit { code: 0 }
@@ -1483,7 +1574,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(false)); // link DOWN
@@ -1499,7 +1590,7 @@ mod tests {
                 server,
                 open,
                 outgoing_tx,
-                exec_slot,
+                slots,
                 owner,
                 host_info,
                 link_up,
@@ -1532,7 +1623,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let host_info: SharedHostInfo = Arc::new(Mutex::new(None)); // never handshook
         let link_up = Arc::new(AtomicBool::new(true));
@@ -1548,7 +1639,7 @@ mod tests {
                 server,
                 open,
                 outgoing_tx,
-                exec_slot,
+                slots,
                 owner,
                 host_info,
                 link_up,
@@ -1582,10 +1673,11 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
-        // Pre-claim as Exec — a competing interactive connect must fail fast.
-        let _held = try_acquire(&owner, ShellOwner::Exec).expect("pre-claim Exec");
+        // Pre-claim as Exec — against this (legacy) host a competing
+        // interactive connect must fail fast.
+        let _held = try_acquire(&owner, ShellOwner::Exec, false).expect("pre-claim Exec");
         let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(true));
 
@@ -1599,7 +1691,7 @@ mod tests {
                 server,
                 open,
                 outgoing_tx,
-                exec_slot,
+                slots,
                 owner.clone(),
                 host_info,
                 link_up,
@@ -1624,7 +1716,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(true));
@@ -1640,7 +1732,7 @@ mod tests {
                 server,
                 open,
                 outgoing_tx,
-                exec_slot,
+                slots,
                 owner,
                 host_info,
                 link_up,
@@ -1681,7 +1773,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(true));
@@ -1692,7 +1784,7 @@ mod tests {
             rows: 24,
         };
         let (h_slot, h_owner, h_hi, h_link) = (
-            exec_slot.clone(),
+            slots.clone(),
             owner.clone(),
             host_info.clone(),
             link_up.clone(),
@@ -1714,9 +1806,9 @@ mod tests {
         assert_eq!(current_owner(&owner), ShellOwner::Interactive);
 
         // Host rejects the open — HostError with no ShellExit to follow.
-        wait_slot_installed(&exec_slot);
+        wait_slot_installed(&slots.exec);
         stage_event(
-            &exec_slot,
+            &slots.exec,
             ExecEvent::HostError("shell already open".into()),
         );
 
@@ -1748,6 +1840,160 @@ mod tests {
 
     // ---- Atomic IpcConnect cutover (Task 7) -----------------------------
 
+    /// The same situation against a host with the dedicated pty slot: the exec
+    /// run must go through, because it lands in a slot the console never
+    /// touches. This is the whole point of the split, at the handler level.
+    #[test]
+    fn exec_proceeds_while_interactive_holds_channel_on_a_dual_host() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let socket = tmp.path().join("wd-exec.sock");
+
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let slots = ShellSlots::new();
+        let owner = new_shared_owner();
+        // A live console, claimed the way the relay claims it on a dual host.
+        let _held =
+            try_acquire(&owner, ShellOwner::Interactive, true).expect("pre-claim Interactive");
+        let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        spawn_ipc_acceptor(
+            socket.clone(),
+            outgoing_tx,
+            slots,
+            owner.clone(),
+            inflight,
+            dual_host_info(),
+            link_up,
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write_connect(
+            &mut client,
+            &IpcConnect::Exec(IpcRequest {
+                cmd: "echo hi".into(),
+                ssh: None,
+                timeout_secs: 5,
+                compress: false,
+            }),
+        )
+        .unwrap();
+
+        // Not refused: the run opens its own shell on the wire. (It then waits
+        // for a sentinel that never comes and times out on its own; all this
+        // test needs is that it started at all.)
+        match outgoing_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("exec must reach the wire beside a live console")
+            .message
+        {
+            Message::ShellOpen { .. } => {}
+            other => panic!("expected ShellOpen, got {other:?}"),
+        }
+    }
+
+    /// Against a dual host the relay must speak the pty dialect end to end:
+    /// open with `PtyOpen`, re-address the term's stdin to `PtyInput`, and
+    /// close with `PtyClose`. The term itself is unchanged and knows none of
+    /// this.
+    #[test]
+    fn interactive_relay_speaks_the_pty_dialect_on_a_dual_host() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
+        let slots = ShellSlots::new();
+        let owner = new_shared_owner();
+        let host_info = dual_host_info();
+        let link_up = Arc::new(AtomicBool::new(true));
+
+        let open = IpcInteractiveOpen {
+            shell: "pwsh".into(),
+            cols: 100,
+            rows: 30,
+        };
+        let (h_slots, h_owner, h_hi, h_link) = (
+            slots.clone(),
+            owner.clone(),
+            host_info.clone(),
+            link_up.clone(),
+        );
+        let handler = thread::spawn(move || {
+            handle_interactive_connection(
+                server,
+                open,
+                outgoing_tx,
+                h_slots,
+                h_owner,
+                h_hi,
+                h_link,
+            );
+        });
+
+        let _ack = client_handshake(&mut client);
+        match outgoing_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .message
+        {
+            Message::PtyOpen { shell, cols, rows } => {
+                assert_eq!((shell.as_str(), cols, rows), ("pwsh", 100, 30));
+            }
+            other => panic!("expected PtyOpen on a dual host, got {other:?}"),
+        }
+
+        // The term sends `ShellInput`; the relay re-addresses it.
+        write_packet_frame(
+            &mut client,
+            &Packet::new(
+                Message::ShellInput {
+                    data: b"echo hi\r".to_vec(),
+                },
+                0,
+            ),
+        )
+        .unwrap();
+        match outgoing_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .message
+        {
+            Message::PtyInput { data } => assert_eq!(data, b"echo hi\r"),
+            other => panic!("expected PtyInput, got {other:?}"),
+        }
+
+        // Output comes back on the pty slot and reaches the term as the plain
+        // `ShellOutput` it understands.
+        wait_slot_installed(&slots.pty);
+        stage_event(&slots.pty, ExecEvent::ShellOutput(b"hi\r\n".to_vec()));
+        match read_packet_frame(&mut client)
+            .expect("console output")
+            .message
+        {
+            Message::ShellOutput { data } => assert_eq!(data, b"hi\r\n"),
+            other => panic!("expected ShellOutput to the term, got {other:?}"),
+        }
+
+        // Teardown closes the pty slot only.
+        write_packet_frame(&mut client, &Packet::new(Message::Disconnect, 0)).unwrap();
+        assert!(matches!(
+            outgoing_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .message,
+            Message::PtyClose
+        ));
+        handler.join().expect("relay thread");
+        assert_eq!(current_owner(&owner), ShellOwner::Idle);
+    }
+
     /// While an interactive `wd` session holds the shell channel, an incoming
     /// `wd --exec` must fail fast with a transport-class frame (term → exit 125)
     /// and never queue a `ShellOpen` behind the minutes-long PTY session.
@@ -1759,10 +2005,11 @@ mod tests {
         let socket = tmp.path().join("wd-exec.sock");
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         // Pre-claim the channel as Interactive — mirrors a live PTY session.
-        let _held = try_acquire(&owner, ShellOwner::Interactive).expect("pre-claim Interactive");
+        let _held =
+            try_acquire(&owner, ShellOwner::Interactive, false).expect("pre-claim Interactive");
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info = populated_host_info();
         let link_up = Arc::new(AtomicBool::new(true));
@@ -1770,7 +2017,7 @@ mod tests {
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
-            exec_slot,
+            slots,
             owner.clone(),
             inflight,
             host_info,
@@ -1832,7 +2079,7 @@ mod tests {
         let socket = tmp.path().join("wd-exec.sock");
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Packet>();
-        let exec_slot: ExecEventSlot = Arc::new(Mutex::new(None));
+        let slots = ShellSlots::new();
         let owner = new_shared_owner();
         let inflight: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let host_info = populated_host_info();
@@ -1841,7 +2088,7 @@ mod tests {
         spawn_ipc_acceptor(
             socket.clone(),
             outgoing_tx,
-            exec_slot.clone(),
+            slots.clone(),
             owner.clone(),
             inflight,
             host_info,
@@ -1853,7 +2100,7 @@ mod tests {
         // appear one run at a time. For each of the two runs, drain outgoing
         // until the ShellInput carrying the sentinel, extract its uuid, then
         // stage prompt → output → sentinel into whichever slot is installed.
-        let stage_slot = exec_slot.clone();
+        let stage_slot = slots.exec.clone();
         let stage_thread = thread::spawn(move || {
             for _ in 0..2 {
                 let payload = loop {

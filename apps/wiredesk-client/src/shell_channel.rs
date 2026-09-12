@@ -1,25 +1,31 @@
-//! Single-owner lock for the host's one shell slot.
+//! Owner lock for the host's shell slots.
 //!
-//! The Windows host has exactly one shell slot (`self.shell`). Two
-//! consumers on the Mac side now compete for it:
+//! Two consumers on the Mac side want a shell on the host:
 //!   * `wd --exec` (one-shot, FIFO-serialised — many can queue),
 //!   * interactive `wd` (a minutes-long PTY session — must never queue).
 //!
-//! A second `ShellOpen*` on the wire is rejected by the host with
-//! `Error "shell already open"`. We front-run that with a client-side
-//! owner state so a competing acquirer gets an immediate "shell busy"
-//! terminal frame instead of a confusing host-side error.
+//! Whether they can have one at the same time depends on the host, so every
+//! acquire carries a `dual` flag derived from the host's `HelloAck` generation
+//! (`pty_slot_supported`):
 //!
-//! **Policy (plan Task 4 + Codex review):**
-//!   * cross-kind is **fail-fast** — while an `Interactive` session holds the
-//!     channel, any `Exec` acquire fails immediately (→ term exit 125), and
-//!     while *any* `Exec` is present an `Interactive` acquire fails immediately.
-//!     No queuing: a minutes-long interactive session must never block Claude's
-//!     `--exec`.
-//!   * exec-vs-exec is **not** fail-fast — `Exec` acquires **stack** (a
-//!     ref-count). Multiple `wd --exec` handlers coexist as owners; their
-//!     mutual FIFO ordering is enforced one level up by the
-//!     `single_inflight: Arc<Mutex<()>>` mutex in the IPC acceptor.
+//! **`dual == true` — host has separate exec and pty slots (2026-09-12 on).**
+//! The kinds don't see each other: an `Exec` acquire ignores a live console and
+//! vice versa. `Interactive` stays exclusive against *itself* — there is still
+//! exactly one pty slot over there.
+//!
+//! **`dual == false` — one shell slot on the host.** Cross-kind is
+//! **fail-fast**: while an `Interactive` session holds the channel any `Exec`
+//! acquire fails immediately (→ term exit 125), and while any `Exec` is present
+//! an `Interactive` acquire fails immediately. No queuing — a minutes-long
+//! interactive session must never block an agent's `--exec`. A second
+//! `ShellOpen*` would be rejected by the host with `Error "shell already open"`
+//! anyway; this front-runs it so the loser gets a clear "shell busy" frame
+//! instead of a confusing host-side error.
+//!
+//! In both modes exec-vs-exec is **not** fail-fast — `Exec` acquires **stack**
+//! (a ref-count). Multiple `wd --exec` handlers coexist as owners; their mutual
+//! FIFO ordering is enforced one level up by the `single_inflight:
+//! Arc<Mutex<()>>` mutex in the IPC acceptor.
 //!
 //! **Why a ref-count, not a single `Exec` state (Codex P2):** an exec handler
 //! claims `Exec` *before* it queues on `single_inflight`, and releases it
@@ -137,29 +143,38 @@ impl Drop for ShellChannelGuard {
 
 /// Try to claim the channel for `kind`.
 ///
-///   * `Interactive` — exclusive: succeeds only when the channel is fully idle
-///     (no interactive session, no exec present). Returns `None` otherwise.
-///   * `Exec` — stacks: succeeds unless an interactive session holds the
-///     channel, incrementing the exec ref-count. exec-vs-exec never fails here;
+///   * `Interactive` — never shares with another console. With `dual == false`
+///     it also needs the channel fully idle, because an exec run is holding the
+///     host's only shell slot.
+///   * `Exec` — stacks: increments the exec ref-count. With `dual == false` it
+///     fails while an interactive session holds the channel; with `dual == true`
+///     the console is none of its business. exec-vs-exec never fails here;
 ///     FIFO ordering is `single_inflight`'s job one level up.
 ///
+/// `dual` comes from the connected host's `HelloAck` generation and is read
+/// once per connection — see `ipc::host_supports_pty_slot`.
+///
 /// On success returns a `ShellChannelGuard` that releases exactly this claim on
-/// drop. `try_acquire(Idle)` is meaningless and returns `None`.
+/// drop. `try_acquire(Idle, _)` is meaningless and returns `None`.
 // The IPC relay that owns the shell channel is macOS-only for now
 // (see ipc.rs); the type stays cross-platform so its tests run
 // everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn try_acquire(owner: &SharedShellOwner, kind: ShellOwner) -> Option<ShellChannelGuard> {
+pub fn try_acquire(
+    owner: &SharedShellOwner,
+    kind: ShellOwner,
+    dual: bool,
+) -> Option<ShellChannelGuard> {
     let mut guard = owner.lock().expect("shell owner poisoned");
     match kind {
         ShellOwner::Interactive => {
-            if guard.interactive || guard.exec_refs > 0 {
+            if guard.interactive || (!dual && guard.exec_refs > 0) {
                 return None;
             }
             guard.interactive = true;
         }
         ShellOwner::Exec => {
-            if guard.interactive {
+            if !dual && guard.interactive {
                 return None;
             }
             guard.exec_refs += 1;
@@ -167,7 +182,7 @@ pub fn try_acquire(owner: &SharedShellOwner, kind: ShellOwner) -> Option<ShellCh
         ShellOwner::Idle => {
             debug_assert!(
                 false,
-                "try_acquire(Idle) is meaningless — acquire Exec or Interactive"
+                "try_acquire(Idle, _) is meaningless — acquire Exec or Interactive"
             );
             return None;
         }
@@ -183,86 +198,142 @@ mod tests {
     use super::*;
     use std::thread;
 
+    /// The host that predates the second shell slot.
+    const LEGACY: bool = false;
+    /// A host with separate exec and pty slots.
+    const DUAL: bool = true;
+
     #[test]
-    fn idle_acquire_interactive_ok() {
-        let owner = new_shared_owner();
-        let guard = try_acquire(&owner, ShellOwner::Interactive);
-        assert!(guard.is_some(), "Idle channel must be claimable");
-        assert_eq!(current_owner(&owner), ShellOwner::Interactive);
+    fn idle_acquire_works_for_either_kind_in_either_mode() {
+        for dual in [LEGACY, DUAL] {
+            let owner = new_shared_owner();
+            // Bind the guard: a temporary would drop at the end of the
+            // statement and free the channel before we could observe it.
+            let held = try_acquire(&owner, ShellOwner::Interactive, dual);
+            assert!(
+                held.is_some(),
+                "Idle channel must be claimable (dual={dual})"
+            );
+            assert_eq!(current_owner(&owner), ShellOwner::Interactive);
+
+            let owner = new_shared_owner();
+            let held = try_acquire(&owner, ShellOwner::Exec, dual);
+            assert!(held.is_some());
+            assert_eq!(current_owner(&owner), ShellOwner::Exec);
+        }
     }
 
     #[test]
-    fn idle_acquire_exec_ok() {
+    fn legacy_cross_kind_fails_fast() {
+        // One shell slot on the host: whoever got there first keeps it, and
+        // the loser is told immediately rather than left queuing behind a
+        // session that may last minutes.
         let owner = new_shared_owner();
-        let guard = try_acquire(&owner, ShellOwner::Exec);
-        assert!(guard.is_some());
-        assert_eq!(current_owner(&owner), ShellOwner::Exec);
-    }
-
-    #[test]
-    fn second_acquire_cross_kind_fails_fast() {
-        // Interactive holds → an Exec acquire returns None immediately.
-        let owner = new_shared_owner();
-        let _held = try_acquire(&owner, ShellOwner::Interactive).expect("first acquire ok");
+        let _held = try_acquire(&owner, ShellOwner::Interactive, LEGACY).expect("first acquire ok");
         assert!(
-            try_acquire(&owner, ShellOwner::Exec).is_none(),
+            try_acquire(&owner, ShellOwner::Exec, LEGACY).is_none(),
             "cross-kind acquire while Interactive-held must fail fast"
         );
         // And the reverse: Exec holds → Interactive fails fast.
         let owner2 = new_shared_owner();
-        let _held2 = try_acquire(&owner2, ShellOwner::Exec).expect("first acquire ok");
+        let _held2 = try_acquire(&owner2, ShellOwner::Exec, LEGACY).expect("first acquire ok");
         assert!(
-            try_acquire(&owner2, ShellOwner::Interactive).is_none(),
+            try_acquire(&owner2, ShellOwner::Interactive, LEGACY).is_none(),
             "cross-kind acquire while Exec-held must fail fast"
         );
     }
 
     #[test]
-    fn interactive_is_exclusive_same_kind_fails_fast() {
-        // A second interactive acquire while one is held must fail fast.
+    fn dual_cross_kind_coexists() {
+        // The point of the second host slot: an agent's `wd --exec` runs while
+        // the owner is sitting in a console, in either arrival order.
         let owner = new_shared_owner();
-        let _held = try_acquire(&owner, ShellOwner::Interactive).expect("first acquire ok");
-        assert!(try_acquire(&owner, ShellOwner::Interactive).is_none());
+        let _console = try_acquire(&owner, ShellOwner::Interactive, DUAL).expect("console");
+        assert!(
+            try_acquire(&owner, ShellOwner::Exec, DUAL).is_some(),
+            "exec must not be refused while a console is open"
+        );
+
+        let owner2 = new_shared_owner();
+        let _exec = try_acquire(&owner2, ShellOwner::Exec, DUAL).expect("exec");
+        assert!(
+            try_acquire(&owner2, ShellOwner::Interactive, DUAL).is_some(),
+            "a console must not be refused while exec is running"
+        );
+    }
+
+    #[test]
+    fn interactive_is_exclusive_against_itself_in_both_modes() {
+        // There is one pty slot on the host either way, so a second console
+        // always loses — this is the `shell busy` a user still sees.
+        for dual in [LEGACY, DUAL] {
+            let owner = new_shared_owner();
+            let _held =
+                try_acquire(&owner, ShellOwner::Interactive, dual).expect("first acquire ok");
+            assert!(
+                try_acquire(&owner, ShellOwner::Interactive, dual).is_none(),
+                "a second console must be refused (dual={dual})"
+            );
+        }
     }
 
     #[test]
     fn exec_acquires_stack_and_channel_stays_exec_until_last_release() {
         // Codex P2 fix: multiple exec handlers coexist (running + queued). The
         // channel reads `Exec` until the LAST exec guard drops — so interactive
-        // can't overtake a queued exec through an A→B handoff window.
+        // can't overtake a queued exec through an A→B handoff window. Only
+        // matters in legacy mode, where the two kinds exclude each other at all.
         let owner = new_shared_owner();
-        let g1 = try_acquire(&owner, ShellOwner::Exec).expect("exec 1");
-        let g2 = try_acquire(&owner, ShellOwner::Exec).expect("exec 2 stacks");
+        let g1 = try_acquire(&owner, ShellOwner::Exec, LEGACY).expect("exec 1");
+        let g2 = try_acquire(&owner, ShellOwner::Exec, LEGACY).expect("exec 2 stacks");
         assert_eq!(current_owner(&owner), ShellOwner::Exec);
         // While 2 execs are present, interactive must fail fast.
         assert!(
-            try_acquire(&owner, ShellOwner::Interactive).is_none(),
+            try_acquire(&owner, ShellOwner::Interactive, LEGACY).is_none(),
             "interactive must not overtake while any exec is present"
         );
         // Drop one — still Exec (one remains). Interactive still refused.
         drop(g1);
         assert_eq!(current_owner(&owner), ShellOwner::Exec);
-        assert!(try_acquire(&owner, ShellOwner::Interactive).is_none());
+        assert!(try_acquire(&owner, ShellOwner::Interactive, LEGACY).is_none());
         // Drop the last — now Idle, interactive can claim.
         drop(g2);
         assert_eq!(current_owner(&owner), ShellOwner::Idle);
-        assert!(try_acquire(&owner, ShellOwner::Interactive).is_some());
+        assert!(try_acquire(&owner, ShellOwner::Interactive, LEGACY).is_some());
+    }
+
+    #[test]
+    fn dual_exec_stack_is_still_counted() {
+        // The ref-count keeps working in dual mode even though nothing blocks
+        // on it: `current_owner` is what the tests and logs read, and a count
+        // that dipped to zero early would misreport a live run as idle.
+        let owner = new_shared_owner();
+        let g1 = try_acquire(&owner, ShellOwner::Exec, DUAL).expect("exec 1");
+        let g2 = try_acquire(&owner, ShellOwner::Exec, DUAL).expect("exec 2");
+        assert_eq!(current_owner(&owner), ShellOwner::Exec);
+        drop(g1);
+        assert_eq!(current_owner(&owner), ShellOwner::Exec, "one still running");
+        drop(g2);
+        assert_eq!(current_owner(&owner), ShellOwner::Idle);
     }
 
     #[test]
     fn drop_guard_releases_channel() {
-        let owner = new_shared_owner();
-        {
-            let _guard = try_acquire(&owner, ShellOwner::Interactive).expect("acquire ok");
-            assert_eq!(current_owner(&owner), ShellOwner::Interactive);
+        for dual in [LEGACY, DUAL] {
+            let owner = new_shared_owner();
+            {
+                let _guard =
+                    try_acquire(&owner, ShellOwner::Interactive, dual).expect("acquire ok");
+                assert_eq!(current_owner(&owner), ShellOwner::Interactive);
+            }
+            assert_eq!(
+                current_owner(&owner),
+                ShellOwner::Idle,
+                "guard drop must reset owner to Idle (dual={dual})"
+            );
+            // Next acquire (any kind) succeeds now that it's free.
+            assert!(try_acquire(&owner, ShellOwner::Exec, dual).is_some());
         }
-        assert_eq!(
-            current_owner(&owner),
-            ShellOwner::Idle,
-            "guard drop must reset owner to Idle"
-        );
-        // Next acquire (any kind) succeeds now that it's free.
-        assert!(try_acquire(&owner, ShellOwner::Exec).is_some());
     }
 
     #[test]
@@ -273,8 +344,8 @@ mod tests {
         let owner_clone = owner.clone();
 
         let handle = thread::spawn(move || {
-            let _guard =
-                try_acquire(&owner_clone, ShellOwner::Interactive).expect("acquire ok in thread");
+            let _guard = try_acquire(&owner_clone, ShellOwner::Interactive, true)
+                .expect("acquire ok in thread");
             panic!("simulated handler panic");
         });
 
