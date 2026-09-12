@@ -53,9 +53,9 @@ pub struct Args {
     transport: String,
 }
 
-/// Bring the `Run` key in line with `run_on_startup`. Only ever *adds* or
-/// *corrects* the entry — removal stays with the Settings checkbox, which
-/// treats an externally-set key as authoritative.
+/// Bring the registered autostart entry in line with `run_on_startup`.
+/// Only ever *adds* or *corrects* it — removal stays with the Settings
+/// checkbox, which treats an externally-set entry as authoritative.
 fn reconcile_autostart(want: bool) {
     let expected = match ui::autostart::expected_command() {
         Ok(c) => c,
@@ -69,8 +69,10 @@ fn reconcile_autostart(want: bool) {
         return;
     }
     match ui::autostart::enable() {
-        Ok(()) => log::info!("autostart: Run key set to {expected}"),
-        Err(e) => log::warn!("autostart: could not set Run key: {e}"),
+        // Which of the two got armed is in `enable()`'s own log line: a
+        // logon task normally, the Run key only as the unelevated fallback.
+        Ok(()) => log::info!("autostart: registered {expected}"),
+        Err(e) => log::warn!("autostart: could not register {expected}: {e}"),
     }
 }
 
