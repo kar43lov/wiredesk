@@ -459,6 +459,11 @@ impl Transport for BluetoothLeTransport {
         "bluetooth-le-peripheral"
     }
 
+    /// The Bluetooth stack queues writes; see `Transport::buffers_sends`.
+    fn buffers_sends(&self) -> bool {
+        true
+    }
+
     fn try_clone(&self) -> Result<Box<dyn Transport>> {
         Ok(Box::new(BluetoothLeTransport {
             inner: Arc::clone(&self.inner),

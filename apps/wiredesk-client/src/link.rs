@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use wiredesk_core::error::WireDeskError;
 use wiredesk_core::storm::{StormCounter, DEFAULT_STORM_THRESHOLD};
 use wiredesk_protocol::message::{
-    pty_slot_supported, Message, ERR_PTY_BUSY, ERR_PTY_SPAWN, ERR_SHELL_BUSY, ERR_SHELL_SPAWN,
-    VERSION,
+    pty_slot_supported, rx_progress_supported, Message, ERR_PTY_BUSY, ERR_PTY_SPAWN,
+    ERR_SHELL_BUSY, ERR_SHELL_SPAWN, VERSION,
 };
 use wiredesk_protocol::packet::Packet;
 use wiredesk_transport::transport::Transport;
@@ -451,6 +451,57 @@ fn writer_thread(
     }
 }
 
+/// How often the reader may tell the host how much shell output it has
+/// decoded. The host keeps at most 16 KB of output in flight beside an open
+/// console, and 50 ms of RFCOMM is ~6 KB, so reports this far apart never
+/// starve `wd --exec`; closer ones would only add Mac→host traffic.
+const RX_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The client half of `RxProgress`: counts decoded shell output and says when
+/// a report is due. Kept free of I/O and clocks so the pacing is testable.
+#[derive(Debug, Default)]
+struct RxProgressReporter {
+    /// Reports are wanted at all: the host announced generation 3 and our
+    /// link buffers writes (see `Transport::buffers_sends`). On serial the
+    /// blocking write already paces the host, and a report stream would only
+    /// queue in front of keystrokes on a host that reads one packet a tick.
+    enabled: bool,
+    decoded: u64,
+    reported: u64,
+    last_sent: Option<Instant>,
+}
+
+impl RxProgressReporter {
+    /// New handshake: the host restarts its count at zero too.
+    fn reset(&mut self, enabled: bool) {
+        *self = Self {
+            enabled,
+            ..Self::default()
+        };
+    }
+
+    fn note(&mut self, bytes: usize) {
+        self.decoded += bytes as u64;
+    }
+
+    /// The count to report now, if any. `console_open` gates it because the
+    /// host only paces exec beside a console.
+    fn due(&self, now: Instant, console_open: bool) -> Option<u64> {
+        if !self.enabled || !console_open || self.decoded == self.reported {
+            return None;
+        }
+        match self.last_sent {
+            Some(t) if now.saturating_duration_since(t) < RX_PROGRESS_INTERVAL => None,
+            _ => Some(self.decoded),
+        }
+    }
+
+    fn mark_sent(&mut self, bytes: u64, now: Instant) {
+        self.reported = bytes;
+        self.last_sent = Some(now);
+    }
+}
+
 /// Receive-side liveness budget while the link is idle. The host emits a
 /// heartbeat every 2 s; three missed in a row means the peer is gone — host
 /// quit / crash / cable yanked on the *remote* side leaves our local fd open,
@@ -580,9 +631,18 @@ fn reader_loop(
     // per dropped chunk.
     let mut cancel_seen = false;
     let mut cancel_drop_count: u32 = 0;
+    let mut rx_progress = RxProgressReporter::default();
     loop {
         if shutdown.load(Ordering::Acquire) {
             return;
+        }
+        // Checked on every pass, packet or recv timeout alike, so the last
+        // bytes of a burst are still reported once the wire goes quiet —
+        // otherwise the host would sit on them until its stall timer.
+        let now = Instant::now();
+        if let Some(bytes) = rx_progress.due(now, shell_slots.pty_installed()) {
+            let _ = outgoing_tx.send(Packet::new(Message::RxProgress { bytes }, 0));
+            rx_progress.mark_sent(bytes, now);
         }
         match transport.recv() {
             Ok(p) => {
@@ -606,6 +666,8 @@ fn reader_loop(
                             log::info!("host answered after {silent} silent reopen cycle(s)");
                         }
                         reset_session_state(&mut incoming_clip);
+                        rx_progress
+                            .reset(rx_progress_supported(version) && transport.buffers_sends());
                         // Cache host identity/geometry for the interactive
                         // relay's synth `HelloAck` (see LinkContext::host_info).
                         // Populated BEFORE link_up flips true so a relay that
@@ -689,6 +751,7 @@ fn reader_loop(
                     // consumer left — we route to a slot and stop there. The
                     // opcode alone says which one.
                     Message::ShellOutput { data } => {
+                        rx_progress.note(data.len());
                         exec_bridge::route(
                             &shell_slots,
                             exec_bridge::SlotKind::Exec,
@@ -715,6 +778,7 @@ fn reader_loop(
                         );
                     }
                     Message::PtyOutput { data } => {
+                        rx_progress.note(data.len());
                         exec_bridge::route(
                             &shell_slots,
                             exec_bridge::SlotKind::Pty,
@@ -851,6 +915,7 @@ mod tests {
     struct ScriptedTransport {
         steps: Arc<Mutex<VecDeque<Step>>>,
         send_ok: bool,
+        buffers_sends: bool,
     }
 
     impl ScriptedTransport {
@@ -858,7 +923,14 @@ mod tests {
             Self {
                 steps: Arc::new(Mutex::new(steps.into_iter().collect())),
                 send_ok,
+                buffers_sends: false,
             }
+        }
+
+        /// Pose as a Bluetooth link (see `Transport::buffers_sends`).
+        fn buffering(mut self) -> Self {
+            self.buffers_sends = true;
+            self
         }
     }
 
@@ -890,10 +962,14 @@ mod tests {
         fn name(&self) -> &'static str {
             "scripted"
         }
+        fn buffers_sends(&self) -> bool {
+            self.buffers_sends
+        }
         fn try_clone(&self) -> Result<Box<dyn Transport>> {
             Ok(Box::new(ScriptedTransport {
                 steps: self.steps.clone(),
                 send_ok: self.send_ok,
+                buffers_sends: self.buffers_sends,
             }))
         }
     }
@@ -933,6 +1009,112 @@ mod tests {
             },
             0,
         )
+    }
+
+    #[test]
+    fn rx_progress_reporter_reports_only_when_it_helps() {
+        let t0 = Instant::now();
+        let mut r = RxProgressReporter::default();
+        r.note(1000);
+        assert_eq!(r.due(t0, true), None, "not enabled before a v3 handshake");
+
+        r.reset(true);
+        assert_eq!(r.decoded, 0, "a handshake restarts the count");
+        assert_eq!(r.due(t0, true), None, "nothing decoded");
+        r.note(1000);
+        assert_eq!(r.due(t0, false), None, "no console — the host doesn't pace");
+        assert_eq!(r.due(t0, true), Some(1000));
+        r.mark_sent(1000, t0);
+        assert_eq!(r.due(t0 + RX_PROGRESS_INTERVAL, true), None, "nothing new");
+
+        r.note(500);
+        assert_eq!(r.due(t0 + RX_PROGRESS_INTERVAL / 2, true), None, "too soon");
+        assert_eq!(r.due(t0 + RX_PROGRESS_INTERVAL, true), Some(1500));
+    }
+
+    /// Run a reader over `transport` with the pty slot occupied and collect
+    /// the `RxProgress` reports it sends within `window`.
+    fn rx_reports(transport: ScriptedTransport, window: Duration) -> Vec<u64> {
+        let (ctx, outgoing_rx) = test_ctx();
+        let (pty_tx, _pty_rx) = mpsc::channel();
+        *ctx.shell_slots.pty.lock().unwrap() = Some(pty_tx);
+        let (events_tx, _events_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let handle =
+            thread::spawn(move || reader_thread(Box::new(transport), events_tx, stop, ctx));
+        let deadline = Instant::now() + window;
+        let mut reports = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match outgoing_rx.recv_timeout(left) {
+                Ok(p) => {
+                    if let Message::RxProgress { bytes } = p.message {
+                        reports.push(bytes);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+        reports
+    }
+
+    fn ack_v(version: u8) -> Packet {
+        Packet::new(
+            Message::HelloAck {
+                version,
+                host_name: "h".into(),
+                screen_w: 100,
+                screen_h: 100,
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn reader_reports_decoded_shell_output_to_a_v3_host_over_a_buffering_link() {
+        let script = || {
+            vec![
+                Step::Valid(ack_v(HOST_PROTO_VERSION)),
+                Step::Valid(Packet::new(
+                    Message::PtyOutput {
+                        data: vec![0; 1000],
+                    },
+                    1,
+                )),
+                Step::Valid(Packet::new(Message::ShellOutput { data: vec![0; 500] }, 2)),
+            ]
+        };
+        // The burst's tail is reported once the wire goes quiet.
+        let reports = rx_reports(
+            ScriptedTransport::new(script(), true).buffering(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(reports.last(), Some(&1500), "got {reports:?}");
+
+        // Serial: the blocking write paces the host already.
+        assert!(rx_reports(
+            ScriptedTransport::new(script(), true),
+            Duration::from_millis(300)
+        )
+        .is_empty());
+
+        // A v2 host would count the opcode as a bad frame.
+        let old_host = vec![
+            Step::Valid(ack_v(2)),
+            Step::Valid(Packet::new(
+                Message::PtyOutput {
+                    data: vec![0; 1000],
+                },
+                1,
+            )),
+        ];
+        assert!(rx_reports(
+            ScriptedTransport::new(old_host, true).buffering(),
+            Duration::from_millis(300)
+        )
+        .is_empty());
     }
 
     #[test]
