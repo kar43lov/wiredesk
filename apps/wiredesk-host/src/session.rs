@@ -40,33 +40,57 @@ fn heartbeat_timeout_for(clipboard_busy: bool, shell_open: bool) -> Duration {
     }
 }
 
-/// How many output chunks one shell slot may put on the wire per tick.
+/// How many bytes of output one shell slot may put on the wire per tick.
 ///
 /// `transport.send` blocks and `tick` does not call `recv` while it is
-/// sending, so a full budget is dead air for everything else on the link. A
-/// chunk is up to `MAX_PAYLOAD` (4 KB), so this is 64 KB per tick — ~218 ms on
-/// the 3 Mbaud serial link, ~533 ms on RFCOMM, seconds on BLE.
-const PUMP_BUDGET: usize = 16;
+/// sending, so a full budget is dead air for everything else on the link:
+/// 64 KB is ~218 ms on the 3 Mbaud serial link, ~533 ms on RFCOMM, seconds
+/// on BLE.
+///
+/// Counted in bytes, not in reads. It used to be 16 *reads*, and a shell
+/// printing line by line hands over one ~50-byte line per read — so a tick
+/// shipped under a kilobyte and the rate was set by how often `tick` runs
+/// (~32/s behind the 10 ms recv timeout), not by the wire. Measured live
+/// 2026-09-14: 200 KB took 31.0 s as 4000 lines and 2.5 s as one string.
+const PUMP_BUDGET: usize = 16 * MAX_PAYLOAD;
 
-/// The exec slot's budget while an interactive PTY is also open.
+/// The exec slot's budget while an interactive PTY is in use.
 ///
 /// A `wd --exec` dumping hundreds of KB (a live case: a 407 KB Elasticsearch
 /// `_search`) would otherwise hold the wire for its whole burst and freeze the
 /// owner's console. A quarter budget caps one blocking stretch at ~55 ms
 /// (serial) / ~136 ms (RFCOMM) and still leaves exec far more throughput than
 /// anything but a bulk dump needs.
-const PUMP_BUDGET_EXEC_SHARED: usize = 4;
+const PUMP_BUDGET_EXEC_SHARED: usize = 4 * MAX_PAYLOAD;
 
-/// Pure helper — the exec slot's per-tick chunk budget. Extracted so the
-/// yield-to-the-console rule can be unit-tested without spawning shells.
+/// How long a PTY has to stay silent before exec gets its full budget back.
 ///
-/// With no PTY open this is the pre-two-slot number, so a lone `wd --exec`
-/// streams at exactly the rate it always did.
-fn exec_pump_budget(pty_open: bool) -> usize {
-    if pty_open {
-        PUMP_BUDGET_EXEC_SHARED
-    } else {
-        PUMP_BUDGET
+/// The quarter budget used to apply for as long as a console was merely
+/// *open*, and a console is open-and-idle most of its life: measured live
+/// 2026-09-12, a 407 KB dump took 61 s beside an untouched console against
+/// 15 s alone. Now the throttle holds only while the console is in use —
+/// keystrokes, resizes or output within this window.
+///
+/// The price is the first keystroke after a pause. The host reads one packet
+/// per tick, after pumping, so that keystroke waits out one full-budget
+/// stretch (~218 ms serial, ~533 ms RFCOMM) — and one more for each packet
+/// queued ahead of it. The client's heartbeat, every 2 s, lands there about
+/// one time in ten. From its echo on the throttle is back. None of it applies
+/// unless exec has a bulk dump pending; two seconds spans the gaps inside
+/// ordinary typing.
+const PTY_QUIET_BEFORE_FULL_EXEC: Duration = Duration::from_secs(2);
+
+/// Pure helper — the exec slot's per-tick byte budget. Extracted so the
+/// yield-to-the-console rule can be unit-tested without spawning shells or
+/// reading the clock.
+///
+/// `pty_quiet_for` is how long the PTY has been silent, `None` when no PTY is
+/// open. With none open, or one silent long enough, this is the pre-two-slot
+/// number, so a lone `wd --exec` streams at exactly the rate it always did.
+fn exec_pump_budget(pty_quiet_for: Option<Duration>) -> usize {
+    match pty_quiet_for {
+        Some(quiet) if quiet < PTY_QUIET_BEFORE_FULL_EXEC => PUMP_BUDGET_EXEC_SHARED,
+        _ => PUMP_BUDGET,
     }
 }
 
@@ -133,6 +157,10 @@ pub struct Session<T: Transport, I: InputInjector> {
     /// PTY-mode shell driving interactive `wd`. Independent of [`Self::exec`]
     /// unless it was opened the legacy way — see [`PtySlot::legacy`].
     pty: Option<PtySlot>,
+    /// Last time the PTY slot saw input, a resize or output, or was opened.
+    /// Meaningless while [`Self::pty`] is `None`. Drives the exec budget —
+    /// see [`PTY_QUIET_BEFORE_FULL_EXEC`].
+    pty_last_activity: Instant,
     /// A shell started ahead of time, waiting to be handed to the next
     /// `ShellOpen`, together with the argv it was started with.
     ///
@@ -158,10 +186,10 @@ pub struct Session<T: Transport, I: InputInjector> {
     storm: StormCounter,
 }
 
-/// Split one read of the shell's output into packets.
+/// Split a tick's worth of a shell's output into packets.
 ///
-/// The shell reader hands over up to 4096 bytes at a time and the protocol
-/// takes a payload of exactly that, so a full read is one packet. It used to
+/// The protocol takes a payload of up to 4096 bytes, so every packet but the
+/// last is full. It used to
 /// be cut at 480 — the limit back when `MAX_PAYLOAD` was 512 — and that
 /// literal stayed behind when the limit was raised to 4096, turning every
 /// full read into nine packets instead of one. Nothing was lost by it, but
@@ -233,6 +261,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             screen_h,
             exec: None,
             pty: None,
+            pty_last_activity: now,
             warm: None,
             warm_enabled: true,
             // Unit tests get a clipboard with no OS backend: see
@@ -294,6 +323,39 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     pub fn inject_pty_for_test(&mut self, legacy: bool, shell: &str) {
         let proc = ShellProcess::spawn(shell, None).expect("test shell");
         self.pty = Some(PtySlot { proc, legacy });
+        self.note_pty_activity();
+    }
+
+    /// Test-only: open the exec slot with its output fed by the test instead
+    /// of by the child, so the exact shape of the reads is under control.
+    #[cfg(test)]
+    pub fn exec_events_for_test(&mut self) -> std::sync::mpsc::Sender<ShellEvent> {
+        let mut proc = ShellProcess::spawn("", None).expect("test shell");
+        let (tx, rx) = std::sync::mpsc::channel();
+        proc.events_rx = rx;
+        self.exec = Some(proc);
+        tx
+    }
+
+    /// Test-only: make the PTY look silent for longer than
+    /// [`PTY_QUIET_BEFORE_FULL_EXEC`], without sleeping.
+    #[cfg(test)]
+    pub fn silence_pty_for_test(&mut self) {
+        self.pty_last_activity =
+            Instant::now() - PTY_QUIET_BEFORE_FULL_EXEC - Duration::from_secs(1);
+    }
+
+    fn note_pty_activity(&mut self) {
+        self.pty_last_activity = Instant::now();
+    }
+
+    /// The exec slot's chunk budget as of `now` — see [`exec_pump_budget`].
+    fn exec_budget_at(&self, now: Instant) -> usize {
+        exec_pump_budget(
+            self.pty
+                .as_ref()
+                .map(|_| now.saturating_duration_since(self.pty_last_activity)),
+        )
     }
 
     /// Test-only: rewind `last_heartbeat_recv` so the next tick() sees the
@@ -437,7 +499,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// Drain stdout/stderr from both shell slots into outbound packets, and
     /// notify the client when either shell exits. See [`pump_order`] for why
     /// the console goes first and [`exec_pump_budget`] for what `wd --exec`
-    /// gives up while it is open.
+    /// gives up while it is in use.
     fn pump_shell_events(&mut self) -> Result<()> {
         for slot in pump_order() {
             self.pump_slot(slot)?;
@@ -445,15 +507,18 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         Ok(())
     }
 
-    /// One slot's share of a tick: drain up to its budget of events, ship them
+    /// One slot's share of a tick: drain up to its budget of bytes, ship them
     /// on the opcodes that slot speaks, and report an exit.
     fn pump_slot(&mut self, slot: ShellSlot) -> Result<()> {
         let budget = match slot {
             ShellSlot::Pty => PUMP_BUDGET,
-            ShellSlot::Exec => exec_pump_budget(self.pty.is_some()),
+            ShellSlot::Exec => self.exec_budget_at(Instant::now()),
         };
 
-        let mut outputs: Vec<Vec<u8>> = Vec::new();
+        // Everything the shell has handed over, glued into one buffer: a shell
+        // printing line by line produces reads of a few dozen bytes, and one
+        // packet per read wastes both the budget and a transport write each.
+        let mut output: Vec<u8> = Vec::new();
         let mut exit_code: Option<i32> = None;
 
         {
@@ -464,9 +529,10 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             let Some(sh) = proc else {
                 return Ok(());
             };
-            for _ in 0..budget {
+            // Whole reads only, so the last one may overshoot by under a read.
+            while output.len() < budget {
                 match sh.events_rx.try_recv() {
-                    Ok(ShellEvent::Output(data)) => outputs.push(data),
+                    Ok(ShellEvent::Output(data)) => output.extend_from_slice(&data),
                     Ok(ShellEvent::Exit(code)) => {
                         exit_code = Some(code);
                         break;
@@ -486,15 +552,21 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             ShellSlot::Pty => self.pty.as_ref().is_some_and(|p| p.legacy),
         };
 
-        for chunk in outputs {
-            for piece in split_shell_output(&chunk) {
-                let data = piece.to_vec();
-                self.send(if legacy_opcodes {
-                    Message::ShellOutput { data }
-                } else {
-                    Message::PtyOutput { data }
-                })?;
-            }
+        for piece in split_shell_output(&output) {
+            let data = piece.to_vec();
+            self.send(if legacy_opcodes {
+                Message::ShellOutput { data }
+            } else {
+                Message::PtyOutput { data }
+            })?;
+        }
+
+        // Output counts as use: a console running `ping` or a build keeps the
+        // exec throttle on just like typing does. Marked after the sends, not
+        // before: on a slow link they can outlast the whole quiet window, and
+        // exec — pumped next — would find the mark already stale.
+        if slot == ShellSlot::Pty && !output.is_empty() {
+            self.note_pty_activity();
         }
 
         // Detect process exit even if we didn't get an Exit event
@@ -765,7 +837,9 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                             self.pty = Some(PtySlot {
                                 proc,
                                 legacy: false,
-                            })
+                            });
+                            // The prompt is about to be drawn.
+                            self.note_pty_activity();
                         }
                         Err(e) => {
                             log::error!("failed to spawn pty shell: {e}");
@@ -783,6 +857,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 // the split and stayed shared.
                 if let Some(slot) = self.pty.as_ref() {
                     slot.proc.resize(*cols, *rows);
+                    // A resize makes the console redraw.
+                    self.note_pty_activity();
                 }
                 // No pty open → silently ignore. Pre-spawn resize is
                 // a benign race when client computes initial size in
@@ -817,6 +893,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                         if !slot.proc.write(data.clone()) {
                             log::warn!("pty stdin writer is gone");
                         }
+                        // Throttle exec before the echo exists, not after.
+                        self.note_pty_activity();
                     }
                     // Either nothing is open, or the open PTY is a legacy one
                     // whose client speaks `ShellInput`. Both mean this frame
@@ -1631,10 +1709,98 @@ mod tests {
         // in the console actually feels.
         assert_eq!(pump_order(), [ShellSlot::Pty, ShellSlot::Exec]);
         // Alone, exec streams at exactly the pre-split rate.
-        assert_eq!(exec_pump_budget(false), PUMP_BUDGET);
-        // Beside a console it yields.
-        assert!(exec_pump_budget(true) < PUMP_BUDGET);
-        assert_eq!(exec_pump_budget(true), PUMP_BUDGET_EXEC_SHARED);
+        assert_eq!(exec_pump_budget(None), PUMP_BUDGET);
+        // Beside a console in use it yields.
+        const { assert!(PUMP_BUDGET_EXEC_SHARED < PUMP_BUDGET) };
+        assert_eq!(
+            exec_pump_budget(Some(Duration::ZERO)),
+            PUMP_BUDGET_EXEC_SHARED
+        );
+        let almost = PTY_QUIET_BEFORE_FULL_EXEC - Duration::from_millis(1);
+        assert_eq!(exec_pump_budget(Some(almost)), PUMP_BUDGET_EXEC_SHARED);
+        // Beside a console left alone it gets everything back — an open but
+        // untouched console cost a 407 KB dump 61 s instead of 15 s.
+        assert_eq!(
+            exec_pump_budget(Some(PTY_QUIET_BEFORE_FULL_EXEC)),
+            PUMP_BUDGET
+        );
+    }
+
+    #[test]
+    fn line_by_line_output_is_glued_into_full_packets_up_to_the_byte_budget() {
+        // A shell printing lines hands over one line per read. Budgeted per
+        // read, a tick shipped 16 lines — under a kilobyte — and 200 KB took
+        // 31 s live against 2.5 s for the same bytes as one string.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        let events = session.exec_events_for_test();
+        let mut line = vec![b'x'; 51];
+        line.push(b'\n');
+        for _ in 0..4000 {
+            events.send(ShellEvent::Output(line.clone())).unwrap();
+        }
+
+        session.pump_shell_events().unwrap();
+
+        let (mut packets, mut bytes) = (0, 0);
+        while let Some(p) = client.recv_timeout(Duration::from_millis(20)) {
+            if let Message::ShellOutput { data } = p.message {
+                assert!(data.len() <= MAX_PAYLOAD, "packet of {} bytes", data.len());
+                packets += 1;
+                bytes += data.len();
+            }
+        }
+        assert!(
+            (PUMP_BUDGET..PUMP_BUDGET + line.len()).contains(&bytes),
+            "one tick ships the byte budget in whole reads, got {bytes}"
+        );
+        assert_eq!(packets, bytes.div_ceil(MAX_PAYLOAD), "full packets only");
+    }
+
+    #[test]
+    fn console_use_rearms_the_exec_throttle() {
+        // Every kind of use has to restart the quiet window, or exec would
+        // take the full budget in the middle of someone's typing. Compared
+        // against a timestamp rather than a sleep, so a slow runner can't
+        // make it flaky.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        assert_eq!(session.exec_budget_at(Instant::now()), PUMP_BUDGET);
+
+        session.inject_pty_for_test(false, "");
+        session.silence_pty_for_test();
+        assert_eq!(
+            session.exec_budget_at(Instant::now()),
+            PUMP_BUDGET,
+            "an idle console must not throttle exec"
+        );
+
+        let before = Instant::now();
+        client
+            .send(&Packet::new(
+                Message::PtyInput {
+                    data: b"x".to_vec(),
+                },
+                1,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(session.pty_last_activity >= before, "a keystroke is use");
+        assert_eq!(session.exec_budget_at(before), PUMP_BUDGET_EXEC_SHARED);
+
+        session.silence_pty_for_test();
+        let before = Instant::now();
+        client
+            .send(&Packet::new(
+                Message::PtyResize {
+                    cols: 100,
+                    rows: 30,
+                },
+                2,
+            ))
+            .unwrap();
+        session.tick().unwrap();
+        assert!(session.pty_last_activity >= before, "a resize is use");
     }
 
     #[test]
@@ -1767,12 +1933,20 @@ mod tests {
             ))
             .unwrap();
         session.tick().unwrap();
+        // `tick` pumps before it reads, so the echo can't have been pumped
+        // yet: whatever marks activity from here on is the output itself.
+        session.silence_pty_for_test();
+        let before = Instant::now();
         match pump_until(&mut session, &mut client, is_output) {
             Some(Message::PtyOutput { data }) => {
                 assert_eq!(data, b"from-pty\n", "console output on pty opcodes");
             }
             other => panic!("expected PtyOutput from the pty slot, got {other:?}"),
         }
+        assert!(
+            session.pty_last_activity >= before,
+            "console output keeps the exec throttle on"
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
