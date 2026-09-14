@@ -173,7 +173,7 @@ wd --exec "[System.IO.File]::WriteAllBytes('C:\\Temp\\wd-q.json', [Convert]::Fro
   - Для git editor'а — `EDITOR=true git ...` или `--no-edit` где есть.
 - **Multi-line input** — wd шлёт команду одной строкой. Multiline scripts либо собирай через `;`, либо пиши скрипт в файл и зови `bash script.sh`.
 - **stdin** — нет. `wd --exec "cat | grep foo"` без stdin провиснет до timeout.
-- **Очень большой output** (>100 KB) — медленно (ограничен 11 KB/s). Лучше grep'ни на remote. Future: `--compress` flag (см. `docs/briefs/wd-exec-compression.md`).
+- **Очень большой output** упирается в провод: ≈270 KB/s на FT232H @ 3 Mbaud (4.15 МБ за 15 с, замер 14.09.2026), ≈11 KB/s на CH340, ≈120 KB/s на RFCOMM. Мегабайты лучше grep'нуть на remote или жать через `--compress`.
 
 ## Encoding (кириллица в SQL-запросах)
 
