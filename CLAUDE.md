@@ -87,7 +87,9 @@ CH340 USB-to-TTL кабели: красный=VCC (изолировать), си
 
 `docs/briefs/ft232h-upgrade.md` — бриф апгрейда канала (**SHIPPED 2026-05-28** @ 3 Mbaud verified live; см. шапку файла).
 
-`docs/briefs/interactive-wd-via-gui-ipc.md` + `docs/plans/completed/20260703-interactive-wd-via-gui-ipc.md` — interactive `wd` через GUI IPC (**SHIPPED в main 2026-07-03, live-verified**; 730 тестов на момент приёмки; последний direct-serial-путь устранён). Live-приёмка на реальном Mac+Ghostty+Win11: `wd` при открытом GUI подключился через IPC, промпт PowerShell не потерялся, `wd --exec` при активном интерактиве → «shell busy» exit 125. Host не менялся (wire-совместим, переустанавливать не нужно). 3 Codex P2 из `/pg.review` пофикшено — все три про порядок операций в двунаправленном socket-релее.
+`docs/briefs/interactive-wd-via-gui-ipc.md` + `docs/plans/completed/20260703-interactive-wd-via-gui-ipc.md` — interactive `wd` через GUI IPC (**SHIPPED 2026-07-03**): последний direct-serial-путь устранён, `wd` при открытом GUI ходит через IPC-релей. Детали приёмки — в шапке плана.
+
+`docs/plans/completed/20260912-dual-shell-slots.md` — два shell-слота на хосте (**SHIPPED в main 2026-09-12**, PR #30): интерактивный `wd` и `wd --exec` работают одновременно, взаимного «shell busy» между ними больше нет. 🔴 Долг: AC2 по букве не выполнен (exec при открытой консоли ×4 против критерия ≤10 %), AC3/AC6/AC8 не проверялись.
 
 `docs/briefs/daemon-multiplex.md` — SUPERSEDED roadmap-бриф: full `wiredesk-daemon`-extraction больше не нужен — embedded-IPC-мост покрыл и `wd --exec`, и interactive `wd`.
 

@@ -2,6 +2,8 @@
 
 **Status:** ✅ SHIPPED 2026-07-03 (ветка `feat/interactive-wd-via-gui-ipc`, план `docs/plans/completed/20260703-interactive-wd-via-gui-ipc.md`, 723 теста зелёные, AC1–AC7 verified). Расширяет `wd-exec-via-gui-ipc.md` (SHIPPED) на **interactive**-кейс, который тот бриф явно вывел из scope. Закрыл последний путь в WireDesk, требующий терминирования GUI. Реализовано ровно по Approach A ниже; host не менялся. Осталась ручная live-приёмка на FT232H @ 3 Mbaud (AC1/AC5 — см. Post-Completion плана).
 
+🔴 **Устарела одна посылка этого брифа — «у хоста ровно один shell-слот».** С 2026-09-12 слота два, и взаимного `shell busy` между интерактивным `wd` и `wd --exec` больше нет (`docs/plans/completed/20260912-dual-shell-slots.md`). Всё, что ниже написано про fail-fast между *разными* видами (разделы «Политика конкуренции», AC2), описывает состояние на июль и историю решения, а не сегодняшнее поведение. Отказ остался только для второго **интерактивного** `wd`: pty-слот по-прежнему один.
+
 ## Цель
 
 Интерактивный `wd` (PowerShell PTY в Ghostty/iTerm) работает пока `WireDesk.app` запущен, **включая активный capture мыши/клавиатуры** — без Quit GUI и без контенции за serial-порт.
