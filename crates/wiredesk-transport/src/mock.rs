@@ -11,6 +11,7 @@ pub struct MockTransport {
     tx: mpsc::Sender<Vec<u8>>,
     rx: mpsc::Receiver<Vec<u8>>,
     connected: bool,
+    buffers_sends: bool,
 }
 
 impl MockTransport {
@@ -28,6 +29,12 @@ impl MockTransport {
         Packet::from_bytes(&raw).ok()
     }
 
+    /// Make this end report [`Transport::buffers_sends`] — lets a test play a
+    /// Bluetooth link without one.
+    pub fn set_buffers_sends(&mut self, on: bool) {
+        self.buffers_sends = on;
+    }
+
     /// Create a pair of connected transports (A↔B).
     pub fn pair() -> (Self, Self) {
         let (tx_a, rx_b) = mpsc::channel();
@@ -37,11 +44,13 @@ impl MockTransport {
             tx: tx_a,
             rx: rx_a,
             connected: true,
+            buffers_sends: false,
         };
         let b = Self {
             tx: tx_b,
             rx: rx_b,
             connected: true,
+            buffers_sends: false,
         };
 
         (a, b)
@@ -73,6 +82,10 @@ impl Transport for MockTransport {
 
     fn name(&self) -> &'static str {
         "mock"
+    }
+
+    fn buffers_sends(&self) -> bool {
+        self.buffers_sends
     }
 
     fn try_clone(&self) -> Result<Box<dyn Transport>> {

@@ -76,6 +76,11 @@ impl ShellSlots {
         let live = |s: &ExecEventSlot| s.lock().map(|g| g.is_some()).unwrap_or(false);
         live(&self.exec) || live(&self.pty)
     }
+
+    /// True while an interactive console is attached to the pty slot.
+    pub fn pty_installed(&self) -> bool {
+        self.pty.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
 }
 
 impl Default for ShellSlots {

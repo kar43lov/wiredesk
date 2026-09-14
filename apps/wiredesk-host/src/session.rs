@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,10 +43,11 @@ fn heartbeat_timeout_for(clipboard_busy: bool, shell_open: bool) -> Duration {
 
 /// How many bytes of output one shell slot may put on the wire per tick.
 ///
-/// `transport.send` blocks and `tick` does not call `recv` while it is
-/// sending, so a full budget is dead air for everything else on the link:
-/// 64 KB is ~218 ms on the 3 Mbaud serial link, ~533 ms on RFCOMM, seconds
-/// on BLE.
+/// On serial `transport.send` blocks and `tick` does not call `recv` while it
+/// is sending, so a full budget is dead air for everything else on the link:
+/// 64 KB is ~218 ms at 3 Mbaud. RFCOMM and BLE `send` only queues into the
+/// Bluetooth stack, so there the budget paces nothing — see
+/// [`EXEC_INFLIGHT_CAP`].
 ///
 /// Counted in bytes, not in reads. It used to be 16 *reads*, and a shell
 /// printing line by line hands over one ~50-byte line per read — so a tick
@@ -58,9 +60,9 @@ const PUMP_BUDGET: usize = 16 * MAX_PAYLOAD;
 ///
 /// A `wd --exec` dumping hundreds of KB (a live case: a 407 KB Elasticsearch
 /// `_search`) would otherwise hold the wire for its whole burst and freeze the
-/// owner's console. A quarter budget caps one blocking stretch at ~55 ms
-/// (serial) / ~136 ms (RFCOMM) and still leaves exec far more throughput than
-/// anything but a bulk dump needs.
+/// owner's console. A quarter budget caps one blocking stretch at ~55 ms on
+/// serial and still leaves exec far more throughput than anything but a bulk
+/// dump needs.
 const PUMP_BUDGET_EXEC_SHARED: usize = 4 * MAX_PAYLOAD;
 
 /// How long a PTY has to stay silent before exec gets its full budget back.
@@ -73,12 +75,177 @@ const PUMP_BUDGET_EXEC_SHARED: usize = 4 * MAX_PAYLOAD;
 ///
 /// The price is the first keystroke after a pause. The host reads one packet
 /// per tick, after pumping, so that keystroke waits out one full-budget
-/// stretch (~218 ms serial, ~533 ms RFCOMM) — and one more for each packet
+/// stretch (~218 ms on serial) — and one more for each packet
 /// queued ahead of it. The client's heartbeat, every 2 s, lands there about
 /// one time in ten. From its echo on the throttle is back. None of it applies
 /// unless exec has a bulk dump pending; two seconds spans the gaps inside
 /// ordinary typing.
 const PTY_QUIET_BEFORE_FULL_EXEC: Duration = Duration::from_secs(2);
+
+/// On a link that buffers writes (RFCOMM, BLE), the most `wd --exec` output
+/// that may be on its way to the client while a console is open.
+///
+/// There the pump budget above paces nothing: `send` returns as soon as the
+/// Bluetooth stack has queued the bytes, the stack takes tens of KB, and a
+/// keystroke's echo waits behind all of it — 0.84 s median on RFCOMM with a
+/// bulk `wd --exec` running, measured 2026-09-14, and the throttle did not
+/// slow that dump at all. The client reports what it has decoded
+/// (`RxProgress`), and exec only tops its in-flight bytes back up to this
+/// cap, so an echo never queues behind more than ~140 ms of RFCOMM worth of
+/// exec output. Exec still moves at link speed: it is refilled as fast as
+/// the link drains.
+///
+/// Only exec's own bytes count against it. The console's output is not
+/// paced, and were it counted here, a console printing at link speed would
+/// hold exec at zero for as long as it prints.
+const EXEC_INFLIGHT_CAP: u64 = PUMP_BUDGET_EXEC_SHARED as u64;
+
+/// How long in-flight bytes may go unconfirmed before the host stops waiting
+/// for the client. The client reports every ~50 ms while output arrives; a
+/// lost report must not freeze `wd --exec`, and neither may a client that
+/// stopped reporting because its console already closed while the host's
+/// `PtyClose` is still on its way.
+const RX_PROGRESS_STALL: Duration = Duration::from_secs(1);
+
+/// Most `RxProgress` packets one tick takes in on top of its one real packet.
+///
+/// The host reads one packet per tick, and a tick sending a console's bulk
+/// output blocks for ~0.5 s on RFCOMM, while reports come up to 20 a second:
+/// counted as ordinary packets they would queue up by the hundred in front
+/// of a Ctrl+C. The bound only keeps a misbehaving peer from starving the
+/// pump.
+const MAX_REPORTS_PER_TICK: usize = 32;
+
+/// Shell output sent to the client versus what it says it has decoded.
+///
+/// Counts `ShellOutput` and `PtyOutput` payloads from both slots since the
+/// handshake — the same bytes the client counts, so the difference is what
+/// is still queued somewhere between the two. The link keeps order, so a
+/// confirmed count covers the earliest bytes sent; that is how the exec
+/// slot's share of what is still on its way is told apart.
+#[derive(Debug)]
+struct ShellFlow {
+    sent: u64,
+    acked: u64,
+    /// Exec's unconfirmed sends as (end offset within `sent`, length), oldest
+    /// first. Bounded: a stall release confirms everything.
+    exec_pending: VecDeque<(u64, u64)>,
+    /// The client has sent `RxProgress` this session — only one on a
+    /// buffering link with a console open does.
+    peer_reports: bool,
+    /// Confirmations stopped moving for [`RX_PROGRESS_STALL`]: exec is back
+    /// on the plain byte budget until a report confirms something new.
+    stalled: bool,
+    /// When `acked` last moved forward. A report repeating an old count is
+    /// not progress: it must not keep exec waiting on bytes that will never
+    /// be confirmed.
+    last_progress: Instant,
+    /// When `acked` last fell behind `sent`; `None` while caught up.
+    unacked_since: Option<Instant>,
+}
+
+impl ShellFlow {
+    fn new(now: Instant) -> Self {
+        Self {
+            sent: 0,
+            acked: 0,
+            exec_pending: VecDeque::new(),
+            peer_reports: false,
+            stalled: false,
+            last_progress: now,
+            unacked_since: None,
+        }
+    }
+
+    fn note_sent(&mut self, slot: ShellSlot, bytes: usize, now: Instant) {
+        if bytes == 0 {
+            return;
+        }
+        if self.sent == self.acked {
+            self.unacked_since = Some(now);
+        }
+        self.sent += bytes as u64;
+        if slot == ShellSlot::Exec {
+            self.exec_pending.push_back((self.sent, bytes as u64));
+        }
+    }
+
+    /// Forget exec sends the client has confirmed in full.
+    fn drop_confirmed_exec(&mut self) {
+        while self
+            .exec_pending
+            .front()
+            .is_some_and(|&(end, _)| end <= self.acked)
+        {
+            self.exec_pending.pop_front();
+        }
+    }
+
+    /// Record a report. Returns `true` for the first one of the session.
+    fn on_report(&mut self, bytes: u64, now: Instant) -> bool {
+        let first = !self.peer_reports;
+        self.peer_reports = true;
+        // A report can't exceed what was sent unless the counters drifted
+        // (a report from before a re-handshake); clamp rather than go negative.
+        let confirmed = bytes.min(self.sent);
+        if confirmed > self.acked {
+            self.acked = confirmed;
+            self.drop_confirmed_exec();
+            self.last_progress = now;
+            // Past the point a stall gave up at: the client has caught up
+            // with everything sent unpaced meanwhile, pacing is safe again.
+            self.stalled = false;
+        }
+        if self.acked == self.sent {
+            self.unacked_since = None;
+        }
+        first
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> u64 {
+        self.sent - self.acked
+    }
+
+    /// Exec's unconfirmed bytes. Only the oldest pending send can be
+    /// confirmed in part.
+    fn exec_in_flight(&self) -> u64 {
+        self.exec_pending
+            .iter()
+            .map(|&(end, len)| len.min(end - self.acked))
+            .sum()
+    }
+
+    /// Exec may be paced on reports: the client sends them, and they still
+    /// move.
+    fn pacing(&self) -> bool {
+        self.peer_reports && !self.stalled
+    }
+
+    /// Give up on unconfirmed bytes after [`RX_PROGRESS_STALL`] without
+    /// progress, and stop pacing until a report confirms new bytes. Returns
+    /// whether it did.
+    fn release_if_stalled(&mut self, now: Instant) -> bool {
+        let Some(since) = self.unacked_since else {
+            return false;
+        };
+        let waiting_since = since.max(self.last_progress);
+        if now.saturating_duration_since(waiting_since) < RX_PROGRESS_STALL {
+            return false;
+        }
+        self.acked = self.sent;
+        self.exec_pending.clear();
+        self.unacked_since = None;
+        self.stalled = true;
+        true
+    }
+}
+
+/// Pure helper — exec's budget on a buffering link: whatever keeps its
+/// in-flight bytes at or under [`EXEC_INFLIGHT_CAP`].
+fn inflight_exec_budget(in_flight: u64) -> usize {
+    EXEC_INFLIGHT_CAP.saturating_sub(in_flight) as usize
+}
 
 /// Pure helper — the exec slot's per-tick byte budget. Extracted so the
 /// yield-to-the-console rule can be unit-tested without spawning shells or
@@ -161,6 +328,8 @@ pub struct Session<T: Transport, I: InputInjector> {
     /// Meaningless while [`Self::pty`] is `None`. Drives the exec budget —
     /// see [`PTY_QUIET_BEFORE_FULL_EXEC`].
     pty_last_activity: Instant,
+    /// Shell output sent versus confirmed — paces exec on buffering links.
+    flow: ShellFlow,
     /// A shell started ahead of time, waiting to be handed to the next
     /// `ShellOpen`, together with the argv it was started with.
     ///
@@ -262,6 +431,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             exec: None,
             pty: None,
             pty_last_activity: now,
+            flow: ShellFlow::new(now),
             warm: None,
             warm_enabled: true,
             // Unit tests get a clipboard with no OS backend: see
@@ -332,7 +502,11 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     pub fn exec_events_for_test(&mut self) -> std::sync::mpsc::Sender<ShellEvent> {
         let mut proc = ShellProcess::spawn("", None).expect("test shell");
         let (tx, rx) = std::sync::mpsc::channel();
-        proc.events_rx = rx;
+        let real = std::mem::replace(&mut proc.events_rx, rx);
+        // Keep reading what the child really prints. Dropping this receiver
+        // makes its reader threads quit and close the pipe, the next prompt the
+        // shell writes kills it with SIGPIPE, and the slot vanishes mid-test.
+        std::thread::spawn(move || while real.recv().is_ok() {});
         self.exec = Some(proc);
         tx
     }
@@ -349,8 +523,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         self.pty_last_activity = Instant::now();
     }
 
-    /// The exec slot's chunk budget as of `now` — see [`exec_pump_budget`].
+    /// The exec slot's byte budget as of `now`: paced by the client's reports
+    /// on a buffering link with a console open, by [`exec_pump_budget`]
+    /// everywhere else — including a buffering link whose client never
+    /// reports (built before `RxProgress`).
     fn exec_budget_at(&self, now: Instant) -> usize {
+        if self.pty.is_some() && self.flow.pacing() && self.transport.buffers_sends() {
+            return inflight_exec_budget(self.flow.exec_in_flight());
+        }
         exec_pump_budget(
             self.pty
                 .as_ref()
@@ -408,7 +588,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         self.transport.send(&packet)
     }
 
-    /// Process one incoming packet. Returns Ok(true) if packet was processed,
+    /// Process one incoming packet, plus any `RxProgress` reports queued ahead
+    /// of it. Returns Ok(true) if packet was processed,
     /// Ok(false) if no packet available (timeout), Err on fatal error.
     pub fn tick(&mut self) -> Result<bool> {
         // Send heartbeat if needed
@@ -443,25 +624,33 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             }
         }
 
-        // Try to receive a packet
-        let packet = match self.transport.recv() {
-            Ok(p) => p,
-            Err(WireDeskError::Transport(ref msg)) if msg.contains("timeout") => {
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        };
+        // Try to receive a packet. `RxProgress` reports don't use up the
+        // tick's one packet — see [`MAX_REPORTS_PER_TICK`].
+        let mut reports = 0;
+        loop {
+            let packet = match self.transport.recv() {
+                Ok(p) => p,
+                Err(WireDeskError::Transport(ref msg)) if msg.contains("timeout") => {
+                    return Ok(reports > 0);
+                }
+                Err(e) => return Err(e),
+            };
 
-        // A real packet decoded → the channel is alive; clear the storm run
-        // BEFORE handling (Codex iter3 P3): a handler error (e.g. injector
-        // failure on a key event) returns early via `?`, and a decoded frame
-        // must still break the protocol-error streak — the wire is fine, the
-        // failure is local. This is the SINGLE reset site: the other Ok-paths
-        // of tick() (heartbeat-timeout, recv-timeout) return without a decoded
-        // packet, and resetting there would break "timeouts don't participate".
-        self.storm.on_valid_packet();
-        self.handle_packet(packet)?;
-        Ok(true)
+            // A real packet decoded → the channel is alive; clear the storm run
+            // BEFORE handling (Codex iter3 P3): a handler error (e.g. injector
+            // failure on a key event) returns early via `?`, and a decoded frame
+            // must still break the protocol-error streak — the wire is fine, the
+            // failure is local. This is the SINGLE reset site: the other Ok-paths
+            // of tick() (heartbeat-timeout, recv-timeout) return without a decoded
+            // packet, and resetting there would break "timeouts don't participate".
+            self.storm.on_valid_packet();
+            let report = matches!(packet.message, Message::RxProgress { .. });
+            self.handle_packet(packet)?;
+            if !report || reports == MAX_REPORTS_PER_TICK {
+                return Ok(true);
+            }
+            reports += 1;
+        }
     }
 
     /// Record one protocol (decode) error from the recv path. Returns `true`
@@ -501,6 +690,11 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     /// the console goes first and [`exec_pump_budget`] for what `wd --exec`
     /// gives up while it is in use.
     fn pump_shell_events(&mut self) -> Result<()> {
+        if self.flow.release_if_stalled(Instant::now()) && self.flow.peer_reports {
+            log::debug!(
+                "no RxProgress for {RX_PROGRESS_STALL:?} — treating in-flight output as delivered"
+            );
+        }
         for slot in pump_order() {
             self.pump_slot(slot)?;
         }
@@ -514,6 +708,12 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             ShellSlot::Pty => PUMP_BUDGET,
             ShellSlot::Exec => self.exec_budget_at(Instant::now()),
         };
+        // A spent in-flight budget means "wait for the client", not "look for
+        // an exit": the exit event sits behind output this tick doesn't drain,
+        // and reporting it now would cut the command's tail off.
+        if budget == 0 {
+            return Ok(());
+        }
 
         // Everything the shell has handed over, glued into one buffer: a shell
         // printing line by line produces reads of a few dozen bytes, and one
@@ -554,6 +754,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
         for piece in split_shell_output(&output) {
             let data = piece.to_vec();
+            self.flow.note_sent(slot, data.len(), Instant::now());
             self.send(if legacy_opcodes {
                 Message::ShellOutput { data }
             } else {
@@ -676,6 +877,8 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 }
                 log::info!("HELLO from '{client_name}' v{version}");
                 self.client_name = Some(client_name.clone());
+                // The client counts shell output from its own handshake on.
+                self.flow = ShellFlow::new(Instant::now());
                 // Announce the generation, not the `Hello` version: this is
                 // how the client learns whether it may use the pty slot.
                 self.send(Message::HelloAck {
@@ -695,6 +898,15 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
 
             (SessionState::Connected, Message::Heartbeat) => {
                 self.last_heartbeat_recv = Instant::now();
+            }
+
+            (SessionState::Connected, Message::RxProgress { bytes }) => {
+                if self.flow.on_report(*bytes, Instant::now()) {
+                    log::info!(
+                        "client reports received shell output — pacing wd --exec on it \
+                         while a console is open"
+                    );
+                }
             }
 
             (SessionState::Connected, Message::MouseMove { x, y }) => {
@@ -1755,6 +1967,251 @@ mod tests {
             "one tick ships the byte budget in whole reads, got {bytes}"
         );
         assert_eq!(packets, bytes.div_ceil(MAX_PAYLOAD), "full packets only");
+    }
+
+    /// Exec output bytes (`ShellOutput` only) the client end has received so far.
+    fn drain_exec_output(client: &mut MockTransport) -> usize {
+        let mut bytes = 0;
+        while let Some(p) = client.recv_timeout(Duration::from_millis(20)) {
+            if let Message::ShellOutput { data } = p.message {
+                bytes += data.len();
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn shell_flow_tracks_what_is_still_on_its_way() {
+        let t0 = Instant::now();
+        let mut f = ShellFlow::new(t0);
+        assert_eq!(f.in_flight(), 0);
+        assert!(
+            !f.release_if_stalled(t0 + RX_PROGRESS_STALL * 2),
+            "nothing to release"
+        );
+
+        f.note_sent(ShellSlot::Pty, 4096, t0);
+        f.note_sent(ShellSlot::Pty, 4096, t0);
+        assert_eq!(f.in_flight(), 8192);
+        assert!(f.on_report(4096, t0), "first report of the session");
+        assert!(!f.on_report(4096, t0));
+        assert_eq!(f.in_flight(), 4096);
+        // A report can't confirm more than was sent.
+        f.on_report(u64::MAX, t0);
+        assert_eq!(f.in_flight(), 0);
+
+        // Unconfirmed bytes wait for a report, but not forever — and once the
+        // wait gives up, exec isn't paced on reports until they move again.
+        assert!(f.pacing());
+        f.note_sent(ShellSlot::Pty, 1000, t0);
+        assert!(!f.release_if_stalled(t0 + RX_PROGRESS_STALL / 2));
+        assert!(f.release_if_stalled(t0 + RX_PROGRESS_STALL));
+        assert_eq!(f.in_flight(), 0);
+        assert!(!f.pacing(), "a stalled client no longer paces exec");
+
+        // A report that confirms nothing new neither resumes pacing nor
+        // keeps a wait alive: a console closed on the client stops the
+        // reports, and one repeating a count the host has passed is no
+        // evidence of delivery.
+        let t1 = t0 + RX_PROGRESS_STALL * 3;
+        f.note_sent(ShellSlot::Pty, 8000, t1);
+        f.on_report(f.acked, t1 + RX_PROGRESS_STALL / 2);
+        assert!(!f.pacing());
+        assert!(f.release_if_stalled(t1 + RX_PROGRESS_STALL));
+
+        // Reports that do move keep the wait alive even when the client never
+        // quite catches up, and switch pacing back on.
+        let t2 = t1 + RX_PROGRESS_STALL * 3;
+        f.note_sent(ShellSlot::Pty, 8000, t2);
+        f.on_report(f.acked + 1000, t2 + RX_PROGRESS_STALL * 2);
+        assert!(f.pacing());
+        assert!(!f.release_if_stalled(t2 + RX_PROGRESS_STALL * 2 + RX_PROGRESS_STALL / 2));
+
+        assert_eq!(inflight_exec_budget(0), EXEC_INFLIGHT_CAP as usize);
+        assert_eq!(inflight_exec_budget(EXEC_INFLIGHT_CAP - 1), 1);
+        assert_eq!(inflight_exec_budget(EXEC_INFLIGHT_CAP), 0);
+        assert_eq!(inflight_exec_budget(EXEC_INFLIGHT_CAP * 4), 0);
+    }
+
+    #[test]
+    fn exec_in_flight_counts_only_exec_bytes_the_client_has_not_confirmed() {
+        // The link keeps order, so a confirmed count covers the oldest sends
+        // whichever slot they came from.
+        let t0 = Instant::now();
+        let mut f = ShellFlow::new(t0);
+        f.note_sent(ShellSlot::Pty, 1000, t0); //    0..1000
+        f.note_sent(ShellSlot::Exec, 3000, t0); // 1000..4000
+        f.note_sent(ShellSlot::Pty, 50_000, t0); // 4000..54000
+        f.note_sent(ShellSlot::Exec, 2000, t0); // 54000..56000
+        assert_eq!(f.in_flight(), 56_000);
+        assert_eq!(f.exec_in_flight(), 5000, "console bytes don't count");
+
+        f.on_report(2500, t0);
+        assert_eq!(
+            f.exec_in_flight(),
+            1500 + 2000,
+            "first exec send half confirmed"
+        );
+        f.on_report(30_000, t0);
+        assert_eq!(f.exec_in_flight(), 2000);
+        assert_eq!(f.exec_pending.len(), 1, "confirmed sends are forgotten");
+        f.on_report(56_000, t0);
+        assert_eq!(f.exec_in_flight(), 0);
+        assert!(f.exec_pending.is_empty());
+
+        f.note_sent(ShellSlot::Exec, 4000, t0);
+        assert!(f.release_if_stalled(t0 + RX_PROGRESS_STALL));
+        assert_eq!(f.exec_in_flight(), 0);
+        assert!(
+            f.exec_pending.is_empty(),
+            "a stall release forgets them too"
+        );
+    }
+
+    #[test]
+    fn a_console_printing_at_link_speed_does_not_starve_exec() {
+        let (mut host_t, mut client) = MockTransport::pair();
+        host_t.set_buffers_sends(true);
+        let mut session = Session::new(host_t, MockInjector::default(), "h".into(), 1920, 1080);
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(false, "");
+        session
+            .handle_packet(Packet::new(Message::RxProgress { bytes: 0 }, 1))
+            .unwrap();
+        // The console has put far more than the cap on the wire, none of it
+        // confirmed yet.
+        session.flow.note_sent(
+            ShellSlot::Pty,
+            EXEC_INFLIGHT_CAP as usize * 4,
+            Instant::now(),
+        );
+        assert!(session.flow.pacing());
+        assert_eq!(
+            session.exec_budget_at(Instant::now()),
+            EXEC_INFLIGHT_CAP as usize
+        );
+    }
+
+    #[test]
+    fn a_buffering_link_paces_exec_on_the_clients_reports_beside_a_console() {
+        // RFCOMM's `send` returns once the Bluetooth stack has queued the
+        // bytes, so the pump budget alone let exec fill that queue and a
+        // keystroke echoed 0.84 s late. With reports, exec only tops the
+        // in-flight bytes back up to the cap.
+        let (mut host_t, mut client) = MockTransport::pair();
+        host_t.set_buffers_sends(true);
+        let mut session = Session::new(host_t, MockInjector::default(), "h".into(), 1920, 1080);
+        connect(&mut session, &mut client);
+        let events = session.exec_events_for_test();
+        session.inject_pty_for_test(false, "");
+        for _ in 0..200 {
+            events.send(ShellEvent::Output(vec![b'x'; 1000])).unwrap();
+        }
+
+        // No report yet — the client may be a build without them, so the
+        // byte budget still applies and exec isn't frozen.
+        session.pump_shell_events().unwrap();
+        let first = drain_exec_output(&mut client);
+        assert!(first >= PUMP_BUDGET_EXEC_SHARED, "got {first}");
+
+        // The client has decoded nothing yet: the cap is spent, exec waits.
+        session
+            .handle_packet(Packet::new(Message::RxProgress { bytes: 0 }, 1))
+            .unwrap();
+        session.pump_shell_events().unwrap();
+        assert_eq!(
+            drain_exec_output(&mut client),
+            0,
+            "must wait for the client"
+        );
+
+        // Everything confirmed — exec gets exactly the cap back.
+        let sent = session.flow.sent;
+        session
+            .handle_packet(Packet::new(Message::RxProgress { bytes: sent }, 2))
+            .unwrap();
+        session.pump_shell_events().unwrap();
+        let refill = drain_exec_output(&mut client);
+        assert!(
+            (PUMP_BUDGET_EXEC_SHARED..PUMP_BUDGET_EXEC_SHARED + 1000).contains(&refill),
+            "got {refill}"
+        );
+
+        // A lost report must not freeze the command: exec falls back to the
+        // byte budget until reports move again.
+        let past = Instant::now() - RX_PROGRESS_STALL * 2;
+        session.flow.last_progress = past;
+        session.flow.unacked_since = Some(past);
+        session.pump_shell_events().unwrap();
+        assert!(!session.flow.pacing());
+        assert!(
+            drain_exec_output(&mut client) > 0,
+            "stalled reports release exec"
+        );
+
+        // With the console gone, exec streams at the full budget again.
+        session.pty_kill();
+        session.pump_shell_events().unwrap();
+        assert!(drain_exec_output(&mut client) >= PUMP_BUDGET_EXEC_SHARED);
+    }
+
+    #[test]
+    fn a_link_that_blocks_on_send_ignores_reports() {
+        // Serial pacing already works through the blocking write; its budget
+        // must not change because a client happened to report.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.inject_pty_for_test(false, "");
+        session.silence_pty_for_test();
+        session.flow.note_sent(
+            ShellSlot::Exec,
+            EXEC_INFLIGHT_CAP as usize * 8,
+            Instant::now(),
+        );
+        session
+            .handle_packet(Packet::new(Message::RxProgress { bytes: 0 }, 1))
+            .unwrap();
+        assert_eq!(session.exec_budget_at(Instant::now()), PUMP_BUDGET);
+    }
+
+    #[test]
+    fn a_new_handshake_forgets_the_previous_clients_counters() {
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session.flow.note_sent(ShellSlot::Pty, 5000, Instant::now());
+        session
+            .handle_packet(Packet::new(Message::RxProgress { bytes: 1000 }, 1))
+            .unwrap();
+        assert!(session.flow.peer_reports);
+        connect(&mut session, &mut client);
+        assert_eq!(session.flow.in_flight(), 0);
+        assert!(!session.flow.peer_reports);
+    }
+
+    #[test]
+    fn reports_queued_ahead_of_a_packet_do_not_use_up_its_tick() {
+        // One packet per tick, and a tick sending a console's bulk output
+        // blocks for half a second on RFCOMM: if reports took ticks, a Ctrl+C
+        // would wait behind every report that piled up meanwhile.
+        let (mut session, mut client) = setup();
+        connect(&mut session, &mut client);
+        session
+            .flow
+            .note_sent(ShellSlot::Pty, 10_000, Instant::now());
+        for (i, bytes) in [1000u64, 2000, 3000, 4000].into_iter().enumerate() {
+            client
+                .send(&Packet::new(Message::RxProgress { bytes }, 10 + i as u16))
+                .unwrap();
+        }
+        client.send(&Packet::new(Message::Disconnect, 20)).unwrap();
+
+        assert!(session.tick().unwrap());
+        assert_eq!(session.flow.acked, 4000, "every queued report is taken in");
+        assert_eq!(
+            session.state,
+            SessionState::WaitingForHello,
+            "and the packet behind them handled in the same tick"
+        );
     }
 
     #[test]

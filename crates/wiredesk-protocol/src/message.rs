@@ -15,16 +15,25 @@ pub const VERSION: u8 = 1;
 ///   `wd --exec` (the behaviour shipped until 2026-09-12).
 /// * `2` — separate exec and pty slots; PTY opens through
 ///   [`MessageType::PtyOpen`] and runs alongside `wd --exec`.
+/// * `3` — the host understands [`MessageType::RxProgress`].
 ///
 /// A host never has to understand a *newer* client: a client that sees `1`
 /// speaks nothing but the pre-existing opcodes.
-pub const HOST_PROTO_VERSION: u8 = 2;
+pub const HOST_PROTO_VERSION: u8 = 3;
 
 /// Whether a host announcing `host_version` has the dedicated pty slot, i.e.
 /// whether `PtyOpen`/`PtyInput`/`PtyClose` may be put on the wire at all.
-/// Anything below [`HOST_PROTO_VERSION`] gets the legacy single-slot path.
+/// Anything below generation 2 gets the legacy single-slot path.
 pub fn pty_slot_supported(host_version: u8) -> bool {
-    host_version >= HOST_PROTO_VERSION
+    host_version >= 2
+}
+
+/// Whether a host announcing `host_version` accepts `RxProgress`. An older
+/// host answers an unknown opcode with a decode error, and ten of those in a
+/// row read as a frame-error storm and reopen its port — so a client must
+/// never send one to it.
+pub fn rx_progress_supported(host_version: u8) -> bool {
+    host_version >= 3
 }
 
 /// `Message::Error { code, .. }` values the host sends. Kept as named
@@ -129,6 +138,17 @@ pub enum MessageType {
     PtyClose = 0x4B,
     /// The pty slot's shell terminated. Mirror of `ShellExit` (0x44).
     PtyExit = 0x4C,
+    /// Client → host: how many bytes of shell output (`ShellOutput` and
+    /// `PtyOutput` payloads, both slots) the client has decoded since the
+    /// handshake. Wire layout: `[bytes u64 LE]`.
+    ///
+    /// Exists for links whose `send` returns once the OS has *buffered* the
+    /// data rather than once it left (RFCOMM, BLE): the host cannot see that
+    /// queue, so without this it fills it with `wd --exec` output and a
+    /// console keystroke echoes only after the whole queue drains — 0.84 s
+    /// on RFCOMM, measured 2026-09-14. Only sent to a host announcing
+    /// generation 3 (see [`rx_progress_supported`]).
+    RxProgress = 0x4D,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -163,6 +183,7 @@ impl TryFrom<u8> for MessageType {
             0x4A => Ok(Self::PtyOutput),
             0x4B => Ok(Self::PtyClose),
             0x4C => Ok(Self::PtyExit),
+            0x4D => Ok(Self::RxProgress),
             _ => Err(WireDeskError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -276,6 +297,10 @@ pub enum Message {
     PtyExit {
         code: i32,
     },
+    /// Shell output bytes the client has decoded since the handshake.
+    RxProgress {
+        bytes: u64,
+    },
 }
 
 impl Message {
@@ -308,6 +333,7 @@ impl Message {
             Self::PtyOutput { .. } => MessageType::PtyOutput,
             Self::PtyClose => MessageType::PtyClose,
             Self::PtyExit { .. } => MessageType::PtyExit,
+            Self::RxProgress { .. } => MessageType::RxProgress,
         }
     }
 
@@ -402,6 +428,9 @@ impl Message {
             Self::PtyResize { cols, rows } => {
                 buf.extend_from_slice(&cols.to_le_bytes());
                 buf.extend_from_slice(&rows.to_le_bytes());
+            }
+            Self::RxProgress { bytes } => {
+                buf.extend_from_slice(&bytes.to_le_bytes());
             }
         }
         buf
@@ -556,6 +585,14 @@ impl Message {
                 let cols = u16::from_le_bytes([payload[0], payload[1]]);
                 let rows = u16::from_le_bytes([payload[2], payload[3]]);
                 Ok(Self::PtyResize { cols, rows })
+            }
+            MessageType::RxProgress => {
+                ensure_min_len(payload, 8)?;
+                let mut le = [0u8; 8];
+                le.copy_from_slice(&payload[..8]);
+                Ok(Self::RxProgress {
+                    bytes: u64::from_le_bytes(le),
+                })
             }
         }
     }
@@ -829,9 +866,25 @@ mod tests {
         assert_eq!(MessageType::try_from(0x4A).unwrap(), MessageType::PtyOutput);
         assert_eq!(MessageType::try_from(0x4B).unwrap(), MessageType::PtyClose);
         assert_eq!(MessageType::try_from(0x4C).unwrap(), MessageType::PtyExit);
+        assert_eq!(
+            MessageType::try_from(0x4D).unwrap(),
+            MessageType::RxProgress
+        );
         // One past the last assigned opcode must stay unknown, or a future
         // addition would be silently swallowed by an old peer.
-        assert!(MessageType::try_from(0x4D).is_err());
+        assert!(MessageType::try_from(0x4E).is_err());
+    }
+
+    #[test]
+    fn roundtrip_rx_progress() {
+        roundtrip(&Message::RxProgress { bytes: 0 });
+        roundtrip(&Message::RxProgress { bytes: 4_148_894 });
+        roundtrip(&Message::RxProgress { bytes: u64::MAX });
+        assert_eq!(
+            Message::RxProgress { bytes: 0x0102 }.serialize(),
+            vec![0x02, 0x01, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(Message::deserialize(MessageType::RxProgress, &[1, 2, 3]).is_err());
     }
 
     #[test]
@@ -979,9 +1032,15 @@ mod tests {
         // A host that predates the pty slot must never see the new opcodes.
         assert!(!pty_slot_supported(0));
         assert!(!pty_slot_supported(1));
+        assert!(pty_slot_supported(2));
         assert!(pty_slot_supported(HOST_PROTO_VERSION));
         // A future host stays compatible — the check is a floor, not equality.
         assert!(pty_slot_supported(HOST_PROTO_VERSION + 1));
+        // `RxProgress` is one generation later: a v2 host has the pty slot but
+        // would count the new opcode as a bad frame.
+        assert!(!rx_progress_supported(2));
+        assert!(rx_progress_supported(3));
+        assert!(rx_progress_supported(HOST_PROTO_VERSION));
         // `Hello` stays pinned; bumping it would lock new clients out of an
         // un-rebuilt host (see the VERSION doc comment).
         assert_eq!(VERSION, 1);

@@ -975,6 +975,11 @@ impl Transport for RfcommTransport {
         "rfcomm-client"
     }
 
+    /// The Bluetooth stack queues writes; see `Transport::buffers_sends`.
+    fn buffers_sends(&self) -> bool {
+        true
+    }
+
     fn try_clone(&self) -> Result<Box<dyn Transport>> {
         Ok(Box::new(RfcommTransport {
             inner: Arc::clone(&self.inner),
