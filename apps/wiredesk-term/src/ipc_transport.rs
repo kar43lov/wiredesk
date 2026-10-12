@@ -405,6 +405,7 @@ mod tests {
                 assert_eq!(open.rows, 40);
             }
             IpcConnect::Exec(req) => panic!("expected Interactive, got Exec: {req:?}"),
+            IpcConnect::Browser => panic!("expected Interactive, got Browser"),
         }
         let pkt = read_packet_frame(&mut rx_raw).expect("packet after dispatch");
         assert!(matches!(pkt.message, Message::Hello { .. }));

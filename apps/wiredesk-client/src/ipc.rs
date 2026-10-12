@@ -284,6 +284,161 @@ fn dispatch_connection(
             host_info,
             link_up,
         ),
+        IpcConnect::Browser => {
+            handle_browser_connection(stream, outgoing_tx, slots, host_info, link_up)
+        }
+    }
+}
+
+/// The companion owns only this packet route, never a shell lock. Closing
+/// either side closes both socket halves, joins the input pump, then resets
+/// host streams BEFORE releasing ownership, so an old reset cannot race a
+/// newly accepted companion.
+fn handle_browser_connection(
+    mut stream: UnixStream,
+    outgoing: mpsc::Sender<Packet>,
+    slots: ShellSlots,
+    host_info: SharedHostInfo,
+    link_up: Arc<AtomicBool>,
+) {
+    use std::net::Shutdown;
+    use std::sync::atomic::AtomicU64;
+    use wiredesk_exec_core::ipc::{read_packet_frame, write_packet_frame};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let info = host_info.lock().ok().and_then(|g| g.clone());
+    let Some(info) = info.filter(|i| {
+        link_up.load(Ordering::Acquire)
+            && wiredesk_protocol::message::browser_supported(i.proto_version)
+    }) else {
+        let _ = write_packet_frame(
+            &mut stream,
+            &Packet::new(
+                Message::Error {
+                    code: 126,
+                    msg: "browser requires a connected protocol v4 host".into(),
+                },
+                0,
+            ),
+        );
+        return;
+    };
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::sync_channel(64);
+    let Ok(mut slot) = slots.browser.lock() else {
+        return;
+    };
+    if slot.is_some() {
+        let _ = write_packet_frame(
+            &mut stream,
+            &Packet::new(
+                Message::Error {
+                    code: 126,
+                    msg: "browser companion already connected".into(),
+                },
+                0,
+            ),
+        );
+        return;
+    }
+    *slot = Some((id, tx));
+    drop(slot);
+    struct Guard {
+        id: u64,
+        slot: crate::exec_bridge::BrowserSlot,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = self.slot.lock() {
+                if slot.as_ref().is_some_and(|(id, _)| *id == self.id) {
+                    slot.take();
+                }
+            }
+        }
+    }
+    let _guard = Guard {
+        id,
+        slot: slots.browser.clone(),
+    };
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return;
+    }
+    if write_packet_frame(
+        &mut stream,
+        &Packet::new(
+            Message::HelloAck {
+                version: info.proto_version,
+                host_name: info.host_name,
+                screen_w: info.screen_w as u16,
+                screen_h: info.screen_h as u16,
+            },
+            0,
+        ),
+    )
+    .is_err()
+    {
+        return;
+    }
+    let Ok(mut reader) = stream.try_clone() else {
+        return;
+    };
+    if reader.set_read_timeout(None).is_err() {
+        return;
+    }
+    let input_outgoing = outgoing.clone();
+    let alive = Arc::new(AtomicBool::new(true));
+    let input_alive = alive.clone();
+    let input_link = link_up.clone();
+    let input_slot = slots.browser.clone();
+    let input_thread = thread::spawn(move || {
+        while let Ok(packet) = read_packet_frame(&mut reader) {
+            if !input_alive.load(Ordering::Acquire) || !input_link.load(Ordering::Acquire) {
+                break;
+            }
+            if !matches!(packet.message, Message::Browser { .. }) {
+                break;
+            }
+            // Keep ownership check and enqueue atomic with reader-side
+            // teardown/reset. A cleared route must not feed stale bytes
+            // into a replacement companion that reuses stream ids.
+            let Ok(owner) = input_slot.lock() else { break };
+            if !owner.as_ref().is_some_and(|(owner, _)| *owner == id) {
+                break;
+            }
+            if input_outgoing.send(packet).is_err() {
+                break;
+            }
+        }
+        input_alive.store(false, Ordering::Release);
+    });
+    while alive.load(Ordering::Acquire) && link_up.load(Ordering::Acquire) {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(packet) => {
+                if write_packet_frame(&mut stream, &packet).is_err() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    alive.store(false, Ordering::Release);
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = input_thread.join();
+    if let Ok(slot) = slots.browser.lock() {
+        if slot.as_ref().is_some_and(|(owner, _)| *owner == id) && link_up.load(Ordering::Acquire) {
+            let _ = outgoing.send(Packet::new(
+                Message::Browser {
+                    stream: 0,
+                    kind: 6,
+                    offset: 0,
+                    data: vec![],
+                },
+                0,
+            ));
+        }
     }
 }
 
@@ -1019,6 +1174,156 @@ fn handle_interactive_connection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_relay_keeps_exec_and_pty_routes_and_releases_only_its_own_route() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let slots = ShellSlots::new();
+        let (exec_tx, _exec_rx) = mpsc::channel();
+        let (pty_tx, _pty_rx) = mpsc::channel();
+        *slots.exec.lock().unwrap() = Some(exec_tx);
+        *slots.pty.lock().unwrap() = Some(pty_tx);
+        let handler_slots = slots.clone();
+        let (outgoing, rx) = mpsc::channel();
+        let info = Arc::new(Mutex::new(Some(crate::link::HostInfo {
+            host_name: "test".into(),
+            screen_w: 1280,
+            screen_h: 800,
+            proto_version: 4,
+        })));
+        let handle = thread::spawn(move || {
+            handle_browser_connection(
+                server,
+                outgoing,
+                handler_slots,
+                info,
+                Arc::new(AtomicBool::new(true)),
+            )
+        });
+        assert!(matches!(
+            read_packet_frame(&mut client).unwrap().message,
+            Message::HelloAck { version: 4, .. }
+        ));
+        write_packet_frame(
+            &mut client,
+            &Packet::new(
+                Message::Browser {
+                    stream: 7,
+                    kind: 1,
+                    offset: 0,
+                    data: vec![],
+                },
+                0,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().message,
+            Message::Browser {
+                stream: 7,
+                kind: 1,
+                ..
+            }
+        ));
+        slots
+            .browser
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .try_send(Packet::new(
+                Message::Browser {
+                    stream: 7,
+                    kind: 2,
+                    offset: 0,
+                    data: vec![],
+                },
+                0,
+            ))
+            .unwrap();
+        assert!(matches!(
+            read_packet_frame(&mut client).unwrap().message,
+            Message::Browser {
+                stream: 7,
+                kind: 2,
+                ..
+            }
+        ));
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        handle.join().unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().message,
+            Message::Browser {
+                stream: 0,
+                kind: 6,
+                ..
+            }
+        ));
+        assert!(slots.browser.lock().unwrap().is_none());
+        assert!(slots.exec.lock().unwrap().is_some());
+        assert!(slots.pty.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn old_host_rejects_browser_without_sending_new_opcodes() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (outgoing, rx) = mpsc::channel();
+        let info = Arc::new(Mutex::new(Some(crate::link::HostInfo {
+            host_name: "old".into(),
+            screen_w: 1280,
+            screen_h: 800,
+            proto_version: 3,
+        })));
+        handle_browser_connection(
+            server,
+            outgoing,
+            ShellSlots::new(),
+            info,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(matches!(
+            read_packet_frame(&mut client).unwrap().message,
+            Message::Error { code: 126, .. }
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn old_browser_handler_cannot_reset_or_clear_new_connection_after_reconnect() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let slots = ShellSlots::new();
+        let handler_slots = slots.clone();
+        let (outgoing, rx) = mpsc::channel();
+        let info = Arc::new(Mutex::new(Some(crate::link::HostInfo {
+            host_name: "test".into(),
+            screen_w: 1280,
+            screen_h: 800,
+            proto_version: 4,
+        })));
+        let handle = thread::spawn(move || {
+            handle_browser_connection(
+                server,
+                outgoing,
+                handler_slots,
+                info,
+                Arc::new(AtomicBool::new(true)),
+            )
+        });
+        read_packet_frame(&mut client).unwrap();
+        slots.forget_host_generation();
+        let (new_tx, _new_rx) = mpsc::sync_channel(1);
+        *slots.browser.lock().unwrap() = Some((u64::MAX, new_tx));
+        handle.join().unwrap();
+        assert_eq!(slots.browser.lock().unwrap().as_ref().unwrap().0, u64::MAX);
+        assert!(
+            rx.try_recv().is_err(),
+            "old handler sent a reset into new session"
+        );
+    }
+
     #[test]
     fn a_finished_run_does_not_hold_the_next_command_for_two_seconds() {
         // The host never answers ShellClose, so this budget is paid in

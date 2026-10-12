@@ -706,6 +706,26 @@ fn reader_loop(
                     Message::Heartbeat => {
                         let _ = events_tx.send(TransportEvent::Heartbeat);
                     }
+                    msg @ Message::Browser { .. } => {
+                        if let Ok(mut slot) = shell_slots.browser.lock() {
+                            if let Some((_, tx)) = slot.as_ref() {
+                                if tx.try_send(Packet::new(msg, 0)).is_err() {
+                                    // Closing only the browser relay lets it
+                                    // tear down its streams; never block exec.
+                                    let _ = outgoing_tx.send(Packet::new(
+                                        Message::Browser {
+                                            stream: 0,
+                                            kind: 6,
+                                            offset: 0,
+                                            data: vec![],
+                                        },
+                                        0,
+                                    ));
+                                    slot.take();
+                                }
+                            }
+                        }
+                    }
                     Message::ClipOffer { format, total_len } => {
                         if incoming_cancel.swap(false, Ordering::AcqRel) && cancel_seen {
                             log::info!(

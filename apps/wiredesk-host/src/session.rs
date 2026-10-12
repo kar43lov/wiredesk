@@ -330,6 +330,8 @@ pub struct Session<T: Transport, I: InputInjector> {
     pty_last_activity: Instant,
     /// Shell output sent versus confirmed — paces exec on buffering links.
     flow: ShellFlow,
+    /// Independent TCP browser streams; no shell ownership is involved.
+    browser: wiredesk_browser::Hub,
     /// A shell started ahead of time, waiting to be handed to the next
     /// `ShellOpen`, together with the argv it was started with.
     ///
@@ -432,6 +434,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             pty: None,
             pty_last_activity: now,
             flow: ShellFlow::new(now),
+            browser: wiredesk_browser::Hub::default(),
             warm: None,
             warm_enabled: true,
             // Unit tests get a clipboard with no OS backend: see
@@ -617,6 +620,14 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
         // Drain pending shell output and exit events without blocking
         self.pump_shell_events()?;
 
+        // One bounded browser frame per tick, after both shell slots. Browser
+        // workers wait for end-to-end acks and never fill a transport queue.
+        if self.state == SessionState::Connected {
+            if let Some(msg) = self.browser.poll() {
+                self.send(msg)?;
+            }
+        }
+
         // Push local clipboard changes (poll-rate-limited internally).
         if self.state == SessionState::Connected {
             for msg in self.clipboard.poll() {
@@ -644,7 +655,10 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             // of tick() (heartbeat-timeout, recv-timeout) return without a decoded
             // packet, and resetting there would break "timeouts don't participate".
             self.storm.on_valid_packet();
-            let report = matches!(packet.message, Message::RxProgress { .. });
+            let report = matches!(
+                packet.message,
+                Message::RxProgress { .. } | Message::Browser { .. }
+            );
             self.handle_packet(packet)?;
             if !report || reports == MAX_REPORTS_PER_TICK {
                 return Ok(true);
@@ -812,6 +826,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
     fn kill_all_shells(&mut self) {
         self.exec_kill();
         self.pty_kill();
+        self.browser.reset();
     }
 
     /// Hand over the pre-warmed shell when it is the one being asked for,
@@ -879,6 +894,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                 self.client_name = Some(client_name.clone());
                 // The client counts shell output from its own handshake on.
                 self.flow = ShellFlow::new(Instant::now());
+                self.browser.reset();
                 // Announce the generation, not the `Hello` version: this is
                 // how the client learns whether it may use the pty slot.
                 self.send(Message::HelloAck {
@@ -907,6 +923,10 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
                          while a console is open"
                     );
                 }
+            }
+
+            (SessionState::Connected, msg @ Message::Browser { .. }) => {
+                self.browser.dispatch(msg.clone(), true);
             }
 
             (SessionState::Connected, Message::MouseMove { x, y }) => {

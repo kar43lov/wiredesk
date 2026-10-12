@@ -1676,6 +1676,7 @@ mod tests {
             let req = match read_connect(&mut stream).expect("read_connect") {
                 IpcConnect::Exec(req) => req,
                 IpcConnect::Interactive(open) => panic!("expected Exec, got Interactive: {open:?}"),
+                IpcConnect::Browser => panic!("expected Exec, got Browser"),
             };
             assert_eq!(req.cmd, "echo hi");
             assert_eq!(req.ssh, None);

@@ -1,0 +1,155 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WireDesk — браузер</title><style>
+body{margin:0;background:#edf1f5;color:#203044;font:15px system-ui}header{display:flex;gap:10px;align-items:center;padding:12px 18px;background:#173c61;color:white;flex-wrap:wrap}h1{font-size:18px;margin:0 12px 0 0}input,select,button{padding:8px;border:1px solid #bac7d3;border-radius:5px;font:inherit}button{cursor:pointer}#url{flex:1;min-width:180px}#status{padding:10px 18px}main{padding:0 18px 18px}#screen{display:block;max-width:100%;background:white;border:1px solid #c5cfda;cursor:default}#screen:focus{outline:3px solid #2986ce}#token{width:280px}#text{min-width:250px}small{padding:0 18px;display:block;margin-bottom:10px}
+</style><header><h1>WireDesk · браузер</h1><input id="token" type="password" placeholder="Токен из browser-token" autocomplete="off"><button id="connect">Подключиться</button><select id="tabs"></select><button id="refresh">Обновить вкладки</button></header>
+<header><button id="back" aria-label="Назад">←</button><button id="forward" aria-label="Вперёд">→</button><input id="url" placeholder="Адрес страницы"><button id="go">Открыть</button><input id="text" placeholder="Текст в выбранное поле"><button id="type">Ввести</button><button id="frame">Обновить экран</button><label><input id="auto" type="checkbox"> Автообновление</label></header>
+<div id="status" role="status">Запустите wd-browser и подключите браузер на Windows.</div><small>Клик и прокрутка — по изображению. Для клавиатуры сначала нажмите на изображение. Автообновление включается отдельно.</small><main><img id="screen" tabindex="0" alt="Удалённая вкладка"></main>
+<script>
+const $ = id => document.getElementById(id);
+let ws, seq = 0, pending = new Map(), busy = false, dirty = false, imageSocket;
+let mouseQueue = Promise.resolve(), nextMove, moving = false, pressed = false, hoverTimer;
+const viewport = { width: 1280, height: 800 };
+const status = text => $('status').textContent = text;
+const token = () => $('token').value.trim();
+const fragmentToken = new URLSearchParams(location.hash.slice(1)).get('token');
+if (fragmentToken) { $('token').value = fragmentToken; history.replaceState(null, '', location.pathname); }
+function command(method, params = {}, connection = ws) {
+  return new Promise((resolve, reject) => {
+    if (!connection || connection !== ws || connection.readyState !== 1) return reject(Error('Нет подключения'));
+    const id = ++seq;
+    const timer = setTimeout(() => { pending.delete(id); reject(Error('Истёк срок ожидания')); }, 15000);
+    pending.set(id, { resolve, reject, timer });
+    connection.send(JSON.stringify({ id, method, params }));
+  });
+}
+function disconnected() {
+  imageSocket = undefined; nextMove = undefined; pressed = false;
+  for (const p of pending.values()) { clearTimeout(p.timer); p.reject(Error('Соединение закрыто')); }
+  pending.clear(); status('Соединение закрыто. Проверьте WireDesk и обновите вкладки.');
+}
+async function tabs() {
+  try {
+    const r = await fetch('/targets', { headers: { Authorization: 'Bearer ' + token() } });
+    if (!r.ok) throw Error('Проверьте токен и браузер на Windows');
+    const list = (await r.json()).filter(t => t.type === 'page');
+    $('tabs').replaceChildren();
+    for (const t of list) {
+      const o = document.createElement('option'); o.value = t.webSocketDebuggerUrl;
+      o.textContent = t.title || t.url || 'Без названия'; o.dataset.url = t.url; $('tabs').append(o);
+    }
+    if (!list.length) throw Error('Нет открытых вкладок');
+    await selectTab();
+  } catch (e) { status(e.message); }
+}
+async function selectTab() {
+  if (ws) { ws.onclose = null; ws.close(); disconnected(); }
+  $('screen').removeAttribute('src'); imageSocket = undefined;
+  const u = new URL($('tabs').value);
+  if (u.protocol !== 'ws:' || u.hostname !== '127.0.0.1' || u.port !== '19222' || !u.pathname.startsWith('/devtools/')) throw Error('Недопустимый адрес вкладки');
+  u.searchParams.set('token', token());
+  const connection = new WebSocket(u); ws = connection;
+  connection.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.id && pending.has(m.id)) {
+      const p = pending.get(m.id); pending.delete(m.id); clearTimeout(p.timer);
+      m.error ? p.reject(Error(m.error.message)) : p.resolve(m.result);
+    }
+  };
+  connection.onclose = () => { if (connection === ws) disconnected(); };
+  connection.onerror = () => { if (connection === ws) status('Ошибка соединения с вкладкой'); };
+  connection.onopen = async () => {
+    try {
+      if (connection !== ws) return;
+      $('url').value = $('tabs').selectedOptions[0].dataset.url;
+      await command('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor: 1, mobile: false }, connection);
+      await screenshot();
+    } catch (e) { status(e.message); }
+  };
+}
+async function screenshot() {
+  if (busy) { dirty = true; return; }
+  busy = true; dirty = false; const connection = ws, started = performance.now();
+  try {
+    const r = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: { x: 0, y: 0, ...viewport, scale: 1 } }, connection);
+    if (connection !== ws) return;
+    await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => { if (connection === ws) { $('screen').src = img.src; imageSocket = connection; } resolve(); };
+      img.onerror = () => reject(Error('Повреждённый кадр')); img.src = 'data:image/png;base64,' + r.data;
+    });
+    if (connection === ws) status('Кадр получен за ' + ((performance.now() - started) / 1000).toFixed(2) + ' с');
+  } catch (e) { status(e.message); }
+  finally { busy = false; if (dirty) setTimeout(screenshot, 100); }
+}
+async function act(fn) {
+  const connection = ws;
+  try { await fn(connection); if (connection === ws) await screenshot(); } catch (e) { status(e.message); }
+}
+const ready = () => imageSocket === ws && ws?.readyState === 1;
+function point(e) {
+  const r = $('screen').getBoundingClientRect();
+  return { x: Math.max(0, Math.min(viewport.width - 1, (e.clientX - r.left) * viewport.width / r.width)),
+           y: Math.max(0, Math.min(viewport.height - 1, (e.clientY - r.top) * viewport.height / r.height)) };
+}
+function mouse(params) {
+  const connection = ws;
+  const job = mouseQueue.then(() => command('Input.dispatchMouseEvent', params, connection));
+  mouseQueue = job.catch(() => {}); return job;
+}
+$('connect').onclick = tabs; $('refresh').onclick = tabs;
+$('tabs').onchange = () => selectTab().catch(e => status(e.message)); $('frame').onclick = screenshot;
+$('go').onclick = () => act(connection => { imageSocket = undefined; return command('Page.navigate', { url: $('url').value }, connection); });
+$('type').onclick = () => act(connection => command('Input.insertText', { text: $('text').value }, connection));
+function historyStep(delta) {
+  return act(async connection => {
+    const h = await command('Page.getNavigationHistory', {}, connection);
+    const entry = h.entries[h.currentIndex + delta];
+    if (entry) { imageSocket = undefined; await command('Page.navigateToHistoryEntry', { entryId: entry.id }, connection); $('url').value = entry.url; }
+  });
+}
+$('back').onclick = () => historyStep(-1); $('forward').onclick = () => historyStep(1);
+$('screen').draggable = false; $('screen').oncontextmenu = e => e.preventDefault();
+$('screen').onpointerdown = e => {
+  if (!ready() || e.button !== 0) return; e.preventDefault(); $('screen').focus(); $('screen').setPointerCapture(e.pointerId);
+  pressed = true; nextMove = undefined; clearTimeout(hoverTimer);
+  mouse({ type: 'mousePressed', ...point(e), button: 'left', buttons: 1, clickCount: 1 }).catch(e => status(e.message));
+};
+$('screen').onpointermove = e => { if (ready()) nextMove = { ...point(e), buttons: pressed ? 1 : 0 }; };
+$('screen').onpointerup = e => {
+  if (!ready() || !pressed) return; const p = point(e); pressed = false; nextMove = undefined;
+  act(async () => { await mouse({ type: 'mouseMoved', ...p, buttons: 1 }); await mouse({ type: 'mouseReleased', ...p, button: 'left', buttons: 0, clickCount: 1 }); });
+};
+$('screen').onpointercancel = e => { if (pressed) $('screen').onpointerup(e); };
+setInterval(async () => {
+  if (!ready() || moving || !nextMove) return;
+  const p = nextMove; nextMove = undefined; moving = true;
+  try { await mouse({ type: 'mouseMoved', ...p }); clearTimeout(hoverTimer); if (!pressed) hoverTimer = setTimeout(screenshot, 250); }
+  catch (e) { status(e.message); } finally { moving = false; }
+}, 50);
+let wheel = 0, wheelTimer;
+$('screen').addEventListener('wheel', e => {
+  if (!ready()) return; e.preventDefault(); wheel += e.deltaY; clearTimeout(wheelTimer); const p = point(e);
+  wheelTimer = setTimeout(() => { const deltaY = wheel; wheel = 0; act(() => mouse({ type: 'mouseWheel', ...p, deltaX: 0, deltaY })); }, 100);
+}, { passive: false });
+$('screen').onpaste = e => {
+  if (!ready()) return; e.preventDefault(); const text = e.clipboardData?.getData('text/plain');
+  if (text) act(connection => command('Input.insertText', { text }, connection));
+};
+$('screen').onkeydown = e => {
+  if (!ready()) return;
+  // Let the browser dispatch a user-initiated paste event; it supplies the
+  // local text without Clipboard API permission or a remote clipboard race.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
+  e.preventDefault();
+  const modifiers = (e.altKey ? 1 : 0) | ((e.ctrlKey || e.metaKey) ? 2 : 0) | (e.shiftKey ? 8 : 0);
+  const meta = e.key === 'Meta';
+  const key = meta ? 'Control' : e.key, code = meta ? 'ControlLeft' : e.code;
+  const vk = meta ? 17 : e.keyCode;
+  const text = !e.ctrlKey && !e.metaKey && !e.altKey ? (e.key === 'Enter' ? String.fromCharCode(13) : e.key.length === 1 ? e.key : undefined) : undefined;
+  act(async connection => {
+    await command('Input.dispatchKeyEvent', { type: text === undefined ? 'rawKeyDown' : 'keyDown', key, code, windowsVirtualKeyCode: vk, modifiers, text }, connection);
+    await command('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, modifiers }, connection);
+  });
+};
+setInterval(() => { if ($('auto').checked && ws?.readyState === 1 && !busy) screenshot(); }, 1000);
+</script></html>

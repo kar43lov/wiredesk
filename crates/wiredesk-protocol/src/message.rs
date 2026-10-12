@@ -16,10 +16,16 @@ pub const VERSION: u8 = 1;
 /// * `2` — separate exec and pty slots; PTY opens through
 ///   [`MessageType::PtyOpen`] and runs alongside `wd --exec`.
 /// * `3` — the host understands [`MessageType::RxProgress`].
+/// * `4` — an independent browser tunnel over [`MessageType::Browser`].
 ///
 /// A host never has to understand a *newer* client: a client that sees `1`
 /// speaks nothing but the pre-existing opcodes.
-pub const HOST_PROTO_VERSION: u8 = 3;
+pub const HOST_PROTO_VERSION: u8 = 4;
+
+/// Generation 4 adds the independent, loopback-only browser tunnel.
+pub fn browser_supported(host_version: u8) -> bool {
+    host_version >= 4
+}
 
 /// Whether a host announcing `host_version` has the dedicated pty slot, i.e.
 /// whether `PtyOpen`/`PtyInput`/`PtyClose` may be put on the wire at all.
@@ -149,6 +155,8 @@ pub enum MessageType {
     /// on RFCOMM, measured 2026-09-14. Only sent to a host announcing
     /// generation 3 (see [`rx_progress_supported`]).
     RxProgress = 0x4D,
+    /// Browser stream: id u32, kind u8, byte offset u64, then data.
+    Browser = 0x50,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -184,6 +192,7 @@ impl TryFrom<u8> for MessageType {
             0x4B => Ok(Self::PtyClose),
             0x4C => Ok(Self::PtyExit),
             0x4D => Ok(Self::RxProgress),
+            0x50 => Ok(Self::Browser),
             _ => Err(WireDeskError::Protocol(format!(
                 "unknown message type: 0x{v:02X}"
             ))),
@@ -301,6 +310,14 @@ pub enum Message {
     RxProgress {
         bytes: u64,
     },
+    /// Independent of both shell slots. Kinds: open=1, ready=2, data=3,
+    /// ack=4, fin=5, reset=6, fin-ack=7. Stream zero is reset-all only.
+    Browser {
+        stream: u32,
+        kind: u8,
+        offset: u64,
+        data: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -334,6 +351,7 @@ impl Message {
             Self::PtyClose => MessageType::PtyClose,
             Self::PtyExit { .. } => MessageType::PtyExit,
             Self::RxProgress { .. } => MessageType::RxProgress,
+            Self::Browser { .. } => MessageType::Browser,
         }
     }
 
@@ -431,6 +449,17 @@ impl Message {
             }
             Self::RxProgress { bytes } => {
                 buf.extend_from_slice(&bytes.to_le_bytes());
+            }
+            Self::Browser {
+                stream,
+                kind,
+                offset,
+                data,
+            } => {
+                buf.extend_from_slice(&stream.to_le_bytes());
+                buf.push(*kind);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(data);
             }
         }
         buf
@@ -594,6 +623,27 @@ impl Message {
                     bytes: u64::from_le_bytes(le),
                 })
             }
+            MessageType::Browser => {
+                ensure_min_len(payload, 13)?;
+                let stream = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let kind = payload[4];
+                let offset = u64::from_le_bytes(payload[5..13].try_into().unwrap());
+                let data = payload[13..].to_vec();
+                if !(1..=7).contains(&kind)
+                    || (kind != 3 && !data.is_empty())
+                    || (kind == 3 && data.is_empty())
+                    || (stream == 0 && (kind != 6 || offset != 0))
+                    || (matches!(kind, 1 | 2 | 6) && offset != 0)
+                {
+                    return Err(WireDeskError::Protocol("invalid browser frame".into()));
+                }
+                Ok(Self::Browser {
+                    stream,
+                    kind,
+                    offset,
+                    data,
+                })
+            }
         }
     }
 }
@@ -644,6 +694,52 @@ fn ensure_min_len(data: &[u8], min: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_frames_are_bounded_validated_and_generation_gated() {
+        assert!(!browser_supported(3));
+        assert!(browser_supported(4));
+        for kind in 1..=7 {
+            let m = Message::Browser {
+                stream: 1,
+                kind,
+                offset: 0,
+                data: if kind == 3 { vec![42] } else { vec![] },
+            };
+            assert_eq!(
+                Message::deserialize(m.msg_type(), &m.serialize()).unwrap(),
+                m
+            );
+        }
+        assert!(Message::deserialize(MessageType::Browser, &[0; 12]).is_err());
+        for m in [
+            Message::Browser {
+                stream: 1,
+                kind: 8,
+                offset: 0,
+                data: vec![],
+            },
+            Message::Browser {
+                stream: 0,
+                kind: 1,
+                offset: 0,
+                data: vec![],
+            },
+            Message::Browser {
+                stream: 1,
+                kind: 2,
+                offset: 0,
+                data: vec![1],
+            },
+            Message::Browser {
+                stream: 1,
+                kind: 3,
+                offset: 0,
+                data: vec![],
+            },
+        ] {
+            assert!(Message::deserialize(MessageType::Browser, &m.serialize()).is_err());
+        }
+    }
     use super::*;
 
     fn roundtrip(msg: &Message) {

@@ -50,6 +50,16 @@ remain macOS-only (see [Known limitations](docs/known-limitations.md)).
 
 ## What WireDesk does
 
+### Remote browser (opt-in, macOS client)
+
+`wd-browser` exposes the Windows browser's Chrome DevTools Protocol at
+`127.0.0.1:19222` and a manual viewer at `127.0.0.1:19223`. It uses its own
+reliable binary stream channel, alongside both interactive `wd` and
+`wd --exec`; neither shell slot is reserved. Requires a protocol v4 host,
+the running Mac GUI, and a separately configured Windows Chrome profile.
+Both local services require an owner-only token. See [browser setup and
+verification](docs/browser.md).
+
 ### Input
 
 - **Keyboard and mouse** from the client to the host, including X1/X2 side buttons (Back/Forward). Input is injected on Windows via `SendInput` using **scancodes**, so any keyboard layout works — Cyrillic included.
