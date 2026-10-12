@@ -5442,6 +5442,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiredesk-browser"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "wiredesk-protocol",
+]
+
+[[package]]
+name = "wiredesk-browser-cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "uuid",
+ "wiredesk-browser",
+ "wiredesk-exec-core",
+ "wiredesk-protocol",
+]
+
+[[package]]
 name = "wiredesk-client"
 version = "0.1.0"
 dependencies = [
@@ -5532,6 +5551,7 @@ dependencies = [
  "uuid",
  "windows 0.58.0",
  "winresource",
+ "wiredesk-browser",
  "wiredesk-core",
  "wiredesk-protocol",
  "wiredesk-transport",

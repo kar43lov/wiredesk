@@ -20,6 +20,9 @@ use wiredesk_exec_core::ExecEvent;
 /// reader thread holds an `Arc` clone and consults the `Option` on every event.
 pub type ExecEventSlot = Arc<Mutex<Option<mpsc::Sender<ExecEvent>>>>;
 
+pub type BrowserSlot =
+    Arc<Mutex<Option<(u64, mpsc::SyncSender<wiredesk_protocol::packet::Packet>)>>>;
+
 /// Which consumer an incoming shell event is addressed to. The reader decides
 /// this from the opcode alone — `ShellOutput` is exec's, `PtyOutput` is the
 /// console's — so it never has to know which handlers happen to be running.
@@ -41,6 +44,8 @@ pub struct ShellSlots {
     pub exec: ExecEventSlot,
     /// Where the interactive console's traffic goes.
     pub pty: ExecEventSlot,
+    /// Packet route for the browser companion. Independent of shell owners.
+    pub browser: BrowserSlot,
     /// True while the connected host predates the dedicated pty slot, i.e.
     /// its console streams on the `Shell*` opcodes like `wd --exec` does.
     /// Set from `HelloAck` on every handshake, cleared on every link-down —
@@ -56,6 +61,9 @@ impl ShellSlots {
     /// know" must not read as "the old host".
     pub fn forget_host_generation(&self) {
         self.legacy_fallback.store(false, Ordering::Relaxed);
+        if let Ok(mut browser) = self.browser.lock() {
+            browser.take();
+        }
     }
 
     /// Fresh, empty slots in strict mode.
@@ -66,6 +74,7 @@ impl ShellSlots {
         Self {
             exec: Arc::new(Mutex::new(None)),
             pty: Arc::new(Mutex::new(None)),
+            browser: Arc::new(Mutex::new(None)),
             legacy_fallback: Arc::new(AtomicBool::new(false)),
         }
     }

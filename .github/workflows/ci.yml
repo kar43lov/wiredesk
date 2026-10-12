@@ -55,9 +55,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (host + client + shared crates)
-        run: cargo clippy -p wiredesk-host -p wiredesk-client -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core --all-targets -- -D warnings
+        run: cargo clippy -p wiredesk-host -p wiredesk-client -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core -p wiredesk-browser -p wiredesk-browser-cli --all-targets -- -D warnings
       - name: Test (host + client + shared crates)
-        run: cargo test -p wiredesk-host -p wiredesk-client -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core
+        run: cargo test -p wiredesk-host -p wiredesk-client -p wiredesk-transport -p wiredesk-protocol -p wiredesk-core -p wiredesk-exec-core -p wiredesk-browser -p wiredesk-browser-cli
 
   audit:
     name: cargo audit

@@ -1,0 +1,8 @@
+[package]
+name = "wiredesk-browser"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wiredesk-protocol.workspace = true
+log.workspace = true

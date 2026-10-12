@@ -1,0 +1,15 @@
+[package]
+name = "wiredesk-browser-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wd-browser"
+path = "src/main.rs"
+
+[dependencies]
+wiredesk-browser.workspace = true
+wiredesk-protocol.workspace = true
+wiredesk-exec-core.workspace = true
+uuid.workspace = true
+serde_json = "1"

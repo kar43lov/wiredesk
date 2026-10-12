@@ -60,6 +60,8 @@ pub struct IpcInteractiveOpen {
 pub enum IpcConnect {
     Exec(IpcRequest),
     Interactive(IpcInteractiveOpen),
+    /// Independent browser packet relay; does not claim a shell slot.
+    Browser,
 }
 
 /// Server → client stream: zero or more `Stdout` frames followed by
@@ -150,8 +152,15 @@ pub fn write_connect<W: Write>(w: &mut W, conn: &IpcConnect) -> io::Result<()> {
 
 /// Decode the framed `IpcConnect` dispatch frame from the stream.
 pub fn read_connect<R: Read>(r: &mut R) -> io::Result<IpcConnect> {
+    use bincode::Options;
     let bytes = read_frame(r)?;
-    bincode::deserialize(&bytes).map_err(bincode_to_io)
+    // The new unit variant would otherwise accept a legacy bare request
+    // whose string length happens to equal its enum tag, ignoring the tail.
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(&bytes)
+        .map_err(bincode_to_io)
 }
 
 /// Encode + frame a `Packet` for the interactive stream. After the
@@ -219,6 +228,16 @@ pub fn default_socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_connect_is_appended_without_changing_existing_tags() {
+        let mut bytes = Vec::new();
+        write_connect(&mut bytes, &IpcConnect::Browser).unwrap();
+        assert_eq!(bytes, vec![0, 0, 0, 4, 2, 0, 0, 0]);
+        assert_eq!(
+            read_connect(&mut Cursor::new(bytes)).unwrap(),
+            IpcConnect::Browser
+        );
+    }
     use super::*;
     use std::io::Cursor;
 
