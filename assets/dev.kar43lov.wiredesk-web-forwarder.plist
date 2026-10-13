@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.kar43lov.wiredesk-web-forwarder</string>
+  <key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/dev.kar43lov.wiredesk-web-forwarder</string></array>
+  <key>UserName</key><string>nobody</string>
+  <key>Sockets</key><dict><key>HttpListener</key><dict>
+    <key>SockNodeName</key><string>127.0.0.1</string>
+    <key>SockServiceName</key><string>80</string>
+    <key>SockFamily</key><string>IPv4</string>
+    <key>SockType</key><string>stream</string>
+    <key>SockProtocol</key><string>TCP</string>
+  </dict></dict>
+</dict></plist>

@@ -2048,6 +2048,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5454,6 +5456,7 @@ name = "wiredesk-browser-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tempfile",
  "uuid",
  "wiredesk-browser",
  "wiredesk-exec-core",
@@ -5490,6 +5493,7 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.58.0",
  "winresource",
+ "wiredesk-browser-cli",
  "wiredesk-core",
  "wiredesk-exec-core",
  "wiredesk-protocol",
@@ -5540,6 +5544,7 @@ dependencies = [
  "native-windows-gui",
  "portable-pty",
  "serde",
+ "serde_json",
  "serialport",
  "tempfile",
  "thiserror 2.0.18",

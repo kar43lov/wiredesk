@@ -17,10 +17,16 @@ pub const VERSION: u8 = 1;
 ///   [`MessageType::PtyOpen`] and runs alongside `wd --exec`.
 /// * `3` — the host understands [`MessageType::RxProgress`].
 /// * `4` — an independent browser tunnel over [`MessageType::Browser`].
+/// * `5` — desktop requests through OPEN_DESKTOP in that bounded tunnel.
 ///
 /// A host never has to understand a *newer* client: a client that sees `1`
 /// speaks nothing but the pre-existing opcodes.
-pub const HOST_PROTO_VERSION: u8 = 4;
+pub const HOST_PROTO_VERSION: u8 = 5;
+
+/// Generation 5 adds an internal desktop endpoint to the bounded stream hub.
+pub fn desktop_supported(host_version: u8) -> bool {
+    host_version >= 5
+}
 
 /// Generation 4 adds the independent, loopback-only browser tunnel.
 pub fn browser_supported(host_version: u8) -> bool {
@@ -629,11 +635,11 @@ impl Message {
                 let kind = payload[4];
                 let offset = u64::from_le_bytes(payload[5..13].try_into().unwrap());
                 let data = payload[13..].to_vec();
-                if !(1..=7).contains(&kind)
+                if !(1..=8).contains(&kind)
                     || (kind != 3 && !data.is_empty())
                     || (kind == 3 && data.is_empty())
                     || (stream == 0 && (kind != 6 || offset != 0))
-                    || (matches!(kind, 1 | 2 | 6) && offset != 0)
+                    || (matches!(kind, 1 | 2 | 6 | 8) && offset != 0)
                 {
                     return Err(WireDeskError::Protocol("invalid browser frame".into()));
                 }
@@ -698,7 +704,9 @@ mod tests {
     fn browser_frames_are_bounded_validated_and_generation_gated() {
         assert!(!browser_supported(3));
         assert!(browser_supported(4));
-        for kind in 1..=7 {
+        assert!(!desktop_supported(4));
+        assert!(desktop_supported(5));
+        for kind in 1..=8 {
             let m = Message::Browser {
                 stream: 1,
                 kind,
@@ -714,7 +722,7 @@ mod tests {
         for m in [
             Message::Browser {
                 stream: 1,
-                kind: 8,
+                kind: 9,
                 offset: 0,
                 data: vec![],
             },

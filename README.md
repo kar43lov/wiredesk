@@ -50,22 +50,36 @@ remain macOS-only (see [Known limitations](docs/known-limitations.md)).
 
 ## What WireDesk does
 
-### Remote browser (opt-in, macOS client)
+### Remote browser (macOS client)
 
-`wd-browser` exposes the Windows browser's Chrome DevTools Protocol at
-`127.0.0.1:19222` and a manual viewer at `127.0.0.1:19223`. It uses its own
+The Mac GUI automatically exposes the Windows browser's Chrome DevTools Protocol at
+`127.0.0.1:19222` and a manual viewer at `http://wiredesk.localhost/` after the
+one-time helper installation in `docs/browser.md` (otherwise port `19223`). Settings
+provides Open browser and Copy link buttons; the access link persists across restarts.
+The service reconnects with the GUI and sends no browser traffic while unused.
+It uses its own
 reliable binary stream channel, alongside both interactive `wd` and
 `wd --exec`; neither shell slot is reserved. Requires a protocol v4 host,
 the running Mac GUI, and a separately configured Windows Chrome profile.
+The standalone `wd-browser` is optional and cannot share the GUI service's ports.
 Both local services require an owner-only token. See [browser setup and
 verification](docs/browser.md).
+
+### Windows desktop view (opt-in, macOS client)
+
+With a generation-5 host, **Экран Windows** displays the existing primary
+Windows desktop in either the Mac application or the browser panel. JPEG
+frames are requested about once a second while enabled; input uses the
+existing link. Both shell slots remain available. The panel requires the
+same private key for frames and input, and the host opens no additional
+network listener. See `docs/browser.md` for controls and limitations.
 
 ### Input
 
 - **Keyboard and mouse** from the client to the host, including X1/X2 side buttons (Back/Forward). Input is injected on Windows via `SendInput` using **scancodes**, so any keyboard layout works — Cyrillic included.
 - **OS-level capture**, not just window-level: a CGEventTap on macOS, a `WH_KEYBOARD_LL` hook on Windows. System shortcuts are intercepted before the local OS sees them, so `Cmd+Space` reaches the host as `Win+Space` and `Cmd+C`/`Cmd+V` as `Ctrl+C`/`Ctrl+V`.
 - **Toggle capture** with `Cmd+Esc` (`Ctrl+Esc` on a Windows client); input returns to the local machine when released. Capture pauses by itself when the window loses focus, so other apps keep their shortcuts.
-- **Fullscreen** with `Cmd+Enter` (`Ctrl+Enter` on Windows) for the "third monitor" workflow: drag WireDesk onto the display fed by the HDMI capture card and it covers exactly that screen. Entering fullscreen engages capture, leaving it releases — one shortcut, not two. On macOS this is a *borderless* fullscreen rather than the system one, so there is no zoom animation and no separate Mission Control tile; the menu bar and Dock do hide. ([Why](docs/known-limitations.md))
+- **Fullscreen** with `Cmd+Enter` (`Ctrl+Enter` on Windows) for the "third monitor" workflow: drag WireDesk onto the display fed by the HDMI capture card and it covers exactly that screen. Entering fullscreen engages capture, leaving it releases — one shortcut, not two. On macOS this is a *borderless* fullscreen rather than the system one, so there is no zoom animation and no separate Mission Control tile; the focused window covers the menu bar and Dock without hiding them on other displays. ([Why](docs/known-limitations.md))
 - **Karabiner-Elements compensation** for people who remap `left_command ↔ left_option` so one physical keyboard suits both operating systems. A Settings checkbox re-swaps the modifiers on the way out, so `Cmd+V` still arrives as `Ctrl+V`.
 
 ### Clipboard
@@ -235,6 +249,7 @@ Differences from the Mac client, all of them consequences of the platform:
 | Keyboard hijack | CGEventTap (needs Accessibility permission) | `WH_KEYBOARD_LL` hook (no permission needed) |
 | Release capture | `Cmd+Esc` | `Ctrl+Esc` |
 | Toggle fullscreen | `Cmd+Enter` | `Ctrl+Enter` |
+| Экран Windows на весь выбранный дисплей / выход | `Ctrl+Cmd+Enter` | пока недоступно |
 | Status area | menu bar item, progress shown as text | tray icon, progress shown in the tooltip |
 | Files on the clipboard | `NSPasteboard` file URL | `CF_HDROP` |
 | Transport | serial, BLE or RFCOMM | serial or RFCOMM (no BLE) |
@@ -410,7 +425,7 @@ the system clipboard, and the calls that remain are serialised).
 | Windows client | New — builds, lints and links; awaiting live use |
 | Bluetooth Classic (RFCOMM) transport | Live-verified Mac ↔ Win11 on a fixed channel with pairing required; SDP lookup does not work from macOS |
 | Bluetooth LE transport | Works, but slower than serial; kept as a fallback |
-| Multi-file clipboard, directories, video | Out of scope by design |
+| Multi-file clipboard, directories, smooth video | Out of scope by design |
 
 ## License
 

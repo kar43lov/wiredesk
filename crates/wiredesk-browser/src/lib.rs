@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use wiredesk_protocol::message::Message;
 use wiredesk_protocol::packet::MAX_PAYLOAD;
 
+mod request;
+use request::RequestSocket;
+pub use request::{request_body, RequestHandler};
+
 pub const PORT: u16 = 19222;
 pub const MAX_STREAMS: usize = 8;
 pub const CHUNK: usize = MAX_PAYLOAD - 13;
@@ -23,6 +27,7 @@ pub const ACK: u8 = 4;
 pub const FIN: u8 = 5;
 pub const RESET: u8 = 6;
 pub const FIN_ACK: u8 = 7;
+pub const OPEN_DESKTOP: u8 = 8;
 const RETRY: Duration = Duration::from_secs(2);
 const STALL: Duration = Duration::from_secs(30);
 
@@ -49,6 +54,7 @@ pub struct Hub {
     epoch: u64,
     target: SocketAddr,
     credit: Arc<AtomicUsize>,
+    desktop: Option<RequestHandler>,
 }
 
 impl Default for Hub {
@@ -61,11 +67,18 @@ impl Default for Hub {
             epoch: 0,
             target: SocketAddr::from((Ipv4Addr::LOCALHOST, PORT)),
             credit: Arc::new(AtomicUsize::new(0)),
+            desktop: None,
         }
     }
 }
 
 impl Hub {
+    /// In-process endpoint only: desktop access never opens a host TCP port.
+    pub fn with_desktop(handler: RequestHandler) -> Self {
+        let mut hub = Self::default();
+        hub.desktop = Some(handler);
+        hub
+    }
     pub fn reset(&mut self) {
         for endpoint in self.streams.values() {
             endpoint.stop.store(true, Ordering::Release);
@@ -86,11 +99,19 @@ impl Hub {
         if id == 0 || self.active() >= MAX_STREAMS || self.streams.contains_key(&id) {
             return false;
         }
-        self.spawn(id, Some(stream), initial);
+        self.spawn(id, Some(stream), initial, OPEN);
         true
     }
 
-    fn spawn(&mut self, id: u32, socket: Option<TcpStream>, initial: Vec<u8>) {
+    pub fn attach_desktop(&mut self, id: u32, stream: TcpStream, initial: Vec<u8>) -> bool {
+        if id == 0 || self.active() >= MAX_STREAMS || self.streams.contains_key(&id) {
+            return false;
+        }
+        self.spawn(id, Some(stream), initial, OPEN_DESKTOP);
+        true
+    }
+
+    fn spawn(&mut self, id: u32, socket: Option<TcpStream>, initial: Vec<u8>, open_kind: u8) {
         let (input, rx) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -98,6 +119,13 @@ impl Hub {
         let tx = self.sender.clone();
         let source = match socket {
             Some(socket) => SocketSource::Accepted(socket),
+            None if open_kind == OPEN_DESKTOP => {
+                let Some(handler) = self.desktop.clone() else {
+                    let _ = tx.try_send((epoch, frame(id, RESET, 0, vec![])));
+                    return;
+                };
+                SocketSource::Request(RequestSocket::new(handler))
+            }
             None => SocketSource::Connect(self.target),
         };
         let link = WorkerLink {
@@ -115,7 +143,7 @@ impl Hub {
             },
         );
         thread::spawn(move || {
-            if let Err(e) = worker(id, source, initial, &rx, &link) {
+            if let Err(e) = worker(id, source, initial, &rx, &link, open_kind) {
                 log::debug!("browser stream {id}: {e}");
                 let _ = link.output.try_send((epoch, frame(id, RESET, 0, vec![])));
             }
@@ -135,11 +163,11 @@ impl Hub {
             }
             return;
         }
-        if host && kind == OPEN {
+        if host && matches!(kind, OPEN | OPEN_DESKTOP) {
             if let Some(e) = self.streams.get(&id) {
                 let _ = e.input.try_send(msg);
             } else if self.active() < MAX_STREAMS {
-                self.spawn(id, None, vec![]);
+                self.spawn(id, None, vec![], kind);
             } else {
                 let _ = self
                     .sender
@@ -208,6 +236,25 @@ impl Receive {
 enum SocketSource {
     Accepted(TcpStream),
     Connect(SocketAddr),
+    Request(RequestSocket),
+}
+
+trait WireSocket: Read + Write {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+impl WireSocket for TcpStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+impl WireSocket for RequestSocket {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        if matches!(how, Shutdown::Write) {
+            self.shutdown_write()
+        } else {
+            Ok(())
+        }
+    }
 }
 
 struct WorkerLink {
@@ -242,21 +289,28 @@ fn worker(
     initial: Vec<u8>,
     input: &mpsc::Receiver<Message>,
     link: &WorkerLink,
+    open_kind: u8,
 ) -> io::Result<()> {
     let output = &link.output;
     let epoch = link.epoch;
     let stop = &link.stop;
-    let host = matches!(socket, SocketSource::Connect(_));
-    let mut socket = match socket {
-        SocketSource::Accepted(s) => s,
-        SocketSource::Connect(target) => {
-            TcpStream::connect_timeout(&target, Duration::from_millis(500))?
+    let host = !matches!(socket, SocketSource::Accepted(_));
+    let mut socket: Box<dyn WireSocket> = match socket {
+        SocketSource::Accepted(s) => {
+            s.set_nonblocking(true)?;
+            s.set_nodelay(true)?;
+            Box::new(s)
         }
+        SocketSource::Connect(target) => {
+            let s = TcpStream::connect_timeout(&target, Duration::from_millis(500))?;
+            s.set_nonblocking(true)?;
+            s.set_nodelay(true)?;
+            Box::new(s)
+        }
+        SocketSource::Request(s) => Box::new(s),
     };
-    socket.set_nonblocking(true)?;
-    socket.set_nodelay(true)?;
     let mut ready = host;
-    let mut queued = VecDeque::from([frame(id, if host { READY } else { OPEN }, 0, vec![])]);
+    let mut queued = VecDeque::from([frame(id, if host { READY } else { open_kind }, 0, vec![])]);
     let mut initial = initial.into_iter();
     let mut send_offset = 0u64;
     let mut flight: Option<(Vec<u8>, Instant, Credit)> = None;
@@ -298,7 +352,7 @@ fn worker(
                 };
                 match kind {
                     RESET => return Ok(()),
-                    OPEN if host => queued.push_back(frame(id, READY, 0, vec![])),
+                    OPEN | OPEN_DESKTOP if host => queued.push_back(frame(id, READY, 0, vec![])),
                     READY if !host => {
                         ready = true;
                         progress = Instant::now();
@@ -399,7 +453,7 @@ fn worker(
                 fin_sent = Some(Instant::now());
             }
             if !ready && open_sent.elapsed() >= RETRY {
-                queued.push_back(frame(id, OPEN, 0, vec![]));
+                queued.push_back(frame(id, open_kind, 0, vec![]));
                 open_sent = Instant::now();
             }
         }
@@ -424,6 +478,91 @@ fn worker(
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn desktop_stream_uses_memory_endpoint_and_recovers_a_lost_open() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut host = Hub::with_desktop(Arc::new(|raw| {
+            assert_eq!(request_body(raw)?.unwrap().0, "GET /desktop/frame HTTP/1.1");
+            Ok(vec![7; 64000])
+        }));
+        let mut client = Hub::default();
+        let address = listener.local_addr().unwrap();
+        let user = thread::spawn(move || {
+            let mut s = TcpStream::connect(address).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+            s.write_all(b"GET /desktop/frame HTTP/1.1\r\n\r\n").unwrap();
+            s.shutdown(Shutdown::Write).unwrap();
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, vec![7; 64000]);
+        });
+        assert!(client.attach_desktop(1, listener.accept().unwrap().0, vec![]));
+        let start = Instant::now();
+        let mut lost = false;
+        while !user.is_finished() && start.elapsed() < Duration::from_secs(7) {
+            for _ in 0..16 {
+                if let Some(m) = client.poll() {
+                    if matches!(
+                        m,
+                        Message::Browser {
+                            kind: OPEN_DESKTOP,
+                            ..
+                        }
+                    ) && !lost
+                    {
+                        lost = true;
+                    } else {
+                        host.dispatch(m, true);
+                    }
+                }
+                if let Some(m) = host.poll() {
+                    client.dispatch(m, false);
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(lost);
+        assert!(user.is_finished());
+        user.join().unwrap();
+        assert_eq!(host.target, SocketAddr::from((Ipv4Addr::LOCALHOST, PORT)));
+    }
+
+    #[test]
+    fn incomplete_desktop_request_releases_stream_after_peer_eof() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut user = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        user.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut host = Hub::with_desktop(Arc::new(|_| panic!("incomplete request must not run")));
+        let mut client = Hub::default();
+        let request = b"POST /desktop/input HTTP/1.1\r\nContent-Length: 20\r\n\r\n{";
+        assert!(client.attach_desktop(1, listener.accept().unwrap().0, request.to_vec()));
+        user.shutdown(Shutdown::Write).unwrap();
+        let start = Instant::now();
+        let mut opened = false;
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Some(m) = client.poll() {
+                opened = true;
+                host.dispatch(m, true);
+            }
+            if let Some(m) = host.poll() {
+                client.dispatch(m, false);
+            }
+            if opened && host.active() == 0 && client.active() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(opened);
+        assert_eq!(host.active(), 0);
+        assert_eq!(client.active(), 0);
+        match user.read(&mut [0u8; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            result => panic!("closed desktop stream expected, got {result:?}"),
+        }
+    }
 
     #[test]
     fn bidirectional_tcp_recovers_lost_packets_and_acks_without_duplicates() {

@@ -1,7 +1,7 @@
 //! Authenticated loopback CDP gateway. Never exposes a general TCP forward.
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use wiredesk_browser::Hub;
 
 const MAX_HEADER: usize = 16 * 1024;
 const PANEL: &str = include_str!("panel.html");
+const DESKTOP_JS: &str = include_str!("desktop.js");
 
 fn header(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -78,7 +79,14 @@ fn authenticate(raw: &[u8], token: &str, port: u16) -> io::Result<Vec<u8>> {
         let value = value.trim();
         if name.eq_ignore_ascii_case("host") {
             hosts += 1;
-            if value != format!("127.0.0.1:{port}") && value != format!("localhost:{port}") {
+            if value != format!("127.0.0.1:{port}")
+                && value != format!("localhost:{port}")
+                && !(port == 19223
+                    && matches!(
+                        value,
+                        "wiredesk.localhost:19223" | "wiredesk.localhost" | "wiredesk.localhost:80"
+                    ))
+            {
                 return Err(io::Error::other("invalid Host"));
             }
         }
@@ -91,7 +99,11 @@ fn authenticate(raw: &[u8], token: &str, port: u16) -> io::Result<Vec<u8>> {
             continue;
         }
         if name.eq_ignore_ascii_case("origin") {
-            if value != "http://127.0.0.1:19223" && value != "http://localhost:19223" {
+            if value != "http://127.0.0.1:19223"
+                && value != "http://localhost:19223"
+                && value != crate::VIEWER_URL.trim_end_matches('/')
+                && value != crate::VIEWER_URL_WITH_PORT.trim_end_matches('/')
+            {
                 return Err(io::Error::other("invalid Origin"));
             }
             // Chrome need not enable remote-allow-origins. Our token check
@@ -167,20 +179,27 @@ fn read_discovery<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
 /// Listeners are acquired before starting either thread: partial startup
 /// must not leave one port alive after a bind failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn start(hub: Arc<Mutex<Hub>>, alive: Arc<AtomicBool>, token: String) -> io::Result<()> {
-    let cdp = TcpListener::bind((Ipv4Addr::LOCALHOST, 19222))?;
-    let panel = TcpListener::bind((Ipv4Addr::LOCALHOST, 19223))?;
-    cdp.set_nonblocking(true)?;
-    panel.set_nonblocking(true)?;
+pub fn start(
+    hub: Arc<Mutex<Hub>>,
+    alive: Arc<AtomicBool>,
+    token: String,
+    host_version: Arc<AtomicU8>,
+    listeners: [(TcpListener, u16); 2],
+) -> io::Result<Vec<thread::JoinHandle<()>>> {
+    for (listener, _) in &listeners {
+        listener.set_nonblocking(true)?;
+    }
+    let mut threads = Vec::new();
     let ids = Arc::new(AtomicU32::new(1));
     let active_headers = Arc::new(AtomicUsize::new(0));
-    for (listener, port) in [(cdp, 19222), (panel, 19223)] {
+    for (listener, port) in listeners {
         let hub = hub.clone();
         let alive = alive.clone();
         let token = token.clone();
         let ids = ids.clone();
+        let host_version = host_version.clone();
         let active_headers = active_headers.clone();
-        thread::spawn(move || {
+        threads.push(thread::spawn(move || {
             while alive.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -192,6 +211,7 @@ pub fn start(hub: Arc<Mutex<Hub>>, alive: Arc<AtomicBool>, token: String) -> io:
                         let alive = alive.clone();
                         let token = token.clone();
                         let ids = ids.clone();
+                        let host_version = host_version.clone();
                         let active_headers = active_headers.clone();
                         thread::spawn(move || {
                             let result = header(&mut stream).and_then(|raw| {
@@ -203,11 +223,36 @@ pub fn start(hub: Arc<Mutex<Hub>>, alive: Arc<AtomicBool>, token: String) -> io:
                                         PANEL.as_bytes(),
                                     );
                                 }
+                                if port == 19223 && raw.starts_with(b"GET /desktop.js HTTP/1.1\r\n")
+                                {
+                                    return reply(
+                                        &mut stream,
+                                        "200 OK",
+                                        "text/javascript; charset=utf-8",
+                                        DESKTOP_JS.as_bytes(),
+                                    );
+                                }
                                 let initial = authenticate(&raw, &token, port)?;
                                 if !alive.load(Ordering::Acquire) {
                                     return Ok(());
                                 }
-                                if port == 19223 {
+                                let desktop = port == 19223
+                                    && (initial.starts_with(b"GET /desktop/frame HTTP/1.1\r\n")
+                                        || initial
+                                            .starts_with(b"POST /desktop/input HTTP/1.1\r\n"));
+                                if desktop
+                                    && !wiredesk_protocol::message::desktop_supported(
+                                        host_version.load(Ordering::Acquire),
+                                    )
+                                {
+                                    return reply(
+                                        &mut stream,
+                                        "412 Precondition Failed",
+                                        "text/plain",
+                                        b"Update Windows WireDesk host for desktop mode",
+                                    );
+                                }
+                                if port == 19223 && !desktop {
                                     if !initial.starts_with(b"GET /targets HTTP/1.1\r\n") {
                                         return Err(io::Error::other("unknown viewer path"));
                                     }
@@ -220,8 +265,16 @@ pub fn start(hub: Arc<Mutex<Hub>>, alive: Arc<AtomicBool>, token: String) -> io:
                                     }
                                     // Timeout settings are superseded by the
                                     // hub's nonblocking socket worker.
-                                    if !hub.lock().unwrap().attach(id, stream.try_clone()?, initial)
-                                    {
+                                    let mut hub = hub.lock().unwrap();
+                                    if !alive.load(Ordering::Acquire) {
+                                        return Ok(());
+                                    }
+                                    let attached = if desktop {
+                                        hub.attach_desktop(id, stream.try_clone()?, initial)
+                                    } else {
+                                        hub.attach(id, stream.try_clone()?, initial)
+                                    };
+                                    if !attached {
                                         return Err(io::Error::other(
                                             "browser connection limit reached",
                                         ));
@@ -241,7 +294,7 @@ pub fn start(hub: Arc<Mutex<Hub>>, alive: Arc<AtomicBool>, token: String) -> io:
                         });
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5))
+                        thread::sleep(Duration::from_millis(50))
                     }
                     Err(_) => {
                         alive.store(false, Ordering::Release);
@@ -249,14 +302,52 @@ pub fn start(hub: Arc<Mutex<Hub>>, alive: Arc<AtomicBool>, token: String) -> io:
                     }
                 }
             }
-        });
+        }));
     }
-    Ok(())
+    Ok(threads)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_requires_owner_key_and_generation_before_opening_stream() {
+        let cdp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let viewer = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = viewer.local_addr().unwrap();
+        let alive = Arc::new(AtomicBool::new(true));
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let workers = start(
+            hub.clone(),
+            alive.clone(),
+            "secret".into(),
+            Arc::new(AtomicU8::new(4)),
+            [(cdp, 19222), (viewer, 19223)],
+        )
+        .unwrap();
+        for (authorization, expected) in [
+            ("", 403),
+            ("Authorization: Bearer wrong\r\n", 403),
+            ("Authorization: Bearer secret\r\n", 412),
+        ] {
+            let mut s = TcpStream::connect(address).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            write!(
+                s,
+                "GET /desktop/frame HTTP/1.1\r\nHost: localhost:19223\r\n{authorization}\r\n"
+            )
+            .unwrap();
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.starts_with(format!("HTTP/1.1 {expected} ").as_bytes()));
+        }
+        assert_eq!(hub.lock().unwrap().active(), 0);
+        assert!(hub.lock().unwrap().poll().is_none());
+        alive.store(false, Ordering::Release);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
     #[test]
     fn discovery_uses_content_length_without_waiting_for_eof() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -313,5 +404,66 @@ mod tests {
             "GET /?token=secret HTTP/1.1\r\nHost: evil.example:19222\r\n\r\n",
             "GET /?token=secret HTTP/1.1\r\nHost: 127.0.0.1:19222\r\nOrigin: https://evil.example\r\n\r\n",
         ] { assert!(authenticate(request.as_bytes(), "secret", 19222).is_err()); }
+    }
+
+    #[test]
+    fn local_domain_requires_key_and_rejects_lookalikes() {
+        let request = "GET /targets HTTP/1.1\r\nHost: wiredesk.localhost:19223\r\nAuthorization: Bearer secret\r\n\r\n";
+        assert!(authenticate(request.as_bytes(), "secret", 19223).is_ok());
+        for host in ["wiredesk.localhost", "wiredesk.localhost:80"] {
+            let bare = request.replace("wiredesk.localhost:19223", host);
+            assert!(authenticate(bare.as_bytes(), "secret", 19223).is_ok());
+            assert!(authenticate(bare.as_bytes(), "secret", 19222).is_err());
+            assert!(authenticate(
+                bare.replace("Authorization: Bearer secret\r\n", "")
+                    .as_bytes(),
+                "secret",
+                19223
+            )
+            .is_err());
+        }
+        assert!(authenticate(
+            request
+                .replace("Authorization: Bearer secret\r\n", "")
+                .as_bytes(),
+            "secret",
+            19223
+        )
+        .is_err());
+        for host in [
+            "wiredesk.localhost.evil.example:19223",
+            "evil.wiredesk.localhost:19223",
+        ] {
+            assert!(authenticate(
+                request.replace("wiredesk.localhost:19223", host).as_bytes(),
+                "secret",
+                19223
+            )
+            .is_err());
+        }
+        let ws = "GET /devtools/page/1?token=secret HTTP/1.1\r\nHost: 127.0.0.1:19222\r\nOrigin: http://wiredesk.localhost:19223\r\n\r\n";
+        let forwarded =
+            String::from_utf8(authenticate(ws.as_bytes(), "secret", 19222).unwrap()).unwrap();
+        assert!(!forwarded.contains("secret") && !forwarded.contains("Origin:"));
+        assert!(authenticate(
+            ws.replace(
+                "http://wiredesk.localhost:19223",
+                "http://wiredesk.localhost"
+            )
+            .as_bytes(),
+            "secret",
+            19222
+        )
+        .is_ok());
+        assert!(authenticate(
+            ws.replace(
+                "http://wiredesk.localhost:19223",
+                "http://wiredesk.localhost.evil.example:19223"
+            )
+            .as_bytes(),
+            "secret",
+            19222
+        )
+        .is_err());
     }
 }

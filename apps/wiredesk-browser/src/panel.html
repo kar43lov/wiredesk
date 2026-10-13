@@ -1,13 +1,14 @@
 <!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WireDesk — браузер</title><style>
 body{margin:0;background:#edf1f5;color:#203044;font:15px system-ui}header{display:flex;gap:10px;align-items:center;padding:12px 18px;background:#173c61;color:white;flex-wrap:wrap}h1{font-size:18px;margin:0 12px 0 0}input,select,button{padding:8px;border:1px solid #bac7d3;border-radius:5px;font:inherit}button{cursor:pointer}#url{flex:1;min-width:180px}#status{padding:10px 18px}main{padding:0 18px 18px}#screen{display:block;max-width:100%;background:white;border:1px solid #c5cfda;cursor:default}#screen:focus{outline:3px solid #2986ce}#token{width:280px}#text{min-width:250px}small{padding:0 18px;display:block;margin-bottom:10px}
-</style><header><h1>WireDesk · браузер</h1><input id="token" type="password" placeholder="Токен из browser-token" autocomplete="off"><button id="connect">Подключиться</button><select id="tabs"></select><button id="refresh">Обновить вкладки</button></header>
+</style><header><h1>WireDesk</h1><select id="mode" aria-label="Режим"><option value="browser">Браузер</option><option value="desktop">Экран Windows</option></select><input id="token" type="password" placeholder="Токен из browser-token" autocomplete="off"><button id="connect">Подключиться</button><select id="tabs"></select><button id="refresh">Обновить вкладки</button></header>
 <header><button id="back" aria-label="Назад">←</button><button id="forward" aria-label="Вперёд">→</button><input id="url" placeholder="Адрес страницы"><button id="go">Открыть</button><input id="text" placeholder="Текст в выбранное поле"><button id="type">Ввести</button><button id="frame">Обновить экран</button><label><input id="auto" type="checkbox"> Автообновление</label></header>
-<div id="status" role="status">Запустите wd-browser и подключите браузер на Windows.</div><small>Клик и прокрутка — по изображению. Для клавиатуры сначала нажмите на изображение. Автообновление включается отдельно.</small><main><img id="screen" tabindex="0" alt="Удалённая вкладка"></main>
+<div id="status" role="status">Подключите WireDesk и браузер на Windows.</div><small>Клик и прокрутка — по изображению. Для клавиатуры сначала нажмите на изображение. Автообновление включается отдельно.</small><main><img id="screen" tabindex="0" alt="Удалённая вкладка"></main>
 <script>
 const $ = id => document.getElementById(id);
-let ws, seq = 0, pending = new Map(), busy = false, dirty = false, imageSocket;
+let ws, seq = 0, pending = new Map(), busy = false, dirty = false, imageSocket, reconnectTimer;
 let mouseQueue = Promise.resolve(), nextMove, moving = false, pressed = false, hoverTimer;
+let viewerEpoch = 0;
 const viewport = { width: 1280, height: 800 };
 const status = text => $('status').textContent = text;
 const token = () => $('token').value.trim();
@@ -25,13 +26,20 @@ function command(method, params = {}, connection = ws) {
 function disconnected() {
   imageSocket = undefined; nextMove = undefined; pressed = false;
   for (const p of pending.values()) { clearTimeout(p.timer); p.reject(Error('Соединение закрыто')); }
-  pending.clear(); status('Соединение закрыто. Проверьте WireDesk и обновите вкладки.');
+  pending.clear(); status('Соединение закрыто. Подключение восстановится автоматически.');
+}
+function reconnect() {
+  clearTimeout(reconnectTimer);
+  if (token()) reconnectTimer = setTimeout(tabs, 2000);
 }
 async function tabs() {
+  const epoch = viewerEpoch;
+  clearTimeout(reconnectTimer);
   try {
     const r = await fetch('/targets', { headers: { Authorization: 'Bearer ' + token() } });
     if (!r.ok) throw Error('Проверьте токен и браузер на Windows');
     const list = (await r.json()).filter(t => t.type === 'page');
+    if (epoch !== viewerEpoch) return;
     $('tabs').replaceChildren();
     for (const t of list) {
       const o = document.createElement('option'); o.value = t.webSocketDebuggerUrl;
@@ -39,7 +47,7 @@ async function tabs() {
     }
     if (!list.length) throw Error('Нет открытых вкладок');
     await selectTab();
-  } catch (e) { status(e.message); }
+  } catch (e) { if (epoch === viewerEpoch) { status(e.message); reconnect(); } }
 }
 async function selectTab() {
   if (ws) { ws.onclose = null; ws.close(); disconnected(); }
@@ -55,7 +63,7 @@ async function selectTab() {
       m.error ? p.reject(Error(m.error.message)) : p.resolve(m.result);
     }
   };
-  connection.onclose = () => { if (connection === ws) disconnected(); };
+  connection.onclose = () => { if (connection === ws) { disconnected(); reconnect(); } };
   connection.onerror = () => { if (connection === ws) status('Ошибка соединения с вкладкой'); };
   connection.onopen = async () => {
     try {
@@ -152,4 +160,5 @@ $('screen').onkeydown = e => {
   });
 };
 setInterval(() => { if ($('auto').checked && ws?.readyState === 1 && !busy) screenshot(); }, 1000);
-</script></html>
+if (fragmentToken) tabs();
+</script><script src="/desktop.js"></script></html>

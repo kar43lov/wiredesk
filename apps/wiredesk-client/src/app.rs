@@ -380,6 +380,18 @@ pub struct WireDeskApp {
     /// duplicates after a successful reconnect). `None` only in unit tests
     /// that construct the app without a supervisor.
     reconnect_request_tx: Option<mpsc::Sender<()>>,
+    #[cfg(target_os = "macos")]
+    browser_service: Option<wiredesk_browser_cli::Service>,
+    #[cfg(target_os = "macos")]
+    desktop_view: Option<crate::desktop_view::DesktopView>,
+    #[cfg(target_os = "macos")]
+    desktop_fullscreen: bool,
+    #[cfg(target_os = "macos")]
+    desktop_capture_pending: bool,
+    #[cfg(target_os = "macos")]
+    browser_error: Option<String>,
+    #[cfg(target_os = "macos")]
+    browser_clipboard_state: Option<crate::clipboard::ClipboardState>,
 }
 
 // ---- UI palette / sizing constants ---------------------------------------
@@ -635,6 +647,18 @@ impl WireDeskApp {
             incoming_cancel,
             transient_toast: None,
             reconnect_request_tx: None,
+            #[cfg(target_os = "macos")]
+            browser_service: None,
+            #[cfg(target_os = "macos")]
+            desktop_view: None,
+            #[cfg(target_os = "macos")]
+            desktop_fullscreen: false,
+            #[cfg(target_os = "macos")]
+            desktop_capture_pending: false,
+            #[cfg(target_os = "macos")]
+            browser_error: None,
+            #[cfg(target_os = "macos")]
+            browser_clipboard_state: None,
         }
     }
 
@@ -644,6 +668,19 @@ impl WireDeskApp {
     /// the app without a live supervisor.
     pub fn set_reconnect_request_tx(&mut self, tx: mpsc::Sender<()>) {
         self.reconnect_request_tx = Some(tx);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_browser_service(
+        &mut self,
+        result: std::io::Result<wiredesk_browser_cli::Service>,
+        clipboard_state: crate::clipboard::ClipboardState,
+    ) {
+        self.browser_clipboard_state = Some(clipboard_state);
+        match result {
+            Ok(service) => { self.desktop_view = Some(crate::desktop_view::DesktopView::new(service.desktop_client())); self.browser_service = Some(service); },
+            Err(e) => self.browser_error = Some(format!("Браузерный доступ не запущен: {e}. Если работает отдельный wd-browser, закройте его и перезапустите WireDesk.")),
+        }
     }
 
     /// Seed the geometry tracker with the rectangle `main()` handed to
@@ -1053,6 +1090,30 @@ impl WireDeskApp {
                 );
             });
 
+            // ---- Browser group ----
+            #[cfg(target_os = "macos")]
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Браузер через Windows").strong());
+                ui.monospace(self.browser_service.as_ref().map_or(wiredesk_browser_cli::VIEWER_URL_WITH_PORT, |service| service.viewer_url()));
+                if let Some(service) = &self.browser_service {
+                    ui.label(service.status());
+                    ui.horizontal(|ui| {
+                        if ui.button("Открыть браузер").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(service.access_url()));
+                        }
+                        if ui.button("Скопировать ссылку").on_hover_text("Ссылка содержит ключ доступа. Не передавайте её другим людям.").clicked() {
+                            let message = match crate::clipboard::locked_copy_local_text(service.access_url(), self.browser_clipboard_state.as_ref().unwrap()) {
+                                Ok(()) => "Ссылка скопирована".to_owned(),
+                                Err(e) => format!("Не удалось скопировать ссылку: {e}"),
+                            };
+                            self.save_toast = Some((message, Instant::now()));
+                        }
+                    });
+                } else if let Some(error) = &self.browser_error {
+                    ui.label(error);
+                }
+            });
+
             // ---- System group ----
             ui.group(|ui| {
                 ui.label(egui::RichText::new("System").strong());
@@ -1184,7 +1245,65 @@ impl WireDeskApp {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn toggle_desktop_fullscreen(&mut self, ctx: &egui::Context) {
+        if self.desktop_fullscreen {
+            self.stop_desktop_fullscreen();
+            if self.fullscreen {
+                self.toggle_fullscreen(ctx);
+            }
+            if self.capturing {
+                self.toggle_capture();
+            }
+            return;
+        }
+        let Some(view) = &mut self.desktop_view else {
+            return;
+        };
+        view.start();
+        self.desktop_fullscreen = true;
+        if !self.fullscreen {
+            self.toggle_fullscreen(ctx);
+        }
+        // Wait for the first visible frame before sending input to Windows.
+        if self.capturing {
+            self.toggle_capture();
+        }
+        self.desktop_capture_pending = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop_desktop_fullscreen(&mut self) {
+        self.desktop_fullscreen = false;
+        self.desktop_capture_pending = false;
+        if let Some(view) = &mut self.desktop_view {
+            view.enabled = false;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconcile_desktop_capture(&mut self, frame_ready: bool) {
+        if frame_ready
+            && self.desktop_capture_pending
+            && self.permission_granted
+            && self.state == ConnectionState::Connected
+            && self.desktop_fullscreen
+            && self.fullscreen
+        {
+            if !self.capturing {
+                self.toggle_capture();
+            }
+            self.desktop_capture_pending = false;
+        } else if !frame_ready && self.capturing {
+            self.toggle_capture();
+        }
+    }
+
     fn toggle_capture(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.desktop_capture_pending = false;
+        }
         self.capturing = !self.capturing;
         if self.capturing {
             self.status_msg = "input captured (Cmd+Esc to release)".into();
@@ -1903,6 +2022,10 @@ impl WireDeskApp {
         // input goes nowhere — surface that loudly with a yellow banner so the
         // (now-frozen) Host view isn't mistaken for a live session.
         let link_lost = self.state != ConnectionState::Connected;
+        #[cfg(target_os = "macos")]
+        let desktop_mode = self.desktop_fullscreen;
+        #[cfg(not(target_os = "macos"))]
+        let desktop_mode = false;
         let (banner_fill, banner_text) = if link_lost {
             (
                 egui::Color32::from_rgb(180, 140, 0).linear_multiply(0.35),
@@ -1911,7 +2034,15 @@ impl WireDeskApp {
         } else {
             (
                 COLOR_CAPTURE_RED.linear_multiply(0.3),
-                "CAPTURING — Cmd+Esc to release",
+                if desktop_mode {
+                    if self.capturing {
+                        "Экран Windows — Ctrl+Cmd+Enter: выйти · Cmd+Esc: отпустить ввод"
+                    } else {
+                        "Экран Windows — ввод отпущен · Ctrl+Cmd+Enter: выйти"
+                    }
+                } else {
+                    "CAPTURING — Cmd+Esc to release"
+                },
             )
         };
 
@@ -2090,6 +2221,7 @@ impl WireDeskApp {
 
 impl eframe::App for WireDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let capturing_at_start = self.capturing;
         // Process transport events. Drain into a local Vec first so we can
         // call &mut self helpers without conflicting with the rx borrow.
         let mut pending: Vec<TransportEvent> = Vec::new();
@@ -2121,6 +2253,10 @@ impl eframe::App for WireDeskApp {
                     // emitting this event, so the status row starts clean.
                 }
                 TransportEvent::Disconnected(reason) => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.desktop_capture_pending = false;
+                    }
                     self.state = ConnectionState::Disconnected;
                     self.capturing = false;
                     self.status_msg = format!("disconnected: {reason}");
@@ -2194,6 +2330,10 @@ impl eframe::App for WireDeskApp {
         self.sync_tap_to_focus(ctx);
         self.sync_fullscreen_level(ctx);
         self.sync_fullscreen_state(ctx);
+        #[cfg(target_os = "macos")]
+        if self.desktop_fullscreen && !self.fullscreen {
+            self.stop_desktop_fullscreen();
+        }
         self.drain_pending_position_restore(ctx);
         self.reapply_dock_icon_if_needed();
         self.rescue_offscreen_window(ctx);
@@ -2209,6 +2349,10 @@ impl eframe::App for WireDeskApp {
         for ev in pending_tap_events {
             match ev {
                 TapEvent::ReleaseCapture => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.desktop_capture_pending = false;
+                    }
                     if self.capturing {
                         self.toggle_capture();
                     }
@@ -2221,11 +2365,19 @@ impl eframe::App for WireDeskApp {
                 TapEvent::ToggleFullscreen => {
                     self.toggle_fullscreen(ctx);
                 }
+                TapEvent::ToggleDesktopFullscreen => {
+                    #[cfg(target_os = "macos")]
+                    self.toggle_desktop_fullscreen(ctx);
+                }
             }
         }
 
         let show_chrome = self.should_show_chrome();
         let permission_granted = self.permission_granted;
+        #[cfg(target_os = "macos")]
+        let desktop_enabled = self.desktop_view.as_ref().is_some_and(|v| v.enabled);
+        #[cfg(not(target_os = "macos"))]
+        let desktop_enabled = false;
 
         // In capture mode banner / progress / info-text all live in
         // overlays so they don't occlude Host's top row coordinate-
@@ -2234,10 +2386,23 @@ impl eframe::App for WireDeskApp {
         // full Host display in both windowed and fullscreen capture.
         if !show_chrome {
             self.render_capture_overlays(ctx);
-            self.render_capture_info_text(ctx);
+            if !desktop_enabled {
+                self.render_capture_info_text(ctx);
+            }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let mut panel = egui::CentralPanel::default();
+        if desktop_enabled {
+            panel = panel.frame(egui::Frame::NONE);
+        }
+        panel.show(ctx, |ui| {
+            #[cfg(target_os = "macos")]
+            if desktop_enabled {
+                if let Some(view) = &mut self.desktop_view {
+                    view.draw(ui);
+                }
+                return;
+            }
             if !show_chrome {
                 return;
             }
@@ -2387,9 +2552,26 @@ impl eframe::App for WireDeskApp {
                         egui::Button::new(egui::RichText::new(btn_text).size(16.0).strong())
                             .fill(btn_fill)
                             .min_size(CAPTURE_BTN_MIN_SIZE);
-                    if ui.add(capture_btn).clicked() {
-                        self.toggle_capture();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.add(capture_btn).clicked() {
+                            self.toggle_capture();
+                        }
+                        #[cfg(target_os = "macos")]
+                        if self.desktop_view.is_some()
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Экран Windows").size(16.0).strong(),
+                                    )
+                                    .fill(COLOR_CAPTURE_BLUE)
+                                    .min_size(CAPTURE_BTN_MIN_SIZE),
+                                )
+                                .on_hover_text("Control+Command+Enter — открыть / закрыть")
+                                .clicked()
+                        {
+                            self.toggle_desktop_fullscreen(ctx);
+                        }
+                    });
                     let capture_label = if self.capturing {
                         "Input: CAPTURED (Cmd+Esc to release)"
                     } else {
@@ -2492,7 +2674,24 @@ impl eframe::App for WireDeskApp {
         });
 
         // Handle captured input — push to outgoing channel (non-blocking).
-        if self.capturing && self.state == ConnectionState::Connected {
+        #[cfg(target_os = "macos")]
+        {
+            let size = if desktop_enabled {
+                self.desktop_view.as_ref().and_then(|v| v.frame_size())
+            } else {
+                Some([self.screen_w, self.screen_h])
+            };
+            if let Some([w, h]) = size {
+                self.mapper.set_screen_size(w, h);
+            }
+            if desktop_enabled {
+                self.reconcile_desktop_capture(size.is_some());
+            }
+        }
+        if self.capturing
+            && self.state == ConnectionState::Connected
+            && (!desktop_enabled || capturing_at_start)
+        {
             // When the OS-level keyboard hijack is running (a CGEventTap on
             // macOS, a low-level hook on Windows) it is the sole source of
             // key events — skip egui forwarding to avoid double KeyDown.
@@ -2508,6 +2707,17 @@ impl eframe::App for WireDeskApp {
                 ctx.input(|input: &egui::InputState| input.events.clone());
             let mouse_pos = ctx.input(|input: &egui::InputState| input.pointer.hover_pos());
             let screen_rect = ctx.screen_rect();
+
+            // Position must reach the host before a click in this frame.
+            if let Some(pos) = mouse_pos {
+                self.mapper.send_mouse_move(
+                    &self.outgoing_tx,
+                    pos.x,
+                    pos.y,
+                    screen_rect.width(),
+                    screen_rect.height(),
+                );
+            }
 
             for event in &events {
                 match event {
@@ -2547,16 +2757,6 @@ impl eframe::App for WireDeskApp {
                     }
                     _ => {}
                 }
-            }
-
-            if let Some(pos) = mouse_pos {
-                self.mapper.send_mouse_move(
-                    &self.outgoing_tx,
-                    pos.x,
-                    pos.y,
-                    screen_rect.width(),
-                    screen_rect.height(),
-                );
             }
         }
 
@@ -2632,6 +2832,30 @@ mod tests {
     fn chrome_shown_by_default() {
         let app = make_app();
         assert!(app.should_show_chrome());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_capture_waits_for_visible_frame_and_never_reengages_after_release() {
+        let mut app = make_app();
+        app.fullscreen = true;
+        app.desktop_fullscreen = true;
+        app.desktop_capture_pending = true;
+        app.permission_granted = true;
+        app.state = ConnectionState::Connected;
+        app.reconcile_desktop_capture(false);
+        assert!(!app.capturing);
+        assert!(app.desktop_capture_pending);
+        app.reconcile_desktop_capture(true);
+        assert!(app.capturing);
+        app.toggle_capture();
+        app.reconcile_desktop_capture(true);
+        assert!(!app.capturing);
+        app.desktop_capture_pending = true;
+        app.stop_desktop_fullscreen();
+        app.reconcile_desktop_capture(true);
+        assert!(!app.capturing);
+        assert!(!app.desktop_capture_pending);
     }
 
     #[test]

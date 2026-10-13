@@ -6,6 +6,27 @@
 
 ## Module maps
 
+### Desktop requests (generation 5)
+
+`Browser` opcode остаётся `0x50`; новый kind `OPEN_DESKTOP = 8` выбирает
+внутренний `RequestSocket`, а не произвольный TCP-адрес. `Hello.version = 1`
+не меняется, хост сообщает `HelloAck.version = 5`. Mac проверяет поколение
+до открытия потока; IPC повторяет проверку перед отправкой в канал.
+
+`apps/wiredesk-host/src/desktop.rs` принимает только запрос JPEG основного
+монитора и ограниченные JSON-действия ввода. GDI-захват и JPEG-сжатие идут
+на worker потока; shell-loop не блокируется. Данные в памяти, без файла,
+нового сетевого порта, shell или clipboard. Общий Hub ограничивает потоки
+и количество неподтверждённых чанков для браузера и экрана вместе.
+Неполный запрос при FIN возвращает RESET и освобождает поток.
+
+Mac-панель проверяет owner-key и точные Host/Origin перед открытием потока.
+Нативный viewer получает кадр через тот же защищённый localhost-маршрут,
+декодирует его вне GUI-потока и хранит только последний кадр. Ввод Mac-окна
+идёт прежним транспортом; mapper берёт пропорции фактического кадра.
+Каждый viewer запрашивает максимум один кадр за раз; выключенный viewer
+не создаёт запросов кадров. Подробности управления — `docs/browser.md`.
+
 ### Host (`apps/wiredesk-host/src/`)
 
 ```
@@ -221,14 +242,14 @@ crates/wiredesk-transport/src/bluetooth/
 **Threading.**
 - Отдельный thread `wiredesk-keyboard-tap` с CFRunLoop.
 - `CGEventTapCreate` с маской `KeyDown | KeyUp | FlagsChanged | TapDisabledByTimeout | TapDisabledByUserInput`.
-- Callback быстрый: проверяет `enabled: Arc<AtomicBool>` + `passive: Arc<AtomicBool>`. Три состояния: ACTIVE (intercept всё, Drop на Host) / PASSIVE (только Cmd+Esc и Cmd+Enter — отправляем `TapEvent::EngageCapture`/`ToggleFullscreen` в UI и Drop, остальное Keep) / IDLE (`enabled=false`, всё Keep — macOS видит ввод как обычно).
+- Callback быстрый: проверяет `enabled: Arc<AtomicBool>` + `passive: Arc<AtomicBool>`. Три состояния: ACTIVE (ввод на Host, локальные хоткеи перехватываются) / PASSIVE (Cmd+Esc, Cmd+Enter, Ctrl+Cmd+Enter отправляют TapEvent в UI; остальное Keep) / IDLE (обычный ввод Mac).
 - `CGEventFlags` приходят как полный bitmask текущего состояния модификаторов (не diff). `prev_flags: Arc<AtomicU64>` хранит прошлый bitmask, `cg_flag_change_to_scancodes(cur, prev)` выдаёт список (scancode, pressed) для отправки.
 - При `kCGEventTapDisabled*` — re-enable через сохранённый `CFMachPortRef` (как `usize` через `Arc<AtomicUsize>`, потому что raw pointer нужно протащить в callback closure).
 - Shutdown: `CFRunLoop` сохранён в `Arc<Mutex<Option<CFRunLoop>>>`. `Drop for TapHandle` вызывает `rl.stop()`, join потока с timeout 1с.
 
 **Focus-gating + passive mode.** `WireDeskApp::sync_tap_to_focus()` бежит в каждом `update()`, читает `ctx.input(|i| i.viewport().focused)` и синхронизирует через 3-стейт machine:
 - `(focused=true, capturing=true)` → `enable()` (ACTIVE) — всё на Host;
-- `(focused=true, capturing=false)` → `enable_passive()` (PASSIVE) — ловим только Cmd+Esc для engage и Cmd+Enter для fullscreen, остальное Mac обрабатывает сам. Без passive AppKit перехватывает Cmd+Esc как Cancel-button accelerator до того как egui увидит keypress, и engage capture хоткеем не работает.
+- `(focused=true, capturing=false)` → `enable_passive()` (PASSIVE) — ловим три локальных хоткея. При переходе из ACTIVE сначала вызывается `disable()`: удержанные модификаторы отпускаются на Host ровно один раз. Иначе их последующий FlagsChanged ушёл бы только в Mac, оставив Windows Ctrl нажатым. Без passive AppKit перехватывает Cmd+Esc как Cancel-button accelerator до egui.
 - `(focused=false, _)` → `disable()` (IDLE) — sticky-cleanup, отправляются KeyUp для нажатых модификаторов, чтобы Host не остался с залипшим Ctrl.
 
 **Cmd → Ctrl mapping.** Cmd OR Ctrl на Mac → Ctrl на Windows. Bit 20 (Command) или bit 18 (Control) в CGEventFlags — оба маппятся на единственный Win scancode 0x1D. Если оба нажаты одновременно — не дублируем press/release (см. тесты в `keymap::cg_flag_change_to_scancodes`).
@@ -238,10 +259,11 @@ crates/wiredesk-transport/src/bluetooth/
 |-------|--------|----------|
 | `Cmd+Esc` | `0x35` | Toggle capture (вкл/выкл) |
 | `Cmd+Enter` | `0x24` | Toggle fullscreen |
+| `Ctrl+Cmd+Enter` | `0x24` | Экран Windows на выбранном дисплее / выход |
 
-Оба перехватываются tap-callback'ом (через `is_release_capture` и `is_cmd_enter`) и не форвардятся на Host. Также детектятся в egui-input для случая когда tap не запущен (out-of-capture, пользователь нажал Cmd+Enter ещё до Capture).
+Хоткеи обрабатываются tap-callback'ом и не передаются на Host; требуется фокус окна WireDesk. Для Ctrl+Cmd+Enter отдельная защёлка поглощает повторы и соответствующий Return-up, даже если модификаторы уже отпущены. Desktop-режим использует прежний путь fullscreen с выбором дисплея; захват включается после первого кадра. Ошибка кадра или разрыв связи освобождает ввод, повторный захват — явным Cmd+Esc.
 
-**Файлы.** `apps/wiredesk-client/src/keyboard_tap.rs` (~440 строк), `keymap.rs::cgkeycode_to_scancode`, `keymap.rs::cg_flag_change_to_scancodes`. Deps: `core-graphics 0.25`, `core-foundation 0.10`, `accessibility-sys 0.1` под `cfg(target_os = "macos")`.
+**Файлы.** `apps/wiredesk-client/src/keyboard_tap.rs`, `keymap.rs::cgkeycode_to_scancode`, `keymap.rs::cg_flag_change_to_scancodes`. Deps: `core-graphics 0.25`, `core-foundation 0.10`, `accessibility-sys 0.1` под `cfg(target_os = "macos")`.
 
 ---
 

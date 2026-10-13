@@ -48,14 +48,14 @@ rustup update stable    # 11.09.2026 локально был 1.94, CI 1.98 → �
 - macOS Secure Input — поля паролей в любом приложении на Mac отключают CGEventTap системно
 - Accessibility permission требуется и привязана к binary
 - Файлы — single-file, ≤20 MB. Multi-file selection silently skip'ается (Phase 2 follow-up:…
-- Видео — никогда
+- Плавное видео — HDMI; «Экран Windows» передаёт JPEG основного монитора по запросу (host generation 5, Mac-окно и локальная панель, оба shell-слота свободны)
 - Save+Restart pattern: большинство changes в settings UI требуют перезапуск процесса
 - Mac autostart — не реализован (только manual launch из дока / Spotlight)
 - Автозапуск хоста на Windows работает только от администратора (UIPI режет `SendInput` в окна элевированных приложений), поэтому заводится задачей планировщика `ONLOGON` + `RL HIGHEST`, а не ключом `Run`; 🔴 exe при этом обязан лежать в каталоге, куда обычный пользователь писать не может, иначе автозапуск = локальный EoP
 - Outbound text debounce — ~400ms окно для physical Cmd+V (accepted limitation): debounce задерживает…
 - Outbound text debounce — mixed-format clipboard, image case (accepted limitation): если ОДИН clipboard-item…
 - Тот же race для файлов — FIXED (`main` `bf47aae`, 2026-07-01): Finder-копия файла лениво (200ms–9s…
-- Code signing / нотарификация .app — не делается
+- `.app` подписывается локальной identity `WireDesk Dev` (если установлена), иначе ad-hoc; нотарификации нет. Стабильная identity сохраняет Accessibility между пересборками — `docs/run.md`
 - Single-instance на Win'е: при втором запуске exe — открывается Settings существующего процесса (через named…
 - App icon в .exe embed'ится только при сборке на Windows (rc.exe / windres needed)
 - PTY-mode — только на Windows-host'е и только для интерактивного `wd`; `wd --exec` остаётся pipe-based (design choice)

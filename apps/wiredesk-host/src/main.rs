@@ -5,9 +5,11 @@
 // is finicky in the linker — being unconditional avoids surprises.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod browser_startup;
 mod clipboard;
 mod clipboard_files;
 mod config;
+mod desktop;
 mod injector;
 mod logging;
 mod session;
@@ -183,6 +185,8 @@ fn main() {
         counters.clone(),
         receive_files.clone(),
     );
+
+    browser_startup::start(cfg.start_browser);
 
     let last_status = Arc::new(Mutex::new(ui::status_bridge::StatusState::default()));
 
