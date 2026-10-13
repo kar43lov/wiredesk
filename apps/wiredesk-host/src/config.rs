@@ -19,6 +19,8 @@ pub struct HostConfig {
     pub height: u16,
     pub host_name: String,
     pub run_on_startup: bool,
+    /// Start the dedicated, unelevated Chrome profile for CDP on host boot.
+    pub start_browser: bool,
 
     /// Accept incoming files from Mac → Host. When false, an incoming
     /// `ClipOffer{format=FILE}` is rejected on receipt — the Mac side
@@ -74,6 +76,7 @@ impl Default for HostConfig {
             height: 1440,
             host_name: "wiredesk-host".to_string(),
             run_on_startup: false,
+            start_browser: false,
             receive_files: true,
             transport: default_transport(),
             transport_fallback: None,
@@ -240,6 +243,7 @@ mod tests {
             height: 1080,
             host_name: "test-host".to_string(),
             run_on_startup: true,
+            start_browser: true,
             receive_files: true,
             transport: "serial".to_string(),
             transport_fallback: None,
@@ -312,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_does_not_enable_browser_debugging() {
+        let cfg: HostConfig = toml::from_str("port = 'COM8'\nrun_on_startup = true\n").unwrap();
+        assert!(!cfg.start_browser);
+        assert_eq!(cfg.port, "COM8");
+        let enabled: HostConfig = toml::from_str("start_browser = true\n").unwrap();
+        assert!(enabled.start_browser);
+        assert!(
+            toml::from_str::<HostConfig>(&toml::to_string(&enabled).unwrap())
+                .unwrap()
+                .start_browser
+        );
+    }
+
+    #[test]
     fn save_creates_parent_dir() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("dir").join("config.toml");
@@ -350,6 +368,7 @@ mod tests {
             height: 720,
             host_name: "from-toml".to_string(),
             run_on_startup: true,
+            start_browser: true,
             receive_files: true,
             transport: "serial".to_string(),
             transport_fallback: None,

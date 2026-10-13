@@ -10,6 +10,8 @@ mod app;
 mod clipboard;
 mod clipboard_files;
 mod config;
+#[cfg(target_os = "macos")]
+mod desktop_view;
 mod exec_bridge;
 mod input;
 /// End-to-end interactive-IPC round-trip test (Task 9). Test-only — the crate
@@ -290,7 +292,7 @@ fn main() {
     // not by the poll thread, so the UI sees real wire-state progress
     // instead of an instant jump to 100% as packets queue.
     clipboard::spawn_poll_thread(
-        clipboard_state,
+        clipboard_state.clone(),
         outgoing_tx.clone(),
         poll_events_tx,
         send_images.clone(),
@@ -387,6 +389,8 @@ fn main() {
     );
     // Let the UI ask the supervisor to reconnect on each Disconnected event.
     app.set_reconnect_request_tx(reconnect_request_tx);
+    #[cfg(target_os = "macos")]
+    app.set_browser_service(wiredesk_browser_cli::Service::start(), clipboard_state);
     // Seed the geometry tracker with what we just asked winit for, so the
     // first sampled rect doesn't look like a move and rewrite an identical
     // config.

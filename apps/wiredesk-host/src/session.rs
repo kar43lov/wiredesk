@@ -434,7 +434,7 @@ impl<T: Transport, I: InputInjector> Session<T, I> {
             pty: None,
             pty_last_activity: now,
             flow: ShellFlow::new(now),
-            browser: wiredesk_browser::Hub::default(),
+            browser: wiredesk_browser::Hub::with_desktop(crate::desktop::handler()),
             warm: None,
             warm_enabled: true,
             // Unit tests get a clipboard with no OS backend: see

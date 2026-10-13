@@ -400,6 +400,11 @@ fn handle_browser_connection(
             if !matches!(packet.message, Message::Browser { .. }) {
                 break;
             }
+            if matches!(packet.message, Message::Browser { kind: 8, .. })
+                && !wiredesk_protocol::message::desktop_supported(info.proto_version)
+            {
+                break;
+            }
             // Keep ownership check and enqueue atomic with reader-side
             // teardown/reset. A cleared route must not feed stale bytes
             // into a replacement companion that reuses stream ids.

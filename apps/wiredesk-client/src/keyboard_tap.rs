@@ -75,6 +75,44 @@ fn is_cmd_enter(keycode: u16, flags: u64, swap: bool) -> bool {
     keycode == CG_KEY_RETURN && matches_cmd_only(flags, swap)
 }
 
+fn is_desktop_enter(keycode: u16, flags: u64, swap: bool) -> bool {
+    keycode == CG_KEY_RETURN
+        && flags & CG_FLAG_CONTROL != 0
+        && matches_cmd_only(flags & !CG_FLAG_CONTROL, swap)
+}
+
+#[cfg(test)]
+mod desktop_shortcut_tests {
+    use super::*;
+    #[test]
+    fn desktop_shortcut_is_distinct_and_exact() {
+        let combo = CG_FLAG_CONTROL | CG_FLAG_COMMAND;
+        assert!(is_desktop_enter(CG_KEY_RETURN, combo, false));
+        assert!(!is_cmd_enter(CG_KEY_RETURN, combo, false));
+        for flags in [
+            0,
+            CG_FLAG_COMMAND,
+            CG_FLAG_CONTROL,
+            combo | CG_FLAG_SHIFT,
+            combo | CG_FLAG_ALT,
+        ] {
+            assert!(!is_desktop_enter(CG_KEY_RETURN, flags, false));
+        }
+        assert!(!is_desktop_enter(CG_KEY_ESCAPE, combo, false));
+        assert!(is_desktop_enter(
+            CG_KEY_RETURN,
+            CG_FLAG_CONTROL | CG_FLAG_ALT,
+            true
+        ));
+        assert!(is_desktop_enter(CG_KEY_RETURN, combo, true));
+        assert!(!is_desktop_enter(
+            CG_KEY_RETURN,
+            CG_FLAG_CONTROL | CG_FLAG_ALT,
+            false
+        ));
+    }
+}
+
 /// `true` if a synthetic KeyDown is a Cmd+V paste (Whispr Flow / TextExpander
 /// / AppleScript). Only a real paste should kick the clipboard poll thread out
 /// of its outbound-text debounce — kicking on *any* synthetic key would let an
@@ -104,6 +142,8 @@ pub enum TapEvent {
     EngageCapture,
     /// User pressed Cmd+Enter — toggle fullscreen.
     ToggleFullscreen,
+    /// Control+Command+Enter toggles the Windows desktop fullscreen mode.
+    ToggleDesktopFullscreen,
 }
 
 /// A batched synthetic key combo deferred to the dispatcher thread so
@@ -204,6 +244,9 @@ impl TapHandle {
     /// OFF. Tap stays running and watches for Cmd+Esc / Cmd+Enter to
     /// toggle modes — everything else passes through.
     pub fn enable_passive(&self) {
+        if self.enabled.load(Ordering::SeqCst) {
+            self.disable();
+        }
         self.enabled.store(false, Ordering::SeqCst);
         self.passive.store(true, Ordering::SeqCst);
     }
@@ -472,6 +515,7 @@ mod macos {
             let tap_events_cb = tap_events_tx.clone();
             let synth_tx_cb = synth_tx.clone();
             let poll_kick_cb = poll_kick_tx.clone();
+            let desktop_return_down = AtomicBool::new(false);
 
             let join = thread::Builder::new()
                 .name("wiredesk-keyboard-tap".into())
@@ -535,6 +579,44 @@ mod macos {
                                 event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
                             let is_physical = state_id == HID_SYSTEM_STATE_ID;
                             let swap = swap_setting && is_physical;
+
+                            if matches!(event_type, CGEventType::KeyDown)
+                                && event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                    as u16
+                                    == super::CG_KEY_RETURN
+                                && desktop_return_down.load(Ordering::SeqCst)
+                            {
+                                return CallbackResult::Drop;
+                            }
+
+                            if matches!(event_type, CGEventType::KeyUp)
+                                && event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                    as u16
+                                    == super::CG_KEY_RETURN
+                                && desktop_return_down.swap(false, Ordering::SeqCst)
+                            {
+                                return CallbackResult::Drop;
+                            }
+
+                            // Intercept both halves of the desktop shortcut, including
+                            // autorepeat. Its Return must never reach the remote app.
+                            if (is_active || is_passive)
+                                && matches!(event_type, CGEventType::KeyDown | CGEventType::KeyUp)
+                                && super::is_desktop_enter(
+                                    event
+                                        .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                                        as u16,
+                                    event.get_flags().bits(),
+                                    swap,
+                                )
+                            {
+                                if matches!(event_type, CGEventType::KeyDown)
+                                    && !desktop_return_down.swap(true, Ordering::SeqCst)
+                                {
+                                    let _ = tap_events_cb.send(TapEvent::ToggleDesktopFullscreen);
+                                }
+                                return CallbackResult::Drop;
+                            }
 
                             // Passive mode: window focused but capture is OFF.
                             // Watch only for the toggle hotkeys (Cmd+Esc /
@@ -1495,6 +1577,40 @@ mod tests {
 
         // prev_flags must be cleared.
         assert_eq!(h.prev_flags.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn passive_transition_releases_desktop_shortcut_modifiers_once() {
+        let (out_tx, out_rx) = mpsc::channel();
+        let (tap_tx, _tap_rx) = mpsc::channel();
+        let h = start(
+            out_tx,
+            tap_tx,
+            make_swap_flag(),
+            make_synth_tx(),
+            make_kick_tx(),
+        );
+        h.enable();
+        h.prev_flags
+            .store(CG_FLAG_COMMAND | CG_FLAG_CONTROL, Ordering::SeqCst);
+        h.enable_passive();
+        assert!(!h.is_enabled());
+        assert!(h.is_passive());
+        assert_eq!(h.prev_flags.load(Ordering::SeqCst), 0);
+        let packets: Vec<_> = out_rx.try_iter().collect();
+        // Both Mac modifiers map to one Windows Ctrl in the normal layout.
+        assert_eq!(packets.len(), 1);
+        assert!(matches!(
+            packets[0].message,
+            wiredesk_protocol::message::Message::KeyUp {
+                scancode: WIN_SCAN_LCTRL,
+                ..
+            }
+        ));
+        h.enable_passive();
+        h.disable();
+        assert!(out_rx.try_recv().is_err());
     }
 
     #[test]

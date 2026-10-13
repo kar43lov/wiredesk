@@ -82,6 +82,7 @@ pub struct SettingsWindow {
     pub system_frame: nwg::Frame,
     pub system_layout: nwg::GridLayout,
     pub autostart_check: nwg::CheckBox,
+    pub browser_check: nwg::CheckBox,
     pub copy_mac_btn: nwg::Button,
 
     // --- Bottom button-bar (outside groups) ---
@@ -144,7 +145,7 @@ impl SettingsWindow {
                 // legibility. `center(true)` places it on the active monitor
                 // (overriding the fixed position) so it can't spawn off-screen.
                 nwg::Window::builder()
-                    .size((520, 600))
+                    .size((520, 636))
                     .position((300, 300))
                     .center(true)
                     .title("WireDesk Host Settings")
@@ -368,6 +369,16 @@ impl SettingsWindow {
                 .parent(&s.system_frame)
                 .build(&mut s.autostart_check)?;
 
+            nwg::CheckBox::builder()
+                .text("Start browser for remote access")
+                .check_state(if config.start_browser {
+                    nwg::CheckBoxState::Checked
+                } else {
+                    nwg::CheckBoxState::Unchecked
+                })
+                .parent(&s.system_frame)
+                .build(&mut s.browser_check)?;
+
             nwg::Button::builder()
                 .text("Copy Mac launch command")
                 .parent(&s.system_frame)
@@ -449,7 +460,8 @@ impl SettingsWindow {
                 .spacing(4)
                 .margin([6, 6, 6, 6])
                 .child_item(nwg::GridLayoutItem::new(&s.autostart_check, 0, 0, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.copy_mac_btn, 0, 1, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.browser_check, 0, 1, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.copy_mac_btn, 0, 2, 3, 1))
                 .build(&s.system_layout)?;
 
             // Button-bar internal grid: 4 cols × 1 row. Col 0 holds Quit
@@ -473,7 +485,7 @@ impl SettingsWindow {
             // layout.
             nwg::GridLayout::builder()
                 .parent(&s.window)
-                .min_size([440, 560])
+                .min_size([440, 596])
                 .max_column(Some(3))
                 .spacing(4)
                 .margin([6, 6, 6, 6])
@@ -492,13 +504,13 @@ impl SettingsWindow {
                 // Display so the visual grid stays even.
                 .child_item(nwg::GridLayoutItem::new(&s.clipboard_title, 0, 9, 3, 1))
                 .child_item(nwg::GridLayoutItem::new(&s.clipboard_frame, 0, 10, 3, 2))
-                // Row 12: System title; rows 13-14: System frame
+                // Row 12: System title; rows 13-15: System frame
                 .child_item(nwg::GridLayoutItem::new(&s.system_title, 0, 12, 3, 1))
-                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 13, 3, 2))
-                // Row 15: button-bar (right-aligned via internal grid)
-                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 15, 3, 1))
-                // Row 16: message label
-                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 16, 3, 1))
+                .child_item(nwg::GridLayoutItem::new(&s.system_frame, 0, 13, 3, 3))
+                // Row 16: button-bar (right-aligned via internal grid)
+                .child_item(nwg::GridLayoutItem::new(&s.bar_frame, 0, 16, 3, 1))
+                // Row 17: message label
+                .child_item(nwg::GridLayoutItem::new(&s.message_label, 0, 17, 3, 1))
                 .build(&s.layout)?;
 
             // Hidden by default — caller decides when to reveal.
@@ -568,6 +580,7 @@ impl SettingsWindow {
         let width = format::validate_dimension(&self.width_input.text())?;
         let height = format::validate_dimension(&self.height_input.text())?;
         let run_on_startup = self.autostart_check.check_state() == nwg::CheckBoxState::Checked;
+        let start_browser = self.browser_check.check_state() == nwg::CheckBoxState::Checked;
         // Task 8: file clipboard receive toggle. Checkbox lives in the
         // Clipboard group; mirrors the Mac client's `receive_files` toggle.
         // Save-and-Restart respawns the host process so the value takes
@@ -585,6 +598,7 @@ impl SettingsWindow {
             width,
             height,
             run_on_startup,
+            start_browser,
             receive_files,
             transport,
             // Preserve fields not edited in this form.

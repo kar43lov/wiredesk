@@ -60,6 +60,19 @@ fn locked_set_image(
 }
 
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Explicit UI copy, serialized with every background pasteboard call.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)]
+pub fn locked_copy_local_text(text: String, state: &ClipboardState) -> Result<(), arboard::Error> {
+    let _guard = wiredesk_core::clipboard_lock::hold();
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.clone())?;
+    // Publish suppression before releasing the pasteboard lock, so the
+    // poll thread cannot see this access key as new outbound text.
+    state.set_text(hash_text(&text));
+    Ok(())
+}
 /// Per-chunk byte cap: everything a `ClipChunk` can carry.
 ///
 /// The payload of that message is the 2-byte chunk index followed by the
