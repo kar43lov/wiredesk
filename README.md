@@ -200,7 +200,7 @@ Release builds run as a background tray agent — no console window; a monitor-g
 
 # Right-click the tray icon for: Show Settings… / Open Logs / Quit
 # Settings window persists changes to %APPDATA%\WireDesk\config.toml
-# "Run on startup" toggle writes HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+# "Run on startup" prefers an elevated logon task; HKCU Run is a fallback
 ```
 
 Logs roll daily into `%APPDATA%\WireDesk\host.log.YYYY-MM-DD`. Panics and `log::*` macros across the host crate are captured into the same file via `tracing-log`.
