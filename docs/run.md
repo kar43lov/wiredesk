@@ -28,6 +28,28 @@ Release-сборка работает фоновым tray-приложением
 .\target\release\wiredesk-host.exe
 ```
 
+#### Ручное обновление и запуск из репозитория
+
+Для текущего пользовательского варианта exe запускается непосредственно из
+`C:\Download\prjcts\wiredesk\target\release\`; перенос в Program Files не нужен.
+Перед обновлением закрыть хост через tray → Quit. Вставить весь блок в PowerShell:
+
+```powershell
+& {
+    $ErrorActionPreference = 'Stop'
+    Set-Location 'C:\Download\prjcts\wiredesk'
+    git pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }
+    cargo build --release --locked -p wiredesk-host
+    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+    Start-Process '.\target\release\wiredesk-host.exe' -Verb RunAs
+}
+```
+
+Для запуска уже собранного exe достаточно `Start-Process` из последней строки.
+Это ручной запуск с запросом UAC; требования к каталогу для автоматической
+задачи планировщика описаны отдельно в `docs/known-limitations.md`.
+
 - **Tray-меню** (правый клик): Show Settings / Open Logs / Quit
 - **Typography:** глобальный default font — Segoe UI 16px (`nwg::Font::set_global_default` сразу после `nwg::init()`, до построения окон). На Win11 со 100% scaling это нативный диалог-вид; контролы наследуют без явного присваивания.
 - **Settings window** (через tray): port — выпадающий список обнаруженных портов с подписью чипа («COM7 — FT232H», «COM5 — CH340», «COM9 — USB serial 1234:ABCD», «COM1 — serial») + free-text manual override («or type:»), обновляется при каждом открытии окна и по `Detect`. Кнопка `Detect` (`ui::format::classify_ports` / `target_indices`) перечисляет все serial-порты, заполняет дропдаун и авто-выбирает WireDesk-адаптер — CH340 VID 0x1A86 **или** FTDI VID 0x0403 (FT232H/R/2232/4232); при двух адаптерах берёт первый и просит выбрать. Выбор в дропдауне копирует bare-COM в manual-поле (canonical value, читается при Save). Дальше: baud, width/height, чекбокс «Run on startup (as admin)» (заводит задачу планировщика с `RunLevel HIGHEST`; из неэлевированного host'а откатывается на ключ `Run` с warning'ом в логе), кнопка Copy Mac launch command. Кнопки в нижнем button-bar: `Re&start` (сохраняет TOML и спавнит новый процесс через `Command::spawn` + `stop_thread_dispatch`; новый процесс получает mutex через 5×100ms retry-loop) / `&Save` (primary — пишет TOML без рестарта). Save+Restart pattern: большинство изменений требуют перезапуск для apply. **Исключение — чекбокс «Receive files»: применяется live по Save** (без Restart) через shared `Arc<AtomicBool>` (`main` → session_thread + Save-handler); порт/baud/размер/transport по-прежнему требуют Restart. Окно **resizable** (флаг `MAIN_WINDOW`, а не `WINDOW` — есть `WS_THICKFRAME` + minimize/maximize; nwg `GridLayout` reflow'ится по `WM_SIZE`, `center(true)` открывает окно по центру активного монитора). Раньше был `WINDOW` (fixed-border) — на мониторе с другим DPI/масштабом правая колонка раскладки обрезалась без возможности расширить окно.
@@ -56,7 +78,7 @@ Logs tee to `/tmp/wiredesk-mac.log` for retrospective analysis.
 **Подпись и Accessibility.** `build-mac-app.sh` подписывает бандл ad-hoc, и macOS считает каждую пересборку новым приложением — грант Accessibility слетает, экран с инструкцией показывается снова. Один раз выполнить `./scripts/make-dev-signing-cert.sh` — он кладёт в login keychain self-signed identity «WireDesk Dev» (два запроса пароля: доверие сертификату и первый `codesign`), после чего скрипт сборки подхватывает её сам (или задать любую другую через `WIREDESK_SIGN_IDENTITY`), designated requirement остаётся прежним и грант переживает пересборки. Сам грант, выданный уже работающему процессу, подхватывается без перезапуска — тап стартует, экран пропадает через ≤2 с.
 
 - **Settings panel** в chrome-UI (сгруппирована в три `ui.group()` блока — Connection / Display / System): port (combo + free-text), baud, host screen W×H, monitor selection (ComboBox с кэшированным `monitor::list_monitors()` через NSScreen, refresh раз в секунду), client name. Save пишет `~/Library/Application Support/WireDesk/config.toml` и показывает inline toast 3 секунды. В capture/fullscreen settings panel скрыта (info-only screen без интерактивных элементов).
-- **Capture-mode UI**: в обычном Capture Input центральная панель пустая, а подсказки и прогресс — overlays; это сохраняет координаты мыши. В режиме «Экран Windows» панель рисует кадр с чёрными полями по пропорциям, подсказка содержит Ctrl+Cmd+Enter для выхода. Баннер не принимает клики; progress-overlay принимает только действия отмены передачи.
+- **Capture-mode UI**: в обычном Capture Input центральная панель пустая, а подсказки и прогресс — overlays; это сохраняет координаты мыши. В режиме «Экран Windows» виден только кадр с чёрными полями по пропорциям: баннеры, подсказки и progress-overlay скрыты. Ctrl+Cmd+Enter выходит из режима, Cmd+Esc освобождает ввод. Прогресс и кнопка отмены передачи доступны после выхода из desktop-режима.
 - **Permission screen** (`render_permission_screen`): тексты вынесены в pure helper `permission_steps() -> &'static [&'static str]` (4 шага). Каждый шаг — `ui.group()` с цифрой в кружке слева. Кнопка `Open System Settings` живёт внутри шага 1 (action рядом с инструкцией).
 - **Per-monitor fullscreen** (`Cmd+Enter`) — borderless: окно занимает выбранный дисплей без отдельного Space. `Decorations(false)`, `OuterPosition` и `InnerSize` задают границы; `mac_window::set_above_menu_bar` поднимает только окно WireDesk над меню-баром и Dock, пока оно в фокусе. При потере фокуса уровень возвращается к обычному. Dock на остальных дисплеях не скрывается. Если выбранный дисплей недоступен, используется текущий с предупреждением. Причина отказа от native fullscreen и механизм восстановления — `docs/known-limitations.md`.
 - **Экран Windows** — синяя кнопка рядом с Capture Input или `Ctrl+Cmd+Enter`: тот же выбранный дисплей, изображение текущего Windows-стола, автоматический захват после первого кадра. Повторное сочетание закрывает режим и освобождает ввод. `Cmd+Esc` отпускает или снова включает ввод; после ошибки кадра/разрыва связи включать его явно. При выходе из ACTIVE в PASSIVE удержанные модификаторы отпускаются на Windows. Требуется host generation 5; настройка панели и ограничения — `docs/browser.md`.

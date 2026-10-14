@@ -2017,15 +2017,13 @@ impl WireDeskApp {
     /// separate Area pinned to the BOTTOM of the screen — Host's bottom
     /// row is less click-critical than the top.
     fn render_capture_overlays(&self, ctx: &egui::Context) {
+        // Only ordinary capture uses these overlays. Desktop mode renders
+        // the remote image alone; its frame errors appear in DesktopView.
         let screen_rect = ctx.screen_rect();
         // When the link is down the user is still in capture/fullscreen but
         // input goes nowhere — surface that loudly with a yellow banner so the
         // (now-frozen) Host view isn't mistaken for a live session.
         let link_lost = self.state != ConnectionState::Connected;
-        #[cfg(target_os = "macos")]
-        let desktop_mode = self.desktop_fullscreen;
-        #[cfg(not(target_os = "macos"))]
-        let desktop_mode = false;
         let (banner_fill, banner_text) = if link_lost {
             (
                 egui::Color32::from_rgb(180, 140, 0).linear_multiply(0.35),
@@ -2034,15 +2032,7 @@ impl WireDeskApp {
         } else {
             (
                 COLOR_CAPTURE_RED.linear_multiply(0.3),
-                if desktop_mode {
-                    if self.capturing {
-                        "Экран Windows — Ctrl+Cmd+Enter: выйти · Cmd+Esc: отпустить ввод"
-                    } else {
-                        "Экран Windows — ввод отпущен · Ctrl+Cmd+Enter: выйти"
-                    }
-                } else {
-                    "CAPTURING — Cmd+Esc to release"
-                },
+                "CAPTURING — Cmd+Esc to release",
             )
         };
 
@@ -2382,13 +2372,11 @@ impl eframe::App for WireDeskApp {
         // In capture mode banner / progress / info-text all live in
         // overlays so they don't occlude Host's top row coordinate-
         // mapping. Render BEFORE CentralPanel so they sit on top.
-        // CentralPanel itself stays empty — Mac coords map 1:1 onto
-        // full Host display in both windowed and fullscreen capture.
-        if !show_chrome {
+        // Ordinary capture keeps CentralPanel empty; desktop mode draws
+        // its frame without overlays and uses the frame's aspect ratio.
+        if !show_chrome && !desktop_enabled {
             self.render_capture_overlays(ctx);
-            if !desktop_enabled {
-                self.render_capture_info_text(ctx);
-            }
+            self.render_capture_info_text(ctx);
         }
 
         let mut panel = egui::CentralPanel::default();
